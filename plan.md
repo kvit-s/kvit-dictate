@@ -4,9 +4,11 @@ A local, private replacement for Windows `Win+H`: press a hotkey, talk, text app
 whatever field has focus. Target machine is this one — RTX 5090 (32 GB), 64 GB RAM,
 28 logical cores, Windows 11 Pro.
 
-The PRD is a research memo, not a spec. This plan turns it into buildable steps, with the
-central constraint made explicit up front: **we do not yet know which ASR model wins, so
-the first thing we build is the harness that decides it — not the app.**
+**Revision 2**, incorporating `plan-review.md`. The review found three blocking defects, all
+real, and its central structural argument is correct: the defining interaction (an inline
+overlay anchored at the insertion point) was a hard architectural dependency scheduled for
+testing *after* a week of model work. It is now tested first. Changes from revision 1 are
+summarised in §9.
 
 ---
 
@@ -16,379 +18,384 @@ The PRD's recommendation is sound in shape:
 
 > hotkey → mic → VAD → streaming ASR → optional second-pass correction → inject into focused window
 
-and its ranking (streaming model first for latency, larger model for accuracy, Whisper as
-baseline) is the right instinct.
-
 **Caveat that must be resolved before anything is built:** the specific artifacts the PRD
 names — `nvidia/nemotron-speech-streaming-en-0.6b`, Qwen3-ASR 0.6B/1.7B (arXiv 2601.21337),
 and the 50-config comparison (arXiv 2604.14493) — are cited from a chat transcript with
-`utm_source=chatgpt.com` on every link. I cannot confirm from my own knowledge that all
-three exist exactly as described, and citations of that provenance are a common place for
-plausible-but-wrong model names and arXiv IDs to appear. Phase 0 exists to check this. If a
-model turns out not to exist, the architecture below is unaffected — only the contents of
-the candidate list change, which is exactly why the candidate list is data, not code.
+`utm_source=chatgpt.com` on every link. I cannot confirm from my own knowledge that all three
+exist as described, and that provenance is a common source of plausible-but-wrong model names
+and arXiv IDs. Phase 0A checks this. The architecture is unaffected either way — only the
+contents of the candidate list change, which is why the candidate list is data, not code.
+
+Consequently this document says **"the selected streaming finalist"**, never "Nemotron",
+except when quoting the PRD.
 
 ---
 
-## 1. Architecture decision
+## 1. Architecture
 
 ### 1.1 Two processes, one contract
 
 ```
 ┌─────────────────────────────┐        ┌──────────────────────────────┐
-│  kvit-dictate.exe (C++)     │        │  asr-server (Python, phase 1)│
+│  kvit-dictate.exe (C++)     │        │  asr-server (Python)         │
 │                             │        │                              │
-│  • global hotkey            │ named  │  • model registry            │
+│  • global hotkey            │ named  │  • one backend per process   │
 │  • WASAPI mic capture       │ pipe   │  • VAD                       │
-│  • VAD gate (optional)      │◄──────►│  • streaming decode          │
-│  • floating overlay         │ binary │  • partial/final emission    │
-│  • text commit engine       │ frames │  • optional 2nd-pass rescore │
-│  • SendInput / clipboard    │ + JSON │                              │
-│  • tray + settings          │        │  (swappable: NeMo, HF,       │
-└─────────────────────────────┘        │   faster-whisper, sherpa)    │
-                                       └──────────────────────────────┘
+│  • session state machine    │◄──────►│  • streaming decode          │
+│  • anchor estimation        │ binary │  • stability computation     │
+│  • commit engine            │ frames │  • partial/final emission    │
+│  • overlay / injection      │ + JSON │                              │
+│  • tray + settings          │        │  (NeMo | HF | ONNX | CT2)    │
+└─────────────────────────────┘        └──────────────────────────────┘
 ```
 
 **Why split.** Every candidate model has a different runtime — NeMo, HuggingFace
-`transformers`, `faster-whisper`/CTranslate2, ONNX. Binding all of those into a C++ process
-is weeks of work *per model*, spent before we know which one we keep. In Python each new
-candidate is a ~50-line adapter. The split lets us run the model bake-off in days instead of
-months, and the C++ side never learns which model it is talking to.
+`transformers`, `faster-whisper`/CTranslate2, ONNX. Binding all of those into a C++ process is
+weeks of work *per model*, spent before we know which one we keep. In Python each new
+candidate is a ~50-line adapter.
 
-**Why this is not a cop-out on "lightweight".** The C++ front-end is the part that must be
-lightweight, and it stays lightweight — it is a few hundred KB of Win32 with no model code in
-it. The Python process is a service, and Phase 5 replaces it in-process if measurements say
-we should. Because the contract is fixed in Phase 1, that swap touches nothing on the C++ side.
+**One backend per process, not a registry inside one interpreter.** A Python-side model
+registry cannot enumerate models that only exist under a *different* interpreter, which is
+exactly the situation §5 creates. So the model→interpreter mapping lives in a **C++-side
+manifest** (`models.json`), and selecting a model restarts the sidecar under that model's
+interpreter. The C++ side still never learns what the model *is* — only which executable to
+launch.
 
-### 1.2 Transport: duplex named pipe, message mode
+### 1.2 Transport and protocol
 
-`\\.\pipe\kvit-dictate`. Not a TCP socket:
+`\\.\pipe\kvit-dictate-<random>` — a duplex, message-mode named pipe. Not a TCP socket: no
+Windows Firewall prompt on first run (which reads badly for a privacy tool), no port
+collision, no discovery dance.
 
-- No Windows Firewall prompt on first run (a loopback listener triggers one; users read that
-  as "this dictation app wants network access", which is exactly the wrong first impression
-  for a privacy-motivated tool).
-- No port collision, no port-file discovery dance.
-- Pipe ACL restricts it to the current user for free.
+**Security — correcting an error in revision 1.** I previously wrote that a named pipe's ACL
+restricts it to the current user "for free". That is false. Microsoft documents that the
+default descriptor "grant[s] full control to the LocalSystem account, administrators, and the
+creator owner. They also grant read access to members of the Everyone group and the anonymous
+account." Required instead:
 
-Framing: 4-byte little-endian length + 1-byte type + payload.
-Type `0x01` = JSON control message (UTF-8), type `0x02` = raw PCM audio (16 kHz, mono, s16le).
-Audio flows client→server continuously while the hotkey is held; control flows both ways.
+- An **explicit DACL built on the logon SID**, not merely the user SID. Microsoft's own
+  guidance: *"To prevent remote users or users on a different terminal services session from
+  accessing a named pipe, use the logon SID on the DACL for the pipe."*
+- A **per-launch unpredictable pipe name**, generated by the parent and passed to the child on
+  its command line, defeating pipe squatting by a process that started first.
+- **Peer validation** via `GetNamedPipeClientProcessId` — confirm the connected client is the
+  child we spawned, not merely someone who guessed the name.
+- Prefer individual access rights over `FILE_GENERIC_WRITE`, which implies
+  `FILE_CREATE_PIPE_INSTANCE` and would let a client create rival instances.
 
-Control messages (v0):
+**Framing.** 4-byte little-endian length + 1-byte type + payload. Type `0x01` = JSON control
+(UTF-8), `0x02` = raw PCM audio (16 kHz mono s16le). Max control frame 64 KiB, max audio frame
+64 KiB; anything larger is a protocol error that terminates the session rather than being
+truncated.
+
+**Text and offsets are UTF-8 end to end.** All offsets are **UTF-8 byte offsets** and must land
+on a grapheme-cluster boundary — never splitting a UTF-8 sequence, a surrogate pair, or a
+combining sequence. The C++ side converts to UTF-16 only at the Windows API boundary. Revision
+1's `stable_chars` was ambiguous between characters, bytes, and UTF-16 code units; it is now
+`stable_bytes` with this definition attached.
+
+**Identity, so a late message can never hit the wrong window.** Every message carries
+`session_id` (one per hotkey activation) and, where applicable, `utterance_id` (one per
+VAD-delimited utterance) plus a monotonic `seq`. The client **drops any message whose
+`session_id` is not the current one** — this is the rule that prevents a `final` arriving after
+a stop/restart from being injected into whatever the user has since focused.
 
 ```jsonc
 // C++ → server
-{"t":"hello","proto":1,"model":"nemotron-stream-0.6b"}
-{"t":"start","sample_rate":16000,"context":["llama.cpp","Qwen3","RTX 5090"]}
-{"t":"stop"}          // hotkey released — flush and finalize
+{"t":"hello","proto":1}
+{"t":"start","session_id":"s7","sample_rate":16000,"context":["llama.cpp","Qwen3"]}
+{"t":"stop","session_id":"s7"}     // finalise what exists, then end
+{"t":"cancel","session_id":"s7"}   // discard, emit nothing further
 
 // server → C++
-{"t":"ready","model":"...","warm_ms":2140}
-{"t":"partial","text":"can you change the llama dot cpp config","stable_chars":31,"seq":7}
-{"t":"final","text":"Can you change the llama.cpp configuration…","seq":7,"latency_ms":180}
-{"t":"error","msg":"..."}
+{"t":"loading","model":"..."}
+{"t":"ready","model":"...","warm_ms":2140,"mode":"native-streaming"}
+{"t":"partial","session_id":"s7","utterance_id":3,"seq":12,
+ "text":"can you change the llama dot cpp config","stable_bytes":31}
+{"t":"final","session_id":"s7","utterance_id":3,"seq":13,
+ "text":"Can you change the llama.cpp configuration…","audio_pos_ms":4820}
+{"t":"stopped","session_id":"s7"}
+{"t":"error","session_id":"s7","fatal":true,"msg":"..."}
 ```
 
-`stable_chars` is the load-bearing field — see §1.4.
+- `text` in `partial` is **cumulative for the current utterance**, not a delta.
+- `stable_bytes` is a prefix length into `text`, and is **monotonically non-decreasing within
+  an utterance** — see the invariant in §1.4.
+- Sequence numbers are per-session and monotonic; out-of-order or duplicate `seq` is dropped,
+  a gap is logged and the anchor confidence reset.
+
+**Backpressure.** Bounded queues both directions. If the audio queue fills, the session ends
+with an explicit overload error — silently dropping or delaying audio produces mysteriously
+bad transcription and is not acceptable. Control-message backlog above a threshold is likewise
+fatal rather than absorbed.
+
+**Protocol spec is written and versioned before either endpoint is implemented**
+(`docs/protocol.md`). Cross-language fixtures (fragmented reads, coalesced frames, malformed
+lengths, invalid UTF-8, boundary-splitting offsets, reconnect, cancel, stale-session) land with
+the protocol in Phase 2, when it stabilises — not deferred to the end, and not gold-plated
+before the shape is known.
 
 ### 1.3 UI toolkit: plain Win32, not Qt
 
 `..\kvit-notes` proves the Qt 6.10.1 / MSVC 2022 toolchain works here, and I looked at it
-before deciding. But its UI needs are a rich text editor's; kvit-dictate's UI is:
+before deciding. But its UI needs are a rich text editor's; kvit-dictate's are a tray icon, a
+settings dialog, and a layered click-through overlay positioned from screen-capture geometry
+and painted with DirectWrite. Qt contributes nothing to the third and costs ~45 MB (Quick) or
+~25 MB (Widgets). Plain Win32 + Direct2D/DirectWrite is a few hundred KB and puts nothing
+between us and the APIs this app is *made of* (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`, WASAPI,
+`SendInput`, `BitBlt`, `SetWindowDisplayAffinity`).
 
-1. a tray icon,
-2. an **inline caret-anchored overlay** rendering the uncommitted text tail (§1.4a),
-3. a settings dialog (hotkey, model, mic, injection mode).
-
-Item 2 is the whole product, and it is not a widget — it is a layered, click-through window
-positioned from an insertion point recovered by screen differencing (§1.4b) and painted with
-DirectWrite in a fixed configured style. Qt contributes
-nothing to that and costs ~45 MB (Quick) or ~25 MB (Widgets) to not contribute it. Plain
-Win32 + Direct2D/DirectWrite is a few hundred KB, starts instantly, and puts nothing between
-us and the APIs this app is *made of* (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`, WASAPI, `SendInput`,
-`BitBlt`).
-
-Window flags, all four load-bearing:
+Overlay window flags, all load-bearing:
 `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`.
-`WS_EX_NOACTIVATE` — if the overlay takes focus, the target loses it and injection lands in
-our own window. `WS_EX_TRANSPARENT` — clicks pass through to the app underneath, which the
-user must be able to keep using while the overlay floats over their text.
+`WS_EX_NOACTIVATE` — if the overlay takes focus, the target loses it and injection lands in our
+own window. `WS_EX_TRANSPARENT` — clicks pass through.
 
-Process must be `PROCESS_PER_MONITOR_DPI_AWARE_V2`: the target window can be on a different
-monitor at a different scale, and caret rectangles come back in physical pixels.
+Additionally `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (Windows 10 2004+): DWM
+then excludes the overlay from all capture surfaces, which is what stops **our own overlay from
+contaminating the anchor captures in §1.5**. Not a security measure — a correctness one.
 
-Fallback: if the settings dialog and tray plumbing turn out to be a slog, build *only those*
-in Qt Widgets and keep the hot path native. Decide at the end of Phase 3, not now.
+Process must be `PROCESS_PER_MONITOR_DPI_AWARE_V2`: the target can be on a different monitor at
+a different scale, and captured rectangles are physical pixels.
 
-### 1.4 The hard part nobody plans for: streaming commit
+Fallback: if the settings dialog and tray plumbing become a slog, build *only those* in Qt
+Widgets and keep the hot path native. Decide after Phase 3.
+
+### 1.4 Commit engine and the committed-prefix invariant
 
 Streaming ASR revises what it already said. `Win+H` hides this; we cannot, because we are
-typing into someone else's editor. Naïvely replaying revisions means emitting backspaces into
-an arbitrary application — and backspace is not a safe key to send blind: in a browser it can
-navigate, in an IDE it can dismiss autocomplete, in a terminal it can eat a prompt.
+typing into someone else's document. Replaying revisions means sending backspaces into an
+arbitrary application, and backspace is not safe to send blind: in a browser it can navigate,
+in an IDE it can dismiss autocomplete, in a terminal it can eat a prompt.
 
-So the C++ side owns a **commit engine** with a strict rule: *only text the model is unlikely
-to revise gets injected; everything else lives in the overlay only.*
+> **The invariant.** Every byte sequence injected into the target must remain a prefix of every
+> later hypothesis, and of the final text, for that utterance. Committed text is never
+> repaired.
 
-- Server marks a prefix stable (`stable_chars`) when it has been unchanged across N
-  consecutive partials (N tunable, start at 2) and is ≥ M chars behind the decode head.
-- C++ injects only newly-stable prefix bytes. Append-only. Never backspaces into the target.
-- The unstable tail renders in the overlay, positioned at the caret and styled to match the
-  target field (§1.4a), so the user sees the model thinking without the document churning.
-- On `final`, the remaining tail is injected in one shot and the overlay clears.
+Revision 1 violated this. The experiment matrix listed `periodic-500ms` / `periodic-1000ms`
+commit policies, which commit on a timer regardless of stability — directly contradicting the
+invariant stated two sections earlier. The overlay can absorb revisions only while text is
+*in* the overlay; it cannot absorb a revision to text already in the document. The review
+caught this; it was a genuine defect.
 
-### 1.4a Inline overlay — the mechanism that makes this feel like `Win+H`
+**Resolution: cadence and eligibility are separate knobs.**
 
-`Win+H` commits periodically and draws the uncommitted remainder as an inline overlay that
-starts at the end of the committed text and mimics the input box's font and colours.
+- *Eligibility* — which prefix is safe to commit — is determined **only** by stability.
+- *Cadence* — `periodic-Nms` — controls only **when an already-eligible stable prefix is
+  flushed**. It can delay a commit; it can never promote unstable text.
 
-That detail is the trick, and it reframes §1.4. If the pending text is rendered *at the
-caret, in the target's own font and colour*, the user cannot tell committed text from pending
-text — it reads as one continuous stream of words appearing as they speak. Commit timing
-stops being a perceived-latency tradeoff and becomes an implementation detail. A floating
-status pill somewhere else on screen would not do this: the eye has to travel, and the seam
-between "text in the pill" and "text in the document" is exactly what makes a dictation tool
-feel laggy.
+**Stability algorithm**, stated precisely because "stable" was doing unexamined work:
 
-Consequences for the plan:
+1. Maintain the last `N` hypotheses for the current utterance (default `N = 2`).
+2. Candidate = longest common prefix over those `N`, computed on **grapheme clusters**.
+3. Retract to at least `M` clusters behind the decode head (default `M = 3`) — the tail of a
+   hypothesis is where revision concentrates.
+4. Retract further to the last **word boundary** (whitespace or terminal punctuation). Never
+   commit a partial word; a revised word-ending is the most common revision there is.
+5. Require the candidate to have been unchanged for `T` ms (default 200).
+6. Emit as `stable_bytes`. **Monotonic within an utterance** — it may never decrease.
+7. Reset entirely at an utterance boundary.
 
-- **Commit policy can be time-based, not just stability-based.** Add `periodic-Nms` to the
-  experiment matrix (§4) alongside `stable-N`. With the overlay absorbing the churn, periodic
-  commits are viable and simpler.
-- **Flicker rate (§Phase 2) demotes from UX metric to correctness metric.** It no longer
-  predicts perceived quality — the overlay hides revision. It still bounds how much text we
-  can commit before the model would have changed it, i.e. how wrong the final document gets.
-- **Locating the insertion point becomes a hard dependency**, and it is the riskiest
-  component in the app (§1.4b). Note this is the *only* thing that must be recovered from the
-  target — the overlay's appearance is fixed in settings, not sampled from the app.
+Trailing whitespace is held back rather than committed, so that a following punctuation
+revision does not require rewriting across a committed space.
 
-**Stop conditions match `Win+H`:** any real click or keystroke during dictation commits what
-we have and stops. The low-level keyboard hook already sees every key; add `WH_MOUSE_LL` for
-clicks. Both must filter `LLKHF_INJECTED` / `LLMHF_INJECTED` so our own `SendInput` traffic
-never stops the session it is producing. See §1.4c for silence.
+**Violation handling.** If a backend emits a `final` (or a later `partial`) that is not an
+extension of what we already committed:
 
-### 1.4c Two different silence timeouts — don't conflate them
+- **Preserve the document.** Never silently repair, never send backspaces.
+- Log the unapplicable correction, both texts, and the diverging offset.
+- Surface it: the overlay flags the utterance and the tray shows a warning state.
+- Count it as an **irrevocable-error event**, attributed to that backend and configuration.
 
-Long thinking pauses mid-dictation must not end the session. `Win+H` handles this badly: it
-auto-stops after a short silence and exposes **no setting to change it**, which is one of the
-most common complaints about it. (I don't have a reliable figure for its exact default and
-won't invent one — the point that matters is that it's short and not configurable.)
+**Metric: irrevocable committed error rate (ICER)** — committed graphemes that differ from the
+final hypothesis, per 1000 committed. This replaces flicker as the headline safety number.
+Flicker measures churn the user never sees, and can be high with zero document corruption; ICER
+measures text that is actually wrong in the actual document, which is the failure that matters.
+Both are recorded; ICER is what gates.
 
-The fix is to recognise these are two unrelated timers that a naive implementation merges:
+A **speculative mode** (commit ahead of stability, to measure the achievable latency ceiling)
+may be run in the harness. It is named unsafe, excluded from defaults, and never shipped.
+
+### 1.5 Anchor estimation: best-effort, confidence-scored
+
+The overlay renders pending text at the insertion point in the target application. **The
+overlay's appearance is fixed in settings** — one font, size and colour used everywhere — not
+sampled from the target. Style-matching was abandoned earlier: font family is unrecoverable
+from pixels, colour sampling breaks on gradients and themed backgrounds, and a consistent
+appearance makes pending text legible *as* pending. So exactly one property must be recovered
+from the target: **where the insertion point is**.
+
+No accessibility APIs. UIA is cross-process COM that can block for seconds on a busy target —
+the same target receiving our synthetic keystrokes — and it is absent in the targets that
+matter most here (WSLg, terminals). WSLg is the sharpest case: those windows expose no UIA text
+pattern at all, which is precisely why `Win+H` refuses to dictate into them, and they are
+ordinary Windows windows for `SendInput` and `BitBlt` purposes.
+
+**Revision 1 overclaimed this mechanism.** It called commit differencing "correct by
+construction", "universal", and a source of "free failure detection". None of those survive
+contact with the counterexamples, and the review was right to reject the framing. Screen
+differencing is a **best-effort estimator with a confidence score**, and the plan now treats it
+that way.
+
+Three sources, combined into one confidence-scored anchor:
+
+| Source | Confidence | Notes |
+|---|---|---|
+| **A. `GetGUIThreadInfo().rcCaret`** | high when non-empty | Free, synchronous, no capture. Correct for classic Win32 edit controls; empty for apps drawing their own caret. |
+| **B. Last left-click before the hotkey** | medium | `WH_MOUSE_LL` is already installed for stop-on-input, so this is one cached point. Pure coordinates — works in WSLg, terminals, Electron, games. |
+| **C. Commit differencing** | variable — scored per commit | Capture before/after an injection; the changed region locates the text we just wrote. |
+
+**Source B validity rules:** click window must still be foreground; left-button only
+(right-click opens a context menu, middle-click pastes on X11); **invalidate on mouse wheel**
+(scrolling moves the caret with no click); keyboard navigation since the click downgrades to
+low confidence rather than discarding. Imprecise when clicking past end-of-line (caret snaps
+left), into an empty field, or merely to focus. Vertical placement is the reliable half — the
+click lands within the target line — so anchor the line box on click Y and treat X as a hint.
+
+**Source C, stated honestly.** The changed region's right edge is *not* generally the insertion
+point. Known failure cases:
+
+- whitespace-only or newline-only commits produce little or no visible change;
+- **line wrap** — the bounding box's right edge is on the previous line; use the rightmost
+  changed pixel of the *last changed text row*, not of the bounding box;
+- **RTL and bidirectional text** — the insertion point is at the *left* edge;
+- target auto-scroll or horizontal scroll repaints the whole viewport;
+- selection replacement changes a region that includes deleted text;
+- syntax highlighting, spellcheck underlines, and lint decorations repaint older text;
+- block cursors, autocomplete popups, animation, and caret blink all add changed regions;
+- password fields render dots; some content is deliberately capture-excluded.
+
+Confidence is scored from diff shape: a compact single-row change near the previous anchor
+scores high; a full-viewport change scores zero (treated as scroll — discard, keep previous
+anchor). Hysteresis prevents flapping between sources.
+
+**Below a confidence threshold the overlay degrades deterministically**: floating pill near the
+target, or no preview at all, configurable. This is a defined state, not a bug.
+
+**Injection success and anchor estimation are separate signals.** An empty diff does *not*
+prove injection failed — whitespace can be accepted invisibly, and text can land outside the
+visible region. A non-empty diff does not prove the expected text arrived. Injection success is
+determined by the mechanism in §1.7, never inferred from pixels.
+
+**Mechanics.** Capture via `BitBlt` from the desktop DC (post-composition, so it sees Chromium,
+WSLg, everything DWM draws). Our overlay is excluded via `WDA_EXCLUDEFROMCAPTURE` (§1.3). An
+all-black capture indicates HDR/multi-plane overlay — fall back to `Windows.Graphics.Capture`,
+**whose exact desktop API path and any user-visible capture indicator must be prototyped in
+Phase 0B rather than assumed transparent**. Account for target-window movement between the
+before and after frames. Async-rendering targets (Electron, WSLg over RDP) need the after-frame
+polled to a short deadline, not captured once. Capture and diff run on a worker thread; no COM,
+no cross-process calls.
+
+### 1.6 Session lifetime and silence
+
+Long thinking pauses must not end the session. `Win+H` handles this badly: it stops after a
+short silence and exposes **no setting to change it**, a frequent complaint. (I don't have a
+reliable figure for its exact default and won't invent one; what matters is that it is short
+and fixed.)
+
+Two unrelated timers that a naive implementation merges:
 
 | Timer | Default | Purpose |
 |---|---|---|
-| **Endpoint silence** | ~0.8 s | Ends an *utterance* for the model — triggers finalisation, punctuation, sentence boundary. Purely an ASR concern; the session continues. |
-| **Session silence** | **generous — 120 s, configurable, `never` permitted** | How long the session survives with no speech at all. |
+| **Endpoint silence** | ~0.8 s | Ends an *utterance* — finalisation, punctuation, sentence boundary. The session continues. |
+| **Session silence** | **120 s, configurable, `never` permitted** | How long the session survives with no speech at all. |
 
-A minute-long pause therefore costs nothing: the utterance endpoints after 0.8 s and finalises
-cleanly, the session stays open, and resuming speech simply starts a new utterance appended
-after a space.
+A minute-long pause therefore costs nothing: the utterance endpoints and finalises at 0.8 s,
+the session stays open, resuming starts a new utterance appended after a space.
 
-**A long session timeout is safe here specifically because of the stop-on-input rule
-(§1.4a).** Clicking anywhere or pressing any key already ends the session, which covers
-essentially every real "I'm done" moment. That makes an idle session harmless and removes the
-usual reason to time out aggressively. `never` is a legitimate setting, not a foot-gun.
+A generous session timeout is safe **because of stop-on-input** (§1.8): any click or keystroke
+already ends the session, covering essentially every real "I'm done" moment. `never` is a
+legitimate setting.
 
-**Gate the model with VAD during silence.** Do not keep feeding silence to a streaming model
-across a 60-second pause: several ASR models hallucinate on long silence — `wan-dancer`'s own
-`notes/transcribe.py` carries a comment about Whisper emitting "Thank you." / "Bye" over
-trailing silence, with timestamps past the end of the audio. During VAD-detected silence, stop
-feeding the decoder and reset its state at the endpoint; resume on speech onset.
+**VAD-gate the decoder during silence.** Do not feed 60 seconds of silence to a streaming
+model — several ASR models hallucinate on it. `wan-dancer`'s own `notes/transcribe.py` carries
+a comment about Whisper emitting "Thank you." / "Bye" over trailing silence with timestamps
+past the end of the audio. Stop feeding at the endpoint, reset decoder state, resume on speech
+onset. Silence-only and noise-only hallucination tests are part of the bake-off (§4).
 
-The mic stays open across a long pause, so the tray icon and overlay must show listening state
-unambiguously — an idle-but-hot mic the user has forgotten about is the one real cost of a
-generous timeout.
+The mic stays open across a long pause, so listening state must be unambiguous in the tray.
 
-### 1.4b Finding the insertion point: screen differencing, no accessibility APIs
+### 1.7 Text injection and target safety
 
-The obvious design is a tiered probe — UI Automation first, `GetGUIThreadInfo` next, pixel
-sampling as the last resort. **Rejected.** One universal path is better here, and pixel
-differencing is the one that works everywhere.
+**Both mechanisms ship**, selectable globally and per-app. Neither is obviously better and the
+answer is likely per-target:
 
-Reasons, in order of weight:
+1. **`SendInput` with `KEYEVENTF_UNICODE`** — universal across Win32/UWP/Electron/games. Slow
+   for long text (~1–2 ms/char with pacing); some apps drop fast synthetic input.
+2. **Clipboard + `Ctrl+V`** — fast and atomic, but clobbers the clipboard and fails where
+   `Ctrl+V` is bound elsewhere (terminals want `Ctrl+Shift+V`).
 
-1. **It is the only path that reaches WSL.** WSLg apps are X11/Wayland clients composited
-   into Windows windows through an RDP pipe. They expose no UIA text pattern at all — which
-   is precisely why `Win+H` refuses to dictate into them. They *are* real Windows windows, so
-   `SendInput` reaches them and the desktop DC captures them. Pixel sampling therefore works
-   where `Win+H` structurally cannot. That is a capability `Win+H` does not have, not parity.
-2. **It deletes the worst threading hazard in the app.** UIA is cross-process COM; a single
-   call can block for seconds on a busy target — the same target receiving our synthetic
-   keystrokes. A screen `BitBlt` has bounded cost and no cross-process dependency.
-3. **A tiered design must be tested and tuned per tier, per app.** Three code paths with
-   different accuracy and different failure modes, and the rarely-hit tiers are the ones that
-   rot. One path is exercised by every single dictation.
-4. Games, Java/Swing, RDP sessions and Electron all collapse from "special cases" into
-   "normal".
+UI Automation `TextPattern`/`ValuePattern` is **not implemented** — absent in the targets that
+matter most here, and §1.5 commits to a no-UIA design.
 
-**The overlay's style is fixed, not sampled.** A single appearance configured once in
-settings — font, size, colours — used in every application. Style matching was never worth
-what it cost: font family is unrecoverable from pixels anyway, colour sampling breaks on
-gradients and themed backgrounds, and a consistent look actually *reads better* because the
-pending text becomes visually identifiable as pending. This deletes the whole
-sampling-and-calibration layer.
+**UIPI is a hard boundary, not a failure to detect.** `SendInput` cannot inject into a
+higher-integrity target: an elevated window will silently ignore input from our non-elevated
+process, and Microsoft notes the return value does not identify UIPI as the cause. So elevated
+targets get an **explicit unsupported state** — detected up front by comparing integrity levels
+at session start, surfaced in the overlay and tray — never a generic "injection seemed not to
+work" guess.
 
-**So the problem reduces to exactly one thing: where is the insertion point on screen?**
+**Target identity** = top-level foreground `HWND` at hotkey press, plus focused thread and
+focused control where obtainable (`GetGUIThreadInfo().hwndFocus`). Both are validated before
+every injection. Any change ends the session rather than continuing into a new target.
 
-**Blink differencing is not the answer** — carets frequently do not blink. Windows Terminal
-can be configured with a steady cursor, many editors default to steady, `GetCaretBlinkTime()`
-can return `INFINITE` system-wide, and a focused-but-idle app may not draw a caret at all.
-Any mechanism that requires blinking fails on a large fraction of real targets.
+**Refuse to run** on the secure desktop, during UAC prompts, on the lock screen, and into
+password fields (`ES_PASSWORD` / `IsWindowVisible` heuristics where detectable). Remote-session
+behaviour is declared in the supported-target matrix, not discovered by users.
 
-**Primary mechanism: commit differencing.** We do not need the caret to blink, because *we
-are the thing making text appear.* Every commit is a probe we were going to send anyway:
-
-1. Capture the foreground window's client region from the desktop DC (`BitBlt` from
-   `GetDC(NULL)` — post-composition, so it sees Chromium, WSLg, and everything else DWM draws).
-2. Inject the committed chunk (§1.5).
-3. Capture again once the app has repainted.
-4. Diff. The changed region *is* the text we just wrote. Its **right edge is the new insertion
-   point**; its height is the line height.
-
-This is strictly better than blink detection on every axis that matters:
-
-- **No blink required**, so steady-cursor terminals and editors work.
-- **Self-correcting.** Every commit re-anchors from scratch, so scrolling, window moves, line
-  wraps, and the user clicking elsewhere all resolve themselves within one commit
-  (~500 ms) instead of needing separate tracking.
-- **Correct by construction.** The overlay renders pending text starting at the end of
-  committed text — which is precisely what the diff's right edge gives us. No inference.
-- **Free failure detection.** An empty diff means the injection produced no visible change,
-  i.e. it silently failed. That is exactly the signal §1.5 needs to decide `SendInput` vs
-  clipboard per app, and we get it without a separate mechanism.
-
-**Bootstrap — before the first commit there is no anchor.** In order:
-
-1. `GetGUIThreadInfo().rcCaret` — free, synchronous, no capture. Correct for classic Win32
-   edit controls, empty for apps that draw their own caret. Try it because it costs nothing.
-
-2. **The last left-click before the hotkey.** How a text position gets chosen, almost always,
-   is that the user clicks there. So cache the most recent left-button-down point and use it
-   as the initial anchor.
-
-   This costs nothing to add: `WH_MOUSE_LL` is already installed for stop-on-input (§1.4a),
-   so the clicks are already flowing through a hook we own. Store screen coordinates plus
-   `WindowFromPoint` at click time. It is pure coordinates — no API dependency — so it works
-   identically in WSLg, terminals, Electron, and games.
-
-   Validity rules, all cheap:
-   - The click's window must still be the foreground window; otherwise discard.
-   - **Left-button only** — right-click opens a context menu and middle-click pastes on X11.
-   - **Invalidate on mouse wheel.** Scrolling moves the caret on screen without any click, and
-     the hook already sees wheel events.
-   - Keyboard navigation since the click (arrows, Tab, Home/End) marks the anchor
-     *low-confidence* rather than discarding it — a roughly-right anchor still beats no
-     overlay, and it self-corrects at the first commit.
-
-   Known-imprecise cases, all self-correcting within one commit: clicking past the end of a
-   line (the caret snaps to line end, potentially far left of the click), clicking into an
-   empty field (caret goes to field start), and clicking merely to focus a window. Vertical
-   placement is the reliable part — the click lands within the target line — so anchor the
-   overlay's line box on the click Y and treat the click X as a hint.
-
-3. **Otherwise show no overlay until the first commit lands** — what `Win+H` does. The first
-   words arrive in ~300 ms.
-
-Step 2 is what makes the overlay feel instant, and its accuracy matters less than its
-existence: appearing immediately in roughly the right place reads as responsive, and the
-commit-diff correction at ~500 ms is largely invisible because the pending text is being
-redrawn at that same instant anyway (the committed prefix leaves the overlay). **Snap, don't
-animate** — a silent reposition during a content change goes unnoticed; a slide draws the eye
-to the error.
-
-**Capture cost.** Full client-rect capture only for bootstrap and re-acquire; once anchored,
-capture a band around the expected region (last anchor ± a couple of lines). At ~2 commits/s
-this is negligible on this machine.
-
-**Failure modes:**
-
-- **Busy background** (video, animated UI) pollutes the diff. Mitigate by diffing across the
-  narrowest possible window around the injection, and by preferring the changed component
-  nearest the previous anchor. If nothing is confident, keep the previous anchor — a slightly
-  stale overlay position is far better than a jumping one.
-- **HDR / multi-plane overlay** can make `BitBlt` return black. Detect an all-black capture
-  and fall back to `Windows.Graphics.Capture`, which is DWM-composited and immune.
-- **App renders asynchronously** (Electron, WSLg over RDP) so the "after" capture may precede
-  the repaint. Poll the diff for a few frames with a short deadline rather than capturing once.
-
-**Threading:** capture and diff run on a worker thread; results reach the paint path as plain
-structs. No COM, no cross-process calls, no MTA apartment.
-
-**Occlusion: not a concern.** The overlay may cover autocomplete popups and tooltips while
-dictating; that is acceptable and needs no special handling.
-
-**Second-pass correction is deferred.** The PRD's "Nemotron then Qwen" two-stage idea, and
-the UI/UX questions it raises about rewriting already-committed text, are out of scope until
-single-model streaming is proven end-to-end. Prove Nemotron alone first, measure what it
-actually gets wrong, then decide whether a second pass is worth its complexity. Noted in §4
-as a deferred variable, not a Phase 2 experiment.
-
-### 1.5 Text injection strategy
-
-**Both mechanisms ship in Phase 4, selectable in settings.** Neither is obviously better and
-the answer is likely per-app, so the plan is to build both and decide from real use rather
-than from reasoning:
-
-1. **`SendInput` with `KEYEVENTF_UNICODE`** — universal, works in Win32/UWP/Electron/games.
-   Slow for long text (~1–2 ms/char with pacing), and some apps drop fast synthetic input.
-2. **Clipboard + `Ctrl+V`** — fast and atomic, but clobbers the clipboard (save/restore, and
-   accept that clipboard-manager tools will still see it) and fails where `Ctrl+V` is bound
-   elsewhere (terminals want `Ctrl+Shift+V`).
-
-UI Automation `TextPattern`/`ValuePattern` is **not** implemented — it is absent in exactly
-the targets that matter most here (WSLg, terminals), and §1.4b already commits to a no-UIA
-design.
-
-Settings: a global default plus per-app overrides, since the WSLg question below will
-probably force a split. Start with `SendInput` as the default because it is the correctness
-baseline, and record failures during dogfooding.
+**Clipboard restoration checks ownership.** Restore only if we still own the clipboard state we
+set (`GetClipboardSequenceNumber` compared against the value at set time). If the user or
+another app changed the clipboard meanwhile, leave it alone — silently overwriting a user's
+copy is worse than leaving our text there.
 
 **WSLg needs an early test.** `SendInput` reaches WSLg windows as ordinary Windows input, but
-that input is translated to X11 keysyms across the RDP pipe, and it is genuinely unclear
-whether `KEYEVENTF_UNICODE` survives that translation intact. Clipboard paste is the more
-likely path there (WSLg shares the clipboard by design). This is a concrete Phase 3 test, not
-a Phase 4 detail — if `SendInput` fails into WSL, the per-app override mechanism becomes
-mandatory rather than nice-to-have.
+that input is translated to X11 keysyms across the RDP pipe, and it is unclear whether
+`KEYEVENTF_UNICODE` survives intact. Clipboard paste is the likelier path (WSLg shares the
+clipboard by design). This is a Phase 0B test.
 
-Capture the target `HWND` via `GetForegroundWindow()` **at hotkey-press**, and validate it is
-still foreground before each injection — never inject into whatever happens to be focused later.
+### 1.8 Hotkey
 
-### 1.6 Hotkey
+**Default `Win+Y`, toggle semantics like `Win+H`.** Press to start; stops on session silence
+(§1.6), on any real click or keystroke, or on the hotkey again. No push-to-talk hold — the
+`Win+H` gesture is the target.
 
-**Default: `Win+Y`, toggle semantics, exactly like `Win+H`.**
+`Win+Y` is nominally the Mixed Reality toggle, effectively dead on a desktop without a headset.
 
-Press to start listening; it stops on silence (VAD), or on any click or keystroke (§1.4a).
-No push-to-talk hold — the `Win+H` gesture is the target and hold-to-talk is a different
-product.
+**Mechanism.** `RegisterHotKey` refuses shell-owned combos, so it cannot bind `Win+Y`. A
+`WH_KEYBOARD_LL` hook on a dedicated thread sees keys before the shell's hotkey processing;
+returning `1` without `CallNextHookEx` swallows the combo. (`Ctrl+Alt+Del` and `Win+L` are
+immune.) The callback must never block — a slow hook is silently unhooked by Windows and the
+hotkey dies with no error.
 
-`Win+Y` is nominally the Mixed Reality toggle, a feature that is effectively dead on a desktop
-without a headset, so taking it costs nothing real.
+**Start-menu suppression.** Swallowing the `Y` leaves Windows seeing a bare Win press, which
+pops Start on release. Fix: inject a harmless `VK_CONTROL` tap before the Win key-up. It is a
+hack against undocumented shell behaviour and a plausible casualty of a Windows update, so it
+lives behind one commented function with a test, and non-Win alternatives stay one click away.
 
-**Mechanism.** `RegisterHotKey` refuses shell-owned combos outright, so it cannot bind
-`Win+Y`. A low-level keyboard hook (`WH_KEYBOARD_LL`) on a dedicated thread sees keys *before*
-the shell's hotkey processing, so returning `1` without calling `CallNextHookEx` swallows the
-combo before Explorer ever sees it. (`Ctrl+Alt+Del` and `Win+L` are the only combos immune to
-this — they route through a protected path.) The hook callback must never block: a slow hook
-gets silently unhooked by Windows and the hotkey dies with no error.
+**Activation must not immediately self-stop.** The chord's own key-up events, and the injected
+suppression tap, arrive *after* the session starts and would trigger stop-on-input. Explicit
+rule: the session ignores all key-up events for keys already down at activation, plus anything
+flagged `LLKHF_INJECTED` / `LLMHF_INJECTED`. Our own `SendInput` traffic must never stop the
+session producing it. This is a unit-tested state machine, not an ad-hoc filter.
 
-**The one wrinkle with any `Win+<key>` binding.** Once we swallow the `Y`, Windows sees a Win
-press with no intervening key and pops the Start menu when Win is released. The standard fix
-is to inject a harmless keystroke (a bare `VK_CONTROL` tap) before the Win key-up so the
-shell considers the chord consumed. It works, but it is a hack against undocumented shell
-behaviour and is a plausible casualty of a future Windows update — so it goes behind a single
-well-commented function with a test, and the settings dialog keeps non-Win alternatives one
-click away.
+**Second hotkey press finalises** (commits the stable prefix, discards the unstable tail after
+a final decode). `Esc` cancels — discards everything uncommitted. Both are explicit; the
+unstable tail's fate is never ambiguous.
 
-**Settings offers:**
+**Settings offers:** `Win+Y` (default) · `Win+J` / `Win+O` (same class) · `F13`–`F24` (free, no
+Win-key hack) · `Ctrl+Win+Space` · right `Ctrl` / right `Alt` / `CapsLock`.
 
-| Binding | Notes |
-|---|---|
-| `Win+Y` | **default** — shell-owned but by a dead feature; needs the Start-menu fix above |
-| `Win+J` / `Win+O` | same class — Windows tips, orientation lock |
-| `F13`–`F24` | completely free, no Win-key hack at all; available if your keyboard can emit them |
-| `Ctrl+Win+Space` | chord, no shell conflict |
-| Right `Ctrl` / right `Alt` / `CapsLock` | single-key options, no Start-menu problem; AltGr matters on non-US layouts |
+### 1.9 Privacy and network policy
+
+"Local" means more than local inference:
+
+- **No transcripts or audio persisted by default.** Diagnostic logging of recognised text is
+  opt-in, retention-bounded, and off in release builds.
+- **No network access during dictation.** No telemetry, no cloud fallback, no model
+  auto-download at runtime. Model fetching is an explicit, separate, user-initiated action.
+- Benchmark artifacts under `bench/results/` may contain corpus text; the corpus itself and any
+  result file containing verbatim transcripts are **gitignored**, with only aggregate metrics
+  committed.
+- The mic is open only during a session, and session state is always visible in the tray.
 
 ---
 
@@ -396,298 +403,271 @@ click away.
 
 ```
 kvit-dictate/
-├─ prd.md
-├─ plan.md
-├─ CMakeLists.txt              # C++ app only
-├─ CMakePresets.json           # mirror kvit-notes: windows-msvc-release
-├─ win-build.bat               # no WSL-sync step; this repo is Windows-native
+├─ prd.md · plan.md · plan-review.md
+├─ docs/
+│  ├─ protocol.md              # versioned wire spec (§1.2)
+│  └─ supported-targets.md     # per-app matrix, published from Phase 0B/4 measurements
+├─ CMakeLists.txt · CMakePresets.json · win-build.bat
 ├─ src/
 │  ├─ main.cpp                 # tray, message loop, lifecycle
-│  ├─ hotkey.{h,cpp}           # WH_KEYBOARD_LL (Win+Y) + WH_MOUSE_LL stop-on-input,
-│  │                           #   also caches last left-click as bootstrap anchor
-│  ├─ anchor_tracker.{h,cpp}   # commit-diff screen capture → insertion point
-│  ├─ audio_capture.{h,cpp}    # WASAPI shared-mode → 16 kHz mono s16
-│  ├─ ipc_client.{h,cpp}       # named pipe, framing, reconnect
-│  ├─ commit_engine.{h,cpp}    # stable-prefix diff → injection ops  ← unit-tested
-│  ├─ injector.{h,cpp}         # SendInput / clipboard / UIA
-│  ├─ overlay.{h,cpp}          # layered window, D2D/DWrite
-│  ├─ settings.{h,cpp}         # JSON in %LOCALAPPDATA%\kvit-dictate
-│  └─ server_host.{h,cpp}      # spawn/supervise the ASR process
-├─ tests/                      # ctest; commit_engine + framing are pure logic
-├─ envs/                       # only created when §5.1a forces it; gitignored
-│  └─ .venv-onnx/              #   ONNX runtime, no torch — the preferred backend env
-├─ server/                     # Python; runs under a venv chosen per backend
-│  ├─ pyproject.toml
-│  ├─ kvit_asr/
-│  │  ├─ __main__.py           # pipe server + session state machine
-│  │  ├─ protocol.py           # framing, mirrors ipc_client.cpp
-│  │  ├─ vad.py                # Silero VAD (ONNX)
-│  │  ├─ registry.py           # name → adapter
-│  │  └─ backends/
-│  │     ├─ base.py            # StreamingASR: feed(pcm) → partial|final
-│  │     ├─ whisper_ct2.py     # faster-whisper — baseline, known-good
-│  │     ├─ nemo_stream.py     # NeMo streaming (Nemotron/Parakeet/Canary)
-│  │     ├─ qwen3_asr.py       # HF transformers
-│  │     └─ sherpa_onnx.py     # ONNX — the C++-portable path
+│  ├─ hotkey.{h,cpp}           # WH_KEYBOARD_LL + WH_MOUSE_LL; caches last click
+│  ├─ session.{h,cpp}          # session/utterance state machine   ← unit-tested
+│  ├─ audio_capture.{h,cpp}    # WASAPI → 16 kHz mono s16 (also drives bench recorder)
+│  ├─ ipc_client.{h,cpp}       # pipe, DACL, framing, reconnect
+│  ├─ commit_engine.{h,cpp}    # stability → injection ops         ← unit-tested
+│  ├─ anchor.{h,cpp}           # 3-source confidence-scored anchor
+│  ├─ injector.{h,cpp}         # SendInput / clipboard; UIPI + focus guards
+│  ├─ overlay.{h,cpp}          # layered, click-through, capture-excluded
+│  └─ settings.{h,cpp}         # + models.json manifest (model → interpreter)
+├─ tools/
+│  ├─ probe/                   # Phase 0B spike: fixed-text injector + anchor probe
+│  └─ testtarget/              # controlled app: edit, richedit, multiline, password
+├─ tests/
+├─ envs/                       # per-backend locked envs (§5); gitignored
+├─ server/
+│  ├─ pyproject.toml + per-backend lock files   ← authoritative, live here
+│  └─ kvit_asr/{__main__,protocol,vad,backends/}
 └─ bench/
-   ├─ corpus/                  # audio + reference transcripts (gitignored: large)
-   ├─ record.py                # capture own-voice reads via same WASAPI path
-   ├─ run_matrix.py            # model × mode × chunk-size sweep
-   ├─ metrics.py               # WER, term recall, latency, flicker
-   └─ results/                 # one JSON per run; committed
+   ├─ corpus/{dev,heldout}/    # gitignored
+   ├─ record.py · run_matrix.py · metrics.py · results/
 ```
 
 ---
 
 ## 3. Phases
 
-Each phase ends with something runnable. Phases 1–2 are the experiment; 3–4 are the app;
-5 is optional consolidation.
+Phase order follows the review's recommendation. The change that matters: **the Windows
+feasibility spike moves ahead of all model work.** If the inline anchor does not work
+reliably, both the UX and the commit policy change — so selecting a model first would optimise
+a component of a product whose defining interaction is unproven.
 
-### Phase 0 — Verify the landscape (½ day)
+### Phase 0A — Source and environment verification (½ day)
 
-Before writing an adapter for a model that may not exist:
+1. Resolve each PRD citation against the actual HF model page / arXiv listing.
+2. For each that resolves, record: licence, params, runtime dependency, **streaming mode**
+   (`native-streaming` | `stateful-chunked` | `pseudo-streaming/overlapping-window`), and
+   **whether a published ONNX export exists**. The streaming-mode column keeps latency
+   comparisons interpretable — a batch Whisper adapter wrapped in a sliding window is not
+   comparable to a natively streaming model. The ONNX column decides both Phase 5 feasibility
+   and whether NeMo need ever be installed (§5).
+3. Backfill with models known real regardless: `nvidia/parakeet-tdt-0.6b-v2`, faster-whisper
+   large-v3 / distil-large-v3, sherpa-onnx prebuilt streaming transducers.
+4. Produce reproducible lock files per backend. **Install nothing into `..\wan-dancer\.venv`.**
 
-1. Resolve each PRD claim against the actual Hugging Face model page / arXiv listing:
-   `nvidia/nemotron-speech-streaming-en-0.6b`, Qwen3-ASR 0.6B/1.7B, arXiv 2601.21337,
-   arXiv 2604.14493.
-2. For each that resolves: record license, param count, runtime dependency, streaming
-   support, and **whether a published ONNX export exists**. That last column now decides two
-   things at once — Phase 5's in-process C++ feasibility *and* whether we can avoid ever
-   installing NeMo (§5.1a).
-3. Backfill the candidate list with models known to be real regardless of the above:
-   `nvidia/parakeet-tdt-0.6b-v2` (NeMo, strong English, real streaming support),
-   `faster-whisper` large-v3 and distil-large-v3 (baseline), and sherpa-onnx's prebuilt
-   streaming transducers.
-4. ~~Confirm PyTorch works on Blackwell (sm_120).~~ **Already satisfied** — see §5.
-   `..\wan-dancer\.venv` has torch 2.10.0+cu130 with `sm_120` in `get_arch_list()` and the
-   5090 detected. This was the biggest environment risk in the original plan and it is gone.
-   Remaining check is a real forward pass per *backend*, not per torch install.
+**Exit:** `bench/CANDIDATES.md`. Torch/sm_120 is already verified (§5) — that gate is closed.
 
-**Exit:** `bench/CANDIDATES.md` — a table of models that provably exist, load, and run on
-this GPU. Everything downstream reads from this list.
+### Phase 0B — Windows feasibility spike (3–4 days) ← **new, and the critical gate**
 
-### Phase 1 — Offline bake-off (2–3 days)
+No ASR. Fixed text only. `tools/probe/` builds a minimal injector, focus guard, overlay, and
+anchor estimator, and measures them.
 
-No app, no hotkey, no UI. Just: which model is best at *our* audio?
+**Scenario matrix, not just an app list.** Every app × the scenarios that break anchoring:
+empty field · mid-line insertion · selection replacement · line wrap · newline-only ·
+whitespace-only · vertical scroll · horizontal scroll · autocomplete open · steady (non-blinking)
+cursor · dark and light theme · mixed DPI · multi-monitor · HDR · RTL text · password field ·
+elevated target.
 
-1. **Corpus.** Three sets, ~20 min total:
-   - `tech/` — you reading 40–60 technical sentences (the PRD's `llama.cpp` / Qwen3.6 /
-     speculative MTP / RTX 5090 sentence is exactly right; add file paths, CLI flags,
-     git SHAs, model numbers, acronyms). **This is the set that decides the winner** —
-     public benchmarks do not contain this vocabulary, and it is where Win+H actually fails.
-   - `hard/` — same speaker, adverse: fan noise, music, fast speech, trailing-off ends,
-     mid-sentence self-correction.
-   - `clean/` — a LibriSpeech test-clean slice, purely as a sanity check that a backend is
-     wired correctly (a broken adapter shows up here as an absurd WER).
-   Record `tech/` and `hard/` through the *same WASAPI path the app will use*, so the
-   bake-off is not silently testing a different mic chain than production.
-2. **Adapters.** Implement `StreamingASR` for every Phase-0 survivor. Batch mode first.
-3. **Metrics** (`bench/metrics.py`):
-   - WER / CER, normalized (Whisper-style text normalizer) **and** raw — raw is what matters
-     for `llama.cpp` vs `llama dot cpp`, and normalization hides exactly the errors we care about.
-   - **Technical-term recall/F1** against a hand-written keyword list per utterance. A model
-     that gets 97 % WER but drops every identifier is useless here; this metric, not WER,
-     is the headline number.
-   - RTF and peak VRAM.
-4. **Exit:** `bench/results/phase1.json` + a short table. Pick 2–3 finalists.
+Apps: VS Code · Chrome · Windows Terminal · **a WSLg window** · Slack · Explorer search box ·
+Office · `kvit-notes` · `tools/testtarget`.
 
-### Phase 2 — Streaming + latency bake-off (2–3 days)
+Also settle here: the WSLg `SendInput`-vs-clipboard question (§1.7), and the exact
+`Windows.Graphics.Capture` desktop path including any user-visible capture indicator.
 
-The finalists, now measured on the axis that actually distinguishes a dictation tool.
+**Explicit gate — decided before Phase 1 starts:**
 
-1. Wrap each finalist in true chunked streaming (chunk sizes 80/160/320/640 ms where the
-   model allows).
-2. Add VAD (Silero ONNX) — utterance endpointing, and decoder gating during silence so a
-   long pause cannot provoke hallucinated text (§1.4c). Measure endpoint-silence threshold:
-   too short chops sentences, too long delays finalisation.
-3. **Latency metrics:**
-   - *first-partial latency* — speech onset → first text on screen.
-   - *finalization latency* — speech end → `final`.
-   - *commit lag* — speech onset → that word becoming **stable** (this is the number the
-     user feels, and it is strictly worse than first-partial latency).
-   - **flicker rate** — chars emitted in a partial that a later partial revised, per 100
-     chars. Low flicker means we can commit aggressively; high flicker forces Mode B.
-     This is the metric that decides §1.4, and it is the one no public benchmark reports.
-4. ~~Second-pass experiment.~~ **Deferred** — see §4.
-5. **Exit:** one winning (model, chunk size, commit policy) tuple, with
-   numbers behind it. Targets to aim at: first partial < 300 ms, finalize < 500 ms after
-   speech end, flicker < 2 %.
+- Exact Unicode injection in **every** declared supported target, with an explicit failure
+  state for unsupported and elevated ones.
+- Anchor placement within **one line height in ≥ 95 %** of supported scenarios.
+- Deterministic, non-flapping fallback when confidence is low.
 
-### Phase 3 — C++ app skeleton (3–4 days)
+**Meeting the gate** → inline overlay is the baseline UX. **Missing it** → floating preview or
+finalize-only becomes the baseline, and §1.4's commit policy is re-tuned accordingly. Either
+outcome is a success for this phase; not knowing is the only failure.
 
-Now build the thing. Server stays Python; the winner from Phase 2 is hardcoded as default.
+**Exit:** `docs/supported-targets.md` v1 + a go/no-go on the inline overlay.
 
-1. CMake + preset mirroring `kvit-notes` (`windows-msvc-release`, VS 17 2022, x64), minus
-   the WSL mirror-sync — this repo lives on Windows natively.
-2. `hotkey` (`Win+Y`, §1.6) → `audio_capture` → `ipc_client` → console output. No UI. Prove
-   end-to-end audio-to-text through the pipe.
-2b. **WSLg injection spike** — one throwaway binary that `SendInput`s Unicode text into a
-   WSLg window and reports whether it arrives intact, then the same via clipboard paste
-   (§1.5). Cheap, and it decides whether per-app injection overrides are mandatory. Do it
-   here, not in Phase 4.
-3. `server_host`: spawn the Python server as a child, redirect its stderr to a log, restart
-   on crash, kill on exit (job object, so a crashed app never orphans a model holding 4 GB
-   of VRAM).
-4. `commit_engine` with unit tests — pure logic, no Win32, so it is fully testable under
-   ctest. Feed it recorded partial sequences from Phase 2 and assert the injection op stream.
-5. **Exit:** talk into a console window, see committed text scroll.
+### Phase 1 — Production audio path, then offline bake-off (3–4 days)
 
-### Phase 4 — Real app (4–5 days)
+Revision 1 said the corpus would use "the same WASAPI path as production" while scheduling
+WASAPI capture for Phase 3 and naming `bench/record.py` as the recorder. Those cannot be the
+same path. Resolution: **build the real capture module first** — it is small, it is needed
+anyway, and a corpus recorded through a different chain silently tests a different microphone
+pipeline than the product uses.
 
-1. `injector` — **both** methods (SendInput and clipboard), per-app override, target-HWND
-   validation (§1.5).
-2. `anchor_tracker` — commit-differencing insertion-point probe, worker thread (§1.4b).
-   **Build and de-risk this first; it is the highest-risk component in the app.** Ship a
-   standalone probe tool that injects a known string and reports whether the diff resolved a
-   plausible insertion point, per app. Run it against the real target set: VS Code, Chrome,
-   Windows Terminal (**steady cursor, not blinking**), **a WSLg window**, Slack, Explorer's
-   search box, Office, and `kvit-notes` itself. The probe also reports **click-anchor
-   agreement** — how far the last-click bootstrap anchor sat from the commit-diff anchor, per
-   app — which is what tells us whether the bootstrap is worth keeping and where it is worst.
-3. `overlay` — layered, click-through, anchored at the tracked insertion point, drawn in the
-   single configured style (§1.4b). Floating-pill fallback where no anchor resolves. Level
-   meter and state indicator live in the tray icon, not over the user's text.
-4. Tray icon, settings dialog, autostart, model picker driven by the server's registry.
-5. Warm-start: load the model at app start or on first hotkey with an explicit "warming"
-   tray state, so the first dictation of the session is not the slow one.
-6. Failure UX: server dead, no mic, model OOM, target window vanished mid-utterance,
-   caret geometry lost mid-sentence (scroll, window move, popup steals the spot).
-7. **Exit:** daily-drivable. Dogfood it for a week and log every miss into `bench/corpus/tech/`
-   — the corpus should grow from real failures, which is the only way it stays honest.
+1. `audio_capture` for real: native device-format discovery, channel mixing, resample to
+   16 kHz, buffer discontinuity handling, timestamps, default-device-change handling, device
+   selection. **Preserve original-format captures alongside the 16 kHz conversion**, so backend
+   errors stay distinguishable from resampling bugs.
+2. **Corpus, split before any model is run:**
+   - `dev/` — for tuning vocabulary, prompts, normalisation, VAD, stability policy.
+   - `heldout/` — the decision set. Touched once, at selection time. Never tuned on.
+   - Content: `tech/` (40–60 technical sentences — identifiers, paths, CLI flags, model
+     numbers, acronyms; this is where Win+H actually fails and where public benchmarks are
+     silent), `hard/` (noise, fast speech, trailing-off ends, self-correction), `clean/` (a
+     LibriSpeech slice purely as an adapter-sanity check), plus **silence-only** and
+     **noise-only** clips for hallucination testing.
+3. Adapters for every Phase-0A survivor; batch mode first.
+4. Metrics (§4).
 
-### Phase 5 — Optional: collapse to one process
+**Exit:** `bench/results/phase1.json`, candidate set reduced by the pre-registered rule.
 
-Only if Phase 2/4 numbers justify it. Triggers: IPC overhead is a measurable share of commit
-lag, or the ~1.5 GB Python RSS and multi-second cold start become the top complaint.
+### Phase 2 — Protocol freeze + streaming bake-off (3–4 days)
 
-Path: if the winner has ONNX weights, `sherpa-onnx` or ONNX Runtime (DirectML/CUDA EP) links
-into the C++ process directly. If the winner is Whisper-family, `whisper.cpp` with CUDA.
-If the winner is NeMo-only with no ONNX export — keep the sidecar; that is a fine outcome,
-and §1.1 exists precisely so this decision stays cheap.
+1. Freeze `docs/protocol.md` and the §1.4 invariant; land cross-language fixtures.
+2. True chunked streaming for the finalists (80/160/320/640 ms where supported), replayed at
+   **real-time cadence** — not fed as fast as the GPU accepts, which flatters latency.
+3. VAD (Silero ONNX): endpointing plus decoder gating during silence.
+4. Latency decomposition — algorithmic delay, queueing, inference, endpoint delay, and
+   UI/commit delay measured *separately*, warm and cold, with repeated-run variance.
+5. Second-pass correction: **deferred**, not swept. Prove single-model streaming first, measure
+   the actual error distribution, then decide whether a rewrite pass earns its complexity and
+   its UX problems.
+
+**Exit:** one winning (model, chunk size, stability params, cadence) tuple, chosen by the §4
+rule against the held-out set. Targets: first partial < 300 ms, finalisation < 500 ms after
+speech end, **ICER below its declared threshold**.
+
+### Phase 3 — Minimal vertical product (3–4 days)
+
+Hotkey → production audio → secured sidecar → focus-checked injection, console or floating
+status only. `server_host` supervises the child under a job object so a crashed app never
+orphans a model holding VRAM. Crash, restart, and device-change handling included from the
+start.
+
+### Phase 4 — Productisation (gated, not calendared)
+
+The review is right that "4–5 days" was optimistic for hooks, capture fallback, a Direct2D
+overlay, two injection paths, settings, tray, autostart, supervision, and the full failure
+matrix. A calendar estimate here encourages declaring the riskiest paths "good enough" without
+evidence. **Replaced by the exit gates in §7.**
+
+Contents: measured anchor strategy from Phase 0B · tray, settings, autostart · per-app
+injection policies · privacy controls · failure UX · published `docs/supported-targets.md`.
+
+### Phase 5 — Dogfood, then consolidate only from measurements
+
+A week of daily use producing a **categorised failure log and regression cases**, kept separate
+from the tuning corpus. Only then consider single-process C++ inference (via ONNX/sherpa-onnx
+or whisper.cpp, if Phase 0A found an export) or second-pass correction.
 
 ---
 
-## 4. Experiment matrix
+## 4. Experiment design and decision rule
 
 ```
-model         ∈ Phase-0 survivors                    (~4–6)
-chunk_ms      ∈ {80, 160, 320, 640}                  (Phase 2 only)
-commit_policy ∈ {stable-2, stable-3, periodic-500ms, periodic-1000ms, finalize-only}
-inject_method ∈ {SendInput, clipboard}                (Phase 4, per-app, both shipped)
+model         ∈ Phase-0A survivors
+chunk_ms      ∈ {80, 160, 320, 640}            (Phase 2, where supported)
+stability     ∈ N∈{2,3} × M∈{2,3,5} × T∈{100,200,400}ms
+cadence       ∈ {immediate, 500ms, 1000ms}     (flush timing only — never eligibility)
+inject_method ∈ {SendInput, clipboard}         (Phase 0B/4, per-app)
 ```
 
-**Deferred:** `second_pass ∈ {llm-rewrite, asr-rescore}`. Prove single-model streaming
-end-to-end with Nemotron first and measure what it actually gets wrong; only then decide
-whether a second pass earns its complexity and the UX questions it drags in (§1.4b).
+Sequential elimination, not full cross-product: Phase 1 cuts on accuracy (model only), Phase 2
+sweeps the rest on survivors. `run_matrix.py` writes one JSON per cell so results accumulate
+and nothing is re-run by accident. **Any coverage cap — top-N, sampling, no-retry — is logged**;
+silent truncation reads as "we tested everything".
 
-Full cross-product is wasteful. Sequential elimination: Phase 1 cuts on accuracy (model
-only), Phase 2 sweeps chunk × commit × second_pass on survivors only, Phase 4 A/B/Cs by hand
-on the single winner. `bench/run_matrix.py` writes one JSON per cell so results accumulate
-across days and nothing is re-run by accident.
+**Metrics.** WER/CER **normalised and raw** (raw is what matters for `llama.cpp` vs `llama dot
+cpp`; normalisation hides exactly the errors we care about) · **technical-term F1** with
+matching rules defined in advance for case, punctuation, aliases, and compound identifiers ·
+**ICER** (§1.4) · flicker · first-partial / finalisation / commit-lag latency · RTF · peak VRAM
+· cold and warm start · run-to-run variance · hallucinated output on silence-only and
+noise-only input.
+
+**Context-enabled and context-free modes are compared separately.** A backend without
+vocabulary-context support must not silently receive an easier or harder task than one with it.
+
+**The selection rule, stated before the corpus is run:** maximise held-out technical-term F1
+among configurations that meet the first-partial, finalisation, ICER, and VRAM limits. Ties
+break on ICER, then latency. This exists so the winner is not chosen subjectively after seeing
+results.
+
+**A manual `Win+H` comparison on the same sentences is part of Phase 1.** Not a scientific
+benchmark — a sanity check that the system actually improves the failure mode it exists to
+replace. Shipping something worse than the built-in would be the real failure.
 
 ---
 
-## 5. Build & experiment environment (verified on this machine, 2026-08-16)
+## 5. Environment (verified 2026-08-16)
 
-### 5.1 Python — reuse `..\wan-dancer\.venv`, but not for everything
+### 5.1 Python — `..\wan-dancer\.venv` is read-only
 
-That venv is a working GPU stack and reusing it removes the plan's biggest unknown:
+That venv is a working GPU stack and reusing its **Whisper baseline** removes the plan's
+biggest unknown:
 
 ```
-python 3.12.9    torch 2.10.0+cu130    cuda_build 13.0    available True
+python 3.12.9   torch 2.10.0+cu130   cuda_build 13.0   available True
 device NVIDIA GeForce RTX 5090   capability (12,0) = sm_120
 arch_list ['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']
-transformers 5.14.1  numpy 2.4.4  librosa 0.11.0  soundfile 0.14.0  torchaudio 2.11.0+cu130
+transformers 5.14.1   numpy 2.4.4   librosa 0.11.0   torchaudio 2.11.0+cu130
 ```
 
-`sm_120` is compiled in — Blackwell is natively supported, no PTX-JIT fallback. Phase 0's
-torch gate is closed before it opened.
+`sm_120` is compiled in, so Blackwell is natively supported — no PTX-JIT fallback, no silent
+CPU drop. **Phase 0A's torch gate is closed before it opened.**
 
-Two corrections to the assumption behind reusing it, both of which change the plan:
+Two facts about that environment:
 
 **(a) Whisper is not installed as a package.** `wan-dancer\notes\transcribe.py` runs Whisper
-through the `transformers` ASR pipeline against a cached `openai/whisper-large-v3-turbo`
-checkpoint. That is genuinely useful — it is a proven-working Whisper baseline on this GPU,
-and Phase 1's baseline adapter can be a near-copy of that script. But `faster-whisper`,
-`openai-whisper`, and `whisper.cpp` are all still absent, and each pulls its own stack.
+through the `transformers` pipeline against a cached `openai/whisper-large-v3-turbo`. That is a
+proven-working Whisper baseline on this GPU and Phase 1's baseline adapter can be a near-copy
+of it. But `faster-whisper`, `openai-whisper` and `whisper.cpp` are all absent, each pulling its
+own stack.
 
-**(b) That venv must not be used for NeMo.** It contains
-`sageattention 2.2.0+cu130torch2.10.0andhigher.post6`, compiled against that exact torch, and
-it is what wan-dancer's H3 video pipeline runs on. NeMo pins older `transformers` and its own
-torch; if pip resolves by downgrading, sageattention stops loading and the user's video
-pipeline breaks — at render time, not install time. **Not a risk worth taking to save a few
-GB of disk.**
+**(b) It is read-only. This reverses revision 1.** Revision 1 said NeMo must never enter that
+venv, then allowed installing it there if `uv pip install --dry-run` appeared not to move
+torch/transformers/numpy — and the risk table still said "never". The review is right that this
+is both self-contradictory and unsound: a clean resolution does not prove an added package
+won't break an untested import or runtime path, and guarding three package names is too narrow.
+The venv is another project's working GPU pipeline, containing
+`sageattention 2.2.0+cu130torch2.10.0andhigher.post6` compiled against that exact torch.
 
-### 5.1a No new PyTorch environments unless forced
+**Rule: run its existing Whisper baseline, install nothing.** Every new runtime gets its own
+locked environment, even when versions look compatible. Corrupting a working stack is a far
+worse and less reversible cost than disk.
 
-Scanned `C:\apps`, `D:\projects` and the conda envs (2026-08-16). Exactly two torch installs
-exist on this machine:
+### 5.2 Keeping environment count down without risking that one
 
-| Environment | torch | Usable for ASR? |
+Scanned `C:\apps`, `D:\projects` and the conda envs — exactly two torch installs exist:
+
+| Environment | torch | Usable for GPU ASR? |
 |---|---|---|
-| `D:\projects\wan-dancer\.venv` | 2.10.0+cu130, sm_120 | **yes** — the one good GPU env |
+| `D:\projects\wan-dancer\.venv` | 2.10.0+cu130, sm_120 | Whisper baseline only, read-only |
 | `C:\Users\sk\miniconda3\envs\marketenv` | 2.9.1+**cpu** | no — CPU-only build |
 
-So there is no existing NeMo-capable environment to borrow, and a second GPU torch install
-would cost ~4 GB. The plan avoids creating one, in this order:
+The concern about proliferating multi-GB PyTorch environments is addressed by **not needing
+torch**, rather than by sharing one:
 
-1. **Prefer ONNX — it needs no torch at all.** `onnxruntime-gpu` + `sherpa-onnx` is a few
-   hundred MB with no PyTorch anywhere. This is not a compromise: it is *also* the Phase 5
-   path into the C++ process, so doing the streaming experiments on ONNX from the start means
-   the winner is already in the runtime we would eventually want. Phase 0 gains an explicit
-   check — **does a published ONNX export exist for each candidate?** — and a "yes" there
-   removes the entire NeMo question.
-2. **If a model is torch-only, dry-run before installing.** `uv pip install --dry-run
-   nemo_toolkit[asr]` against the existing venv resolves the full dependency graph without
-   touching anything. Read whether it moves torch / transformers / numpy. If it resolves
-   clean, install in place and no new env is needed.
-3. **Only if the dry-run shows the frozen set moving** does a sibling venv get created — and
-   only for that one backend.
+1. **ONNX first.** `onnxruntime-gpu` + `sherpa-onnx` is a few hundred MB with **no PyTorch at
+   all**. This is preferred on the merits, not as a compromise — it is also the path to running
+   the model inside the C++ process in Phase 5, so the winner would already be in the runtime we
+   eventually want. Phase 0A's ONNX column decides how much of the candidate set this covers.
+2. **Whisper/transformers baseline** runs in the existing venv, read-only.
+3. **Torch-only candidate** → its own locked env, created only for that backend.
+4. Before creating any, point `UV_CACHE_DIR` at a directory on **D:** — uv hardlinks packages
+   from cache into venvs, but hardlinks cannot cross volumes, so a C: cache with D: venvs
+   silently full-copies every package.
 
-If a sibling does become necessary, set `UV_CACHE_DIR` to a directory on **D:** first. uv
-hardlinks packages out of its cache into venvs, but hardlinks cannot cross volumes — with the
-cache on C: and venvs on D: every package is a full copy. Same-volume, a second env sharing
-versions with the first costs almost nothing.
-
-Weights are shared regardless: `HF_HOME=c:\apps\llama-swap\gguf\hf` is set globally, so no
-model is ever downloaded twice no matter how many venvs exist.
-
-| Backend | Environment |
-|---|---|
-| Whisper via `transformers` (baseline) | `..\wan-dancer\.venv` — proven, zero new deps |
-| `sherpa-onnx` / ONNX Runtime | `envs\.venv-onnx` — **no torch**, preferred for all streaming candidates |
-| Qwen3-ASR, if a `transformers` model not requiring `transformers<5` | `..\wan-dancer\.venv` after a dry-run |
-| NeMo, *only if no ONNX export exists* | dry-run first; sibling env only if it would move the frozen set |
-
-`server/` takes a `--python` argument so `server_host.cpp` launches whichever interpreter the
-selected model needs — the C++ side already doesn't know what model it's talking to (§1.1),
-and this keeps it that way.
-
-**Ledger requirement:** `..\wan-dancer\asr-models.md` records every model and package added
-for this work, plus the frozen-version set and a post-install check that fails loudly if
-torch/transformers/numpy moved. Written, with the pre-existing baseline captured. Update it
-in the same commit as any install — a ledger backfilled from memory is worthless.
-
-Already cached and free to use: `openai/whisper-large-v3-turbo` (1.5 GB),
+`HF_HOME=c:\apps\llama-swap\gguf\hf` is set globally, so weights are shared regardless of venv
+count and nothing is downloaded twice. Already cached: `whisper-large-v3-turbo` (1.5 GB),
 `Systran/faster-whisper-base.en` (141 MB), `ggerganov/whisper.cpp` ggml (42 MB).
 
-Also present: llama-swap (`C:\apps\llama-swap`, OpenAI-compatible on `127.0.0.1:8080`, not
-always running) serving local GGUF models including `Qwen3.6-27B-MTP` — which is the host for
-Phase 2's second-pass LLM rewrite experiment. That experiment needs no new infrastructure,
-and it can be run against the exact model the PRD's example sentence talks about.
+**Authoritative lock files live in this repository** (`server/`), so kvit-dictate is
+reproducible on its own. `..\wan-dancer\asr-models.md` remains a useful cross-reference ledger
+of what was added where, but is not required to rebuild this project.
 
-### 5.2 C++
+llama-swap (`C:\apps\llama-swap`, OpenAI-compatible on `127.0.0.1:8080`, not always running)
+serves local GGUF models including `Qwen3.6-27B-MTP` — relevant only if second-pass correction
+is revived in Phase 5, and explicitly out of scope until then.
+
+### 5.3 C++
 
 | Component | Status |
 |---|---|
-| Qt | 6.10.1 msvc2022_64 + 6.7.1 at `C:\Qt` — available, **not planned as a dependency** (§1.3) |
-| Compiler | VS 2022 Community, MSVC 2022 |
-| CMake | `C:\Program Files\CMake\bin\cmake.exe` (also VS-bundled). Ninja **not** on PATH — presets use the VS generator, as `kvit-notes` does |
-| GPU / CUDA | RTX 5090 32 GB, driver 610.74; CUDA 12.9 + 12.1 toolkits (torch ships its own cu130 runtime) |
+| Qt | 6.10.1 msvc2022_64 + 6.7.1 at `C:\Qt` — available, **not a dependency** (§1.3) |
+| Compiler | VS 2022 Community, MSVC 2022; C++20, matching `kvit-notes` |
+| CMake | `C:\Program Files\CMake\bin\cmake.exe`. Ninja not on PATH — VS generator, as `kvit-notes` uses |
+| GPU / CUDA | RTX 5090 32 GB, driver 610.74; CUDA 12.9 + 12.1 (torch ships its own cu130 runtime) |
 | RAM / CPU | 64 GB / 28 threads |
-
-C++ standard: C++20, matching `kvit-notes`.
 
 ---
 
@@ -695,43 +675,93 @@ C++ standard: C++20, matching `kvit-notes`.
 
 | Risk | Mitigation |
 |---|---|
-| PRD's models don't exist / aren't as described | Phase 0 gates everything; candidate list is data |
-| ~~PyTorch has no sm_120 kernels~~ | **Closed** — `wan-dancer\.venv` torch 2.10.0+cu130 has sm_120 compiled in (§5.1) |
-| An ASR install downgrades torch and breaks wan-dancer's video pipeline | Per-stack venvs; NeMo never enters the shared one; post-install check in `asr-models.md` §4 |
-| Flicker too high to commit while streaming | Mode B (preview-then-commit) is the fallback and is still a good product |
-| `SendInput` unreliable in some target apps | Clipboard fast path; per-app override in settings; log failures during dogfooding |
-| Commit-diff fails to resolve an insertion point (busy background, async repaint) | Narrow diff window, prefer component nearest previous anchor, keep stale anchor over a jumping one; probe tool measures real per-app success before the design is committed to (Phase 4.2) |
-| `BitBlt` returns black under HDR/MPO | Detect all-black capture, fall back to `Windows.Graphics.Capture` |
-| ~~Font family unrecoverable from pixels~~ | **Moot** — overlay style is fixed in settings, not sampled (§1.4b) |
-| Long pause kills the session, or model hallucinates over silence | Split endpoint (0.8 s) from session (120 s, `never` allowed) timeouts; VAD-gate the decoder during silence (§1.4c) |
-| `SendInput` Unicode doesn't survive the WSLg RDP translation | Phase 3 spike decides it; clipboard path already shipping as the alternative |
-| A second GPU torch env eats another 4 GB | ONNX-first (no torch); `uv pip --dry-run` before any install; `UV_CACHE_DIR` on D: for hardlinking (§5.1a) |
-| Antivirus flags the keyboard hook + synthetic input | Expected — a hotkey-driven keystroke injector looks exactly like a keylogger to heuristics. Sign the binary early; test under Defender before Phase 4 ends |
-| Python sidecar cold start ruins first use | Warm at app start; explicit "warming" overlay state |
-| Scope creep into a transcription app | Non-goals, below |
+| PRD's models don't exist as described | Phase 0A gates everything; candidate list is data |
+| **Inline anchor not reliable enough to build on** | **Phase 0B tests it before any model work, with an explicit ≥95 %/one-line-height gate and a defined fallback UX** |
+| Committed text later revised → corrupted document | Prefix invariant (§1.4); cadence cannot promote unstable text; ICER gates selection; violations preserve the document and are logged |
+| Late `final` injected into the wrong window after restart | `session_id` on every message; client drops non-current sessions; focus revalidated per injection |
+| Pipe readable by Everyone / squatted | Explicit logon-SID DACL, random per-launch name passed to child, `GetNamedPipeClientProcessId` peer check |
+| `SendInput` silently fails into elevated targets (UIPI) | Integrity comparison up front; explicit unsupported state, not diff-based guessing |
+| Activation chord immediately self-stops the session | Ignore key-ups for keys down at activation + all `*_INJECTED` events; unit-tested state machine |
+| `SendInput` Unicode lost across the WSLg RDP translation | Phase 0B decides; clipboard path already shipping as the alternative |
+| Corpus recorded through a different chain than production | Real `audio_capture` built in Phase 1, before recording |
+| Subjective model selection after seeing results | Dev/held-out split; decision rule pre-registered in §4 |
+| A second GPU torch env eats another 4 GB | ONNX-first (no torch); shared `HF_HOME`; `UV_CACHE_DIR` on D: |
+| Breaking wan-dancer's video pipeline | Read-only; nothing installed there (§5.1) |
+| `BitBlt` black under HDR/MPO | Detect, fall back to WGC — with its real UX prototyped in Phase 0B |
+| Antivirus flags keyboard hook + synthetic input | Expected — this looks like a keylogger to heuristics. Sign early; test under Defender before Phase 4 closes |
+| Scope creep into a transcription app | Non-goals below |
 
 **Non-goals for the experimental phase:** file transcription, diarization, multi-language,
-cloud fallback, installer/auto-update, non-Windows. All are reasonable later; none inform the
-model choice, which is the only question this phase exists to answer.
+cloud fallback, installer/auto-update, non-Windows.
 
 ---
 
-## 7. Milestone checklist
+## 7. Exit gates
 
-- [x] **M-1** Experiment env resolved — `wan-dancer\.venv` (torch 2.10.0+cu130, sm_120 ✓),
-      per-stack venv policy, ledger at `..\wan-dancer\asr-models.md`
-- [ ] **M0** `bench/CANDIDATES.md` — models verified to exist and run on sm_120
-- [ ] **M1** Corpus recorded; offline WER + technical-term F1 for all candidates
-- [ ] **M2** Streaming latency + flicker numbers; winning config chosen
-- [ ] **M3** Console end-to-end: hotkey → mic → pipe → committed text
-- [ ] **M4** Overlay, injection, tray, settings — daily-drivable
-- [ ] **M5** One week of dogfooding; failures folded back into the corpus
-- [ ] **M6** *(optional)* single-process C++ inference
+Phase 4 has no calendar estimate; it has gates. "Daily-drivable" is not a subjective call.
+
+- No wrong-window injection under automated focus-race tests.
+- Exact Unicode injection in every declared supported target; explicit failure state for
+  unsupported and elevated ones.
+- Committed-prefix violations below the declared ICER threshold, with **zero silent repairs**.
+- Clean recovery from sidecar crash, mic removal, device change, model OOM, lock/unlock.
+- Bounded audio and IPC queues under overload; no silent audio drops.
+- Hooks survive long sessions and ignore self-injected input.
+- Clipboard restored only when we still own the state we set.
+- No transcript or audio persisted by default; no network access during dictation.
+- Mixed-DPI and multi-monitor overlay tests pass, with deterministic low-confidence fallback.
+- One week of dogfooding yields a categorised failure log and regression cases.
+
+**Test breadth.** Beyond the two pure-logic units (framing, commit engine): session state
+machine · audio conversion and discontinuity · VAD/endpoint transitions · child crash and
+restart · focus races · hook filtering of self-injected events · clipboard preservation · DPI
+coordinate conversion · capture/diff fixtures · and `tools/testtarget` exercising classic edit,
+rich edit, multiline, and password controls.
 
 ---
 
-## 8. Immediate next step
+## 8. Milestones
 
-Phase 0, item 1 — resolve the four PRD citations against real sources, since roughly half the
-plan's model list is currently taken on faith from a chat transcript. Say the word and I'll
-run that verification and write `bench/CANDIDATES.md`.
+- [x] **M-1** Experiment env resolved — torch 2.10.0+cu130 / sm_120 verified; read-only policy
+- [ ] **M0A** `bench/CANDIDATES.md` — models verified, streaming mode + ONNX availability recorded
+- [ ] **M0B** **Windows feasibility spike passed or fallback UX adopted** ← critical gate
+- [ ] **M1** Production audio path + dev/held-out corpus + offline metrics
+- [ ] **M2** Protocol frozen; streaming winner chosen by pre-registered rule
+- [ ] **M3** Minimal vertical product end-to-end
+- [ ] **M4** All §7 gates green
+- [ ] **M5** One week dogfooding; categorised failure log
+- [ ] **M6** *(optional)* single-process C++ inference; *(optional)* second-pass correction
+
+---
+
+## 9. Changes from revision 1
+
+| Review finding | Resolution |
+|---|---|
+| Periodic commit contradicted the append-only invariant | **Accepted.** Cadence and eligibility separated (§1.4); stability algorithm specified; ICER added as the gating metric; speculative mode named unsafe and excluded |
+| Anchor mechanism overclaimed and tested too late | **Accepted.** "Correct by construction"/"universal"/"free failure detection" withdrawn; counterexamples enumerated; confidence scoring + deterministic fallback (§1.5); spike moved to Phase 0B with an explicit gate |
+| Protocol/pipe contract unsafe | **Accepted.** `session_id`/`utterance_id`/`seq`, cumulative semantics, backpressure, frame caps, UTF-8 offsets on grapheme boundaries (§1.2) |
+| Named-pipe default ACL claim | **Wrong, corrected.** Default grants read to Everyone + anonymous; explicit logon-SID DACL, random name, peer validation |
+| Corpus audio path ≠ production path | **Accepted.** Real `audio_capture` built first, in Phase 1 |
+| Shared venv should be read-only | **Accepted**, reversing revision 1's dry-run allowance |
+| Registry can't span interpreters | **Accepted.** Model→interpreter manifest moves to the C++ side (§1.1) |
+| No pre-registered decision rule | **Accepted.** Dev/held-out split, rule stated in §4, "97 % WER" typo fixed |
+| UIPI / target / privacy gaps | **Accepted** (§1.7, §1.9) |
+| Thin test coverage; optimistic Phase 4 estimate | **Accepted.** Breadth listed in §7; Phase 4 calendar replaced by gates |
+| Internal inconsistencies (VAD wording, "Mode B", UIA in tree, stale second-pass refs, Nemotron vs finalist, 1.4b/1.4c order) | **All fixed**; sections renumbered 1.1–1.9 |
+| Record each backend's streaming mode | **Accepted** — column added in Phase 0A |
+| Win+H comparison | **Accepted** — manual comparison in Phase 1 |
+
+**Scoping note, stated rather than silently dropped:** the review asks for full cross-language
+protocol fixtures before implementing either endpoint. Those land in Phase 2 when the protocol
+freezes, not in Phase 0B — writing an exhaustive fixture suite against a shape that the spike
+may still change is wasted work. The *invariants and identifiers* that prevent wrong-window
+injection are adopted immediately, because those are cheap and are the ones with teeth.
+
+---
+
+## 10. Immediate next step
+
+Phase 0A — resolve the four PRD citations, record streaming mode and ONNX availability, and
+write `bench/CANDIDATES.md`. It is half a day, needs no installs, and Phase 0B can start in
+parallel since the spike uses fixed text and no ASR.
