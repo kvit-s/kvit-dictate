@@ -970,11 +970,15 @@ void IpcClient::Impl::io_main(bool need_connect, DWORD expect_pid) {
         return;
     }
 
-    // §5: `hello` is the first frame on the connection, before anything else may cross.
-    proto::HelloMsg hello;
-    hello.proto = proto::kProtoVersion;
-    hello.client = "kvit-dictate/0.1";
-    enqueue_internal(proto::encode_control_frame(proto::Message::of(hello)));
+    // §5: `hello` is the first frame on the connection, before anything else may cross — but this
+    // module does not write it. **SessionMachine does**, on TransportEvent::PeerValidated and
+    // again on ChildRespawned, and fixture 020 asserts exactly that. When this module also wrote
+    // one, two `hello` frames reached the sidecar and the second was a fatal `state_violation`;
+    // the state machine, meanwhile, never learned the transport had connected and rejected the
+    // `hello_ack` as arriving outside HANDSHAKE. One author for one frame.
+    //
+    // What is still owned here is the deadline: entering HANDSHAKE arms HELLO_TIMEOUT_MS, so a
+    // caller that never sends `hello` fails loudly instead of waiting forever.
     set_state(proto::ConnState::Handshake);
     state_deadline = now_ms() + proto::kHelloTimeoutMs;
 

@@ -222,7 +222,12 @@ public:
 
     // Creates the pipe, spawns the child into a job object with
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (so a crashed Client can never orphan a sidecar
-    // holding VRAM), waits for the connection, validates the peer, and sends `hello`.
+    // holding VRAM), waits for the connection, validates the peer, and enters HANDSHAKE.
+    //
+    // **It does not send `hello`.** SessionMachine does, on TransportEvent::PeerValidated — see
+    // fixture 020 — and the caller is what connects the two: it observes `on_state(Handshake)`
+    // and feeds that event to the machine, whose Outcome carries the frame. Entering HANDSHAKE
+    // arms HELLO_TIMEOUT_MS here, so a caller that never sends it fails loudly.
     //
     // Returns as soon as the child is spawned and the connect is pending — the handshake
     // completes asynchronously and is reported through on_state/on_error. Blocking here would
@@ -230,7 +235,8 @@ public:
     Status start(const ChildSpec& child, Callbacks cb);
 
     // Runs the framed I/O loop over an **already connected, already peer-validated** pipe-server
-    // handle, taking ownership of it. `hello` is sent immediately, exactly as start() does.
+    // handle, taking ownership of it. It enters HANDSHAKE without writing `hello`, exactly as
+    // start() does; see the note there for why that frame belongs to SessionMachine.
     //
     // start() is implemented in terms of this, which is the point: the transport half (framing,
     // bounded queues, write deadlines, handshake state) is then reachable without spawning a

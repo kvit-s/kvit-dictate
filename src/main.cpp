@@ -189,6 +189,7 @@ private:
     void end_dictation(kd::LocalEvent why);
 
     bool spawn_sidecar();
+    void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
 
     void set_tray_state(kd::OverlayState s);
@@ -222,6 +223,7 @@ private:
     std::string loaded_model_;
     bool audio_running_ = false;
     unsigned respawn_attempts_ = 0;
+    bool sidecar_respawn_ = false;  // this spawn is §10.3's recovery, not the first launch
 
     std::mutex ipc_mutex_;
     std::deque<kd::proto::Message> ipc_queue_;
@@ -523,10 +525,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 1 || wp == 2) {
                 on_sidecar_lost();
             } else if (wp == 3) {
-                const auto state = static_cast<kd::proto::ConnState>(lp);
-                if (state == kd::proto::ConnState::Idle && tray_state_ == kd::OverlayState::ModelLoading) {
-                    set_tray_state(kd::OverlayState::Idle);
-                }
+                on_conn_state(static_cast<kd::proto::ConnState>(lp));
             }
             return 0;
 
@@ -742,6 +741,7 @@ void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* 
                 // message from the dead one can never be mistaken for a live one (§10.3).
                 if (respawn_attempts_ < 5) {
                     ++respawn_attempts_;
+                    sidecar_respawn_ = true;
                     spawn_sidecar();
                 } else {
                     KD_LOG_ERROR("sidecar failed %u times; not restarting again", respawn_attempts_);
@@ -881,6 +881,41 @@ void App::end_dictation(kd::LocalEvent why) {
         overlay_->hide();
     }
     set_tray_state(kd::OverlayState::Idle);
+}
+
+void App::on_conn_state(kd::proto::ConnState s) {
+    // IpcClient walks the transport (docs §2.4: connect, validate the peer); SessionMachine is the
+    // authority on the protocol (§5, §10.3) and has to see the same walk, or `hello_ack` arrives
+    // while it still believes it is SPAWNING and it kills the connection as a state violation.
+    // The machine's Outcome carries `hello` — this is the only thing that puts that frame on the
+    // wire, and IpcClient deliberately no longer writes one of its own.
+    switch (s) {
+        case kd::proto::ConnState::Validating:
+            if (session_ != nullptr && !sidecar_respawn_) {
+                apply(session_->on_transport(kd::TransportEvent::Connected));
+            }
+            break;
+
+        case kd::proto::ConnState::Handshake:
+            if (session_ != nullptr) {
+                // §10.3 step 5: after a respawn the machine is in DEAD, not VALIDATING, and
+                // ChildRespawned is the event that takes it back to HANDSHAKE — collapsing
+                // SPAWNING/VALIDATING, clearing the dead session, and keeping the session_id
+                // counter, which is the whole point of fixture 020.
+                apply(session_->on_transport(sidecar_respawn_
+                                                 ? kd::TransportEvent::ChildRespawned
+                                                 : kd::TransportEvent::PeerValidated));
+                sidecar_respawn_ = false;
+            }
+            break;
+
+        case kd::proto::ConnState::Idle:
+            if (tray_state_ == kd::OverlayState::ModelLoading) set_tray_state(kd::OverlayState::Idle);
+            break;
+
+        default:
+            break;
+    }
 }
 
 void App::on_sidecar_lost() {
