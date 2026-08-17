@@ -573,9 +573,16 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
-                if (overlay_ != nullptr && anchor_dirty_.exchange(false, std::memory_order_acq_rel)) {
-                    std::lock_guard<std::mutex> lock(anchor_mutex_);
-                    overlay_->set_anchor(latest_anchor_);
+                if (overlay_ != nullptr) {
+                    if (anchor_dirty_.exchange(false, std::memory_order_acq_rel)) {
+                        std::lock_guard<std::mutex> lock(anchor_mutex_);
+                        overlay_->set_anchor(latest_anchor_);
+                    }
+                    // Unconditionally, and cheaply: render() returns immediately unless something
+                    // is dirty or the visibility no longer matches. Rendering only when an *anchor*
+                    // arrived meant set_text() marked the overlay dirty and nothing ever painted
+                    // it — the preview was invisible for a whole session unless a new anchor
+                    // happened to land in the same 50 ms tick.
                     overlay_->render();
                 }
             }
@@ -893,7 +900,15 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         set_tray_state(res.status == kd::InjectStatus::ElevatedUnsupported
                            ? kd::OverlayState::Unsupported
                            : kd::OverlayState::Error);
+        return;
     }
+
+    // Source A again, which anchor.h asks for "at session start **and after each commit**". The
+    // caret has just moved — we moved it — and a caret anchor goes stale after
+    // AnchorConfig::stale_after_ms (3 s). Refreshing only at session start therefore meant the
+    // inline overlay was correct for three seconds and then degraded to the floating pill for the
+    // rest of the session, which is exactly what the first person to watch it reported seeing.
+    if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
 }
 
 // ─── Session lifecycle ──────────────────────────────────────────────────────────────────────
