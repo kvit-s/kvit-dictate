@@ -885,13 +885,22 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         return;
     }
 
+    // plan.md §1.6: "resuming starts a new utterance appended after a space". The engine decides
+    // when — it holds back each utterance's trailing whitespace precisely so this space is added
+    // exactly once, by the side that knows an utterance boundary happened — and this is the only
+    // place that can put it on the wire. Dropping the flag ran every utterance into the one before
+    // it: "…the default modelopen src/protocol.h…", "…code point indexthe café bill…".
+    std::string text;
+    if (r.op->leading_space) text.push_back(' ');
+    text += r.op->text;
+
     // Source C's before/after pair, captured from a rectangle around where we expect the text to
     // land. It used to pass an empty Rect, which fails every capture — "capture region is empty"
     // on every injection — so commit differencing never ran once and the anchor could never do
     // better than the caret or the last click.
     const bool framed = anchor_ != nullptr && submit_before_frame();
-    const kd::InjectResult res = injector_->inject(*target_, r.op->text);
-    if (framed) anchor_->submit_after_frame(r.op->text);
+    const kd::InjectResult res = injector_->inject(*target_, text);
+    if (framed) anchor_->submit_after_frame(text);
 
     if (res.status != kd::InjectStatus::Ok) {
         // Injection success is decided here, by the mechanism that performed it — never inferred
@@ -930,6 +939,34 @@ void App::begin_dictation() {
         return;
     }
     target_ = captured.value();
+
+    // The per-application policy, which decides *how* we type into this target and whether we
+    // type into it at all. docs/supported-targets.md is where these come from: they are
+    // measurements, not guesses, and this is the mechanism the matrix's tiers are declared
+    // through. find_app_policy() existed, was tested, and had never been called.
+    kd::InjectConfig inject_cfg = settings_.inject;
+    if (const kd::AppPolicy* p =
+            kd::find_app_policy(settings_.app_policies, target_->process_name)) {
+        if (!p->supported) {
+            KD_LOG_WARN("policy for %s says unsupported: %s", target_->process_name.c_str(),
+                        p->note.empty() ? "(no reason recorded)" : p->note.c_str());
+            set_tray_state(kd::OverlayState::Unsupported);
+            if (overlay_ != nullptr) {
+                overlay_->set_state(kd::OverlayState::Unsupported);
+                overlay_->show();
+            }
+            target_.reset();
+            return;
+        }
+        KD_LOG_INFO("policy for %s: method=%s%s", target_->process_name.c_str(),
+                    kd::to_string(p->method), p->use_ctrl_shift_v ? " ctrl+shift+v" : "");
+        inject_cfg.method = p->method;
+        // injector.cpp picks the paste chord from TargetIdentity::is_console and says in its own
+        // comment that a caller applying an AppPolicy override sets it here. A terminal-style
+        // paste chord in a non-terminal is exactly what this flag exists to force.
+        if (p->use_ctrl_shift_v) target_->is_console = true;
+    }
+    injector_->set_config(inject_cfg);
 
     // Decided BEFORE a word is spoken. plan.md §1.7: SendInput into a higher-integrity window is
     // silently ignored and the return value does not identify UIPI as the cause, so discovering
@@ -1009,6 +1046,9 @@ void App::finish_dictation(const char* why) {
     KD_LOG_INFO("dictation finished: %s", why);
     finalizing_ = false;
     finalize_deadline_ms_ = 0;
+    // Drop any per-application override, so the next session starts from the user's own settings
+    // rather than from whatever the last target happened to need.
+    if (injector_ != nullptr) injector_->set_config(settings_.inject);
     if (audio_running_) {
         capture_->stop();
         audio_running_ = false;

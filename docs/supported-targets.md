@@ -543,7 +543,20 @@ our heuristic must catch.
 
 ---
 
-## 6. Known-unsupported by design
+### 5.10 Incidental observations — **not measurements**
+
+Things seen while running the product for other reasons. They are recorded because they change
+what the probe should look for, not because they are results: no cell above may be filled in from
+this section, and none of it was taken with the probe or written down at the time by anything but
+a human watching a screen.
+
+| Date | Target | What was seen |
+|---|---|---|
+| 2026-08-17 | **Windows 11 Notepad** (`notepad.exe`, the WinUI/packaged one) | Paced `SendInput` (32 chars per batch, 1000 µs between batches) produced **garbled text**: long runs of one repeated character with most others missing — `can ngemall tttttttttttttttttto aaaaaaaaaaaad llllllll…`. The events themselves are correct by construction (`build_text_events` emits one down/up pair per UTF-16 unit, batch boundaries never split a pair, and the loop never resends), and the same build typed the same text into Notepad3 exactly, so this is the target's input pipeline and not ours. Two things to measure rather than assume: whether slower pacing (fewer chars per batch, longer delay) is enough, and whether the clipboard path is clean — the first thing to try, since a paste is one event instead of hundreds. |
+| 2026-08-17 | **Notepad3** (Scintilla) | Typed the same text exactly, at the same pacing. Also opened its own word-completion popup unbidden — see the `S09` note in §2.1. |
+
+Neither target is in the §5 application list. Notepad is a strong candidate for it: it is the
+first thing anyone tries, it ships with Windows, and it is now known to break the default method.
 
 These are not measurement failures. They are refusals the product makes on purpose, each with a
 reason the user can read. They are listed here so the matrix is the single place that answers
