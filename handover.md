@@ -1,6 +1,6 @@
 # Handover — kvit-dictate
 
-Rewritten 2026-08-16, end of the second session. Commit `a29d82f` on `main`.
+Rewritten 2026-08-17, end of the second session. Commit `624ab98` on `main`.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -10,14 +10,14 @@ work actually stands, what is untrue about it, and what to do next.
 
 ## 1. State in one paragraph
 
-The two processes now talk to each other. `kvit-dictate.exe` spawns the sidecar under the
-interpreter `models.json` names, both ends validate the peer, the handshake completes, the mock
-backend loads and `ready` arrives — a path that had never once completed before this session and
-was broken in five separate places. 725 tests pass across four suites at zero warnings, with
-warnings now errors. **Nothing has still ever transcribed real speech, no model has been
-downloaded, no Phase 0B cell has been measured, and no text has ever been injected into a real
-window** — the hotkey→microphone→commit→SendInput half of `main.cpp` is the largest piece of code
-that has not run, because running it means synthesising keystrokes into whatever has focus.
+**The vertical slice works.** Press Win+Y in Notepad and the mock backend's sentence is typed into
+it, word by word as the hypotheses stabilise; press Win+Y again and the `final`'s remaining tail is
+appended, once, with no duplication and no repair. That path was broken in nine separate places at
+the start of this session and had never run end to end. 728 tests pass across four suites at zero
+warnings, with warnings now errors. What is still untrue of the product: **no real speech has been
+transcribed, no model has been downloaded, no Phase 0B cell has been measured, and the anchor's
+commit differencing has never produced a usable position** — until this session it could not run at
+all, because it was being handed an empty capture rectangle.
 
 ---
 
@@ -54,11 +54,11 @@ Working notes that cost time to rediscover:
 | Area | State |
 |---|---|
 | `docs/protocol.md` + 20 fixtures | Written, and **both endpoints execute the same corpus**. |
-| C++ modules | All 13 implemented. 296 tests. |
-| `src/main.cpp` | **Runs.** Startup, tray, sidecar launch, handshake, model load and the settings dialog have all been executed. The dictation half has not. Still no test touches it. |
+| C++ modules | All 13 implemented. 299 tests. |
+| `src/main.cpp` | **Runs, end to end.** Startup, tray, sidecar launch, handshake, model load, settings dialog, hotkey, microphone, session, commit, injection and finalisation have all been executed against a real target. Still no test touches it — every defect in §5 below was found by running it. |
 | Python sidecar | Implemented and integrated: `kvit_asr/connection.py` is the connection-scoped layer that was missing. 300 tests. |
 | Bench harness | Recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
-| `tools/testtarget` | Implemented — the controlled app with edit/richedit/password/multiline controls that logs the code points it receives. Never run. |
+| `tools/testtarget` | Implemented — the controlled app with edit/richedit/password/multiline controls that logs the code points it receives. Launched and used as an injection target; its own log pane has not been read. |
 | `tools/probe` | Implemented, builds, walks a resumable 162-cell matrix. **0 cells measured.** |
 
 ### Explicitly NOT done
@@ -82,56 +82,62 @@ Working notes that cost time to rediscover:
 
 ---
 
-## 4. Do this first: dictate one sentence
+## 4. Do this next
 
-Everything from the hotkey to the injected character is untested and unexecuted. It needs a human,
-because it installs a global low-level keyboard hook and synthesises keystrokes into whatever
-window has focus.
+The vertical slice runs, so the next questions are about quality rather than existence. In order:
 
-```
-build-windows-msvc-debug\bin\Debug\kvit-dictate.exe
-```
-
-Then, with Notepad (or `kd_testtarget.exe`, which logs the code points it receives) focused, press
-`Win+Y`, speak, and press `Win+Y` again. With the `mock` backend the text is a scripted sentence
-and does not depend on what you say — which is the point: a failure is then attributable to the
-C++ side rather than to a model.
+1. **Dictate with real speech**, against the `mock` entry rather than `mock-ungated` — that is the
+   one with the endpointer in the path. What it tests is the VAD: whether speech opens the gate at
+   all, and whether ~0.8 s of silence closes the utterance and produces a `final` mid-session
+   (plan.md §1.6). Leave a beat of silence after the hotkey: the stdlib energy fallback calibrates
+   its noise floor from the quietest frame of the opening 200 ms, so a stream that opens *on*
+   speech calibrates the floor to the speech and hears nothing after it.
+2. **Watch the overlay.** It is created (`overlay created (capture_excluded=1, mode=Inline)`) and
+   shown, and it is handed the pending text on every commit — but nobody has yet reported seeing
+   it, where it sat, or whether it followed the caret. plan.md §1.5's inline preview is the
+   product's defining interaction, and it is the thing Phase 0B exists to decide.
+3. **Read the anchor's confidence**, now that source C can run at all. The log line to watch for is
+   the absence of "before-frame capture failed"; what to look for instead is whether the diff ever
+   produces an anchor that beats the caret.
 
 Turn the log on first, or there is nothing to read afterwards:
 `%LOCALAPPDATA%\kvit-dictate\settings.json`
 
 ```json
-{ "schema": 1, "privacy": { "log_level": "debug", "diagnostics_file_enabled": true } }
+{ "schema": 1, "model_id": "mock", "privacy": { "log_level": "debug", "diagnostics_file_enabled": true } }
 ```
 
 The log lands in `%LOCALAPPDATA%\kvit-dictate\logs\kvit-dictate.log`.
 
-Things most likely to be wrong, in order:
+**Nothing can test the hotkey chord except a human.** The input filter ignores every event flagged
+LLKHF_INJECTED, by design (plan.md §1.8: our own SendInput must never stop the session producing
+it), so a synthesised Win+Y can never activate anything. The message path underneath it *can* be
+driven — post `WM_APP+0x11` with wParam 0 (activate) or 1 (finalize) to the message-only window,
+found with `FindWindowExW(HWND_MESSAGE, nullptr, L"kvit-dictate-message-window", nullptr)` — and
+that is how the injection path was exercised without a human. Check `GetForegroundWindow()` first
+and refuse to proceed unless it is your own target window; text goes wherever focus is.
 
-1. **The VAD gate.** The sidecar defaults to `--vad auto`, which finds no Silero model and falls
-   back to the stdlib energy endpointer. That fallback calibrates its noise floor from the
-   quietest frame of the opening 200 ms, so if you start talking the instant the session opens it
-   calibrates the floor to your voice and hears nothing at all. Leave a moment of silence after
-   the hotkey. If it still hears nothing, add `"--vad", "none"` to the mock entry's `args` in
-   `models.json` to take the detector out of the picture entirely.
-2. **The `Effect` dispatcher in `App::apply`** — the effect ordering is implemented from
-   `session.h`'s contract and has never been observed.
-3. **`Effect::ApplyText` carries no payload**; `main.cpp` passes the in-flight message alongside
-   the `Outcome`. If a code path reaches `ApplyText` without a message, text is silently dropped.
-4. **Timer cadence.** `on_tick` runs on a 50 ms `WM_TIMER`, which drives both silence timers and
-   the commit cadence. Nothing has validated that interval against real audio.
-5. **The commit engine's stability dwell against a real clock.** Every test of it runs on a
-   manual or ticking clock. The sidecar's `Session.tick()` is driven by audio arrival (see
+Still unobserved, in rough order of how likely they are to be wrong:
+
+1. **The commit engine's stability dwell against a real clock.** Every test of it runs on a manual
+   or ticking clock. The sidecar's `Session.tick()` is driven by audio arrival (see
    `connection.ConnectionSession.handle_audio` for why it is not a timer thread), so if the client
-   ever stops streaming during a session, `stable_bytes` stops advancing.
+   ever stops streaming mid-session, `stable_bytes` stops advancing.
+2. **Timer cadence.** `on_tick` runs on a 50 ms `WM_TIMER`, which drives both silence timers and
+   the commit cadence. Nothing has validated that interval against real audio.
+3. **The session-silence timer** (120 s) and stop-on-input's other reasons — click, wheel — have
+   never fired in a real session.
+4. **Everything about a real model**: cold load time, whether `loading` heartbeats keep the client
+   from timing out, and whether a decoder that takes 300 ms to answer changes any of the above.
 
 ---
 
 ## 5. Defects found by running it, and by the tests
 
 The first four are from the previous session, kept because each is still the kind that fails
-quietly. The rest are this session's, and every one of them was found by *running the thing* —
-none was visible to 691 passing tests.
+quietly. Eleven more are this session's, and every one of them was found by *running the thing* —
+not one was visible to 691 passing tests, and four of the last five were found by a human pressing
+the hotkey twice and describing what they saw.
 
 1. **`common_grapheme_prefix` returned 0 on mid-code-point divergence**, so nothing would commit
    at all for the rest of any utterance containing `café`/`cafè`, `и`/`й`, or two CJK characters
@@ -168,6 +174,25 @@ none was visible to 691 passing tests.
     every time and a second launch exited in silence — the exact "double-click does nothing"
     outcome it was written to avoid. `FindWindowExW(HWND_MESSAGE, …)` is the search that works.
 11. **The settings dialog was unreachable.** ~200 lines of programmatic Win32 that nothing called.
+12. **The hotkey's message never reached its listener.** hotkey.h's contract is that the hook
+    callback posts `WM_APP+0x11` to the owner and the owner hands it back through
+    `dispatch_hotkey_message()`, which is where IHotkeyListener is finally called. `main.cpp` had
+    no case for it, so the message fell into DefWindowProc: the hook installed, saw the chord,
+    posted, and nothing happened. Two neighbouring contracts from the same header were also
+    unwired — `set_injection_mark` (without which our own injected keystrokes read as the user
+    typing and stop the session producing them) and `note_session_started`/`note_session_ended`.
+13. **The modifier of the finalising chord was read as user input.** Win+Y arrives as LWIN down,
+    then Y down; the LWIN stopped the session, and the Y then found none running and started a
+    new one. The user saw a second block of text instead of the first one ending. The existing
+    test pressed both keys and passed, because it ignored the modifier's outcome and nothing in a
+    test ends a session — only the owner does.
+14. **The target was released before `final` could arrive.** `end_dictation` reset it immediately
+    after sending `stop`, so the tail of every utterance — the part `stop` exists to request —
+    found no target and was dropped. It is now held until `stopped`, with a finite grace.
+15. **Source C was handed an empty capture rectangle**, so every before-frame capture failed and
+    commit differencing had never run once. anchor.h's `capture_region_for` wants a box around the
+    insertion point and a MonitorGeometry, which nothing in the tree could produce; that is what
+    `monitor_geometry_for()` is for.
 
 Also worth knowing, from the first session: eight test failures (four in `commit_engine`, four in
 Python `stability`) were **mis-driven tests, not implementation bugs**. Do not assume a red test
@@ -204,8 +229,8 @@ means the code is wrong here.
 
 ## 7. Suggested order
 
-1. **Dictate one sentence** (§4). It is the only thing standing between "the processes talk" and
-   "the product does something".
+1. **The three checks in §4** — speech through the endpointer, the overlay, the anchor. They are
+   cheap, they need the machine, and each one decides something.
 2. **Phase 0B** with `tools/probe --status` to see the matrix, then cell by cell. This is the gate
    that decides whether the inline overlay survives at all — plan.md is explicit that missing it
    changes both the UX and the commit policy, and that *not knowing* is the only failure.

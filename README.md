@@ -174,25 +174,26 @@ The marker is gitignored — whether this machine has a Python environment is a 
 
 ## Status
 
-**The two processes talk to each other; nothing has been dictated yet.** `kvit-dictate.exe` spawns
-the sidecar, both ends validate the peer, the handshake completes, the mock backend loads and
-`ready` arrives — verified by running it. What has never run is the half that needs a human at the
-keyboard: hotkey, microphone, commit, injection. And no model has been downloaded, no corpus
-recorded, and none of the Phase 0B measurements that decide the product's defining interaction
-have been taken.
+**The vertical slice works, with the mock backend.** Press the hotkey in Notepad and text is typed
+into it as the hypotheses stabilise; press it again and the final's remaining tail is appended,
+once — verified by running it, after nine defects that no test had caught. What has still never
+happened is the part that needs a model and a measurement: no real speech has been transcribed, no
+model downloaded, no corpus recorded, and none of the Phase 0B measurements that decide the
+product's defining interaction have been taken. The inline overlay has not yet been observed doing
+its job.
 
 | Phase (`plan.md` §3) | State |
 |---|---|
 | **M-1** Environment resolved | ✅ done — torch 2.10.0+cu130 / sm_120 verified; `..\wan-dancer\.venv` declared read-only |
 | **0A** Source and environment verification | ✅ done — `bench/CANDIDATES.md`; all three PRD citations resolve; four Phase-1 picks selected; NeMo need not be installed |
 | **Protocol spec** | ✅ done — `docs/protocol.md` (proto 1 draft) + 20 fixtures, run by BOTH endpoints. Freezes in Phase 2. |
-| **C++ client** | ✅ implemented — every module under `src/`, wired together in `main.cpp`. 296 tests. Startup, sidecar launch, handshake and the settings dialog have been executed; the dictation path has not. |
+| **C++ client** | ✅ implemented — every module under `src/`, wired together in `main.cpp`. 299 tests. The whole path has now been executed against a real target: hotkey, microphone, session, commit, injection, finalisation. |
 | **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper), joined by `kvit_asr/connection.py`. 300 tests. Only `mock` is registered in the backend REGISTRY. |
 | **Bench harness** | ✅ implemented — recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
 | **0B** Windows feasibility spike | ⚠️ **instrument ready, not run — this is the critical gate.** `tools/probe` builds and walks a resumable 162-cell matrix; 0 cells are measured. Until an operator runs it, the inline-overlay UX is unproven and `docs/supported-targets.md` contains no measurements. |
 | **1** Production audio path + offline bake-off | ⚠️ path built and unit-tested (including the anti-alias response); no corpus recorded, no model run |
 | **2** Protocol freeze + streaming bake-off | ❌ not started — needs a model and a corpus |
-| **3** Minimal vertical product | ⚠️ built; reaches `ready` with the mock backend, never exercised against a real ASR backend or a real microphone |
+| **3** Minimal vertical product | ⚠️ runs end to end with the mock backend; never exercised against a real ASR backend, and the overlay's inline preview is unobserved |
 | **4** Productisation | ❌ not started |
 | **5** Dogfood | ❌ not started |
 
