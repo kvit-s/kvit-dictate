@@ -367,6 +367,19 @@ AnchorDip to_monitor_dips(const Anchor& a, const std::vector<MonitorGeometry>& m
 Rect capture_region_for(Point insertion_point, const AnchorConfig& cfg,
                         const MonitorGeometry& monitor) noexcept;
 
+// The monitor containing `p` — bounds in physical pixels, effective DPI — or the nearest one when
+// the point is on no monitor, which happens for real (a window dragged partly off the desktop, a
+// cached position that outlived a display being unplugged).
+//
+// Windows-facing, and here rather than in the pure block above only because the pure functions
+// take a MonitorGeometry as a parameter: that is what lets the geometry arithmetic be tested with
+// no display attached. This is the one call that has to ask the system.
+MonitorGeometry monitor_geometry_for(Point p) noexcept;
+
+// The same, for a window (its HWND as an opaque value). Used before any anchor exists, when the
+// target's monitor is the best available guess at where the text is going.
+MonitorGeometry monitor_geometry_for_window(uintptr_t window) noexcept;
+
 // ─── The Windows-facing seams ───────────────────────────────────────────────────────────────
 //
 // Both are interfaces so the estimator can be driven from recorded captures in tests, and so

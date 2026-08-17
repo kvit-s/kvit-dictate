@@ -37,6 +37,8 @@
 // display. Do not "fix" a compile error by moving this include into the header.
 #include <windows.h>
 
+#include <shellscalingapi.h>  // GetDpiForMonitor (shcore), for monitor_geometry_for()
+
 namespace kd::anchor {
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -587,6 +589,51 @@ Rect capture_region_for(Point insertion_point, const AnchorConfig& cfg,
 //  Windows-facing half. Everything below touches the desktop; nothing below is unit-tested,
 //  which is precisely why the interesting logic is all above.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+MonitorGeometry geometry_of_monitor(HMONITOR mon) noexcept {
+    MonitorGeometry g;
+    g.dpi = USER_DEFAULT_SCREEN_DPI;
+    if (mon == nullptr) return g;
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        // rcMonitor, not rcWork: this rectangle bounds a *capture*, and the taskbar's pixels are
+        // as capturable as any other. rcWork is the overlay's business (overlay.cpp), because a
+        // preview under the taskbar is unreadable — a diff under it is not.
+        g.bounds.left = mi.rcMonitor.left;
+        g.bounds.top = mi.rcMonitor.top;
+        g.bounds.right = mi.rcMonitor.right;
+        g.bounds.bottom = mi.rcMonitor.bottom;
+    }
+
+    UINT dx = 0;
+    UINT dy = 0;
+    if (SUCCEEDED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy)) && dx != 0) {
+        // dy is read and ignored rather than averaged: Windows reports square DPI for every
+        // display it supports, and silently averaging a non-square value would hide something we
+        // do not model.
+        g.dpi = static_cast<uint32_t>(dx);
+    }
+    return g;
+}
+
+}  // namespace
+
+MonitorGeometry monitor_geometry_for(Point p) noexcept {
+    const POINT pt{p.x, p.y};
+    return geometry_of_monitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
+}
+
+MonitorGeometry monitor_geometry_for_window(uintptr_t window) noexcept {
+    HWND h = reinterpret_cast<HWND>(window);
+    if (h == nullptr || IsWindow(h) == FALSE) {
+        return geometry_of_monitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    }
+    return geometry_of_monitor(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST));
+}
 
 namespace {
 

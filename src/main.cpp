@@ -189,6 +189,7 @@ private:
     void apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* src = nullptr);
     void apply_text(const kd::proto::Message& m);
     void perform_commit(const kd::CommitEngine::Result& r);
+    bool submit_before_frame();
 
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
@@ -823,6 +824,33 @@ void App::apply_text(const kd::proto::Message& m) {
     }
 }
 
+// The rectangle source C captures, and whether there is one worth capturing.
+//
+// With an anchor already in hand it is anchor.h's own box around the insertion point — DPI-scaled,
+// clamped to the monitor, and sitting right-of-centre because text grows rightward. With no anchor
+// yet (the first commit of a session into a target that exposes no caret) there is nothing to
+// centre on, so it falls back to the target window: bigger and slower, but a compact change inside
+// it still scores as compact, and one large capture per session beats never bootstrapping at all.
+bool App::submit_before_frame() {
+    if (!target_.has_value()) return false;
+
+    if (const std::optional<kd::anchor::Anchor> a = anchor_->current(); a.has_value()) {
+        const kd::anchor::Rect region = kd::anchor::capture_region_for(
+            a->insertion_point, settings_.anchor,
+            kd::anchor::monitor_geometry_for(a->insertion_point));
+        if (region.empty()) return false;
+        anchor_->submit_before_frame(region, target_->top_level);
+        return true;
+    }
+
+    RECT wr{};
+    if (GetWindowRect(reinterpret_cast<HWND>(target_->top_level), &wr) == FALSE) return false;
+    const kd::anchor::Rect region{wr.left, wr.top, wr.right, wr.bottom};
+    if (region.empty()) return false;
+    anchor_->submit_before_frame(region, target_->top_level);
+    return true;
+}
+
 void App::perform_commit(const kd::CommitEngine::Result& r) {
     if (r.violation.has_value()) {
         // plan.md §1.4: preserve the document. No repair, no backspaces, ever. The incident is
@@ -850,9 +878,13 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         return;
     }
 
-    if (anchor_ != nullptr) anchor_->submit_before_frame(kd::anchor::Rect{}, target_->top_level);
+    // Source C's before/after pair, captured from a rectangle around where we expect the text to
+    // land. It used to pass an empty Rect, which fails every capture — "capture region is empty"
+    // on every injection — so commit differencing never ran once and the anchor could never do
+    // better than the caret or the last click.
+    const bool framed = anchor_ != nullptr && submit_before_frame();
     const kd::InjectResult res = injector_->inject(*target_, r.op->text);
-    if (anchor_ != nullptr) anchor_->submit_after_frame(r.op->text);
+    if (framed) anchor_->submit_after_frame(r.op->text);
 
     if (res.status != kd::InjectStatus::Ok) {
         // Injection success is decided here, by the mechanism that performed it — never inferred
