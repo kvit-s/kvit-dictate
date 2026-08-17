@@ -1,6 +1,6 @@
 # Handover — kvit-dictate
 
-Written 2026-08-16, end of the implementation session. Commit `586ffaf` on `main`.
+Rewritten 2026-08-16, end of the second session. Commit `a29d82f` on `main`.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -10,14 +10,14 @@ work actually stands, what is untrue about it, and what to do next.
 
 ## 1. State in one paragraph
 
-Both processes are implemented and wired end to end. The C++ client builds to a real 2.4 MB
-`kvit-dictate.exe` with a tray icon, global hotkey, WASAPI capture, a secured named pipe, the
-commit engine, the anchor estimator, both injection paths and a layered overlay. The Python
-sidecar runs on stock CPython 3.12 with nothing installed and speaks the same protocol. 691 tests
-pass across three suites, at zero warnings. **Nothing has ever transcribed real speech, no model
-has been downloaded, no Phase 0B cell has been measured, and `main.cpp`'s wiring has never
-executed outside a debugger.** The gap between "implemented" and "works" is entirely in the
-things that need a human at the machine or a model on disk.
+The two processes now talk to each other. `kvit-dictate.exe` spawns the sidecar under the
+interpreter `models.json` names, both ends validate the peer, the handshake completes, the mock
+backend loads and `ready` arrives — a path that had never once completed before this session and
+was broken in five separate places. 725 tests pass across four suites at zero warnings, with
+warnings now errors. **Nothing has still ever transcribed real speech, no model has been
+downloaded, no Phase 0B cell has been measured, and no text has ever been injected into a real
+window** — the hotkey→microphone→commit→SendInput half of `main.cpp` is the largest piece of code
+that has not run, because running it means synthesising keystrokes into whatever has focus.
 
 ---
 
@@ -29,7 +29,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 296 tests / 35807 checks
 cd build-windows-msvc-debug && ctest -C Debug              # 14 suites, none disabled
 
-python -m unittest discover -s server/tests -t server      # 266 tests  (run from repo root)
+python -m unittest discover -s server/tests -t server      # 300 tests  (run from repo root)
 python -m unittest discover -s bench/tests  -t .           # 129 tests  (run from repo root)
 ```
 
@@ -42,6 +42,10 @@ Working notes that cost time to rediscover:
 * The two Python suites must be run **from the repository root**; `-t` sets the import root and
   running from inside `server/` or `bench/` fails with "Start directory is not importable".
 * `kd_tests.exe --list` prints every test; `--suite <name>` filters.
+* `KD_WERROR` is now **ON**. Debug and Release both build the whole tree at zero warnings.
+* **Kill any running `kvit-dictate.exe` before rebuilding.** It holds the link output *and* the
+  single-instance mutex, so a stale one turns into `LNK1168` plus a new instance that exits
+  immediately — two confusing symptoms of one cause.
 
 ---
 
@@ -49,104 +53,129 @@ Working notes that cost time to rediscover:
 
 | Area | State |
 |---|---|
-| `docs/protocol.md` + 20 fixtures | Written, and **both endpoints execute the same corpus**. This is the only cross-language check that exists and it has already earned its keep (see §5). |
+| `docs/protocol.md` + 20 fixtures | Written, and **both endpoints execute the same corpus**. |
 | C++ modules | All 13 implemented. 296 tests. |
-| `src/main.cpp` | Written and compiles — the orchestrator that turns 12 modules into an app. **Never run.** No test touches it. |
-| Python sidecar | Implemented, stdlib-only core, five backends behind lazy imports. 266 tests. |
+| `src/main.cpp` | **Runs.** Startup, tray, sidecar launch, handshake, model load and the settings dialog have all been executed. The dictation half has not. Still no test touches it. |
+| Python sidecar | Implemented and integrated: `kvit_asr/connection.py` is the connection-scoped layer that was missing. 300 tests. |
 | Bench harness | Recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
-| `tools/testtarget` | Implemented — the controlled app with edit/richedit/password/multiline controls that logs the code points it receives. |
+| `tools/testtarget` | Implemented — the controlled app with edit/richedit/password/multiline controls that logs the code points it receives. Never run. |
 | `tools/probe` | Implemented, builds, walks a resumable 162-cell matrix. **0 cells measured.** |
 
 ### Explicitly NOT done
 
 * **No model downloaded.** `bench/CANDIDATES.md` picked the shortlist; nothing was fetched.
   plan.md §1.9 makes model fetching a deliberate, user-initiated act, so this is correct, not an
-  oversight — but it means every backend except `mock` is untested against reality.
-* **No environments created.** `envs/` does not exist. `server/requirements/*.txt` are pinned and
-  `server/README.md` documents the exact commands, but nothing was installed.
+  oversight — but every backend except `mock` is still untested against reality. Only `mock` is
+  even registered in `backends/__init__.py`'s REGISTRY; the other four modules exist but cannot be
+  named on the command line until they are added there.
+* **No environments created.** `envs/` does not exist. The mock entry no longer needs one — it
+  points at `C:\Python312\python.exe`, because the mock backend is stdlib-only.
 * **No corpus recorded.** `bench/prompts/{tech,hard,ambient}.jsonl` contain 91 real prompts with
   the dev/heldout split baked into the data; no audio exists.
 * **Phase 0B not run** — the critical gate. `docs/supported-targets.md` is all `—`.
-* **No settings dialog.** The tray's "Settings…" opens `settings.json` in the shell instead.
-  `settings.cpp` has `show_settings_dialog`, but `main.cpp` does not call it.
+* **`Hypothesis.stable_bytes_override` is not honoured.** `backends/base.py` documents it as the
+  hook a deliberately hostile mock uses to force an illegal `stable_bytes` onto the wire, so that
+  the C++ side's §8.3 violation handling can be exercised end to end; `connection.LoadedBackend`
+  passes only text across the seam, and `session.Session` computes stability itself. The C++
+  handling is covered by fixtures, so nothing is unverified — but the end-to-end hostile path
+  described in `models.json`'s mock notes does not exist yet.
 
 ---
 
-## 4. Do this first: the end-to-end smoke test
+## 4. Do this first: dictate one sentence
 
-**`main.cpp` is the largest piece of never-executed code in the repository.** Every module below
-it is unit-tested; the wiring between them is not. Find out whether the twelve modules actually
-talk to each other before doing anything else.
-
-`models.json`'s `mock` entry currently points its interpreter at
-`D:\projects\kvit-dictate\envs\mock\Scripts\python.exe`, **which does not exist**. The mock
-backend is stdlib-only, so the cheapest fix is to point it at the system interpreter:
-
-```jsonc
-"interpreter": "C:\\Python312\\python.exe",
-"args": ["--backend", "mock"]
-```
-
-`IpcClient` appends `--pipe <name> --proto 1` itself. The child is launched with `module`
-`kvit_asr`, so its working directory (or `PYTHONPATH`) must contain `server/` — set
-`working_directory` on the `ChildSpec` or add `PYTHONPATH` to the entry's `env`. Verify the CLI
-first, standalone:
+Everything from the hotkey to the injected character is untested and unexecuted. It needs a human,
+because it installs a global low-level keyboard hook and synthesises keystrokes into whatever
+window has focus.
 
 ```
-cd server && C:\Python312\python.exe -m kvit_asr --help
+build-windows-msvc-debug\bin\Debug\kvit-dictate.exe
 ```
 
-That already works. Then run `kvit-dictate.exe`, press `Win+Y` with Notepad focused, and watch
-for: tray reaching "listening", the sidecar spawning, `ready` arriving, mock partials committing
-text into Notepad, and a second `Win+Y` finalising.
+Then, with Notepad (or `kd_testtarget.exe`, which logs the code points it receives) focused, press
+`Win+Y`, speak, and press `Win+Y` again. With the `mock` backend the text is a scripted sentence
+and does not depend on what you say — which is the point: a failure is then attributable to the
+C++ side rather than to a model.
 
-**Be at the machine for this.** It installs a global low-level keyboard hook and will synthesise
-keystrokes into whatever window has focus.
+Turn the log on first, or there is nothing to read afterwards:
+`%LOCALAPPDATA%\kvit-dictate\settings.json`
 
-Things most likely to be wrong on first run, in order:
+```json
+{ "schema": 1, "privacy": { "log_level": "debug", "diagnostics_file_enabled": true } }
+```
 
-1. The child's working directory / `PYTHONPATH`, so `-m kvit_asr` fails to import.
-2. The `Effect` dispatcher in `App::apply` — the effect ordering is implemented from
+The log lands in `%LOCALAPPDATA%\kvit-dictate\logs\kvit-dictate.log`.
+
+Things most likely to be wrong, in order:
+
+1. **The VAD gate.** The sidecar defaults to `--vad auto`, which finds no Silero model and falls
+   back to the stdlib energy endpointer. That fallback calibrates its noise floor from the
+   quietest frame of the opening 200 ms, so if you start talking the instant the session opens it
+   calibrates the floor to your voice and hears nothing at all. Leave a moment of silence after
+   the hotkey. If it still hears nothing, add `"--vad", "none"` to the mock entry's `args` in
+   `models.json` to take the detector out of the picture entirely.
+2. **The `Effect` dispatcher in `App::apply`** — the effect ordering is implemented from
    `session.h`'s contract and has never been observed.
-3. `Effect::ApplyText` carries no payload; `main.cpp` passes the in-flight message alongside the
-   `Outcome`. If a code path reaches `ApplyText` without a message, text is silently dropped.
-4. Timer cadence: `on_tick` runs on a 50 ms `WM_TIMER`, which drives both silence timers and the
-   commit cadence. Nothing has validated that interval against real audio.
+3. **`Effect::ApplyText` carries no payload**; `main.cpp` passes the in-flight message alongside
+   the `Outcome`. If a code path reaches `ApplyText` without a message, text is silently dropped.
+4. **Timer cadence.** `on_tick` runs on a 50 ms `WM_TIMER`, which drives both silence timers and
+   the commit cadence. Nothing has validated that interval against real audio.
+5. **The commit engine's stability dwell against a real clock.** Every test of it runs on a
+   manual or ticking clock. The sidecar's `Session.tick()` is driven by audio arrival (see
+   `connection.ConnectionSession.handle_audio` for why it is not a timer thread), so if the client
+   ever stops streaming during a session, `stable_bytes` stops advancing.
 
 ---
 
-## 5. Four defects the tests caught — read these before trusting a module
+## 5. Defects found by running it, and by the tests
 
-Each would have shipped, and each is the kind that fails quietly.
+The first four are from the previous session, kept because each is still the kind that fails
+quietly. The rest are this session's, and every one of them was found by *running the thing* —
+none was visible to 691 passing tests.
 
-1. **`common_grapheme_prefix` returned 0 on mid-code-point divergence.** The byte-wise prefix
-   landed on a continuation byte and `prev_code_point` refuses one. Effect: *nothing commits at
-   all* for the rest of any utterance containing `café`/`cafè`, `и`/`й`, or two CJK characters
-   sharing lead bytes. Fixed in `utf8.cpp` by flooring to a code-point boundary first;
-   `tests/test_utf8.cpp` pins four such pairs.
-2. **`at_offset` was one byte high** in the C++ JSON decoder — the byte that failed to *continue*
-   a sequence rather than the one that *began* it. Every C++ unit test agreed with the bug because
-   they shared its misunderstanding. Only fixture 008 disagreed. `utf8::validate` now returns both
-   offsets and the header explains which is which.
-3. **The sidecar could never have connected.** It opened the pipe with
-   `GENERIC_READ | GENERIC_WRITE`; `GENERIC_READ` pulls in `FILE_READ_EA` (not granted →
-   `ACCESS_DENIED` on every launch) and `GENERIC_WRITE` pulls in `FILE_CREATE_PIPE_INSTANCE` —
-   the exact right plan.md §1.2 refuses to grant. The client was wrong, not the descriptor.
-   `server/tests/test_protocol.py` now asserts the Python mask equals `kd::kPipeAccessRights` by
-   parsing the header.
-4. **The hotkey's binding key never left the down-at-activation set**, because an early return
-   skipped the clearing that the comment three lines below it mandates.
+1. **`common_grapheme_prefix` returned 0 on mid-code-point divergence**, so nothing would commit
+   at all for the rest of any utterance containing `café`/`cafè`, `и`/`й`, or two CJK characters
+   sharing lead bytes. Fixed in `utf8.cpp`; `tests/test_utf8.cpp` pins four such pairs.
+2. **`at_offset` was one byte high** in the C++ JSON decoder. Every C++ unit test agreed with the
+   bug because they shared its misunderstanding; only fixture 008 disagreed.
+3. **The sidecar could never have connected** — it opened the pipe with `GENERIC_READ |
+   GENERIC_WRITE`, which asks for rights the DACL deliberately does not grant.
+4. **The hotkey's binding key never left the down-at-activation set.**
+5. **Two authors for `hello`.** `IpcClient` wrote the handshake's first frame *and* so did
+   `SessionMachine`, which is the half the frozen fixture corpus tests. Nothing forwarded the
+   transport's walk to the machine, so it sat in SPAWNING and rejected the `hello_ack` as a state
+   violation on every launch, on every respawn, forever. The machine keeps the frame; `main.cpp`
+   maps connection states onto `TransportEvent::Connected` / `PeerValidated` / `ChildRespawned`.
+6. **The sidecar was launched without `-m <module>`** and without the package on its PYTHONPATH,
+   so it died on an unknown option before the pipe mattered. `main.cpp` also never applied a
+   model entry's `env`, never fell back to `models.json`'s `default_model` (so a first run with no
+   settings file started no sidecar at all), and never gave `log::Config` a file even when the
+   settings said to.
+7. **`decode_control` returned a `Message`; `server.py` speaks dicts.** The sidecar's handshake
+   died on `'Hello' object has no attribute 'items'`. It could only ever have worked against the
+   test suite's shim.
+8. **Every `error.code` the sidecar raised as a `ProtocolError` reached the wire spelled
+   `"ErrorCode.state_violation"`** — outside §11.3's catalogue, which §13 tells a receiver to
+   treat as an error about an error. `tests/test_server.py` had already pinned this as an
+   `expectedFailure`; the fix is `ProtocolError.code_raw`.
+9. **Nothing connected `server.py` to `session.py`, `backends/` or `vad.py`.** Four modules, four
+   different plausible interfaces, no owner for the space between them: connection-scoped versus
+   session-scoped, `feed`/`finalize`/`Hypothesis` versus `accept_audio`/`finalise`/`str`, absolute
+   backdated sample positions versus byte offsets into the current chunk. `kvit_asr/connection.py`
+   is those three translations and nothing else. The test suite had carried all three as shims and
+   named them, which is the only reason this took an afternoon rather than a week.
+10. **`FindWindowW` cannot find a message-only window**, so the single-instance path returned null
+    every time and a second launch exited in silence — the exact "double-click does nothing"
+    outcome it was written to avoid. `FindWindowExW(HWND_MESSAGE, …)` is the search that works.
+11. **The settings dialog was unreachable.** ~200 lines of programmatic Win32 that nothing called.
 
-Also worth knowing: eight test failures (four in `commit_engine`, four in Python `stability`) were
-**mis-driven tests, not implementation bugs** — under-driven clocks and miscounted offsets. The
-implementations were right every time. Do not assume a red test means the code is wrong here; the
-modules have been more trustworthy than their tests.
+Also worth knowing, from the first session: eight test failures (four in `commit_engine`, four in
+Python `stability`) were **mis-driven tests, not implementation bugs**. Do not assume a red test
+means the code is wrong here.
 
 ---
 
 ## 6. Open questions recorded rather than guessed
-
-These are written into the code and docs as unknowns. Do not let them quietly become assumptions.
 
 * **`WDA_EXCLUDEFROMCAPTURE` vs a desktop-DC `BitBlt`.** The overlay excludes itself from capture
   so it cannot contaminate the anchor diff (plan.md §1.5). Whether the exclusion actually applies
@@ -154,36 +183,39 @@ These are written into the code and docs as unknowns. Do not let them quietly be
   measurement and Phase 0B's numbers are worthless.
 * **Windows.Graphics.Capture desktop path**, and whether it shows a user-visible capture
   indicator. `make_wgc_capture` is deliberately unimplemented; `anchor.cpp` detects the all-black
-  `BitBlt` that requires it and reports it. `capture.wgc_indicator_seen` stays `null` in probe
-  records until an operator answers it.
+  `BitBlt` that requires it and reports it.
 * **WSLg + `KEYEVENTF_UNICODE`.** Whether Unicode survives translation to X11 keysyms across the
-  RDP pipe. Clipboard is the likelier path. Phase 0B scenario A04 decides it.
+  RDP pipe. Phase 0B scenario A04 decides it.
 * **Unicode version drift.** `utf8::kUnicodeVersion` is literally
-  `"unspecified-pending-protocol-md-14.2"`. The C++ grapheme tables are hand-written and Python's
-  `unicodedata` will drift from them. The fixtures constrain the cases that matter; the general
-  problem is open. The real fix is generating both from one source.
-* **`onnxruntime-gpu` on sm_120 (Blackwell)** — `bench/CANDIDATES.md` §6 could not confirm
-  official Windows support; the upstream issue was closed stale. It gates nothing, because the
-  chosen model runs faster than real time on CPU and this box has 28 threads.
-* **`GetNamedPipeServerProcessId`** availability, for the child-validates-parent direction.
+  `"unspecified-pending-protocol-md-14.2"`. The real fix is generating both tables from one source.
+* **`onnxruntime-gpu` on sm_120 (Blackwell)** — unconfirmed; gates nothing, because the chosen
+  model runs faster than real time on CPU.
+* **The energy VAD's noise-floor warmup** (new). It is deaf to speech that starts within the first
+  200 ms of a session. Silero would not have this wart. Whether it matters in practice is a
+  measurement nobody has taken; `tests/test_connection.py` pins the behaviour so at least it is
+  not a surprise.
+* **Pre-roll is dropped across the VAD seam** (new). `VadEndpointer` replays `preroll_ms` of audio
+  from before a detected onset; `session.Session` gates by splitting the chunk it was given, so
+  that audio is never fed. The cost is the leading fraction of the first word. Fixing it means
+  teaching `Session` to consume the VAD's audio instead of its own — a change to a tested module,
+  and it belongs in the same pass as measuring whether it matters.
 
 ---
 
 ## 7. Suggested order
 
-1. **Smoke test** (§4). Cheapest way to find out if the wiring works. Commit the fix.
-2. **Turn on `KD_WERROR`.** The tree is at zero warnings; the original reason for leaving it off
-   has expired. One line in `CMakeLists.txt`, then rebuild.
-3. **Phase 0B** with `tools/probe --status` to see the matrix, then cell by cell. This is the gate
+1. **Dictate one sentence** (§4). It is the only thing standing between "the processes talk" and
+   "the product does something".
+2. **Phase 0B** with `tools/probe --status` to see the matrix, then cell by cell. This is the gate
    that decides whether the inline overlay survives at all — plan.md is explicit that missing it
    changes both the UX and the commit policy, and that *not knowing* is the only failure.
-4. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
-   the sidecar real. Note `UV_CACHE_DIR` must be on `D:` — uv hardlinks from cache into venvs and
-   hardlinks cannot cross volumes, so a `C:` cache with `D:` venvs silently full-copies everything.
-5. **Record the corpus** with `bench/record.py` — but read its report first: it is written against
+3. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch), register
+   the backend in `backends/__init__.py`'s REGISTRY, and make the sidecar real. Note `UV_CACHE_DIR`
+   must be on `D:` — uv hardlinks from cache into venvs and hardlinks cannot cross volumes, so a
+   `C:` cache with `D:` venvs silently full-copies everything.
+4. **Record the corpus** with `bench/record.py` — but read its report first: it is written against
    the C++ capture path and may need a recording entry point that `audio_capture` does not yet
-   expose. It deliberately does not import a Python audio library, because plan.md caught an
-   earlier revision claiming a corpus recorded through a different chain was equivalent.
+   expose.
 
 ---
 
@@ -194,6 +226,9 @@ These are written into the code and docs as unknowns. Do not let them quietly be
 * No third-party C++ dependencies. No Qt. Everything in-repo, including the JSON parser.
 * No header under `src/` includes `<windows.h>`; handles cross module boundaries as `uintptr_t`.
   This is what keeps the pure modules unit-testable, so do not "fix" it.
+* The sidecar core is stdlib-only. Only individual backends may import numpy/onnxruntime/torch,
+  and each such import lives inside the backend module, so a missing runtime disables one backend
+  rather than the server.
 * `..\wan-dancer\.venv` is **read-only**. Run its Whisper baseline; install nothing into it.
 * Comments explain *why*. Where something is unverified, the code says so rather than asserting.
 * Empty test suites are registered `DISABLED` in `CMakeLists.txt` rather than omitted, so the gap
