@@ -473,6 +473,69 @@ class WhisperTransformersBackend(PseudoStreamingBackend):
         self.decode_ms_total = 0
         self.diagnostics: list[str] = []
 
+    # -- construction from the command line -------------------------------------------------------
+
+    @classmethod
+    def from_backend_config(cls, cfg: Any) -> "WhisperTransformersBackend":
+        """`kvit_asr.connection.open_backend`'s hook: build from a parsed `BackendConfig`.
+
+        Without this, `open_backend` falls back to `cls(**--backend-opt)` and every *typed* field
+        of the command line — `--model`, `--chunk-ms`, `--device` — is dropped on the floor. That
+        failure is silent and expensive: models.json's `whisper-large-v3-turbo` entry passes
+        `--model openai/whisper-large-v3-turbo`, and a backend that never saw it would load
+        `DEFAULT_MODEL` instead and file the result under the wrong row of plan.md §4.
+
+        The mapping is written out rather than derived, because it is genuinely per-backend:
+
+        * `--chunk-ms` is this backend's **hop**, not a model property. It is a batch model in a
+          window we built (`PseudoStreamingBackend`), so the hop is a free parameter — unlike the
+          sherpa-onnx rows, where each chunk size is a separate set of weights.
+        * `--model-dir` has no meaning here and is **not** mapped. `transformers` resolves a
+          checkpoint through `HF_HOME` with `local_files_only` (see `allow_download`), so there is
+          no directory-of-unpacked-files concept to point at. Passing one is an error rather than
+          a silent no-op — a run that thought it was reading local weights and was not is exactly
+          the kind of unattributable measurement plan.md §4 cannot afford.
+        * `--decoding` names a transducer decoding method (greedy_search / modified_beam_search).
+          Whisper is an attention encoder-decoder and has neither; `num_beams` is the nearest
+          thing and is a `--backend-opt`. Rejected loudly for the same reason.
+
+        `--backend-opt` is applied last, so it overrides anything derived here.
+        """
+        options: dict[str, Any] = {}
+        if getattr(cfg, "model", None):
+            options["model"] = cfg.model
+        if getattr(cfg, "chunk_ms", None) is not None:
+            options["hop_ms"] = cfg.chunk_ms
+
+        device = str(getattr(cfg, "device", "auto") or "auto")
+        if device == "dml":
+            raise ValueError(
+                "--device dml is not available for the transformers-whisper backend: it runs on "
+                "torch, which has no DirectML device on this machine. Use cpu or cuda."
+            )
+        if device != "auto":
+            # "auto" is left unmapped so the config's own "auto" resolution runs and *reports*
+            # what it chose, which is what the --device help text promises.
+            options["device"] = device
+
+        if getattr(cfg, "model_dir", None) is not None:
+            raise ValueError(
+                "--model-dir is not meaningful for the transformers-whisper backend: a checkpoint "
+                "is resolved through HF_HOME, not from a directory of unpacked files. Point "
+                "HF_HOME at the cache (models.json does this for the whisper-large-v3-turbo "
+                "entry) and pass the checkpoint id as --model."
+            )
+        if getattr(cfg, "decoding", None):
+            raise ValueError(
+                f"--decoding {cfg.decoding!r} is not meaningful for the transformers-whisper "
+                "backend: it is an attention encoder-decoder, not a transducer, so it has no "
+                "greedy_search/modified_beam_search choice. The nearest knob is "
+                "`--backend-opt num_beams=N`."
+            )
+
+        options.update(getattr(cfg, "options", None) or {})
+        return cls(WhisperTransformersConfig.from_mapping(options))
+
     # -- declaration ----------------------------------------------------------------------------
 
     @property

@@ -518,6 +518,61 @@ class FasterWhisperBackend(PseudoStreamingBackend):
         self.decode_ms_total = 0
         self.diagnostics: list[str] = []
 
+    # -- construction from the command line ---------------------------------------------------------
+
+    @classmethod
+    def from_backend_config(cls, cfg: Any) -> "FasterWhisperBackend":
+        """`kvit_asr.connection.open_backend`'s hook: build from a parsed `BackendConfig`.
+
+        Without this, `open_backend` falls back to `cls(**--backend-opt)` and the *typed* command
+        line — `--model`, `--model-dir`, `--chunk-ms`, `--device` — is dropped silently, loading
+        `DEFAULT_MODEL` on CT2's own defaults and filing the result under whichever row of
+        plan.md §4 the operator believed they had selected.
+
+        Written out rather than derived, because the mapping is per-backend:
+
+        * `--chunk-ms` is the **hop** of a window we built (`PseudoStreamingBackend`), not a model
+          property. Free to choose here, unlike the sherpa-onnx rows where each chunk size is a
+          different set of weights.
+        * `--model-dir` *is* meaningful: it is the CT2 conversion directory, and passing it means
+          no hub lookup happens at all. Mapped straight through.
+        * `--decoding` names a transducer decoding method and Whisper has none; `beam_size` is the
+          nearest knob and is a `--backend-opt`. Rejected loudly rather than ignored.
+        * `--device dml` is refused: CTranslate2 takes `auto`/`cpu`/`cuda` and nothing else, and a
+          value it does not recognise fails deep inside the library rather than here.
+
+        `--backend-opt` is applied last, so it overrides anything derived here.
+        """
+        options: dict[str, Any] = {}
+        if getattr(cfg, "model", None):
+            options["model"] = cfg.model
+        if getattr(cfg, "model_dir", None) is not None:
+            options["model_dir"] = str(cfg.model_dir)
+        if getattr(cfg, "chunk_ms", None) is not None:
+            options["hop_ms"] = cfg.chunk_ms
+
+        device = str(getattr(cfg, "device", "auto") or "auto")
+        if device == "dml":
+            raise ValueError(
+                "--device dml is not available for the faster-whisper backend: CTranslate2 "
+                "accepts auto, cpu or cuda. Use cpu or cuda."
+            )
+        if device != "auto":
+            # "auto" is CTranslate2's own value and resolving it here would hide which device was
+            # actually chosen — the thing the --device help text promises will be reported.
+            options["device"] = device
+
+        if getattr(cfg, "decoding", None):
+            raise ValueError(
+                f"--decoding {cfg.decoding!r} is not meaningful for the faster-whisper backend: "
+                "it is an attention encoder-decoder, not a transducer, so it has no "
+                "greedy_search/modified_beam_search choice. The nearest knob is "
+                "`--backend-opt beam_size=N`."
+            )
+
+        options.update(getattr(cfg, "options", None) or {})
+        return cls(FasterWhisperConfig.from_mapping(options))
+
     # -- declaration ------------------------------------------------------------------------------
 
     @property

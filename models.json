@@ -68,14 +68,14 @@
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "sherpa-onnx",
+        "--backend", "zipformer",
         "--model", "sherpa-onnx-streaming-zipformer-en-2023-06-26",
         "--decoding", "modified_beam_search"
       ],
       "streaming_mode": "native-streaming",
       "requires": ["onnxruntime", "sherpa-onnx", "numpy"],
       "env": {},
-      "notes": "Phase 0A pick 3 (row C) - the context-biasing arm, and the ONLY natively-streaming candidate that supports vocabulary biasing (transducer hotwords, which require modified_beam_search rather than greedy_search). plan.md section 4 requires context-enabled and context-free modes to be compared separately; without this entry the context-enabled column has no native-streaming entrant at all. Expected to lose on raw WER - that is the point: it measures what biasing is worth.",
+      "notes": "Phase 0A pick 3 (row C) - the context-biasing arm, and the ONLY natively-streaming candidate that supports vocabulary biasing (transducer hotwords, which require modified_beam_search rather than greedy_search). plan.md section 4 requires context-enabled and context-free modes to be compared separately; without this entry the context-enabled column has no native-streaming entrant at all. Expected to lose on raw WER - that is the point: it measures what biasing is worth. NOTE the backend is `zipformer`, not `sherpa-onnx`: biasing is a different class, not a flag, and the sherpa-onnx backend REFUSES modified_beam_search outright (bench/CANDIDATES.md section 5.1, k2-fsa/sherpa-onnx#3572), so `--backend sherpa-onnx --decoding modified_beam_search` - which this entry used to say - could only ever have failed at load.",
       "enabled": true
     },
     {

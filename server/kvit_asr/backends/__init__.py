@@ -92,14 +92,31 @@ class BackendUnavailable(BackendLoadError):
 
 
 # name -> "module:attribute". Module paths starting with "." are resolved relative to this
-# package. Only the mock is built in, because it is the only backend whose module exists today;
-# bench/CANDIDATES.md §4 names the four Phase-1 adapters (sherpa-onnx Nemotron, sherpa-onnx
-# Nemotron-3.5, sherpa-onnx zipformer, whisper-large-v3-turbo through transformers) and each
-# registers itself here when its module lands. Listing a module that does not exist would turn a
-# missing file into a runtime ImportError that reads like a missing dependency, which is exactly
-# the confusion this registry is meant to remove.
+# package. The rule for adding a row is that the **module must exist**: listing one that does not
+# would turn a missing file into a runtime ImportError that reads like a missing dependency, which
+# is exactly the confusion this registry is meant to remove. A module whose *runtime* is missing is
+# a different thing entirely and is exactly what belongs here — `load_backend` turns that
+# ImportError into a `BackendUnavailable` naming the environment to create.
+#
+# The names are the `--backend` spellings in models.json, and each module's `create()` docstring
+# names the row it expects. bench/CANDIDATES.md §4's four Phase-1 picks map on as:
+#
+#   A'/B'  sherpa-onnx Nemotron + Nemotron-3.5  -> "sherpa-onnx"
+#   C      streaming zipformer, hotword biasing -> "zipformer"   (a different decoding method AND
+#                                                                 a different class; see below)
+#   D      whisper-large-v3-turbo, transformers -> "transformers-whisper"
+#   E      CT2 Whisper                          -> "faster-whisper"
+#
+# `zipformer` is its own name rather than `--backend sherpa-onnx --decoding modified_beam_search`
+# because the biasing arm is a subclass with different behaviour, not a flag: the base class
+# *refuses* modified_beam_search (bench/CANDIDATES.md §5.1, k2-fsa/sherpa-onnx#3572), so selecting
+# the flag alone can only ever fail.
 REGISTRY: dict[str, str] = {
     "mock": ".mock:MockBackend",
+    "sherpa-onnx": ".sherpa_adapter:SherpaOnnxBackend",
+    "zipformer": ".sherpa_adapter:ZipformerBackend",
+    "transformers-whisper": ".whisper_transformers:WhisperTransformersBackend",
+    "faster-whisper": ".faster_whisper:FasterWhisperBackend",
 }
 
 
