@@ -15,6 +15,22 @@
       "enabled": true
     },
     {
+      "id": "mock-ungated",
+      "display_name": "Mock backend, ungated (no VAD, no microphone needed)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend", "mock",
+        "--vad", "none",
+        "--backend-opt", "silence_peak_threshold=0"
+      ],
+      "streaming_mode": "native-streaming",
+      "requires": ["python>=3.12"],
+      "env": {},
+      "notes": "The `mock` entry above, with the two things that make it depend on the room removed. `--vad none` stops the endpointer gating the decoder, and silence_peak_threshold=0 stops the mock itself treating quiet audio as silence to stay quiet over - so the scripted text advances on whatever the microphone happens to be capturing, including nothing. That makes it the only configuration in which the whole C++ dictation path - hotkey, capture, session, stability, commit, injection, overlay - runs to injected characters with no human speaking and no model on disk, which is exactly what the mock exists for. Use `mock` instead when you want to exercise the endpointer, which needs real sound. Not a model: never report a measurement taken with this entry.",
+      "enabled": true
+    },
+    {
       "id": "nemotron-streaming-en-0.6b-onnx-160ms",
       "display_name": "Nemotron Streaming EN 0.6B (ONNX, 160 ms)",
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",

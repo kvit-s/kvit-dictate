@@ -385,6 +385,13 @@ bool App::startup() {
                     st.message().c_str());
     }
 
+    // plan.md §1.8: "Our own SendInput traffic must never stop the session producing it." The
+    // injector stamps every synthetic event with a per-process random dwExtraInfo; the filter
+    // ignores events carrying it. Wired here rather than inside either module, because the hook
+    // must not depend on the thing it is filtering out. Without this, the first injected
+    // character stops the session that produced it.
+    hotkey_->set_injection_mark(kd::injection_mark().extra_info);
+
     if (const kd::Status st = hotkey_->start(settings_.hotkey,
                                              reinterpret_cast<uintptr_t>(hwnd_), this);
         !st.ok()) {
@@ -516,6 +523,17 @@ LRESULT CALLBACK App::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
+    // The hook callback is forbidden from calling a listener — arbitrary UI work on the hook
+    // thread is how a low-level hook gets slow enough for Windows to remove it — so it posts here
+    // instead, and this call is where IHotkeyListener is finally invoked, on this thread
+    // (hotkey.h, "The hook thread → UI thread post"). Without it the hook installs, sees every
+    // keystroke, recognises the chord, posts, and nothing whatsoever happens: the message falls
+    // through to DefWindowProc. That was the state of this file until the first person pressed
+    // the hotkey.
+    if (kd::dispatch_hotkey_message(msg, static_cast<uintptr_t>(wp), static_cast<intptr_t>(lp))) {
+        return 0;
+    }
+
     switch (msg) {
         case kMsgHotkeyQueue:
             drain_hook_queue();
@@ -863,23 +881,34 @@ void App::begin_dictation() {
     }
     audio_running_ = true;
 
+    // The filter has to know a session is running before the first key-up of the chord that
+    // started it arrives — plan.md §1.8's "ignore key-up events for keys already down at
+    // activation", and the switch that turns typing into stop-on-input for the duration.
+    hotkey_->note_session_started();
+
     apply(session_->on_local(kd::LocalEvent::HotkeyPressed));
     set_tray_state(kd::OverlayState::Listening);
     if (overlay_ != nullptr) {
         overlay_->set_state(kd::OverlayState::Listening);
         overlay_->show();
     }
+    KD_LOG_INFO("dictation started: process=%s pid=%lu password_field=%d console=%d",
+                target_->process_name.c_str(),
+                static_cast<unsigned long>(target_->process_id),
+                target_->is_password_field ? 1 : 0, target_->is_console ? 1 : 0);
 }
 
 void App::end_dictation(kd::LocalEvent why) {
     if (session_ == nullptr || !target_.has_value()) return;
 
+    KD_LOG_INFO("dictation ending: %s", kd::to_string(why));
     apply(session_->on_local(why));
 
     if (audio_running_) {
         capture_->stop();
         audio_running_ = false;
     }
+    hotkey_->note_session_ended();
     target_.reset();
     if (overlay_ != nullptr) {
         overlay_->set_text({}, {});
@@ -930,6 +959,7 @@ void App::on_sidecar_lost() {
         capture_->stop();
         audio_running_ = false;
     }
+    if (target_.has_value() && hotkey_ != nullptr) hotkey_->note_session_ended();
     // Committed text stays in the document — it was correct when it was written and the
     // invariant forbids taking it back. Only the uncommitted tail is lost.
     target_.reset();
