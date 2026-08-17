@@ -677,11 +677,16 @@ class Server:
     Interfaces this class codes against, all of which live in modules owned by other authors.
     They are listed here because they are the seams where an integration mistake will show up:
 
-    `backend_loader(backend_cfg, on_progress) -> backend`
+    `backend_loader(backend_cfg, on_progress, log, allow_hostile) -> backend`
         Default `kvit_asr.connection.open_backend`, imported lazily. `on_progress(stage, percent)`
         may be called any number of times; each call becomes a `loading` message. The returned
         object exposes `model_id: str`, `mode: str` (one of VALID_MODES), and optionally
         `chunk_ms: int | None`, `context_supported: bool`, `close()`.
+
+        `log` and `allow_hostile` are passed as keywords, so a loader that does not care may
+        accept and ignore them — but it must accept them. They are not optional extras: two of
+        `LoadedBackend`'s obligations are to log (an ignored `start.context`, an honoured
+        `stable_bytes_override`), and `allow_hostile` is the gate on the latter.
 
     `session_factory(backend=..., send=..., config=..., log=...) -> session`
         Default `kvit_asr.connection.ConnectionSession` — **not** `kvit_asr.session.Session`,
@@ -944,7 +949,12 @@ class Server:
             # rather than an ImportError at package import time that takes the whole server down.
             from kvit_asr.connection import open_backend as loader  # type: ignore[no-redef]
 
-        return loader(self.cfg.backend, on_progress=on_progress)
+        return loader(
+            self.cfg.backend,
+            on_progress=on_progress,
+            log=self.log,
+            allow_hostile=self.cfg.allow_hostile_backend,
+        )
 
     def _make_session(self) -> Any:
         factory = self._session_factory

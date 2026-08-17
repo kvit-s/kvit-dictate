@@ -145,14 +145,18 @@ def mock_backend_loader(mock_config=None, **facade_overrides):
     scripts, an injected decode failure). ``facade_overrides`` writes over the facade's declared
     fields afterwards — that is how a backend reporting an illegal ``ready.mode`` is tested
     without a backend that lies.
+
+    ``log`` and ``allow_hostile`` are accepted because `Server` passes them (see its docstring's
+    seam list) and forwarded because both change what the facade does: an ignored ``start.context``
+    is only visible in the log, and ``allow_hostile`` is the gate on the hostile modes above.
     """
 
-    def loader(backend_cfg, on_progress=None):
+    def loader(backend_cfg, on_progress=None, log=None, allow_hostile=False):
         if on_progress is not None:
             on_progress("weights", 50)
         mock = MockBackend(mock_config or MockConfig(seed=17))
         mock.load()
-        facade = LoadedBackend(mock)
+        facade = LoadedBackend(mock, log=log, allow_hostile=allow_hostile)
         facade.mock = mock  # the tests reach through to the mock's own state
         for k, v in facade_overrides.items():
             setattr(facade, k, v)
@@ -820,7 +824,7 @@ class TestBackendLoadFailure(ServerTestCase):
 
     @staticmethod
     def _exploding_loader(exc):
-        def loader(backend_cfg, on_progress=None):
+        def loader(backend_cfg, on_progress=None, log=None, allow_hostile=False):
             raise exc
         return loader
 

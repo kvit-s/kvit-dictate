@@ -31,6 +31,25 @@
       "enabled": true
     },
     {
+      "id": "mock-hostile",
+      "display_name": "Mock backend, hostile (deliberately violates the protocol)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend", "mock",
+        "--vad", "none",
+        "--backend-opt", "silence_peak_threshold=0",
+        "--backend-opt", "hostile_stability=decrease",
+        "--backend-opt", "hostile_after_emissions=2",
+        "--allow-hostile-backend"
+      ],
+      "streaming_mode": "native-streaming",
+      "requires": ["python>=3.12"],
+      "env": {},
+      "notes": "`mock-ungated`, plus a sidecar that knowingly emits messages docs/protocol.md forbids. After two well-behaved emissions per utterance the reported stable_bytes goes BACKWARDS (section 8.2 requirement 3, first half), which is the input the Client's section 8.3 violation handling exists to reject and which no correct pipeline can produce - stability is the server's own computation, so the hole has to be drilled deliberately. Swap `hostile_stability=decrease` for `=mutate` to get the other half: the offset never decreases but the bytes below it change, which a receiver comparing only the numbers cannot see while text it has already typed into the document is retracted. --allow-hostile-backend is a separate flag from the --backend-opt pair on purpose, so a backend cannot authorise its own violations; every honoured override is logged at ERROR. TESTING ONLY. Never dictate into a real document with this entry, and never report a measurement taken with it.",
+      "enabled": true
+    },
+    {
       "id": "nemotron-streaming-en-0.6b-onnx-160ms",
       "display_name": "Nemotron Streaming EN 0.6B (ONNX, 160 ms)",
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",

@@ -244,6 +244,31 @@ class MockConfig:
     notes: str = ""
 
     def __post_init__(self) -> None:
+        # `--backend-opt KEY=VALUE` delivers strings, and `connection._coerce_option` can turn one
+        # into an int, a float or a bool but not into an enum member — only the backend knows
+        # which of its fields is an enum. Coercing here is what makes `--backend-opt
+        # hostile_stability=decrease` work from a models.json entry; without it the string
+        # survives all the way to `capabilities`, where `.value` fails with an AttributeError
+        # about `str` that says nothing about the command line that caused it.
+        if isinstance(self.hostile_stability, str):
+            try:
+                self.hostile_stability = HostileMode(self.hostile_stability)
+            except ValueError:
+                raise ValueError(
+                    f"hostile_stability must be one of "
+                    f"{', '.join(m.value for m in HostileMode)}; got "
+                    f"{self.hostile_stability!r}"
+                ) from None
+        if isinstance(self.silence_behaviour, str):
+            try:
+                self.silence_behaviour = SilenceBehaviour(self.silence_behaviour)
+            except ValueError:
+                raise ValueError(
+                    f"silence_behaviour must be one of "
+                    f"{', '.join(m.value for m in SilenceBehaviour)}; got "
+                    f"{self.silence_behaviour!r}"
+                ) from None
+
         if self.emit_every_ms <= 0:
             raise ValueError("emit_every_ms must be positive")
         if self.words_per_emission <= 0:

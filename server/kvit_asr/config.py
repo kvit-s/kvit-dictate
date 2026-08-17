@@ -115,6 +115,21 @@ class ServerConfig:
     backend: BackendConfig = field(default_factory=lambda: BackendConfig(id="mock"))
     session: SessionConfig = field(default_factory=SessionConfig)
 
+    allow_hostile_backend: bool = False
+    """Permit a backend to force a `stable_bytes` the protocol forbids onto the wire.
+
+    `backends.base.Hypothesis.stable_bytes_override` is the hook, and it exists because
+    docs/protocol.md §8.3 — what a Client does when a Server retracts already-published stable
+    text — is otherwise **untestable end to end**: stability is the server's own computation
+    (plan.md §1.4), and no correct pipeline can produce the input §8.3 handles.
+
+    A server-level policy and deliberately **not** a `--backend-opt`. Those are supplied by
+    whoever names the backend and are read by the backend itself, so routing this through them
+    would let a backend authorise its own protocol violations. This flag is the operator saying
+    "I know, I asked for it", which is exactly what base.py's field docstring requires ("The
+    server SHOULD refuse to honour this unless it was started with an explicit
+    allow-hostile-backend flag, and MUST log loudly when it does")."""
+
 
 class _RefuseNetworkAction(argparse.Action):
     """`--port`/`--host` exist only to fail loudly.
@@ -217,6 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="Extra backend option, repeatable. Passed through as strings.",
     )
+    b.add_argument(
+        "--allow-hostile-backend",
+        action="store_true",
+        help="Permit the backend to force an illegal `stable_bytes` onto the wire, so that the "
+        "Client's docs/protocol.md §8.3 violation handling can be exercised end to end. Every "
+        "honoured override is logged at ERROR. TESTING ONLY: with this on, the sidecar knowingly "
+        "emits non-conforming messages. Separate from --backend-opt on purpose — a backend must "
+        "not be able to authorise its own protocol violations.",
+    )
 
     s = p.add_argument_group("session tuning (plan.md §1.4, §1.6 — swept in Phase 2)")
     s.add_argument("--endpoint-silence-ms", type=int, default=DEFAULT_ENDPOINT_SILENCE_MS)
@@ -307,6 +331,7 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
             vad=ns.vad,
             silero_model_path=ns.silero_model,
         ),
+        allow_hostile_backend=ns.allow_hostile_backend,
     )
 
 

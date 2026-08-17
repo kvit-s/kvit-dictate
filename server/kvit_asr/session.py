@@ -90,6 +90,19 @@ class Backend(Protocol):
     A backend may raise. The session converts any exception into a session-scoped
     ``decode_failed`` (docs/protocol.md §11.3, ``fatal:false``) rather than killing the connection,
     because the child is not at fault as a *process*.
+
+    Optionally, a backend may also expose::
+
+        def pending_stable_bytes_override(self) -> int | None: ...
+
+    called immediately after :meth:`accept_audio` and :meth:`finalise`. Returning a number means
+    "publish exactly this ``stable_bytes``, whatever the stability computation says" — the test
+    hook behind `backends.base.Hypothesis.stable_bytes_override`, gated on the sidecar's
+    `--allow-hostile-backend` flag and refused without it. It exists because docs/protocol.md §8.3
+    (what a Client does when a Server retracts already-published stable text) cannot otherwise be
+    exercised end to end: stability is *this* side's computation, so a correct pipeline cannot
+    produce the input §8.3 handles. A backend without the method is the normal case and drives
+    exactly the behaviour it always did.
     """
 
     def reset(self, context: Sequence[str] = ()) -> None: ...
@@ -222,6 +235,9 @@ class Session:
 
         self._last_text: str | None = None
         self._last_stable = 0
+        # True once this utterance's `stable_bytes` has been forced by the backend. See
+        # `_stable_bytes_for`; normal sessions never set it.
+        self._stability_forced = False
 
         self._cancelled = False
         self._terminal = False          # `stopped` (or a fatal error) has been emitted
@@ -413,6 +429,11 @@ class Session:
             return
         if self._last_text is None:
             return
+        if self._stability_forced:
+            # A backend forcing `stable_bytes` owns this utterance's sequence entirely; polling
+            # would publish the tracker's own value over the top of the forced one. See
+            # `_stable_bytes_for`.
+            return
         try:
             stable = self._stability.poll()
         except StabilityViolation as v:
@@ -473,9 +494,49 @@ class Session:
         hypothesis = self._backend.accept_audio(pcm)
         if hypothesis is None:
             return
-        stable = self._stability.observe(hypothesis)
+        stable = self._stable_bytes_for(hypothesis)
         if hypothesis != self._last_text or stable != self._last_stable:
             self._emit_partial(hypothesis, stable)
+
+    def _stable_bytes_override(self) -> int | None:
+        """What the backend demands be published, if it demands anything.
+
+        Read through ``getattr`` because the method is optional on the ``Backend`` protocol — see
+        its docstring. A backend that does not offer it is the normal case and must reach exactly
+        the code path it always did, so this returns ``None`` rather than raising or defaulting.
+        """
+        hook = getattr(self._backend, "pending_stable_bytes_override", None)
+        if hook is None:
+            return None
+        value = hook()
+        return None if value is None else int(value)
+
+    def _stable_bytes_for(self, text: str) -> int:
+        """The ``stable_bytes`` to publish: the computed one, or the one the backend forced.
+
+        Once an override has been honoured, this utterance stays under the backend's control to
+        the end of it. That is the part that is easy to get wrong, so it is spelled out.
+
+        The tracker raises :class:`StabilityViolation` precisely when a hypothesis contradicts what
+        was already published — which is what a hostile backend is *for*. Left running, it would
+        abort the utterance with ``decode_failed`` before the non-conforming frame ever reached the
+        wire, and the §8.3 handling this hook exists to exercise would go on being untested while
+        the test appeared to run. Its state is also stale the moment a forced value is published,
+        so resuming the computation later would raise about a contradiction this session created.
+
+        :meth:`tick` stands down for the same utterance too: the dwell timer would otherwise
+        re-publish the tracker's own value over the top of a forced one. The flag clears at the
+        utterance boundary, so the next utterance is computed normally.
+        """
+        override = self._stable_bytes_override()
+        if override is not None:
+            self._stability_forced = True
+            return override
+        if self._stability_forced:
+            # The backend went quiet about it mid-utterance. Hold the last published value rather
+            # than resuming a computation whose state no longer describes what was sent.
+            return self._last_stable
+        return self._stability.observe(text)
 
     # ── Utterance lifecycle ─────────────────────────────────────────────────────────────────────
 
@@ -491,6 +552,9 @@ class Session:
         self._stability.reset(self._utterance_id)    # plan.md §1.4 step 7
         self._last_text = None
         self._last_stable = 0
+        # A forced `stable_bytes` is scoped to one utterance: §8.2's requirements are per
+        # utterance_id, so the next one starts computed again even against the same backend.
+        self._stability_forced = False
 
     def _close_utterance(self) -> None:
         """Flush the decoder and emit the ``final`` for the open utterance."""
@@ -501,7 +565,21 @@ class Session:
             # `self._last_text is not None` means a `partial` already went out under this id, so
             # §6.2's "exactly one final per utterance_id" obliges us to close it even if the
             # backend's flush came back empty.
-            stable = self._stability.finalise(text)
+            # A `final` is entirely stable by definition (§6.2), and §6.3's decoder enforces it:
+            # `final.stable_bytes`, when present, MUST equal len(utf8(text)). So a backend's
+            # `stable_bytes_override` is deliberately **not** honoured here — forcing a partial
+            # mark onto a `final` would produce a frame rejected as `bad_message` for the wrong
+            # reason, which is precisely the trap `backends.mock` warns about: a test that
+            # proves nothing while appearing to pass. Overrides shape `partial`, which is where
+            # §8.2's monotonicity requirement lives and where §8.3's handling is provoked.
+            self._stable_bytes_override()   # consumed, so it cannot leak into the next utterance
+            if self._stability_forced:
+                # The tracker's state describes a history this session did not send, so
+                # `check_emission` would raise about our own deliberate mutation. The answer the
+                # protocol demands needs no history.
+                stable = len(text.encode("utf-8"))
+            else:
+                stable = self._stability.finalise(text)
             self._emit_final(text, stable)
         else:
             # Nothing was said and nothing was published. Give the id back so the next utterance
@@ -513,6 +591,7 @@ class Session:
         self._stability.reset(self._utterance_id)
         self._last_text = None
         self._last_stable = 0
+        self._stability_forced = False
 
     # ── Emission ────────────────────────────────────────────────────────────────────────────────
 

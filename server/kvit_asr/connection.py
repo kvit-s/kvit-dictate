@@ -75,7 +75,7 @@ class LoadedBackend:
     a second wrapper would only be somewhere else for the two to disagree.
     """
 
-    def __init__(self, backend: Any, *, log: Any = None) -> None:
+    def __init__(self, backend: Any, *, log: Any = None, allow_hostile: bool = False) -> None:
         caps = backend.capabilities
         mode = getattr(caps, "mode", None)
 
@@ -97,6 +97,11 @@ class LoadedBackend:
         # boundary is not wrong, but one that never hears about it cannot choose. The router arms
         # this immediately before Session.on_discontinuity, and the next reset consumes it.
         self._next_reset_is_discontinuity = False
+        # `--allow-hostile-backend`. See `_take_override` for what it gates and why the gate is
+        # here rather than in the backend.
+        self._allow_hostile = bool(allow_hostile)
+        self._pending_override: int | None = None
+        self._refused_overrides = 0
 
     # ── Router-facing ───────────────────────────────────────────────────────────────────────
 
@@ -134,13 +139,72 @@ class LoadedBackend:
         corrupts every document the tool touches.
         """
         hypotheses = self._backend.feed(pcm)
-        return hypotheses[-1].text if hypotheses else None
+        if not hypotheses:
+            self._pending_override = None
+            return None
+        newest = hypotheses[-1]
+        self._pending_override = self._take_override(newest)
+        return newest.text
 
     def finalise(self) -> str:
         final = self._backend.finalize()
+        self._pending_override = None if final is None else self._take_override(final)
         return final.text if final is not None else ""
 
+    def pending_stable_bytes_override(self) -> int | None:
+        """The `stable_bytes` the newest hypothesis demanded, or None for the normal case.
+
+        `kvit_asr.session.Session` calls this immediately after `accept_audio`/`finalise` — see
+        that module's `Backend` protocol, where it is documented as optional. Optional rather than
+        required because it is a test hook: a backend that never lies is the normal case, and a
+        session driving a backend that does not offer this method must behave exactly as before.
+        """
+        return self._pending_override
+
     # ── internals ───────────────────────────────────────────────────────────────────────────
+
+    def _take_override(self, hypothesis: Any) -> int | None:
+        """`Hypothesis.stable_bytes_override`, if this server was told it may honour one.
+
+        The gate lives here, on the server's side of the seam, because that is what
+        `backends.base.Hypothesis.stable_bytes_override` asks for: *"The server SHOULD refuse to
+        honour this unless it was started with an explicit allow-hostile-backend flag, and MUST
+        log loudly when it does."* A backend can therefore always *offer* one — the mock's hostile
+        modes do it unconditionally — and it reaches the wire only when an operator asked for it.
+
+        Both branches are logged, and the refusal branch matters more than it looks: a hostile
+        mock configured without the flag would otherwise behave indistinguishably from a
+        well-behaved one, and a fixture run that proved nothing would look exactly like a fixture
+        run that passed.
+        """
+        override = getattr(hypothesis, "stable_bytes_override", None)
+        if override is None:
+            return None
+
+        if not self._allow_hostile:
+            self._refused_overrides += 1
+            if self._refused_overrides == 1 and self._log is not None:
+                self._log.error(
+                    "hostile_override_refused",
+                    model=self.model_id,
+                    stable_bytes=int(override),
+                    detail="the backend asked to publish a stable_bytes the protocol forbids; "
+                    "start the sidecar with --allow-hostile-backend if that was the intent",
+                )
+            return None
+
+        if self._log is not None:
+            # Every one, not the first: each is a deliberately non-conforming frame on the wire,
+            # and a run's log is the only record of which frames were manufactured.
+            self._log.error(
+                "hostile_override_honoured",
+                model=self.model_id,
+                stable_bytes=int(override),
+                hostile=bool(getattr(hypothesis, "hostile", False)),
+                detail="emitting a stable_bytes docs/protocol.md §8.2 forbids, because "
+                "--allow-hostile-backend was given",
+            )
+        return int(override)
 
     def _apply_context(self, context: Sequence[str]) -> None:
         terms = tuple(context or ())
@@ -173,7 +237,12 @@ def _coerce_option(value: str) -> Any:
     return value
 
 
-def open_backend(backend_cfg: BackendConfig, on_progress: Callable[..., None] | None = None) -> LoadedBackend:
+def open_backend(
+    backend_cfg: BackendConfig,
+    on_progress: Callable[..., None] | None = None,
+    log: Any = None,
+    allow_hostile: bool = False,
+) -> LoadedBackend:
     """`kvit_asr.server.Server`'s default ``backend_loader``: resolve, construct, load, wrap.
 
     Imports ``kvit_asr.backends`` **here** rather than at module scope, which is the rule that
@@ -182,8 +251,16 @@ def open_backend(backend_cfg: BackendConfig, on_progress: Callable[..., None] | 
     same import at module scope would take the process down before the handshake.
 
     A backend class MAY expose ``from_backend_config(cfg)``; that is the hook for a backend with
-    its own config dataclass (sherpa-onnx, zipformer). Otherwise it is constructed from
-    ``--backend-opt`` keywords, which is what ``MockBackend(**overrides)`` accepts.
+    its own config dataclass (sherpa-onnx, zipformer, both Whispers). Otherwise it is constructed
+    from ``--backend-opt`` keywords, which is what ``MockBackend(**overrides)`` accepts.
+
+    ``log`` is threaded through rather than defaulted away because two of :class:`LoadedBackend`'s
+    obligations are *to log*: a `start.context` this backend cannot use is ignored (§6.1) and an
+    ignored hint that says nothing is invisible, and an honoured ``stable_bytes_override`` MUST be
+    logged loudly. Both were unreachable while nothing passed a logger.
+
+    ``allow_hostile`` is ``ServerConfig.allow_hostile_backend``, a server policy rather than a
+    backend option — see that field.
     """
     from kvit_asr.backends import load_backend  # noqa: PLC0415 — deliberately lazy, see above
 
@@ -195,7 +272,7 @@ def open_backend(backend_cfg: BackendConfig, on_progress: Callable[..., None] | 
         backend = cls(**{k: _coerce_option(v) for k, v in (backend_cfg.options or {}).items()})
 
     backend.load(progress=on_progress)
-    return LoadedBackend(backend)
+    return LoadedBackend(backend, log=log, allow_hostile=allow_hostile)
 
 
 # ─── Seam 3: the VAD ────────────────────────────────────────────────────────────────────────
