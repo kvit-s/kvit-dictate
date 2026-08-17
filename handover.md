@@ -1,6 +1,9 @@
 # Handover — kvit-dictate
 
 Written 2026-08-17, end of the second session. Commit `feeb92f` on `main`.
+Amended at the end of the third session (`c270faf`); see §9 for what that changed. The third
+session wrote no C++ and pressed no hotkey, so **everything in §4 is still unobserved** and §1's
+paragraph still stands.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -30,7 +33,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 299 tests / 35820 checks
 cd build-windows-msvc-debug && ctest -C Debug              # 14 suites, none disabled
 
-python -m unittest discover -s server/tests -t server      # 300 tests  (run from repo root)
+python -m unittest discover -s server/tests -t server      # 372 tests  (run from repo root)
 python -m unittest discover -s bench/tests  -t .           # 129 tests  (run from repo root)
 ```
 
@@ -67,13 +70,17 @@ The diagnostics file only exists because `diagnostics_file_enabled` is on — it
 reason plan.md §1.9 gives, and without it the log goes to `OutputDebugString` and nowhere else.
 It lands in `%LOCALAPPDATA%\kvit-dictate\logs\kvit-dictate.log`.
 
-Two model entries in `models.json` matter:
+Three model entries in `models.json` matter:
 
 * `mock` — realistic: the VAD is in the path, so it needs real sound to produce anything.
 * `mock-ungated` — `--vad none` plus `silence_peak_threshold=0`, so the script advances on
   whatever the microphone captures, including a silent room. **This is the one to use when
   testing the C++ side**, because a failure is then attributable to the client and not to a
   detector or to the room.
+* `mock-hostile` — `mock-ungated` plus a sidecar that knowingly emits messages the protocol
+  forbids: after two clean emissions the reported `stable_bytes` goes backwards, retracting text
+  the client has already typed. Added in the third session and **never run against the C++ side**.
+  See §9.
 
 **A diagnostic worth knowing:** the mock advances exactly one script line per *utterance*, in a
 fixed order ("can you change the llama.cpp config…", "open src/protocol.h…", "the café bill…"). So
@@ -99,7 +106,7 @@ someone is using, focus moves.
 | `docs/protocol.md` + 20 fixtures | Written, and **both endpoints execute the same corpus**. |
 | C++ modules | All 13 implemented. 299 tests. |
 | `src/main.cpp` | **Runs, end to end**, against a real target. Still no test touches it, and every defect in §5 lived here or in a seam it owns. |
-| Python sidecar | Implemented and integrated: `kvit_asr/connection.py` is the connection-scoped layer that was missing entirely. 300 tests. |
+| Python sidecar | Implemented and integrated: `kvit_asr/connection.py` is the connection-scoped layer that was missing entirely. 372 tests. All five backends reachable by name; only `mock` has run. |
 | Bench harness | Recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. Never run against real data. |
 | `tools/testtarget` | Used as an injection target. Its own log pane — the thing that reports which code points arrived — has never been read. |
 | `tools/probe` | Builds, walks a resumable 162-cell matrix. **0 cells measured.** |
@@ -108,8 +115,11 @@ someone is using, focus moves.
 
 * **No model downloaded.** plan.md §1.9 makes fetching a deliberate, user-initiated act, so this
   is correct rather than an oversight — but every backend except `mock` is untested against
-  reality, and only `mock` is registered in `backends/__init__.py`'s REGISTRY. The other four
-  modules exist and cannot be named on the command line until they are added there.
+  reality. ~~only `mock` is registered~~ — *fixed in the third session:* all five are in
+  `backends/__init__.py`'s REGISTRY, `--model`/`--chunk-ms`/`--device` now reach them through
+  `from_backend_config`, and `backends/sherpa_adapter.py` is the `Backend`-ABC translation the
+  two sherpa modules never had. Selecting one now fails at `load()` with the environment to
+  create, which is the correct failure. Nothing has decoded a sample.
 * **No environments created.** `envs/` does not exist. The mock entries need none — they run on
   `C:\Python312\python.exe`, because the sidecar core is stdlib-only.
 * **No corpus recorded.** `bench/prompts/{tech,hard,ambient}.jsonl` hold 91 real prompts with the
@@ -118,11 +128,13 @@ someone is using, focus moves.
   observations explicitly marked as not measurements.
 * **The clipboard injection path has never executed.** It is now selected by policy for
   `notepad.exe` and nobody has watched it run — including whether the clipboard is restored.
-* **`Hypothesis.stable_bytes_override` is not honoured.** `backends/base.py` documents it as the
-  hook a deliberately hostile mock uses to force an illegal `stable_bytes` onto the wire so the
-  C++ §8.3 handling can be exercised end to end. `connection.LoadedBackend` passes only text
-  across the seam. The C++ handling is covered by fixtures, so nothing is unverified — but the
-  end-to-end hostile path `models.json` describes does not exist.
+* ~~**`Hypothesis.stable_bytes_override` is not honoured.**~~ *Done in the third session.* The
+  seam carries it, gated on a new server-level `--allow-hostile-backend` (not a `--backend-opt`:
+  a backend must not authorise its own violations), and `models.json` has a `mock-hostile` entry
+  whose args a test drives verbatim. A decreasing `stable_bytes` and a mutated stable prefix are
+  both observed on the wire by `tests/test_hostile_stability.py`. **The C++ half has still never
+  seen one** — the sidecar can now produce the input §8.3 handles, and pointing a real dictation
+  session at `mock-hostile` is the check nobody has run.
 
 ---
 
@@ -277,10 +289,13 @@ the module.
    changes both the UX and the commit policy, and that *not knowing* is the only failure. Add
    Notepad to the application list while you are there; it is the first thing anyone tries and it
    is already known to break the default method.
-3. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch), register
-   the backend in `backends/__init__.py`'s REGISTRY, and make the sidecar real. Note `UV_CACHE_DIR`
-   must be on `D:` — uv hardlinks from cache into venvs and hardlinks cannot cross volumes, so a
-   `C:` cache with `D:` venvs silently full-copies everything.
+3. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
+   the sidecar real. ~~register the backend in REGISTRY~~ — done; what remains is `envs/onnx`, the
+   weights, and the first real `load()`. Note `UV_CACHE_DIR` must be on `D:` — uv hardlinks from
+   cache into venvs and hardlinks cannot cross volumes, so a `C:` cache with `D:` venvs silently
+   full-copies everything. Expect `sherpa_onnx_streaming.py`'s eight recorded UNVERIFIED items to
+   be what the first run is actually about; the adapter around it is tested, the assumptions
+   inside it are not.
 4. **Record the corpus** with `bench/record.py` — but read its report first: it is written against
    the C++ capture path and may need a recording entry point `audio_capture` does not yet expose.
 
@@ -303,3 +318,62 @@ the module.
 * Empty test suites are registered `DISABLED` in `CMakeLists.txt` rather than omitted, so the gap
   between "planned" and "covered" shows up in every ctest run. `KD_TEST_SUITES_PENDING` is
   currently empty; a new module starts there.
+
+---
+
+## 9. What the third session did
+
+No C++ was written, no hotkey was pressed, and no model was fetched. Everything in §4 is still
+unobserved, and §1's paragraph is still an accurate description of the product.
+
+Two commits, both Python, both closing items §3 listed as not done. Both were the same defect as
+§5's list — *a contract written down on one side and never called from the other* — which is now
+the third session in a row where that pattern produced the session's work.
+
+**`9ed2dcc` — the four real backends were unreachable.** `backends/__init__.py` listed only the
+mock, so every `--backend` spelling `models.json` passes resolved to "unknown backend" whatever
+was installed: ~3800 lines of finished adapter with no route in. Underneath that:
+
+* `open_backend` documented a `from_backend_config` hook and no backend provided one, so
+  construction fell back to `cls(**--backend-opt)` and the *typed* command line — `--model`,
+  `--chunk-ms`, `--device`, `--model-dir` — was discarded in silence. A run started with
+  `--model openai/whisper-large-v3-turbo` would have loaded `DEFAULT_MODEL` and reported its
+  numbers under the requested model's name.
+* `SherpaOnnxStreamingBackend` is not a `Backend` at all — it was written standalone against
+  `start_session`/`accept_pcm`/`finish_utterance`. `backends/sherpa_adapter.py` is the owner for
+  that gap, built like `connection.py`: four named translations with what each costs written
+  down. The fourth has teeth — the inner raises a plain `RuntimeError`, which untranslated
+  reaches the wire as a fatal `internal_error` and takes the connection down rather than the
+  session.
+* `models.json`'s zipformer entry said `--backend sherpa-onnx --decoding modified_beam_search`,
+  which could only ever have failed: the base class refuses that method outright. Biasing is a
+  different class, not a flag; it is `--backend zipformer` now.
+
+**`c270faf` — `stable_bytes_override` reaches the wire.** Four links were broken, and the third
+is the one worth remembering: the session's own stability tracker raises `StabilityViolation`
+exactly when a hypothesis contradicts what was published, which is what a hostile backend is
+*for*, so it aborted the utterance with `decode_failed` before the manufactured frame could be
+sent. A test would have looked like it ran. Forcing now stands the computation down for that
+utterance and only that one. An override is deliberately **not** honoured on a `final`: §6.2 makes
+`final.stable_bytes` the whole text and the decoder enforces it, so a forced partial mark there is
+rejected as `bad_message` — the wrong reason, and exactly the trap `mock.py` warns about.
+
+### What this changes about what to do next
+
+`models.json` has a new **`mock-hostile`** entry. It is a one-session check that did not exist
+before, and it belongs with the five in §4: point a real dictation session at it and watch what
+the C++ side does when the sidecar retracts stable text it has already typed. §8.3's handling is
+covered by fixtures at the codec level; it has never run against a live sidecar in a real
+document. Expect the commit engine to refuse the retraction and log it — and if instead the
+document is corrupted, that is the single most valuable defect this project can find before a real
+model is ever loaded.
+
+Otherwise the §7 order is unchanged. §7.3 is smaller now: only `envs/onnx`, the weights and the
+first real `load()` remain, and the thing that first run is really about is the eight recorded
+UNVERIFIED assumptions inside `sherpa_onnx_streaming.py` — the adapter around them is tested, the
+assumptions themselves cannot be until sherpa-onnx is installed.
+
+Nothing was done about the pre-roll dropped across the VAD seam (§6). §6 says it belongs in the
+same pass as measuring whether it matters, and no measurement happened, so it was left alone.
+
+Test counts: **800** across four suites — 299 C++, 372 server, 129 bench — at zero warnings.

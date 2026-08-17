@@ -188,7 +188,7 @@ its job.
 | **0A** Source and environment verification | ✅ done — `bench/CANDIDATES.md`; all three PRD citations resolve; four Phase-1 picks selected; NeMo need not be installed |
 | **Protocol spec** | ✅ done — `docs/protocol.md` (proto 1 draft) + 20 fixtures, run by BOTH endpoints. Freezes in Phase 2. |
 | **C++ client** | ✅ implemented — every module under `src/`, wired together in `main.cpp`. 299 tests. The whole path has now been executed against a real target: hotkey, microphone, session, commit, injection, finalisation. |
-| **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper), joined by `kvit_asr/connection.py`. 300 tests. Only `mock` is registered in the backend REGISTRY. |
+| **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper), joined by `kvit_asr/connection.py`. 372 tests. All five backends are registered and reachable by name; only `mock` has ever run, because the other four need a model on disk and an environment that does not exist yet. |
 | **Bench harness** | ✅ implemented — recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
 | **0B** Windows feasibility spike | ⚠️ **instrument ready, not run — this is the critical gate.** `tools/probe` builds and walks a resumable 162-cell matrix; 0 cells are measured. Until an operator runs it, the inline-overlay UX is unproven and `docs/supported-targets.md` contains no measurements. |
 | **1** Production audio path + offline bake-off | ⚠️ path built and unit-tested (including the anti-alias response); no corpus recorded, no model run |
