@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "010-clean-eof-at-frame-boundary",
+  "kind": "framing",
+  "name": "Peer closes exactly on a frame boundary",
+  "description": "A clean end of stream after a whole frame is orderly shutdown, not a protocol error. The decoder reports the frames and then end-of-stream.",
+  "input": {
+    "chunks": [
+      "18000000017b2274223a2268656c6c6f222c2270726f746f223a317d1f000000017b2274223a2273746f70222c2273657373696f6e5f6964223a227337227d"
+    ],
+    "eof": true
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      },
+      {
+        "type": 1,
+        "payload_len": 30,
+        "payload_hex": "7b2274223a2273746f70222c2273657373696f6e5f6964223a227337227d",
+        "json": {
+          "t": "stop",
+          "session_id": "s7"
+        }
+      }
+    ],
+    "error": null,
+    "end_of_stream": true
+  }
+}

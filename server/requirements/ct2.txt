@@ -1,0 +1,77 @@
+# envs/ct2 — CTranslate2 / faster-whisper. bench/CANDIDATES.md §3, rows E and E′.
+#
+# WHAT IT IS FOR
+#   The `faster-whisper` backend (server/kvit_asr/backends/faster_whisper.py):
+#     * Systran/faster-whisper-large-v3          (row E  — batch accuracy reference, ~3.1 GB)
+#     * Systran/faster-distil-whisper-large-v3   (row E′ — distilled, ~1.5 GB)
+#   CANDIDATES.md §4 puts both in the SECOND TIER: batch accuracy references and the cheapest
+#   CPU-side fallback, deferred until Phase 1 picks 1–4 have run. So this environment does not
+#   need to exist yet, and creating it early buys nothing.
+#
+#   Its one structural virtue is that it needs NO PYTORCH. That is why row E gets its own env
+#   rather than being added to the venv that already has Whisper working: plan.md §5.1 makes
+#   ..\wan-dancer\.venv read-only for this project, and "faster-whisper looks compatible" is
+#   exactly the reasoning §5.1 reverses revision 1 on.
+#
+# APPROXIMATE DOWNLOAD SIZE
+#   ~150 MB of wheels for a CPU-only install (estimate: ctranslate2 is the bulk of it, plus av,
+#   tokenizers, onnxruntime and huggingface_hub, which faster-whisper pulls in transitively).
+#   A GPU install needs the CUDA 12 + cuDNN 9 runtime DLLs on PATH; if they are supplied by the
+#   nvidia-* pip packages instead of a system CUDA install, add ~1.5 GB (estimate) — see the
+#   commented lines at the bottom. Model weights are NOT included and are NOT downloaded by the
+#   sidecar: they live in the shared HF_HOME (c:\apps\llama-swap\gguf\hf) and a human fetches
+#   them once (plan.md §1.9).
+#
+# ─── PROVISIONAL PINS — READ THIS BEFORE BLAMING THE PACKAGE ─────────────────────────────────
+# Written by hand, like requirements/onnx.txt, from bench/CANDIDATES.md and from what is known
+# about this machine. They were NOT produced by a resolver and NOT checked against any package
+# index: Phase 0A installed nothing and downloaded nothing (CANDIDATES.md §6 item 7), and
+# nothing has changed that. A line marked UNVERIFIED may name a version that does not exist; the
+# failure mode is a loud "no matching distribution", which is the intended behaviour — the pin is
+# wrong, not the package. Replace this file wholesale in the first installing session:
+#
+#   set UV_CACHE_DIR=D:\uv-cache
+#   uv pip compile --python-version 3.12 requirements\ct2.txt -o requirements\ct2.txt
+#
+# UV_CACHE_DIR MUST BE ON D: — uv hardlinks packages from its cache into the venv, hardlinks
+# cannot cross volumes, and a C: cache with D: venvs silently full-copies every package
+# (plan.md §5.2 item 4).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# UNVERIFIED. faster-whisper is the adapter's entire API surface (WhisperModel + transcribe).
+# The backend module records every API detail it depends on as UNVERIFIED and turns a mismatch
+# into a specific error naming the installed version, so a wrong pin here is diagnosable rather
+# than mysterious.
+faster-whisper==1.2.0
+
+# UNVERIFIED, and pinned EXPLICITLY even though faster-whisper pulls it in, because this is the
+# package the open question is about. bench/CANDIDATES.md §6 item 2: third-party reports of
+# CUBLAS_STATUS_NOT_SUPPORTED on RTX 50-series (sm_120) with int8 compute, worked around by
+# forcing compute_type=float16. Unverified here. When that is finally settled on this machine,
+# the CTranslate2 version it was settled at is the number that has to be recorded — which it
+# cannot be if the version is whatever the resolver felt like that day.
+ctranslate2==4.7.0
+
+# Observed on this machine: plan.md §5.1 records numpy 2.4.4 in ..\wan-dancer\.venv. The backend
+# converts s16le PCM to float32 through numpy; it is also a hard requirement of ctranslate2.
+numpy==2.4.4
+
+# Audio file I/O for the bench harness (bench/record.py, run_matrix.py). Not used by the sidecar
+# core, which receives PCM over the pipe and never opens a file. UNVERIFIED version.
+soundfile==0.13.1
+
+# ─── GPU: only if a CUDA run is actually wanted ──────────────────────────────────────────────
+# CANDIDATES.md §3 records that this environment needs CUDA 12 + cuDNN 9 DLLs and, unlike the
+# transformers baseline's environment, has no torch to supply them. Two ways to get them:
+#
+#   (a) a system CUDA install already on PATH — this machine has CUDA 12.9 and 12.1 (plan.md
+#       §5.3), so try this first and install nothing;
+#   (b) the nvidia-* wheels below, which put the DLLs inside the venv at a cost of roughly
+#       1.5 GB (estimate).
+#
+# Left commented because (a) may already be sufficient and 1.5 GB spent to discover that would
+# be the exact waste plan.md §5.2 is trying to avoid. Uncomment only after a CUDA run has
+# actually failed to find a DLL. Versions UNVERIFIED.
+#
+# nvidia-cublas-cu12==12.9.0.13
+# nvidia-cudnn-cu12==9.8.0.87

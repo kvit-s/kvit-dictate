@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "004-max-size-frame",
+  "kind": "framing",
+  "name": "Largest legal frame: 65536-byte payload, length field 65537",
+  "description": "MAX_PAYLOAD is 65536 (64 KiB) and the length field covers the type byte, so the largest legal length field value is 65537 (0x00010001, little-endian 01 00 01 00). Must be accepted. Payload is the two bytes 01 ff repeated 32768 times = 32768 s16le samples = 2048 ms of 16 kHz mono audio.",
+  "input": {
+    "chunks": [
+      "0100010002",
+      {
+        "repeat": "01ff",
+        "count": 32768
+      }
+    ]
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 2,
+        "payload_len": 65536,
+        "payload_repeat": {
+          "repeat": "01ff",
+          "count": 32768
+        },
+        "samples": 32768
+      }
+    ],
+    "error": null
+  }
+}

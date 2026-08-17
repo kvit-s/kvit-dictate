@@ -1,0 +1,227 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "description": "Cross-language conformance fixtures for the kvit-dictate named-pipe protocol. Consumed by both the C++ and the Python test suites; see docs/protocol.md section 11 for the schema.",
+  "byte_source": "A byte source is either a lowercase hex string, or an object {\"repeat\":\"<hex unit>\",\"count\":<n>} meaning that unit repeated n times. Arrays of byte sources concatenate.",
+  "kinds": {
+    "framing": "Raw octets in, decoded frames or a fatal framing error out.",
+    "text": "A UTF-8 text and a set of stable_bytes offsets to accept or reject.",
+    "session": "An ordered message trace and the verdict required for each entry."
+  },
+  "cases": [
+    {
+      "id": "001-fragmented-reads",
+      "file": "001-fragmented-reads.json",
+      "kind": "framing",
+      "name": "Frame boundaries split across read() deliveries",
+      "tags": [
+        "framing",
+        "fragmentation"
+      ]
+    },
+    {
+      "id": "002-coalesced-frames",
+      "file": "002-coalesced-frames.json",
+      "kind": "framing",
+      "name": "Three frames delivered in a single read",
+      "tags": [
+        "framing",
+        "coalescing"
+      ]
+    },
+    {
+      "id": "003-zero-length-payload",
+      "file": "003-zero-length-payload.json",
+      "kind": "framing",
+      "name": "Audio frame with an empty payload",
+      "tags": [
+        "framing",
+        "edge"
+      ]
+    },
+    {
+      "id": "004-max-size-frame",
+      "file": "004-max-size-frame.json",
+      "kind": "framing",
+      "name": "Largest legal frame: 65536-byte payload, length field 65537",
+      "tags": [
+        "framing",
+        "limits"
+      ]
+    },
+    {
+      "id": "005-oversize-frame",
+      "file": "005-oversize-frame.json",
+      "kind": "framing",
+      "name": "One byte over the limit: length field 65538",
+      "tags": [
+        "framing",
+        "limits",
+        "fatal"
+      ]
+    },
+    {
+      "id": "006-malformed-length-zero",
+      "file": "006-malformed-length-zero.json",
+      "kind": "framing",
+      "name": "length field 0 after one good frame",
+      "tags": [
+        "framing",
+        "malformed",
+        "fatal"
+      ]
+    },
+    {
+      "id": "007-malformed-length-huge",
+      "file": "007-malformed-length-huge.json",
+      "kind": "framing",
+      "name": "length field 0xFFFFFFFF",
+      "tags": [
+        "framing",
+        "malformed",
+        "fatal"
+      ]
+    },
+    {
+      "id": "008-invalid-utf8-control",
+      "file": "008-invalid-utf8-control.json",
+      "kind": "framing",
+      "name": "Control payload containing a lone 0xE9 byte",
+      "tags": [
+        "framing",
+        "utf8",
+        "fatal"
+      ]
+    },
+    {
+      "id": "009-unknown-frame-type",
+      "file": "009-unknown-frame-type.json",
+      "kind": "framing",
+      "name": "Frame type byte 0x03",
+      "tags": [
+        "framing",
+        "malformed",
+        "fatal"
+      ]
+    },
+    {
+      "id": "010-clean-eof-at-frame-boundary",
+      "file": "010-clean-eof-at-frame-boundary.json",
+      "kind": "framing",
+      "name": "Peer closes exactly on a frame boundary",
+      "tags": [
+        "framing",
+        "lifecycle"
+      ]
+    },
+    {
+      "id": "011-truncated-frame-at-eof",
+      "file": "011-truncated-frame-at-eof.json",
+      "kind": "framing",
+      "name": "Peer closes six bytes short of completing a frame",
+      "tags": [
+        "framing",
+        "lifecycle",
+        "fatal"
+      ]
+    },
+    {
+      "id": "012-offset-splits-utf8-sequence",
+      "file": "012-offset-splits-utf8-sequence.json",
+      "kind": "text",
+      "name": "stable_bytes falling inside a multi-byte UTF-8 sequence",
+      "tags": [
+        "text",
+        "utf8",
+        "offsets"
+      ]
+    },
+    {
+      "id": "013-offset-splits-combining-sequence",
+      "file": "013-offset-splits-combining-sequence.json",
+      "kind": "text",
+      "name": "stable_bytes on a UTF-8 boundary that is not a grapheme-cluster boundary",
+      "tags": [
+        "text",
+        "grapheme",
+        "offsets"
+      ]
+    },
+    {
+      "id": "014-stale-session-id",
+      "file": "014-stale-session-id.json",
+      "kind": "session",
+      "name": "Messages carrying a session_id that is not the current one",
+      "tags": [
+        "session",
+        "identity",
+        "wrong-window"
+      ]
+    },
+    {
+      "id": "015-duplicate-seq",
+      "file": "015-duplicate-seq.json",
+      "kind": "session",
+      "name": "Duplicate and out-of-order seq within the current session",
+      "tags": [
+        "session",
+        "ordering"
+      ]
+    },
+    {
+      "id": "016-seq-gap",
+      "file": "016-seq-gap.json",
+      "kind": "session",
+      "name": "A skipped seq is logged, accepted, and resets anchor confidence",
+      "tags": [
+        "session",
+        "ordering"
+      ]
+    },
+    {
+      "id": "017-stable-bytes-decreases",
+      "file": "017-stable-bytes-decreases.json",
+      "kind": "session",
+      "name": "stable_bytes moving backwards within an utterance",
+      "tags": [
+        "session",
+        "invariant",
+        "text"
+      ]
+    },
+    {
+      "id": "018-stable-prefix-mutates",
+      "file": "018-stable-prefix-mutates.json",
+      "kind": "session",
+      "name": "Text under an already-published stable prefix changes",
+      "tags": [
+        "session",
+        "invariant",
+        "text"
+      ]
+    },
+    {
+      "id": "019-cancel-during-final",
+      "file": "019-cancel-during-final.json",
+      "kind": "session",
+      "name": "cancel written while a final is already in flight",
+      "tags": [
+        "session",
+        "lifecycle",
+        "cancel"
+      ]
+    },
+    {
+      "id": "020-reconnect-after-child-crash",
+      "file": "020-reconnect-after-child-crash.json",
+      "kind": "session",
+      "name": "Child dies mid-session; client restarts it and opens a new session",
+      "tags": [
+        "session",
+        "lifecycle",
+        "reconnect",
+        "wrong-window"
+      ]
+    }
+  ]
+}

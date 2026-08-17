@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "020-reconnect-after-child-crash",
+  "kind": "session",
+  "name": "Child dies mid-session; client restarts it and opens a new session",
+  "description": "session_id must never be reused across child restarts, and a message from the pre-crash session must never be applied even if it somehow arrives on the new connection (a squatter, or a stale writer). The new pipe gets a new random name, so in practice this is defence in depth; the fixture exists because the cost of getting it wrong is text injected into an unrelated window.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 12,
+    "utterance_id": 3
+  },
+  "messages": [
+    {
+      "from": "transport",
+      "event": "broken_pipe",
+      "expect": {
+        "verdict": "abort_session",
+        "effects": [
+          "state -> DEAD",
+          "no injection",
+          "commit engine reset",
+          "surface sidecar-crashed in tray"
+        ]
+      }
+    },
+    {
+      "from": "transport",
+      "event": "child_respawned",
+      "expect": {
+        "verdict": "reconnected",
+        "effects": [
+          "new pipe name",
+          "new client handle"
+        ]
+      }
+    },
+    {
+      "from": "client",
+      "json": {
+        "t": "hello",
+        "proto": 1
+      },
+      "expect": {
+        "verdict": "sent"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "hello_ack",
+        "proto": 1,
+        "server": "kvit-asr/0.1"
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "ready",
+        "model": "example/streaming-en",
+        "warm_ms": 2140,
+        "mode": "native-streaming"
+      },
+      "expect": {
+        "verdict": "accept",
+        "effects": [
+          "state -> IDLE"
+        ]
+      }
+    },
+    {
+      "from": "client",
+      "json": {
+        "t": "start",
+        "session_id": "s8",
+        "sample_rate": 16000
+      },
+      "expect": {
+        "verdict": "sent",
+        "effects": [
+          "current_session_id -> s8",
+          "state -> RUNNING"
+        ]
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "ghost of the dead session",
+        "stable_bytes": 5
+      },
+      "expect": {
+        "verdict": "drop_stale_session"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s8",
+        "utterance_id": 1,
+        "seq": 1,
+        "text": "new session",
+        "stable_bytes": 0
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    }
+  ]
+}

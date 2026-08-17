@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "003-zero-length-payload",
+  "kind": "framing",
+  "name": "Audio frame with an empty payload",
+  "description": "length == 1 covers the type byte and nothing else. This is a well-formed frame carrying zero PCM samples; the decoder must emit it and resynchronise on the frame that follows. (A zero-length payload on type 0x01 is equally well formed at the framing layer; it fails one layer up, as bad_json.)",
+  "input": {
+    "chunks": [
+      "010000000218000000017b2274223a2268656c6c6f222c2270726f746f223a317d"
+    ]
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 2,
+        "payload_len": 0,
+        "payload_hex": "",
+        "samples": 0
+      },
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      }
+    ],
+    "error": null
+  }
+}

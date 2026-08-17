@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "005-oversize-frame",
+  "kind": "framing",
+  "name": "One byte over the limit: length field 65538",
+  "description": "65538 = 0x00010002, little-endian 02 00 01 00. The decoder must reject on the header alone, before reading or allocating any payload, and must terminate the connection. Truncating the frame and continuing is forbidden.",
+  "input": {
+    "chunks": [
+      "0200010002"
+    ]
+  },
+  "expect": {
+    "frames": [],
+    "error": {
+      "code": "frame_too_large",
+      "fatal": true,
+      "at_offset": 0,
+      "detail": "length field 65538 exceeds MAX_PAYLOAD+1 (65537)"
+    }
+  }
+}

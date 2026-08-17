@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "007-malformed-length-huge",
+  "kind": "framing",
+  "name": "length field 0xFFFFFFFF",
+  "description": "The length field is unsigned 32-bit; a decoder that sign-extends, or that allocates before range-checking, fails here. Reject on the header.",
+  "input": {
+    "chunks": [
+      "ffffffff01"
+    ]
+  },
+  "expect": {
+    "frames": [],
+    "error": {
+      "code": "frame_too_large",
+      "fatal": true,
+      "at_offset": 0,
+      "detail": "length field 4294967295 exceeds MAX_PAYLOAD+1 (65537)"
+    }
+  }
+}

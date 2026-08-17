@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "017-stable-bytes-decreases",
+  "kind": "session",
+  "name": "stable_bytes moving backwards within an utterance",
+  "description": "The committed-prefix invariant is not repairable after the fact: bytes already injected cannot be withdrawn. A receiver must therefore refuse the message rather than clamp stable_bytes to its previous value, which would paper over a backend bug while the document silently diverges. The session is aborted; the connection survives.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 11,
+    "utterance_id": 3,
+    "last_stable_bytes": 0
+  },
+  "messages": [
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 12,
+        "text": "can you change the",
+        "stable_bytes": 8
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "can you change the llama",
+        "stable_bytes": 4
+      },
+      "expect": {
+        "verdict": "protocol_error",
+        "error": {
+          "code": "stability_violation",
+          "fatal": false,
+          "at_offset": null,
+          "detail": "stable_bytes 4 < 8 within utterance 3"
+        }
+      }
+    },
+    {
+      "from": "client",
+      "json": {
+        "t": "error",
+        "session_id": "s7",
+        "code": "stability_violation",
+        "fatal": false,
+        "msg": "stable_bytes decreased 8 -> 4 in utterance 3"
+      },
+      "expect": {
+        "verdict": "sent"
+      }
+    }
+  ]
+}

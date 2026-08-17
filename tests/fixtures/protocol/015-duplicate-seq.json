@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "015-duplicate-seq",
+  "kind": "session",
+  "name": "Duplicate and out-of-order seq within the current session",
+  "description": "seq is per-session and strictly increasing across partial and final. A repeated or lower seq is dropped without changing any client state - in particular without moving the committed prefix backwards.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 11,
+    "utterance_id": 3
+  },
+  "messages": [
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 12,
+        "text": "can you change",
+        "stable_bytes": 8
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 12,
+        "text": "can you change the",
+        "stable_bytes": 8
+      },
+      "expect": {
+        "verdict": "drop_duplicate_seq"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 11,
+        "text": "can",
+        "stable_bytes": 0
+      },
+      "expect": {
+        "verdict": "drop_out_of_order"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "can you change the llama",
+        "stable_bytes": 15
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    }
+  ]
+}

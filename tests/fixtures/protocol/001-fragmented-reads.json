@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "001-fragmented-reads",
+  "kind": "framing",
+  "name": "Frame boundaries split across read() deliveries",
+  "description": "Two frames delivered in four chunks whose boundaries fall inside the length prefix, inside the payload, and across the frame boundary. A conforming decoder is stream-oriented and must not assume one read yields one frame.",
+  "input": {
+    "chunks": [
+      "1800",
+      "0000017b227422",
+      "3a2268656c6c6f222c2270726f746f223a317d050000",
+      "00020100ffff"
+    ]
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      },
+      {
+        "type": 2,
+        "payload_len": 4,
+        "payload_hex": "0100ffff",
+        "samples": 2
+      }
+    ],
+    "error": null
+  }
+}

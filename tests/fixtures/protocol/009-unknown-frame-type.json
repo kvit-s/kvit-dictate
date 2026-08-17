@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "009-unknown-frame-type",
+  "kind": "framing",
+  "name": "Frame type byte 0x03",
+  "description": "Only 0x01 and 0x02 are defined in proto 1. Because both endpoints agreed on proto 1 during the handshake, an undefined type is a peer bug, not a forward-compatibility event; skipping it would hide the bug.",
+  "input": {
+    "chunks": [
+      "03000000030102"
+    ]
+  },
+  "expect": {
+    "frames": [],
+    "error": {
+      "code": "unknown_frame_type",
+      "fatal": true,
+      "at_offset": 4,
+      "detail": "type byte 0x03 undefined in proto 1"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+# whisper-transformers — THERE IS NO ENVIRONMENT TO CREATE, AND NOTHING TO INSTALL.
+#
+# This file deliberately pins nothing. It exists because a reader looking for "how do I run the
+# Whisper baseline" looks in requirements/ first, and an absence here would read as an omission
+# rather than as the decision it is — the same reason mock.txt exists.
+#
+# WHAT IT IS FOR
+#   bench/CANDIDATES.md §4 pick 4 (row D): openai/whisper-large-v3-turbo through the HuggingFace
+#   `transformers` pipeline — the accuracy baseline that anchors the scale for every other
+#   candidate, and the natural partner for the manual Win+H comparison in plan.md §4. The
+#   adapter is server/kvit_asr/backends/whisper_transformers.py.
+#
+# ITS ENVIRONMENT ALREADY EXISTS AND IS READ-ONLY
+#   D:\projects\wan-dancer\.venv — python 3.12.9, torch 2.10.0+cu130 (sm_120 compiled in),
+#   transformers 5.14.1, numpy 2.4.4 (plan.md §5.1). models.json names that interpreter for this
+#   model, and selecting the model restarts the sidecar under it.
+#
+#   NOTHING MAY BE INSTALLED INTO IT. Not faster-whisper, not NeMo, not qwen-asr, not an
+#   "obviously compatible" pin, not under a --dry-run justification. plan.md §5.1 reverses
+#   revision 1 on exactly this point and the reversal is load-bearing: that venv is another
+#   project's working GPU pipeline, containing sageattention compiled against that exact torch
+#   build, and a clean dependency resolution is not evidence that an added package leaves an
+#   untested import or runtime path intact. Corrupting a working stack is a far worse and less
+#   reversible cost than disk.
+#
+#   If that venv ever stops working for us, the response is a NEW locked environment under
+#   envs/, created by a human — never a package added to that one. Such a file would be a real
+#   requirements file and would replace this one.
+#
+# APPROXIMATE DOWNLOAD SIZE: 0 bytes of packages. The weights (openai/whisper-large-v3-turbo,
+#   ~1.5 GB) are ALREADY in the shared cache HF_HOME=c:\apps\llama-swap\gguf\hf (plan.md §5.2,
+#   confirmed present in CANDIDATES.md §3), so there is nothing to fetch either.
+#
+# HOW TO RUN IT (server/README.md has the full form):
+#   D:\projects\wan-dancer\.venv\Scripts\python.exe -m kvit_asr ^
+#       --pipe \\.\pipe\kvit-dictate-<hex> --backend transformers-whisper ^
+#       --model openai/whisper-large-v3-turbo
+#   with PYTHONPATH pointing at D:\projects\kvit-dictate\server, because kvit_asr is NOT
+#   installed into that venv — it is imported from the source tree. That is possible only
+#   because the sidecar core has zero third-party dependencies (server/pyproject.toml).

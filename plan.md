@@ -723,11 +723,21 @@ rich edit, multiline, and password controls.
 ## 8. Milestones
 
 - [x] **M-1** Experiment env resolved — torch 2.10.0+cu130 / sm_120 verified; read-only policy
-- [ ] **M0A** `bench/CANDIDATES.md` — models verified, streaming mode + ONNX availability recorded
-- [ ] **M0B** **Windows feasibility spike passed or fallback UX adopted** ← critical gate
-- [ ] **M1** Production audio path + dev/held-out corpus + offline metrics
-- [ ] **M2** Protocol frozen; streaming winner chosen by pre-registered rule
-- [ ] **M3** Minimal vertical product end-to-end
+- [x] **M0A** `bench/CANDIDATES.md` — models verified, streaming mode + ONNX availability recorded.
+      All three PRD citations resolved as real. Lock files still outstanding (they need network
+      resolution), so step 4 of Phase 0A is the one part of this milestone not done.
+- [ ] **M0B** **Windows feasibility spike passed or fallback UX adopted** ← critical gate.
+      *Instrument built and resumable (`tools/probe`, 162 cells); zero cells measured. The gate is
+      untouched — having the tool is not having the answer.*
+- [ ] **M1** Production audio path + dev/held-out corpus + offline metrics.
+      *Audio path built and unit-tested (downmix, format conversion, anti-alias response,
+      discontinuity reporting); prompt lists written; no audio recorded, no model run.*
+- [ ] **M2** Protocol frozen; streaming winner chosen by pre-registered rule.
+      *Spec written and both endpoints pass the same 20 fixtures; the freeze itself waits for
+      Phase 2. Selection rule implemented in `bench/run_matrix.py` ahead of any data, which is the
+      point of pre-registering it.*
+- [ ] **M3** Minimal vertical product end-to-end.
+      *Built and wired; never run against a real backend or microphone.*
 - [ ] **M4** All §7 gates green
 - [ ] **M5** One week dogfooding; categorised failure log
 - [ ] **M6** *(optional)* single-process C++ inference; *(optional)* second-pass correction

@@ -1,0 +1,72 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "inherits": "windows-msvc-base",
+      "displayName": "Windows MSVC x64 (Debug)",
+      "description": "Visual Studio 17 2022, x64. Ninja is not on PATH on this machine, so the VS generator is used, matching kvit-notes (plan.md section 5.3). Multi-config: the configuration is chosen at build time, and the Debug/Release split here exists so the two have separate binary directories and separate CMake caches.",
+      "binaryDir": "${sourceDir}/build-windows-msvc-debug"
+    },
+    {
+      "name": "windows-msvc-release",
+      "inherits": "windows-msvc-base",
+      "displayName": "Windows MSVC x64 (Release)",
+      "description": "Release build. Note that KD_ENABLE_TRANSCRIPT_LOG is defined only for the Debug configuration (see CMakeLists.txt), so a Release binary physically cannot write a transcript - plan.md section 1.9.",
+      "binaryDir": "${sourceDir}/build-windows-msvc-release"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "011-truncated-frame-at-eof",
+  "kind": "framing",
+  "name": "Peer closes six bytes short of completing a frame",
+  "description": "A partial frame at end of stream is a broken peer (crash, kill, or a writer that did not flush). The already-decoded frames stand; the partial one is discarded and never delivered in truncated form.",
+  "input": {
+    "chunks": [
+      "18000000017b2274223a2268656c6c6f222c2270726f746f223a317d54000000017b2274223a227374617274222c2273657373696f6e5f6964223a227337222c2273616d706c655f72617465223a31363030302c22636f6e74657874223a5b226c6c616d612e637070222c225177"
+    ],
+    "eof": true
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      }
+    ],
+    "error": {
+      "code": "truncated_frame",
+      "fatal": true,
+      "at_offset": 28,
+      "detail": "end of stream with 82 of 88 frame bytes buffered"
+    }
+  }
+}

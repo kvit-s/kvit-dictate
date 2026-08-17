@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "019-cancel-during-final",
+  "kind": "session",
+  "name": "cancel written while a final is already in flight",
+  "description": "The race the client cannot avoid: the user presses Esc at the same moment the server commits an utterance. Ordering on the pipe cannot help, because the final was written before the cancel was read. Rule: once the client has written cancel for a session it discards every subsequent partial and final for that session, and waits for stopped. The server must still send stopped so the teardown is acknowledged rather than timed out.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 12,
+    "utterance_id": 3
+  },
+  "messages": [
+    {
+      "from": "client",
+      "json": {
+        "t": "cancel",
+        "session_id": "s7"
+      },
+      "expect": {
+        "verdict": "sent",
+        "effects": [
+          "state -> CANCELLING",
+          "drop queued outbound audio for s7"
+        ]
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "final",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "Can you change the llama.cpp config",
+        "audio_pos_ms": 4820
+      },
+      "expect": {
+        "verdict": "drop_cancelled_session"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 4,
+        "seq": 14,
+        "text": "and also",
+        "stable_bytes": 0
+      },
+      "expect": {
+        "verdict": "drop_cancelled_session"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "stopped",
+        "session_id": "s7"
+      },
+      "expect": {
+        "verdict": "accept",
+        "effects": [
+          "state -> IDLE",
+          "no injection performed for s7 after cancel"
+        ]
+      }
+    }
+  ]
+}

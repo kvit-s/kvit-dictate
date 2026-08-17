@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "default_model": "mock",
+  "models": [
+    {
+      "id": "mock",
+      "display_name": "Mock backend (no model, no GPU)",
+      "interpreter": "D:\\projects\\kvit-dictate\\envs\\mock\\Scripts\\python.exe",
+      "module": "kvit_asr",
+      "args": ["--backend", "mock"],
+      "streaming_mode": "native-streaming",
+      "requires": ["python>=3.12"],
+      "env": {},
+      "notes": "Emits scripted partial/final messages from a fixed script with no audio decoding at all. It exists so the whole C++ side - handshake, session lifetime, seq ordering, stable_bytes monotonicity, commit engine, injection, overlay - can be exercised end to end without a GPU, and so that a failure is attributable to the C++ side rather than to a model. It also drives the deliberate protocol violations the fixtures require (a decreasing stable_bytes, a mutated stable prefix), which no real backend will produce on demand. This is the default because it is the only entry whose environment costs nothing to create.",
+      "enabled": true
+    },
+    {
+      "id": "nemotron-streaming-en-0.6b-onnx-160ms",
+      "display_name": "Nemotron Streaming EN 0.6B (ONNX, 160 ms)",
+      "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend", "sherpa-onnx",
+        "--model", "csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25",
+        "--chunk-ms", "160"
+      ],
+      "streaming_mode": "native-streaming",
+      "requires": ["onnxruntime-gpu", "sherpa-onnx", "numpy"],
+      "env": {},
+      "notes": "Phase 0A pick 1 - the streaming finalist candidate (bench/CANDIDATES.md section 4, row A'). No PyTorch. The published ONNX export is distributed as one repository per chunk size, which maps one-to-one onto the chunk_ms sweep in plan.md section 4; add a separate entry per chunk size rather than making chunk size a runtime setting, because the weights differ. Cannot be context-biased: greedy_search only (CANDIDATES.md section 5.1), so it must report context_supported:false in `ready` rather than silently ignoring start.context.",
+      "enabled": true
+    },
+    {
+      "id": "nemotron-3.5-streaming-0.6b-onnx-320ms",
+      "display_name": "Nemotron-3.5 Streaming 0.6B (ONNX, 320 ms)",
+      "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend", "sherpa-onnx",
+        "--model", "csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-320ms-2026-06-11",
+        "--chunk-ms", "320"
+      ],
+      "streaming_mode": "native-streaming",
+      "requires": ["onnxruntime-gpu", "sherpa-onnx", "numpy"],
+      "env": {},
+      "notes": "Phase 0A pick 2 (row B'). Same adapter as the entry above, one model swap. Adds the 320 ms configuration that the English-only model's 160/560 gap does not cover. Kept as a variant, not a separate workstream: if it is not measurably better on the technical corpus, delete this entry.",
+      "enabled": true
+    },
+    {
+      "id": "zipformer-streaming-en-onnx",
+      "display_name": "Streaming Zipformer EN (ONNX, hotword biasing)",
+      "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend", "sherpa-onnx",
+        "--model", "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        "--decoding", "modified_beam_search"
+      ],
+      "streaming_mode": "native-streaming",
+      "requires": ["onnxruntime", "sherpa-onnx", "numpy"],
+      "env": {},
+      "notes": "Phase 0A pick 3 (row C) - the context-biasing arm, and the ONLY natively-streaming candidate that supports vocabulary biasing (transducer hotwords, which require modified_beam_search rather than greedy_search). plan.md section 4 requires context-enabled and context-free modes to be compared separately; without this entry the context-enabled column has no native-streaming entrant at all. Expected to lose on raw WER - that is the point: it measures what biasing is worth.",
+      "enabled": true
+    },
+    {
+      "id": "whisper-large-v3-turbo",
+      "display_name": "Whisper large-v3-turbo (baseline, existing venv)",
+      "interpreter": "D:\\projects\\wan-dancer\\.venv\\Scripts\\python.exe",
+      "module": "kvit_asr",
+      "args": ["--backend", "transformers-whisper", "--model", "openai/whisper-large-v3-turbo"],
+      "streaming_mode": "pseudo-streaming",
+      "requires": ["transformers", "torch", "librosa"],
+      "env": {
+        "HF_HOME": "c:\\apps\\llama-swap\\gguf\\hf"
+      },
+      "notes": "Phase 0A pick 4 (row D) - the accuracy baseline, zero install. READ-ONLY VENV: plan.md section 5.1 and CANDIDATES.md are explicit that D:\\projects\\wan-dancer\\.venv belongs to another project and that NOTHING may be installed into it - not faster-whisper, not NeMo, not an 'obviously compatible' pin, not under a --dry-run justification. This entry only runs the interpreter that is already there. Pseudo-streaming, so per plan.md its latency numbers are not comparable with the native-streaming rows and must be reported in a separate block. HF_HOME is already set globally on this machine; it is repeated here so the child does not depend on the parent's environment happening to carry it.",
+      "enabled": true
+    }
+  ]
+}

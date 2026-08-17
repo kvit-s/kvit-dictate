@@ -1,0 +1,59 @@
+# envs/onnx — the ONNX-first environment, CPU execution provider.
+#
+# WHAT IT IS FOR
+#   Phase 0A picks 1-3 (bench/CANDIDATES.md §4), i.e. the entire streaming half of the candidate
+#   set, through one runtime and with NO PYTORCH AT ALL:
+#     * csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-{80,160,560,1120}ms  (row A')
+#     * csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-{80,...,1120}ms         (row B')
+#     * sherpa-onnx-streaming-zipformer-en-2023-06-26 — the context-biasing arm          (row C)
+#   plan.md §5.2 puts ONNX first on the merits rather than as a compromise: it is also the
+#   Phase 5 in-process C++ path (sherpa-onnx ships prebuilt Windows libraries and a C++ API), so
+#   the winner would already be in the runtime we eventually want.
+#
+# WHY THIS IS THE CPU FILE
+#   bench/CANDIDATES.md §6.1: whether the official onnxruntime-gpu wheel ships sm_120 kernels for
+#   Blackwell on Windows COULD NOT BE VERIFIED — the upstream issue asking exactly that was
+#   closed stale with no maintainer answer. The CPU execution provider is therefore the baseline
+#   plan, not the fallback: arXiv 2604.14493 measured this model faster than real time on CPU at
+#   0.56 s algorithmic latency, and this machine has 28 threads. See onnx-gpu.txt for the GPU
+#   variant and treat it as the experiment.
+#
+# APPROXIMATE DOWNLOAD SIZE: ~60 MB of wheels (estimate). Model weights are NOT included here
+#   and are NOT downloaded by the sidecar: they live in the shared HF_HOME
+#   (c:\apps\llama-swap\gguf\hf), fetched once by an explicit, user-initiated command.
+#
+# ─── PROVISIONAL PINS — READ THIS BEFORE BLAMING THE PACKAGE ─────────────────────────────────
+# These pins were written by hand from bench/CANDIDATES.md and from versions observed on this
+# machine. They were NOT produced by a resolver and NOT checked against any package index,
+# because Phase 0A installed nothing and downloaded nothing (CANDIDATES.md §6, item 7: "requires
+# network dependency resolution, which is outside the install-nothing scope of this pass").
+# A line marked UNVERIFIED may name a version that does not exist; the failure mode is a loud
+# "no matching distribution", which is the intended behaviour — the pin is wrong, not the
+# package. Replace this file wholesale in the first installing session:
+#
+#   set UV_CACHE_DIR=D:\uv-cache
+#   uv pip compile --python-version 3.12 requirements\onnx.txt -o requirements\onnx.txt
+#
+# UV_CACHE_DIR MUST BE ON D: — uv hardlinks packages from its cache into the venv, hardlinks
+# cannot cross volumes, and a C: cache with D: venvs silently full-copies every package
+# (plan.md §5.2 item 4).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# UNVERIFIED. 1.24.1 is the only onnxruntime version this project has any evidence for: it is
+# the version named in the community Blackwell rebuild referenced in CANDIDATES.md §6.1.
+onnxruntime==1.24.1
+
+# UNVERIFIED — no local evidence of any sherpa-onnx version. The constraint that IS known is
+# functional, not numeric: it must be new enough to carry the Nemotron online-transducer path,
+# whose model repositories are dated 2026-04-25 (row A') and 2026-06-11 (row B'), so anything
+# predating mid-2026 is certainly too old. Pin the resolved version here on first install.
+sherpa-onnx==1.12.14
+
+# Observed on this machine: plan.md §5.1 records numpy 2.4.4 in ..\wan-dancer\.venv. Same major
+# line is what the ONNX stack expects; this is the best-grounded pin in the file.
+numpy==2.4.4
+
+# Audio file I/O for the bench harness (bench/record.py, run_matrix.py). Not used by the
+# sidecar core, which receives PCM over the pipe and never opens a file.
+# UNVERIFIED version.
+soundfile==0.13.1

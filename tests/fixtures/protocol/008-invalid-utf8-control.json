@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "008-invalid-utf8-control",
+  "kind": "framing",
+  "name": "Control payload containing a lone 0xE9 byte",
+  "description": "0xE9 is 'e-acute' in Latin-1 and an incomplete 3-byte lead in UTF-8. Control payloads are UTF-8 by definition; a decoder must validate before parsing and must not substitute U+FFFD. Substitution would silently corrupt text destined for the user's document.",
+  "input": {
+    "chunks": [
+      "47000000017b2274223a2266696e616c222c2273657373696f6e5f6964223a227337222c227574746572616e63655f6964223a312c22736571223a322c2274657874223a22636166e9227d"
+    ]
+  },
+  "expect": {
+    "frames": [],
+    "error": {
+      "code": "bad_utf8",
+      "fatal": true,
+      "at_offset": 72,
+      "detail": "truncated 3-byte sequence: lead 0xE9 followed by 0x22"
+    }
+  }
+}

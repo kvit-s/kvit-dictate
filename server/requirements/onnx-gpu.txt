@@ -1,0 +1,70 @@
+# envs/onnx-gpu — the ONNX environment with the CUDA execution provider. THE EXPERIMENT.
+#
+# WHAT IT IS FOR
+#   Exactly the same backends as requirements/onnx.txt — Phase 0A picks 1–3, the whole streaming
+#   half of the candidate set (bench/CANDIDATES.md §4) — with onnxruntime-gpu instead of
+#   onnxruntime. It exists as a separate file, and a separate environment, for one reason:
+#
+#     bench/CANDIDATES.md §6 item 1: whether the official onnxruntime-gpu wheel ships sm_120
+#     (Blackwell / RTX 5090) CUDA kernels for Windows COULD NOT BE VERIFIED. The upstream issue
+#     asking exactly that (microsoft/onnxruntime#27875) was closed STALE with no maintainer
+#     answer. Third-party reports and community rebuilds imply the official wheel falls back to
+#     CPU on Blackwell; that has not been checked on this machine and is not asserted here.
+#
+#   So requirements/onnx.txt (CPU EP) is the BASELINE PLAN and this file is the experiment.
+#   That ordering is not pessimism: arXiv 2604.14493 measured this exact model faster than real
+#   time on CPU at 0.56 s algorithmic latency, and this machine has 28 threads (plan.md §5.3).
+#
+# HOW TO SETTLE IT, which is the point of creating this env at all
+#   After installing, and BEFORE trusting any latency number from it:
+#
+#     python -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers())"
+#
+#   If CUDAExecutionProvider is absent, or is present but the model still runs at CPU speed, the
+#   answer to §6 item 1 is "no" and it belongs in CANDIDATES.md. A silent CPU fallback inside a
+#   GPU-labelled environment is the failure this file's existence is meant to make visible — it
+#   would otherwise show up only as a latency number nobody could explain. The sidecar logs the
+#   provider it actually got for the same reason (kvit_asr/config.py, --device help text).
+#
+#   DirectML is the second option if CUDA turns out to be unavailable (CANDIDATES.md §6 item 1);
+#   it would be a third file, not an edit to this one.
+#
+# APPROXIMATE DOWNLOAD SIZE: ~350 MB of wheels (estimate) — onnxruntime-gpu carries the CUDA and
+#   cuDNN kernels and is several times the size of the CPU build. Model weights are NOT included
+#   and are NOT downloaded by the sidecar (plan.md §1.9); they live in the shared HF_HOME.
+#
+# ─── PROVISIONAL PINS — same status as requirements/onnx.txt ─────────────────────────────────
+# Written by hand, not by a resolver, and not checked against any package index. UNVERIFIED
+# lines may name versions that do not exist; the failure mode is a loud "no matching
+# distribution". Replace wholesale in the first installing session:
+#
+#   set UV_CACHE_DIR=D:\uv-cache
+#   uv pip compile --python-version 3.12 requirements\onnx-gpu.txt -o requirements\onnx-gpu.txt
+#
+# UV_CACHE_DIR MUST BE ON D: — uv hardlinks from cache into the venv, hardlinks cannot cross
+# volumes, and a C: cache with D: venvs silently full-copies every package (plan.md §5.2 item 4).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# UNVERIFIED, and deliberately the same version requirements/onnx.txt pins for the CPU build:
+# 1.24.1 is the only onnxruntime version this project has any evidence for (it is the version
+# named in the community Blackwell rebuild referenced in CANDIDATES.md §6.1). Keeping the two
+# files on the same version is what makes a CPU-vs-GPU comparison a comparison of execution
+# providers rather than of runtime versions.
+#
+# NOTE: onnxruntime and onnxruntime-gpu must never be installed into the SAME environment —
+# they provide the same `onnxruntime` module and which one wins is an installation-order
+# accident. That is the second reason this is a separate env rather than an extra line.
+onnxruntime-gpu==1.24.1
+
+# UNVERIFIED — no local evidence of any sherpa-onnx version. The known constraint is functional:
+# it must be new enough to carry the Nemotron online-transducer path, whose model repositories
+# are dated 2026-04-25 (row A′) and 2026-06-11 (row B′), so anything predating mid-2026 is
+# certainly too old. Pin the resolved version here on first install.
+sherpa-onnx==1.12.14
+
+# Observed on this machine: plan.md §5.1 records numpy 2.4.4 in ..\wan-dancer\.venv.
+numpy==2.4.4
+
+# Audio file I/O for the bench harness only; the sidecar receives PCM over the pipe and never
+# opens a file. UNVERIFIED version.
+soundfile==0.13.1

@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "018-stable-prefix-mutates",
+  "kind": "session",
+  "name": "Text under an already-published stable prefix changes",
+  "description": "stable_bytes not decreasing is necessary but not sufficient: the bytes below the high-water mark must also be identical. Here stable_bytes rises from 8 to 12 while byte 4 changes from 'y' to 'w', so text the client may already have injected was retracted. Same handling as 017.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 11,
+    "utterance_id": 3,
+    "last_stable_bytes": 0
+  },
+  "messages": [
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 12,
+        "text": "can you change",
+        "stable_bytes": 8
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "can we change the",
+        "stable_bytes": 12
+      },
+      "expect": {
+        "verdict": "protocol_error",
+        "error": {
+          "code": "stability_violation",
+          "fatal": false,
+          "at_offset": 4,
+          "detail": "published prefix 'can you ' != 'can we c' at byte 4"
+        }
+      }
+    },
+    {
+      "from": "client",
+      "json": {
+        "t": "error",
+        "session_id": "s7",
+        "code": "stability_violation",
+        "fatal": false,
+        "msg": "stable prefix mutated at byte 4"
+      },
+      "expect": {
+        "verdict": "sent"
+      }
+    }
+  ]
+}

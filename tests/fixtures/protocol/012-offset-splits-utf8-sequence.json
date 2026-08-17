@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "012-offset-splits-utf8-sequence",
+  "kind": "text",
+  "name": "stable_bytes falling inside a multi-byte UTF-8 sequence",
+  "description": "Byte layout: 63 61 66 | c3 a9 | 20 | e2 98 95  (9 bytes). Offsets 4, 7 and 8 land inside a sequence and must be rejected. Offset 9 (end of text) is legal; offset 10 is out of range.",
+  "text": "café ☕",
+  "text_hex": "636166c3a920e29895",
+  "text_bytes": 9,
+  "checks": [
+    {
+      "stable_bytes": 0,
+      "valid": true,
+      "reason": "start of text"
+    },
+    {
+      "stable_bytes": 3,
+      "valid": true,
+      "reason": "before the 2-byte U+00E9"
+    },
+    {
+      "stable_bytes": 4,
+      "valid": false,
+      "reason": "inside the 2-byte sequence c3 a9"
+    },
+    {
+      "stable_bytes": 5,
+      "valid": true,
+      "reason": "after U+00E9"
+    },
+    {
+      "stable_bytes": 6,
+      "valid": true,
+      "reason": "after the space"
+    },
+    {
+      "stable_bytes": 7,
+      "valid": false,
+      "reason": "inside the 3-byte sequence e2 98 95"
+    },
+    {
+      "stable_bytes": 8,
+      "valid": false,
+      "reason": "inside the 3-byte sequence e2 98 95"
+    },
+    {
+      "stable_bytes": 9,
+      "valid": true,
+      "reason": "end of text"
+    },
+    {
+      "stable_bytes": 10,
+      "valid": false,
+      "reason": "past end of text"
+    }
+  ]
+}

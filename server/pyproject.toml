@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvit-asr"
+version = "0.1.0"
+description = "kvit-dictate ASR sidecar: one backend per process, named-pipe transport, stdlib core"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+readme = "README.md"
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# ZERO REQUIRED RUNTIME DEPENDENCIES. This is the design, not an oversight.
+#
+# The sidecar core — transport, framing, JSON, the session loop, the stability computation and
+# the mock backend — runs on a bare CPython 3.12 with nothing installed. Three things follow,
+# and each of them is worth more than the convenience of a dependency:
+#
+#  1. The `mock` environment in models.json costs nothing to create, so the entire C++ side
+#     (handshake, session lifetime, seq ordering, stable_bytes monotonicity, commit engine,
+#     injection, overlay) can be exercised end to end with no GPU and no model, and a failure is
+#     attributable to the C++ side rather than to a model.
+#  2. A backend whose runtime is missing disables that backend, not the server: every
+#     third-party import lives inside a backend module and happens at load time, so the server
+#     can still answer `hello` and report `model_load_failed` with a message a human can act on.
+#  3. plan.md §5.1 keeps `..\wan-dancer\.venv` read-only. The Whisper baseline runs *in* that
+#     venv, under an interpreter this package must not add anything to — which is only possible
+#     because importing `kvit_asr` pulls in nothing.
+#
+# Adding a required dependency here breaks all three. If one ever seems necessary, it belongs in
+# an extra below, imported inside the backend that needs it.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+dependencies = []
+
+[project.optional-dependencies]
+# Extras name what a backend needs; the authoritative, pinned form is in requirements/, per
+# plan.md §5.2's ONNX-first policy and Phase 0A step 4. These lists deliberately carry no
+# version bounds — a range here that disagreed with a pin there would be one more thing to keep
+# consistent, and the pinned file is the one a human installs from.
+
+# Phase 0A picks 1–3 (bench/CANDIDATES.md §4): Nemotron streaming EN / Nemotron-3.5 / streaming
+# zipformer, all through sherpa-onnx. No PyTorch at all — that is the point of the policy, and
+# it is also the Phase 5 in-process C++ path.
+onnx = ["onnxruntime", "sherpa-onnx", "numpy"]
+
+# Same, with the CUDA execution provider. Kept separate because bench/CANDIDATES.md §6.1 records
+# that sm_120 (Blackwell) support in the official onnxruntime-gpu wheel is UNVERIFIED, and the
+# CPU EP is the baseline plan rather than the fallback.
+onnx-gpu = ["onnxruntime-gpu", "sherpa-onnx", "numpy"]
+
+# Phase 0A row E/E′: faster-whisper large-v3 / distil-large-v3 (CTranslate2). Second tier.
+fasterwhisper = ["faster-whisper"]
+
+# Silero VAD, plan.md §3 Phase 2 item 3. ONNX, so it shares a runtime with the streaming picks;
+# listed separately because a torch-based backend may want VAD without wanting sherpa-onnx.
+silero = ["onnxruntime", "numpy"]
+
+[tool.setuptools]
+packages = ["kvit_asr"]
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# Tests are stdlib `unittest`, run as:
+#
+#     py -3.12 -m unittest discover -s server/tests -t server
+#
+# There is no pytest dependency and no [tool.pytest] section. The suite must be runnable in the
+# `mock` environment, which by construction has nothing installed, and a test runner that has to
+# be installed first would make the zero-dependency claim above untestable in the one
+# environment where it matters most.
+# ─────────────────────────────────────────────────────────────────────────────────────────────

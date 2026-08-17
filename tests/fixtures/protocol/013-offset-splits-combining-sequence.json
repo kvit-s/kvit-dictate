@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "013-offset-splits-combining-sequence",
+  "kind": "text",
+  "name": "stable_bytes on a UTF-8 boundary that is not a grapheme-cluster boundary",
+  "description": "Every rejected offset below is a valid UTF-8 code-point boundary, which is why a UTF-8-only check is insufficient. Clusters: [0,3) e+U+0301 - [3,4) space - [4,22) family ZWJ sequence - [22,23) space - [23,31) regional-indicator pair - [31,32) space - [32,39) keycap #+VS16+U+20E3. Legal offsets are exactly the cluster boundaries 0, 3, 4, 22, 23, 31, 32 and 39.",
+  "text": "é 👨‍👩‍👧 🇩🇪 #️⃣",
+  "text_hex": "65cc8120f09f91a8e2808df09f91a9e2808df09f91a720f09f87a9f09f87aa2023efb88fe283a3",
+  "text_bytes": 39,
+  "checks": [
+    {
+      "stable_bytes": 0,
+      "valid": true,
+      "reason": "start of text"
+    },
+    {
+      "stable_bytes": 1,
+      "valid": false,
+      "reason": "between 'e' and its combining acute U+0301"
+    },
+    {
+      "stable_bytes": 3,
+      "valid": true,
+      "reason": "cluster boundary after e+U+0301"
+    },
+    {
+      "stable_bytes": 4,
+      "valid": true,
+      "reason": "cluster boundary after the space"
+    },
+    {
+      "stable_bytes": 5,
+      "valid": false,
+      "reason": "inside the 4-byte U+1F468"
+    },
+    {
+      "stable_bytes": 8,
+      "valid": false,
+      "reason": "between U+1F468 and the ZWJ that binds it to the next emoji"
+    },
+    {
+      "stable_bytes": 11,
+      "valid": false,
+      "reason": "between the ZWJ and U+1F469"
+    },
+    {
+      "stable_bytes": 22,
+      "valid": true,
+      "reason": "cluster boundary after the ZWJ sequence"
+    },
+    {
+      "stable_bytes": 23,
+      "valid": true,
+      "reason": "cluster boundary after the space"
+    },
+    {
+      "stable_bytes": 27,
+      "valid": false,
+      "reason": "between the two regional indicators of the flag"
+    },
+    {
+      "stable_bytes": 31,
+      "valid": true,
+      "reason": "cluster boundary after the flag"
+    },
+    {
+      "stable_bytes": 32,
+      "valid": true,
+      "reason": "cluster boundary after the space"
+    },
+    {
+      "stable_bytes": 33,
+      "valid": false,
+      "reason": "between '#' and the variation selector U+FE0F"
+    },
+    {
+      "stable_bytes": 36,
+      "valid": false,
+      "reason": "between U+FE0F and the combining enclosing keycap U+20E3"
+    },
+    {
+      "stable_bytes": 39,
+      "valid": true,
+      "reason": "end of text"
+    }
+  ]
+}

@@ -1,0 +1,79 @@
+# ── Build output ────────────────────────────────────────────────────────────────────────────
+build/
+build-*/
+out/
+.vs/
+*.user
+*.aps
+CMakeUserPresets.json
+CMakeSettings.json
+
+# ── Python environments ─────────────────────────────────────────────────────────────────────
+# plan.md §5: each backend gets its OWN locked environment under envs/, created lazily. The
+# lock files under server/ are authoritative and ARE committed; the environments are not.
+envs/
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local marker enabling the Python test target (see CMakeLists.txt). Whether this machine has a
+# Python environment is a local fact, not a repository fact.
+server/.pytest-enabled
+
+# ── Audio and corpus ────────────────────────────────────────────────────────────────────────
+# plan.md §1.9: the corpus itself is gitignored, and so is anything containing verbatim
+# transcripts. No transcripts or audio are persisted by default; nothing recorded gets committed.
+bench/corpus/
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.opus
+
+# ── Benchmark results ───────────────────────────────────────────────────────────────────────
+# plan.md §1.9: "Benchmark artifacts under bench/results/ may contain corpus text; the corpus
+# itself and any result file containing verbatim transcripts are gitignored, with only aggregate
+# metrics committed."
+#
+# So the rule here is deny-by-default with explicit exceptions: a per-cell result file from
+# run_matrix.py contains hypotheses and references and must never be committed, while an
+# aggregate (WER/CER/ICER/latency summaries, no transcript text) may be. Name aggregates
+# `*.aggregate.json` / `*.aggregate.csv` — if you have to think about whether a file is safe to
+# commit, it is not.
+bench/results/**
+!bench/results/**/
+!bench/results/**/*.aggregate.json
+!bench/results/**/*.aggregate.csv
+!bench/results/**/*.md
+!bench/results/.gitkeep
+
+# Anything explicitly marked as containing transcript text, anywhere.
+*.transcript.json
+*.transcript.jsonl
+*.transcript.txt
+
+# ── Logs ────────────────────────────────────────────────────────────────────────────────────
+# Diagnostic logs are opt-in and off in release builds (plan.md §1.9); if one is written into
+# the tree during development it stays out of history.
+*.log
+logs/
+
+# ── Models and weights ──────────────────────────────────────────────────────────────────────
+# Weights live under HF_HOME (plan.md §5.2) and are never vendored here. models.json itself IS
+# committed — it is a manifest of paths, not of weights.
+*.onnx
+*.nemo
+*.gguf
+*.safetensors
+*.bin
+!tests/fixtures/**
+
+# ── OS / editor noise ───────────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp

@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "014-stale-session-id",
+  "kind": "session",
+  "name": "Messages carrying a session_id that is not the current one",
+  "description": "The rule that prevents a late final from being injected into whatever the user has since focused. partial/final for a stale session are dropped outright. stopped/error for a stale session are not applied to any document but are recorded, because they are how the server acknowledges that the old session is finished.",
+  "initial": {
+    "current_session_id": "s8",
+    "state": "RUNNING",
+    "last_seq": 40,
+    "utterance_id": 1
+  },
+  "messages": [
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 12,
+        "text": "stale text",
+        "stable_bytes": 5
+      },
+      "expect": {
+        "verdict": "drop_stale_session"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s8",
+        "utterance_id": 1,
+        "seq": 41,
+        "text": "live text",
+        "stable_bytes": 4
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "final",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 13,
+        "text": "Stale text.",
+        "audio_pos_ms": 4820
+      },
+      "expect": {
+        "verdict": "drop_stale_session"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "error",
+        "session_id": "s7",
+        "code": "decode_failed",
+        "fatal": false,
+        "msg": "backend raised"
+      },
+      "expect": {
+        "verdict": "accept_bookkeeping_only"
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "stopped",
+        "session_id": "s7"
+      },
+      "expect": {
+        "verdict": "accept_bookkeeping_only"
+      }
+    }
+  ]
+}

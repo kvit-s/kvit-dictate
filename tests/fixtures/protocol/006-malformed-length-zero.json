@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "006-malformed-length-zero",
+  "kind": "framing",
+  "name": "length field 0 after one good frame",
+  "description": "The length covers the type byte, so 0 is impossible: the minimum legal value is 1. Frames decoded before the malformed header must still be reported; the malformed header is fatal.",
+  "input": {
+    "chunks": [
+      "18000000017b2274223a2268656c6c6f222c2270726f746f223a317d0000000001"
+    ]
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      }
+    ],
+    "error": {
+      "code": "bad_frame",
+      "fatal": true,
+      "at_offset": 28,
+      "detail": "length field 0 is below the minimum legal value 1"
+    }
+  }
+}

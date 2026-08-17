@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "016-seq-gap",
+  "kind": "session",
+  "name": "A skipped seq is logged, accepted, and resets anchor confidence",
+  "description": "A named pipe does not lose messages in transit, so a gap means the sender skipped numbers or dropped its own output. It is not fatal - refusing the text would be worse than accepting it - but the client has provably missed hypotheses, so any anchor confidence derived from commit differencing is no longer trustworthy and is reset.",
+  "initial": {
+    "current_session_id": "s7",
+    "state": "RUNNING",
+    "last_seq": 12,
+    "utterance_id": 3
+  },
+  "messages": [
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 15,
+        "text": "can you change the llama dot cpp",
+        "stable_bytes": 24
+      },
+      "expect": {
+        "verdict": "accept_after_gap",
+        "gap": {
+          "expected_seq": 13,
+          "received_seq": 15,
+          "missing": 2
+        },
+        "effects": [
+          "log_gap",
+          "reset_anchor_confidence"
+        ]
+      }
+    },
+    {
+      "from": "server",
+      "json": {
+        "t": "partial",
+        "session_id": "s7",
+        "utterance_id": 3,
+        "seq": 16,
+        "text": "can you change the llama dot cpp config",
+        "stable_bytes": 24
+      },
+      "expect": {
+        "verdict": "accept"
+      }
+    }
+  ]
+}

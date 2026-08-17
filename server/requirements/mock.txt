@@ -1,0 +1,26 @@
+# envs/mock — the default environment (models.json `default_model: "mock"`).
+#
+# WHAT IT IS FOR
+#   The mock backend emits scripted partial/final messages from a fixed script with no audio
+#   decoding at all, so the whole C++ side — handshake, session lifetime, seq ordering,
+#   stable_bytes monotonicity, commit engine, injection, overlay — can be exercised end to end
+#   without a GPU, and so a failure is attributable to the C++ side rather than to a model. It
+#   also drives the deliberate protocol violations the fixtures require (a decreasing
+#   stable_bytes, a mutated stable prefix), which no real backend will produce on demand.
+#
+# APPROXIMATE DOWNLOAD SIZE: 0 bytes. Nothing is installed. That is the entire point.
+#
+# The sidecar core is stdlib-only (server/pyproject.toml explains why), so this environment is
+# a bare CPython 3.12 with the source tree on sys.path. This file exists to say that in the same
+# place a reader looks for every other environment, rather than leaving its absence to be read
+# as an omission.
+#
+# CREATE IT:
+#   set UV_CACHE_DIR=D:\uv-cache
+#   uv venv --python 3.12 D:\projects\kvit-dictate\envs\mock
+#   (nothing else — do not `uv pip install` anything here; an empty environment is what proves
+#    the zero-dependency claim, and the unittest suite must pass inside it)
+#
+# RUN THE TESTS IN IT (-t makes server\ the import root, so `import kvit_asr` resolves):
+#   D:\projects\kvit-dictate\envs\mock\Scripts\python.exe -m unittest discover ^
+#       -s D:\projects\kvit-dictate\server\tests -t D:\projects\kvit-dictate\server

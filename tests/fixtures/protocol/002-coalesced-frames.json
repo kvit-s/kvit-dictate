@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "proto": 1,
+  "id": "002-coalesced-frames",
+  "kind": "framing",
+  "name": "Three frames delivered in a single read",
+  "description": "The decoder must drain its buffer completely and emit every whole frame it contains, not just the first.",
+  "input": {
+    "chunks": [
+      "18000000017b2274223a2268656c6c6f222c2270726f746f223a317d54000000017b2274223a227374617274222c2273657373696f6e5f6964223a227337222c2273616d706c655f72617465223a31363030302c22636f6e74657874223a5b226c6c616d612e637070222c225177656e33225d7d05000000020100ffff"
+    ]
+  },
+  "expect": {
+    "frames": [
+      {
+        "type": 1,
+        "payload_len": 23,
+        "payload_hex": "7b2274223a2268656c6c6f222c2270726f746f223a317d",
+        "json": {
+          "t": "hello",
+          "proto": 1
+        }
+      },
+      {
+        "type": 1,
+        "payload_len": 83,
+        "payload_hex": "7b2274223a227374617274222c2273657373696f6e5f6964223a227337222c2273616d706c655f72617465223a31363030302c22636f6e74657874223a5b226c6c616d612e637070222c225177656e33225d7d",
+        "json": {
+          "t": "start",
+          "session_id": "s7",
+          "sample_rate": 16000,
+          "context": [
+            "llama.cpp",
+            "Qwen3"
+          ]
+        }
+      },
+      {
+        "type": 2,
+        "payload_len": 4,
+        "payload_hex": "0100ffff",
+        "samples": 2
+      }
+    ],
+    "error": null
+  }
+}
