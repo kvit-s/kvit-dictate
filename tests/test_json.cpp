@@ -289,8 +289,12 @@ KD_TEST(json, rejects_lone_surrogates) {
 }
 
 KD_TEST(json, rejects_bad_escapes_and_raw_control_characters) {
-    KD_CHECK_EQ(error_of(R"({"a":"\q"})"), ErrorCode::BadString);
-    KD_CHECK_EQ(error_of(R"({"a":"\x41"})"), ErrorCode::BadString);
+    // Written with escapes rather than as raw string literals: MSVC reports C4129 ("unrecognized
+    // character escape sequence") for the \q and \x inside a raw literal, where by definition
+    // there are no escape sequences at all. The bytes are identical; only the compiler's opinion
+    // of them differs, and /WX means an opinion is a build failure.
+    KD_CHECK_EQ(error_of("{\"a\":\"\\q\"}"), ErrorCode::BadString);
+    KD_CHECK_EQ(error_of("{\"a\":\"\\x41\"}"), ErrorCode::BadString);
     KD_CHECK_EQ(error_of("{\"a\":\"" + esc("12") + "\"}"), ErrorCode::BadString);   // short
     KD_CHECK_EQ(error_of("{\"a\":\"" + esc("12g4") + "\"}"), ErrorCode::BadString);  // not hex
 

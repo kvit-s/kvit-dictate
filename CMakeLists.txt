@@ -46,15 +46,19 @@ endif()
 
 # ─── Options ─────────────────────────────────────────────────────────────────────────────────
 
-# Warnings-as-errors is OFF for now, deliberately.
+# Warnings-as-errors is ON.
 #
-# Reason, stated so this does not become permanent by inertia: every module is currently a stub
-# whose .cpp defines none of the functions its header declares, so /W4 legitimately reports
-# unreferenced parameters and unreachable code throughout. Turning warnings into errors today
-# would mean sprinkling suppressions across code that is about to be replaced. Turn this ON at
-# the end of Phase 3, when the vertical slice compiles for real — it is a one-line change and it
-# is listed as such in README.md's status section.
-option(KD_WERROR "Treat compiler warnings as errors (enable at the end of Phase 3)" OFF)
+# It was OFF while every module was a stub whose .cpp defined none of the functions its header
+# declared, because /W4 then legitimately reported unreferenced parameters and unreachable code
+# throughout and the only way to silence it was suppressions on code about to be replaced. That
+# reason expired when the modules were written: Debug and Release both build at zero warnings, so
+# the next warning is new, and the cheapest moment to look at a new warning is the build that
+# introduced it.
+#
+# Note for anyone who trips over it: MSVC reports C4129 for an escape-looking sequence inside a
+# *raw* string literal, where there are no escapes by definition. tests/test_json.cpp writes those
+# two cases with ordinary escapes instead; the bytes are the same.
+option(KD_WERROR "Treat compiler warnings as errors" ON)
 
 option(KD_BUILD_TOOLS "Build tools/probe and tools/testtarget" ON)
 option(KD_BUILD_TESTS "Build the kd_tests binary" ON)
@@ -366,7 +370,7 @@ endif()
 message(STATUS "kvit-dictate ${PROJECT_VERSION}")
 message(STATUS "  generator        : ${CMAKE_GENERATOR}")
 message(STATUS "  C++ standard     : ${CMAKE_CXX_STANDARD}")
-message(STATUS "  warnings as errors: ${KD_WERROR} (turn on at the end of Phase 3)")
+message(STATUS "  warnings as errors: ${KD_WERROR}")
 message(STATUS "  tests            : ${KD_BUILD_TESTS}")
 message(STATUS "  tools            : ${KD_BUILD_TOOLS}")
 if(EXISTS "${KD_PYTEST_MARKER}")

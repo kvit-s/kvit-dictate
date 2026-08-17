@@ -208,16 +208,15 @@ height anywhere; that the WGC fallback works at all (its desktop path is still a
 that a WSLg window accepts `KEYEVENTF_UNICODE`. Every one of these is a Phase 0B or Phase 1
 measurement, and the repository states them as unmeasured rather than assumed.
 
-Two build settings are deliberately not final and are called out here so they do not become
-permanent by inertia:
+One build setting is deliberately not final and is called out here so it does not become permanent
+by inertia:
 
-* **Warnings are not errors** (`KD_WERROR=OFF`). The original reason for this — stubs everywhere
-  producing unreferenced-parameter noise — has expired: the whole tree now compiles at `/W4` with
-  **zero warnings**. The flag is left off only because flipping it is a decision about how the
-  build behaves on a different Windows SDK, not a cleanup, and it should be flipped deliberately
-  rather than as a side effect. It is a one-line change and nothing currently stands in its way.
 * **No application manifest yet.** `PROCESS_PER_MONITOR_DPI_AWARE_V2` must come from a manifest
   (it applies before any window exists) and that lands with the first real window in Phase 3.
+
+**Warnings are errors** (`KD_WERROR=ON`, since the vertical slice ran). Debug and Release both
+build at `/W4` with zero warnings, so the next warning is a new one. If a different Windows SDK
+produces warnings this one does not, that is the moment to look at them, not to turn the flag off.
 
 ---
 
