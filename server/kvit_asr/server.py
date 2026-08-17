@@ -678,17 +678,19 @@ class Server:
     They are listed here because they are the seams where an integration mistake will show up:
 
     `backend_loader(backend_cfg, on_progress) -> backend`
-        Default `kvit_asr.backends.load_backend`, imported lazily. `on_progress(stage, percent)`
+        Default `kvit_asr.connection.open_backend`, imported lazily. `on_progress(stage, percent)`
         may be called any number of times; each call becomes a `loading` message. The returned
         object exposes `model_id: str`, `mode: str` (one of VALID_MODES), and optionally
         `chunk_ms: int | None`, `context_supported: bool`, `close()`.
 
     `session_factory(backend=..., send=..., config=..., log=...) -> session`
-        Default `kvit_asr.session.Session`. The returned object exposes
-        `handle_control(msg: dict) -> None`, `handle_audio(pcm: bytes) -> None`, `close()`, and
-        optionally `current_session_id: str | None`. `send(msg: dict)` writes one control frame
-        and is safe to call from any thread. The session raises `protocol.ProtocolError` for
-        anything docs/protocol.md §11 names.
+        Default `kvit_asr.connection.ConnectionSession` — **not** `kvit_asr.session.Session`,
+        which is session-scoped (one per `start`) where this role is connection-scoped. The
+        returned object exposes `handle_control(msg: dict) -> None`,
+        `handle_audio(pcm: bytes) -> None`, `close()`, and optionally
+        `current_session_id: str | None` and `connection_fatal: bool`. `send(msg: dict)` writes
+        one control frame and is safe to call from any thread. The session raises
+        `protocol.ProtocolError` for anything docs/protocol.md §11 names.
     """
 
     def __init__(
@@ -940,14 +942,16 @@ class Server:
             # Lazy, and inside the try/except in the caller: a backend whose runtime is missing
             # (no onnxruntime, no torch) must produce `model_load_failed` for *that* backend
             # rather than an ImportError at package import time that takes the whole server down.
-            from kvit_asr.backends import load_backend as loader  # type: ignore[no-redef]
+            from kvit_asr.connection import open_backend as loader  # type: ignore[no-redef]
 
         return loader(self.cfg.backend, on_progress=on_progress)
 
     def _make_session(self) -> Any:
         factory = self._session_factory
         if factory is None:
-            from kvit_asr.session import Session as factory  # type: ignore[no-redef]
+            # `kvit_asr.session.Session` is session-scoped and this is a connection-scoped role;
+            # ConnectionSession is the object between them. See kvit_asr/connection.py's header.
+            from kvit_asr.connection import ConnectionSession as factory  # type: ignore[no-redef]
 
         return factory(
             backend=self._backend, send=self.send, config=self.cfg, log=self.log
@@ -1032,6 +1036,7 @@ class Server:
                     "bad_message", True, f"audio payload has odd length {len(payload)}"
                 )
             self._session.handle_audio(payload)
+            self._check_session_fatal()
             return
         if ftype != FRAME_CONTROL:  # pragma: no cover - the decoder rejects unknown types first
             raise ProtocolError_new("unknown_frame_type", True, f"frame type {ftype:#04x}")
@@ -1049,6 +1054,20 @@ class Server:
             self._handle_peer_error(msg)
             return
         self._session.handle_control(msg)
+        self._check_session_fatal()
+
+    def _check_session_fatal(self) -> None:
+        """End the connection when a session reports a §9/§11.1 fault that is not survivable.
+
+        `overload_audio` is the case that exists today: the session has already written the
+        `error` frame with `fatal:true` and, correctly, no `stopped` — §11.1 says the connection
+        is finished, so there is no session teardown left to acknowledge. All that remains is to
+        stop reading, and doing it here rather than inside the session is what keeps connection
+        lifetime in one place.
+        """
+        if getattr(self._session, "connection_fatal", False):
+            self.log.error("session_reported_connection_fatal")
+            raise _Rejected(EXIT_PROTOCOL_ERROR)
 
     def _handle_peer_error(self, msg: dict[str, Any]) -> None:
         """§11.1/§13: act on `fatal`, even for a code this build does not recognise.

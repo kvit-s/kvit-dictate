@@ -91,6 +91,19 @@ class SessionConfig:
     stability_m: int = DEFAULT_STABILITY_M
     stability_hold_ms: int = DEFAULT_STABILITY_HOLD_MS
 
+    # Which endpointer, per `kvit_asr.vad.create_vad`: "auto" (Silero if it loads, else the stdlib
+    # energy fallback with a warning), "silero" (or fail — for the bake-off, where a silent
+    # downgrade would change what is being measured), "energy", or "none".
+    #
+    # "none" is a measurement arm, not an off switch: with no VAD every sample is speech, the
+    # session is one long utterance and `final` arrives only at `stop`. plan.md §4 wants that
+    # comparison available.
+    vad: str = "auto"
+
+    # Absolute path to silero_vad.onnx. Nothing downloads it (plan.md §1.9); an absent file is
+    # reported with the path and, under "auto", falls back.
+    silero_model_path: str | None = None
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -207,6 +220,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = p.add_argument_group("session tuning (plan.md §1.4, §1.6 — swept in Phase 2)")
     s.add_argument("--endpoint-silence-ms", type=int, default=DEFAULT_ENDPOINT_SILENCE_MS)
+    s.add_argument(
+        "--vad",
+        default="auto",
+        choices=("auto", "silero", "energy", "none"),
+        help="Endpointer backend. 'none' disables gating entirely, which makes the whole session "
+        "one utterance — a measurement arm (plan.md §4), not an off switch. (default: auto)",
+    )
+    s.add_argument(
+        "--silero-model",
+        default=None,
+        metavar="PATH",
+        help="Absolute path to silero_vad.onnx. Never downloaded (plan.md §1.9).",
+    )
     s.add_argument("--stability-n", type=int, default=DEFAULT_STABILITY_N)
     s.add_argument("--stability-m", type=int, default=DEFAULT_STABILITY_M)
     s.add_argument("--stability-hold-ms", type=int, default=DEFAULT_STABILITY_HOLD_MS)
@@ -278,6 +304,8 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
             stability_n=ns.stability_n,
             stability_m=ns.stability_m,
             stability_hold_ms=ns.stability_hold_ms,
+            vad=ns.vad,
+            silero_model_path=ns.silero_model,
         ),
     )
 

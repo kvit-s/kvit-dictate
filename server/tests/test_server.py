@@ -25,29 +25,25 @@ in-memory streams treat a stalled peer as end-of-stream after :data:`STALL_TIMEO
 waiting forever. A hanging pipe test that blocks CI forever is worse than a failing one: the
 failing one tells you something.
 
-─── Integration shims, and why they are here rather than hidden ───────────────────────────────
+─── What this file no longer bridges ──────────────────────────────────────────────────────────
 
-Three seams between finished modules do not currently meet, and this file bridges them so the
-end-to-end path can be tested at all. They are named here, in one place, so that an integration
-pass can delete them rather than discover them:
+It used to carry three integration shims, because three seams between finished modules did not
+meet and the end-to-end path could not otherwise be tested at all. All three are now module code
+and the shims are gone:
 
-1. ``kvit_asr.protocol.decode_control`` returns a ``Message`` dataclass; ``kvit_asr.server``
-   calls ``msg.get("t")`` on the result, i.e. it expects a ``dict``. :func:`_control_as_dict`
-   adapts, and passes a ``dict`` straight through, so it becomes a no-op the moment the two agree.
-2. ``kvit_asr.server`` expects its ``session_factory`` to produce a **connection-scoped** object
-   with ``handle_control``/``handle_audio``/``close``; ``kvit_asr.session.Session`` is
-   **session-scoped** (one per ``start``) with ``on_audio``/``on_stop``/``on_cancel``. Nothing in
-   the tree owns the object in between, so :class:`ConnectionSession` is it.
-3. ``kvit_asr.session.Session`` wants a backend with ``reset``/``accept_audio``/``finalise``;
-   ``kvit_asr.backends.mock.MockBackend`` offers ``reset``/``feed``/``finalize`` and returns
-   ``Hypothesis`` objects. :class:`SessionBackendAdapter` translates. Separately,
-   ``kvit_asr.backends.load_backend(name)`` returns a *class* and takes a name, while
-   ``kvit_asr.server`` calls ``loader(backend_cfg, on_progress=...)`` and expects a loaded
-   instance exposing ``model_id``/``mode``; :func:`mock_backend_loader` is that adapter.
+1. ``decode_control`` returning a ``Message`` where ``server.py`` wanted a ``dict`` —
+   ``server.decode_control_dict``.
+2. the missing **connection-scoped** session object between ``server.Server`` and the
+   session-scoped ``session.Session`` — ``connection.ConnectionSession``.
+3. the backend interface mismatch, and a loader that took a name and returned a class where the
+   server passes a ``BackendConfig`` and expects a loaded instance —
+   ``connection.LoadedBackend`` and ``connection.open_backend``.
 
-The shims are deliberately thin and contain no protocol decisions. Everything actually under test
-— framing, the handshake, version negotiation, seq and utterance numbering, the §8.2 invariant,
-cancel semantics, error shaping — comes from the modules, not from here.
+Two knobs are still injected here, and both are injected *through* the real classes rather than
+around them: :func:`mock_backend_loader` builds a ``MockBackend`` with test-chosen settings and
+wraps it in the real ``LoadedBackend``, and the harness passes ``ConnectionSession`` a ticking
+clock (see :class:`TickingClock`) so a session's worth of audio fed in a microsecond can still
+mature a T-millisecond stability hold.
 """
 
 import ctypes
@@ -72,6 +68,7 @@ from kvit_asr.backends.base import ResetReason  # noqa: E402
 from kvit_asr.backends.mock import MockBackend, MockConfig  # noqa: E402
 from kvit_asr.config import BackendConfig, ServerConfig  # noqa: E402
 from kvit_asr.config import SessionConfig as CliSessionConfig  # noqa: E402
+from kvit_asr.connection import ConnectionSession, LoadedBackend  # noqa: E402
 from kvit_asr.protocol import StabilityCheck, check_stability  # noqa: E402
 from kvit_asr.server import EventLogger, Server, TransportError  # noqa: E402
 from kvit_asr.stability import StabilityParams  # noqa: E402
@@ -95,31 +92,6 @@ def speech(ms: int = CHUNK_MS, amp: int = 5000) -> bytes:
     return array.array("h", [amp if i % 2 else -amp for i in range(n)]).tobytes()
 
 
-# ─── Shim 1: decode_control → dict ──────────────────────────────────────────────────────────────
-
-
-_real_decode_control = proto.decode_control
-
-
-def _control_as_dict(payload: bytes) -> dict:
-    """``decode_control`` with the result rendered as a ``dict``.
-
-    Validation is unchanged and still comes from ``kvit_asr.protocol``: every §4 encoding rule and
-    §6 schema rule is applied, and a non-conforming payload still raises ``ProtocolError``. Only
-    the *representation* changes, and it changes to the payload's own JSON rather than to
-    ``Message.to_json()`` — because ``to_json`` omits fields that equal their defaults, and a test
-    asserting that ``ready`` carries ``context_supported: false`` would then be asserting against
-    the shim instead of against the wire.
-
-    A ``dict`` result is passed through unchanged, so this becomes the identity function the moment
-    ``decode_control`` returns one.
-    """
-    msg = _real_decode_control(payload)
-    if isinstance(msg, dict):
-        return msg
-    return json.loads(payload.decode("utf-8"))
-
-
 def wire_code(err: dict) -> str:
     """``error.code`` as docs/protocol.md §11.3 spells it: the bare machine-readable identifier.
 
@@ -138,32 +110,7 @@ def wire_code(err: dict) -> str:
     return code
 
 
-# ─── Shims 2 and 3: the missing connection-scoped session, and the backend adapter ─────────────
-
-
-class SessionBackendAdapter:
-    """``MockBackend`` seen through the interface ``kvit_asr.session.Session`` asks for.
-
-    ``accept_audio`` returns the **newest** hypothesis, not a concatenation. ``feed`` may return
-    several for one chunk and each supersedes the previous one for the same utterance
-    (docs/protocol.md §8.1); joining them would turn cumulative text into a delta pile, which is
-    the one mistake in this area that produces no error anywhere.
-    """
-
-    def __init__(self, mock: MockBackend) -> None:
-        self.mock = mock
-
-    def reset(self, context=()) -> None:
-        self.mock.set_context(list(context))
-        self.mock.reset(ResetReason.UTTERANCE_BOUNDARY)
-
-    def accept_audio(self, pcm: bytes):
-        hypotheses = self.mock.feed(pcm)
-        return hypotheses[-1].text if hypotheses else None
-
-    def finalise(self) -> str:
-        final = self.mock.finalize()
-        return final.text if final is not None else ""
+# ─── Test-chosen settings, injected through the real classes ───────────────────────────────────
 
 
 class TickingClock:
@@ -184,149 +131,32 @@ class TickingClock:
         return self.now
 
 
-class ConnectionSession:
-    """The connection-scoped router ``kvit_asr.server.Server`` drives, over per-session
-    ``kvit_asr.session.Session`` objects.
-
-    Implements only what the two modules leave between them, and each rule it does implement is a
-    quoted requirement rather than a choice:
-
-    * ``start`` while a session is open → fatal ``state_violation`` (§7.2: sessions do not nest).
-    * ``stop``/``cancel`` naming a session the Server does not have open → ``stopped`` with
-      ``reason:"unknown_session"``, **not** an error (§6.1 idempotence; §10.5).
-    * audio arriving with no session open → discarded and counted, never buffered for the next
-      session and never an error (§6.3, the Server obligation).
-    """
-
-    def __init__(self, *, backend, send, config, log=None) -> None:
-        self._facade = backend
-        self._send = send
-        self._cfg = config
-        self._log = log
-        self._session = None
-        self.discarded_audio_bytes = 0
-
-    # -- what Server reads off us -----------------------------------------------------------
-
-    @property
-    def current_session_id(self):
-        s = self._session
-        return s.session_id if s is not None and not s.ended else None
-
-    def handle_control(self, msg: dict) -> None:
-        t = msg.get("t")
-        if t == "start":
-            self._start(msg)
-        elif t == "stop":
-            self._stop(msg)
-        elif t == "cancel":
-            self._cancel(msg)
-        elif t == "discontinuity":
-            self._discontinuity(msg)
-        elif t == "error":
-            self.abort(str(msg.get("session_id") or ""), reason="error")
-        else:
-            raise server_mod.ProtocolError_new(
-                "unknown_message", True, f"unknown control message {t!r}"
-            )
-
-    def handle_audio(self, pcm: bytes) -> None:
-        session = self._session
-        if session is None or session.ended:
-            self.discarded_audio_bytes += len(pcm)
-            return
-        session.on_audio(pcm)
-        # The product drives this from a timer; a test drives it from the audio it just fed. See
-        # TickingClock for why the tick is load-bearing rather than an optimisation.
-        session.tick()
-
-    def abort(self, session_id: str, reason: str = "error") -> None:
-        session = self._session
-        if session is not None and session.session_id == session_id and not session.ended:
-            session.on_cancel()
-
-    def close(self) -> None:
-        session = self._session
-        if session is not None and not session.ended:
-            session.on_cancel()
-
-    # -- internals ---------------------------------------------------------------------------
-
-    def _start(self, msg: dict) -> None:
-        if self.current_session_id is not None:
-            raise server_mod.ProtocolError_new(
-                "state_violation",
-                True,
-                f"start for {msg.get('session_id')!r} while {self.current_session_id!r} is open "
-                "(docs/protocol.md §7.2)",
-            )
-        cli = getattr(self._cfg, "session", CliSessionConfig())
-        self._session = session_mod.Session(
-            str(msg["session_id"]),
-            emit=self._send,
-            backend=SessionBackendAdapter(self._facade.mock),
-            vad=None,
-            config=session_mod.SessionConfig(
-                stability=StabilityParams(
-                    hypotheses_n=cli.stability_n,
-                    retract_clusters_m=cli.stability_m,
-                    hold_ms_t=cli.stability_hold_ms,
-                ),
-                context=tuple(msg.get("context") or ()),
-            ),
-            clock=TickingClock(),
-        )
-        self._facade.mock.reset(ResetReason.SESSION_START)
-
-    def _for(self, msg: dict):
-        session = self._session
-        sid = str(msg.get("session_id"))
-        if session is None or session.session_id != sid or session.ended:
-            # §6.1: idempotent with respect to unknown or already-ended sessions, because the
-            # Client's teardown path also runs on crash paths where its own state is uncertain.
-            self._send({"t": "stopped", "session_id": sid, "reason": "unknown_session"})
-            return None
-        return session
-
-    def _stop(self, msg: dict) -> None:
-        session = self._for(msg)
-        if session is not None:
-            session.on_stop()
-
-    def _cancel(self, msg: dict) -> None:
-        session = self._for(msg)
-        if session is not None:
-            session.on_cancel()
-
-    def _discontinuity(self, msg: dict) -> None:
-        session = self._session
-        if session is not None and not session.ended:
-            session.on_discontinuity(int(msg.get("gap_ms", 0)), msg.get("reason"))
+def ticking_router(**kwargs):
+    """``connection.ConnectionSession`` with a :class:`TickingClock`. The default factory here."""
+    return ConnectionSession(clock=TickingClock(), **kwargs)
 
 
 def mock_backend_loader(mock_config=None, **facade_overrides):
-    """A ``backend_loader`` for ``Server``: builds, loads and wraps a :class:`MockBackend`."""
+    """A ``backend_loader`` for ``Server``: a :class:`MockBackend` in the real
+    :class:`~kvit_asr.connection.LoadedBackend`.
 
-    class _Facade:
-        def __init__(self, mock):
-            self.mock = mock
-            caps = mock.capabilities
-            self.model_id = caps.model_id
-            self.mode = caps.mode.value
-            self.chunk_ms = caps.natural_chunk_ms or None
-            self.context_supported = caps.supports_context
-            for k, v in facade_overrides.items():
-                setattr(self, k, v)
-
-        def close(self):
-            self.mock.unload()
+    ``connection.open_backend`` would do this too, but it builds the mock from
+    ``--backend-opt`` strings; these tests want a ``MockConfig`` object (hostile modes, seeded
+    scripts, an injected decode failure). ``facade_overrides`` writes over the facade's declared
+    fields afterwards — that is how a backend reporting an illegal ``ready.mode`` is tested
+    without a backend that lies.
+    """
 
     def loader(backend_cfg, on_progress=None):
         if on_progress is not None:
             on_progress("weights", 50)
         mock = MockBackend(mock_config or MockConfig(seed=17))
         mock.load()
-        return _Facade(mock)
+        facade = LoadedBackend(mock)
+        facade.mock = mock  # the tests reach through to the mock's own state
+        for k, v in facade_overrides.items():
+            setattr(facade, k, v)
+        return facade
 
     return loader
 
@@ -429,7 +259,7 @@ class ClientEnd:
             if frame is not None:
                 if frame.type != FRAME_CONTROL:
                     raise AssertionError(f"server sent a {frame.type:#04x} frame")
-                return _control_as_dict(frame.payload)
+                return server_mod.decode_control_dict(frame.payload)
             if self._eof:
                 return None
             remaining = deadline - time.monotonic()
@@ -457,20 +287,30 @@ class ClientEnd:
 class ServerHarness:
     """A ``Server`` on a thread, a ``ClientEnd`` in the test, and a bounded teardown."""
 
+    #: The real router, with a ticking clock. Two tests' worth of reasoning, in one place:
+    #: :class:`TickingClock` because these tests feed a session's worth of audio in a microsecond
+    #: and a real clock would leave every candidate inside its T-ms hold, and ``vad="none"``
+    #: because :func:`speech` starts at sample zero — the energy endpointer calibrates its noise
+    #: floor from the opening 200 ms, so a stream that opens *on* speech calibrates the floor to
+    #: the speech and hears nothing after it. VAD gating has its own tests, which lead with
+    #: silence; everything else here is about the protocol, not the detector.
+    DEFAULT_CFG = ServerConfig(
+        pipe_name=r"\\.\pipe\kvit-dictate-inmemory",
+        backend=BackendConfig(id="mock", model="mock"),
+        session=CliSessionConfig(vad="none"),
+    )
+
     def __init__(self, *, backend_loader=None, session_factory=None, cfg=None) -> None:
         c2s, s2c = _Stream(), _Stream()
         self.client = ClientEnd(c2s, s2c)
         self.stderr = io.StringIO()
-        self.cfg = cfg or ServerConfig(
-            pipe_name=r"\\.\pipe\kvit-dictate-inmemory",
-            backend=BackendConfig(id="mock", model="mock"),
-        )
+        self.cfg = cfg or self.DEFAULT_CFG
         self.server = Server(
             self.cfg,
             MemoryChannel(c2s, s2c),
             log=EventLogger(stream=self.stderr, level="debug"),
             backend_loader=backend_loader or mock_backend_loader(),
-            session_factory=session_factory or ConnectionSession,
+            session_factory=session_factory or ticking_router,
         )
         self.exit_code = None
         self._thread = threading.Thread(
@@ -500,14 +340,9 @@ class ServerHarness:
 
 
 class ServerTestCase(unittest.TestCase):
-    """Base: installs the ``decode_control`` shim and guarantees a bounded teardown."""
+    """Base: guarantees a bounded teardown for whatever the test started."""
 
     def setUp(self) -> None:
-        patcher = unittest.mock.patch.object(
-            server_mod.proto, "decode_control", _control_as_dict
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.harness = None
 
     def start(self, **kwargs) -> ServerHarness:
@@ -1261,7 +1096,7 @@ class _PipeServer:
         while True:
             frame = self.reader.next_frame()
             if frame is not None:
-                return _control_as_dict(frame.payload)
+                return server_mod.decode_control_dict(frame.payload)
             if self._eof:
                 return None
             remaining = int((deadline - time.monotonic()) * 1000)
@@ -1324,14 +1159,16 @@ class TestOverARealNamedPipe(ServerTestCase):
         try:
             self.channel = NamedPipeChannel.connect(self.name, log)
             cfg = ServerConfig(
-                pipe_name=self.name, backend=BackendConfig(id="mock", model="mock")
+                pipe_name=self.name,
+                backend=BackendConfig(id="mock", model="mock"),
+                session=CliSessionConfig(vad="none"),  # see ServerHarness.DEFAULT_CFG
             )
             self.exit_code = Server(
                 cfg,
                 self.channel,
                 log=log,
                 backend_loader=mock_backend_loader(),
-                session_factory=ConnectionSession,
+                session_factory=ticking_router,
             ).run()
         except BaseException as exc:  # pragma: no cover
             self.exit_code = exc
