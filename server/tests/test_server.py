@@ -121,19 +121,21 @@ def _control_as_dict(payload: bytes) -> dict:
 
 
 def wire_code(err: dict) -> str:
-    """``error.code`` as docs/protocol.md §11.3 spells it.
+    """``error.code`` as docs/protocol.md §11.3 spells it: the bare machine-readable identifier.
 
-    **A defect, normalised here and pinned by :class:`TestErrorCodeSpelling` — not fixed, because
-    this file owns no module code.** ``kvit_asr.server._error_fields`` does
-    ``str(getattr(exc, "code", ...))`` on a ``kvit_asr.protocol.ErrorCode`` member. ``ErrorCode``
-    is a ``(str, Enum)`` mixin rather than a ``StrEnum``, so ``str()`` yields
-    ``"ErrorCode.state_violation"`` and *that* is what reaches the wire — where §11.3 defines
-    ``code`` as the stable machine-readable identifier the peer branches on, and §13 tells a
-    receiver to treat anything unrecognised as an error about an error. The fix is one line:
-    ``ProtocolError`` already exposes ``code_raw`` for exactly this.
+    This used to *normalise* ``"ErrorCode.state_violation"`` away, working around
+    ``_error_fields`` calling ``str()`` on a ``(str, Enum)`` member. ``_error_fields`` now uses
+    ``ProtocolError.code_raw``, so the helper asserts instead of repairing — a regression would
+    otherwise be quietly absorbed at all thirteen call sites and only :class:`TestErrorCodeSpelling`
+    would notice.
     """
     code = err["code"]
-    return code.split(".", 1)[1] if code.startswith("ErrorCode.") else code
+    assert not code.startswith("ErrorCode."), (
+        f"error.code reached the wire as the repr of a Python enum member ({code!r}); §11.3 "
+        "wants the bare identifier and §13 tells a receiver to treat anything else as an error "
+        "about an error"
+    )
+    return code
 
 
 # ─── Shims 2 and 3: the missing connection-scoped session, and the backend adapter ─────────────
@@ -1046,12 +1048,13 @@ class TestBackendLoadFailure(ServerTestCase):
 
 
 class TestErrorCodeSpelling(ServerTestCase):
-    """The defect :func:`wire_code` normalises away, stated once, in its own test.
+    """Every `error.code` on this wire is §11.3's bare identifier, whichever path produced it.
 
-    Marked ``expectedFailure`` rather than deleted or asserted loosely: it stays visible in every
-    run, it does not turn the suite red for a defect this file does not own, and the day
-    ``_error_fields`` starts using ``ProtocolError.code_raw`` it reports an **unexpected success**,
-    which is a failure that says "delete the decorator and the ``wire_code`` helper".
+    This began as an ``expectedFailure`` pinning a real defect: ``_error_fields`` did
+    ``str(exc.code)`` on an ``ErrorCode`` member of a ``(str, Enum)`` mixin, which spells itself
+    ``"ErrorCode.state_violation"``. It now uses ``ProtocolError.code_raw`` and the test passes.
+    Both halves are kept, because the two codes reach the wire by different routes and only one of
+    them was ever wrong — which is what made it easy to miss.
     """
 
     def test_a_code_originated_as_a_string_is_already_correct(self):
@@ -1063,7 +1066,6 @@ class TestErrorCodeSpelling(ServerTestCase):
         err = self.expect(h.client, "error")
         self.assertEqual(err["code"], "proto_unsupported")
 
-    @unittest.expectedFailure
     def test_a_code_originated_as_a_protocol_error_is_the_bare_wire_spelling(self):
         """The other half: anything raised as a ``ProtocolError`` and shaped by
         ``_error_fields``. §11.3's identifier, not the repr of a Python enum member."""

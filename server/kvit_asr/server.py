@@ -167,6 +167,35 @@ def _next_frame(reader: Any) -> tuple[int, bytes] | None:
     return int(ftype), bytes(payload)
 
 
+def decode_control_dict(payload: bytes) -> dict[str, Any]:
+    """Validate one control payload and hand it back as a ``dict``.
+
+    `kvit_asr.protocol.decode_control` returns a typed `Message` dataclass; this module and
+    `kvit_asr.session` both speak plain dicts (`send()` takes one, `handle_control()` takes one,
+    and the session emits them). Rather than teach four call sites two representations, the
+    conversion happens once, here.
+
+    **Validation is unchanged** and still belongs to `kvit_asr.protocol`: every §4 encoding rule
+    and §6 schema rule is applied by `decode_control`, and a non-conforming payload still raises
+    `ProtocolError` before anything below runs.
+
+    The dict comes from the payload's own JSON rather than from `Message.to_json()`, because
+    `to_json` omits fields that equal their defaults. The wire is authoritative — a receiver that
+    reconstructs a message from the sender's defaults is answering a question nobody asked.
+
+    A `dict` result is passed straight through, so this becomes the identity function on the day
+    `decode_control` returns one.
+    """
+    msg = proto.decode_control(payload)
+    if isinstance(msg, dict):
+        return msg
+    loads = getattr(proto, "strict_json_loads", None)
+    obj = loads(payload) if loads is not None else json.loads(payload.decode("utf-8"))
+    if not isinstance(obj, dict):  # pragma: no cover - decode_control rejects this first
+        raise ProtocolError_new("bad_message", True, "control payload is not a JSON object")
+    return obj
+
+
 def encode_control_payload(msg: dict[str, Any]) -> bytes:
     """A control payload: compact UTF-8 JSON, raw (not \\u-escaped).
 
@@ -789,7 +818,7 @@ class Server:
                 raise ProtocolError_new(
                     "state_violation", True, "audio frame before hello (docs/protocol.md §5)"
                 )
-            msg = proto.decode_control(payload)
+            msg = decode_control_dict(payload)
             self._log_message("rx", msg)
             if msg.get("t") != "hello":
                 raise ProtocolError_new(
@@ -1007,7 +1036,7 @@ class Server:
         if ftype != FRAME_CONTROL:  # pragma: no cover - the decoder rejects unknown types first
             raise ProtocolError_new("unknown_frame_type", True, f"frame type {ftype:#04x}")
 
-        msg = proto.decode_control(payload)
+        msg = decode_control_dict(payload)
         self._log_message("rx", msg)
         t = msg.get("t")
         if t == "hello":
@@ -1069,7 +1098,15 @@ def _error_fields(exc: BaseException) -> tuple[str, bool, str, str | None]:
     Defaults matter: an exception that forgot to say whether it was fatal is treated as fatal,
     because continuing on a stream we may have mis-parsed is the outcome §3.3 forbids.
     """
-    code = str(getattr(exc, "code", "internal_error") or "internal_error")
+    # `code_raw` first, and it is not a stylistic preference: `ProtocolError.code` is an
+    # `ErrorCode` member of a `(str, Enum)` mixin rather than a `StrEnum`, so `str()` on it yields
+    # "ErrorCode.state_violation". §11.3 defines `code` as the stable machine-readable identifier
+    # the peer branches on, and §13 tells a receiver to treat an unrecognised one as an error about
+    # an error — so that spelling would put every error this server raises outside the catalogue.
+    # `code_raw` is the wire spelling, kept by ProtocolError for exactly this.
+    code = str(
+        getattr(exc, "code_raw", None) or getattr(exc, "code", None) or "internal_error"
+    )
     fatal = bool(getattr(exc, "fatal", True))
     msg = str(getattr(exc, "msg", None) or str(exc))
     sid = getattr(exc, "session_id", None)
