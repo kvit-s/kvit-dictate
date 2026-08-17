@@ -85,6 +85,15 @@ theme" item into two rows because they are separately measurable.
 - `S18`: launch the application elevated where it supports it. Where an application cannot
   meaningfully run elevated (e.g. the Explorer search box in the normal shell), record
   `n/a — cannot construct` in Notes rather than leaving the row blank.
+- `S09` is **not only a scenario you construct**. Observed 2026-08-17, in the first end-to-end
+  session anyone ran: Notepad3 (Scintilla) opened its own word-completion list in response to the
+  injected keystrokes, unprompted, listing words already in the document. So an editor with
+  autocompletion enters `S09` *by itself*, on ordinary dictation, and the popup then sits over the
+  insertion point repainting on every commit. Two consequences worth measuring rather than
+  assuming: whether the popup's repaints wreck source C's diff, and whether it swallows a
+  subsequent keystroke — a completion list that treats Enter or Tab as "accept" would rewrite the
+  user's text with a word they did not say. Construct the row deliberately as well, but record
+  the spontaneous case in Notes.
 - `S10`: Windows exposes a system caret blink time, and some applications draw their own caret
   with their own timing or none at all. Record which of the two you observed rather than assuming.
 - Where a scenario cannot exist in an application at all, write `n/a` in the verdict column and
