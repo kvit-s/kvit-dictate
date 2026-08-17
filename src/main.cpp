@@ -192,6 +192,9 @@ private:
     void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
 
+    void show_settings();
+    void apply_settings(kd::Settings next);
+
     void set_tray_state(kd::OverlayState s);
     void update_tray();
     void show_tray_menu();
@@ -224,6 +227,7 @@ private:
     bool audio_running_ = false;
     unsigned respawn_attempts_ = 0;
     bool sidecar_respawn_ = false;  // this spawn is §10.3's recovery, not the first launch
+    bool settings_open_ = false;
 
     std::mutex ipc_mutex_;
     std::deque<kd::proto::Message> ipc_queue_;
@@ -291,7 +295,11 @@ bool App::startup() {
     // broken.
     instance_mutex_ = CreateMutexW(nullptr, TRUE, kSingleInstanceMutex);
     if (instance_mutex_ != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
+        // FindWindowExW with HWND_MESSAGE as the parent, not FindWindowW: a message-only window is
+        // not a child of the desktop and the top-level search never sees it. FindWindowW returns
+        // null here every time, which would make a second launch exit in silence — precisely the
+        // "double-click does nothing, so it must be broken" outcome this branch exists to avoid.
+        if (HWND existing = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr)) {
             PostMessageW(existing, kMsgShowSettings, 0, 0);
         }
         return false;
@@ -577,10 +585,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             }
 
         case kMsgShowSettings:
-            // The settings dialog lives in settings.cpp; until it is surfaced here the tray still
-            // points at the file, which is editable and documented, rather than doing nothing.
-            ShellExecuteW(nullptr, L"open", kd::default_settings_path().wstring().c_str(), nullptr,
-                      nullptr, SW_SHOWNORMAL);
+            show_settings();
             return 0;
 
         case WM_QUERYENDSESSION:
@@ -930,6 +935,111 @@ void App::on_sidecar_lost() {
     target_.reset();
     if (overlay_ != nullptr) overlay_->hide();
     apply(session_->on_transport(kd::TransportEvent::BrokenPipe));
+}
+
+// ─── Settings ───────────────────────────────────────────────────────────────────────────────
+
+void App::show_settings() {
+    // The dialog runs a nested message loop, so this message can arrive again while it is up —
+    // from the tray, or from a second launch of the executable, which posts it here rather than
+    // exiting silently. One dialog is the answer to all of them.
+    if (settings_open_) {
+        if (HWND owned = GetLastActivePopup(hwnd_); owned != nullptr && owned != hwnd_) {
+            SetForegroundWindow(owned);
+        }
+        return;
+    }
+
+    settings_open_ = true;
+    kd::Settings edited = settings_;
+    const bool accepted = kd::show_settings_dialog(reinterpret_cast<uintptr_t>(instance_),
+                                                   reinterpret_cast<uintptr_t>(hwnd_), edited,
+                                                   manifest_);
+    settings_open_ = false;
+    if (accepted) apply_settings(std::move(edited));
+}
+
+void App::apply_settings(kd::Settings next) {
+    // The dialog documents that it returns a normalised, validated copy. Checking anyway is two
+    // lines and the alternative is writing a settings file this build would refuse to load.
+    next.normalise();
+    if (const kd::Status st = next.validate(); !st.ok()) {
+        MessageBoxW(hwnd_, widen(st.message()).c_str(), L"kvit-dictate — settings",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const std::string previous_model = settings_.model_id;
+    const bool diagnostics_file_changed =
+        next.diagnostics_file_enabled != settings_.diagnostics_file_enabled;
+    settings_ = std::move(next);
+
+    if (const kd::Status st = kd::save_settings(settings_, kd::default_settings_path()); !st.ok()) {
+        // Applied in memory but not persisted: say so rather than letting the next launch quietly
+        // revert to the old file.
+        KD_LOG_ERROR("settings could not be saved: %s", st.message().c_str());
+        MessageBoxW(hwnd_,
+                    L"These settings are in effect now but could not be written to disk, so they "
+                    L"will be lost when kvit-dictate restarts.",
+                    L"kvit-dictate — settings", MB_OK | MB_ICONWARNING);
+    }
+
+    kd::log::set_level(settings_.log_level);
+    kd::log::set_transcript_policy(settings_.transcript);
+    if (diagnostics_file_changed) {
+        // log::init is documented as "once, early". The level and the transcript policy are
+        // runtime switches; opening or closing the diagnostics file is not, and pretending it took
+        // effect would be worse than saying it did not.
+        MessageBoxW(hwnd_,
+                    L"The diagnostics-file setting takes effect the next time kvit-dictate starts.",
+                    L"kvit-dictate — settings", MB_OK | MB_ICONINFORMATION);
+    }
+
+    // Everything below is applied unconditionally rather than only when it changed: each call is
+    // idempotent and cheap next to the dialog the user just closed, and a "did it change" test per
+    // field is one more place for a field to be forgotten.
+    if (injector_ != nullptr) injector_->set_config(settings_.inject);
+    if (commit_ != nullptr) commit_->set_params(settings_.stability);
+    if (session_ != nullptr) session_->set_config(settings_.session);
+    if (overlay_ != nullptr) {
+        overlay_->set_style(settings_.overlay_style);
+        overlay_->set_mode(settings_.overlay_mode);
+    }
+
+    if (hotkey_ != nullptr) {
+        hotkey_->stop();
+        if (const kd::Status st = hotkey_->start(settings_.hotkey,
+                                                 reinterpret_cast<uintptr_t>(hwnd_), this);
+            !st.ok()) {
+            MessageBoxW(hwnd_,
+                        L"The new hotkey could not be installed. Another program may already own "
+                        L"it. The previous one is no longer active either.",
+                        L"kvit-dictate", MB_OK | MB_ICONWARNING);
+        }
+    }
+
+    // The anchor estimator takes its configuration at construction, so it is rebuilt. It holds no
+    // session state — the caret cache and the click cache are both refreshed at the next
+    // activation — so this is cheaper than it looks.
+    if (anchor_ != nullptr) {
+        anchor_->stop();
+        anchor_ = std::make_unique<kd::anchor::AnchorEstimator>(
+            settings_.anchor, screen_capture_.get(), caret_provider_.get(), this);
+        if (const kd::Status st = anchor_->start(); !st.ok()) {
+            KD_LOG_WARN("anchor estimator did not restart (%s)", st.message().c_str());
+        }
+    }
+
+    if (settings_.model_id != previous_model) {
+        // plan.md §1.1: a model change is a new child process, never a swap in place. Stopping the
+        // connection is enough to cause one — the transport reports the loss, the state machine
+        // asks for a respawn, and spawn_sidecar() reads the model id we have just written.
+        KD_LOG_INFO("model changed: %s -> %s", previous_model.c_str(), settings_.model_id.c_str());
+        respawn_attempts_ = 0;  // a deliberate change is not one of the five failures
+        loaded_model_.clear();
+        set_tray_state(kd::OverlayState::ModelLoading);
+        if (ipc_ != nullptr) ipc_->stop();
+    }
 }
 
 // ─── Tray ───────────────────────────────────────────────────────────────────────────────────

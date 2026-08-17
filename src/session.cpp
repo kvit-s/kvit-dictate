@@ -302,6 +302,10 @@ void SessionMachine::set_target_provider(ITargetProvider* provider) noexcept {
     impl_->provider = provider;
 }
 
+void SessionMachine::set_config(const SessionConfig& cfg) { impl_->cfg = cfg; }
+
+const SessionConfig& SessionMachine::config() const noexcept { return impl_->cfg; }
+
 // ─── Inbound messages ───────────────────────────────────────────────────────────────────────
 
 SessionMachine::Outcome SessionMachine::on_message(const proto::Message& m) {

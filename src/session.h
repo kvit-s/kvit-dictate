@@ -290,6 +290,18 @@ public:
     // fixture runner can build a machine with no Windows collaborators at all.
     void set_target_provider(ITargetProvider* provider) noexcept;
 
+    // Replace the configuration. The mirror of CommitEngine::set_params, and for the same two
+    // callers: the settings dialog, and a bench sweep between runs.
+    //
+    // The timers are read as they fire rather than latched at session start, so a change during a
+    // live session applies to that session. That is the intended behaviour — a user who has just
+    // shortened the endpoint silence means *now* — and it is safe because the machine keeps no
+    // derived state from the config. It does not touch connection or session state: nothing here
+    // can end a session, and a new machine (which would start in SPAWNING and reject the next
+    // message from the connected child) is never the right way to change a timer.
+    void set_config(const SessionConfig& cfg);
+    [[nodiscard]] const SessionConfig& config() const noexcept;
+
     // ── Driving it ──────────────────────────────────────────────────────────────────────────
 
     // An inbound control message from the Server. Applies §7.1 staleness, §7.4 ordering, §10.2
