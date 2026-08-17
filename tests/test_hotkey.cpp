@@ -250,12 +250,66 @@ KD_TEST(hotkey, ctrl_win_space_requires_both_modifiers) {
     KD_CHECK(o.suppress_start_menu);  // a Win key is involved, so the hack still applies
 }
 
+KD_TEST(hotkey, the_modifier_of_the_finalising_chord_is_not_user_input) {
+    // Regression, found by pressing the hotkey twice in the real application.
+    //
+    // Win+Y reaches the hook as LWIN down and *then* Y down. The LWIN was classified as the user
+    // typing, so the owner ended the session on it — and the Y ten milliseconds later found no
+    // session running and started a *new* one. The user saw a second block of text appear instead
+    // of the first one finishing.
+    //
+    // The test below pressed exactly these two keys and did not catch it, because it ignored the
+    // modifier's outcome. Only the *owner* ends a session (note_session_ended), so a filter driven
+    // without one keeps `session_active_` true and the Y still finalises. The assertion this test
+    // adds is the whole difference.
+    kd::InputFilter f;
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    const kd::FilterOutcome mod = f.on_event(kdown(kd::vk::kLWin, 500));
+    KD_CHECK(!mod.stop_on_input);
+    KD_CHECK(!mod.cancel);
+    KD_CHECK(f.session_active());
+
+    KD_CHECK(f.on_event(kdown(kd::vk::kY, 510)).toggle_finalize);
+}
+
+KD_TEST(hotkey, a_different_chord_on_the_same_modifier_still_stops_the_session) {
+    // The other half of the rule above: excusing the binding's modifier must not excuse whatever
+    // the user pressed it for. Win+A is somebody else's shortcut, and reaching for it while
+    // dictating is exactly the "I am doing something else now" that plan.md §1.8 stops on.
+    kd::InputFilter f;
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    KD_CHECK(!f.on_event(kdown(kd::vk::kLWin, 500)).stop_on_input);
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kA, 510));
+    KD_CHECK(o.stop_on_input);
+    KD_CHECK_EQ(o.stop_reason, kd::StopInputReason::Keystroke);
+    KD_CHECK(!o.swallow);  // and the target still gets its shortcut
+}
+
+KD_TEST(hotkey, a_modifier_the_binding_does_not_use_is_still_user_input) {
+    // The excuse is scoped to the binding. With an F13 binding there is no modifier in the chord,
+    // so a Win press during a session is the user reaching for the Start menu and nothing else.
+    kd::HotkeySpec f13{};
+    f13.vk = kd::vk::kF13;
+    f13.mods = kd::kModNone;
+
+    kd::InputFilter f;
+    f.set_hotkey(f13);
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kF13, 100)).activate);
+    f.on_event(kup(kd::vk::kF13, 110));
+
+    KD_CHECK(f.on_event(kdown(kd::vk::kLWin, 200)).stop_on_input);
+}
+
 KD_TEST(hotkey, second_chord_press_finalises_rather_than_activating_again) {
     kd::InputFilter f;
     activate_win_y(f, 100);
     release_win_y(f, 120);
 
-    f.on_event(kdown(kd::vk::kLWin, 500));
+    KD_CHECK(!f.on_event(kdown(kd::vk::kLWin, 500)).stop_on_input);
     const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kY, 510));
     KD_CHECK(o.toggle_finalize);
     KD_CHECK(!o.activate);

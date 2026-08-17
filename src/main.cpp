@@ -64,6 +64,11 @@ constexpr UINT kMsgShowSettings = WM_APP + 6;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
 
+// How long the target is held after `stop` while waiting for `final` and `stopped`. Generous
+// because a real model's flush is not instant, finite because a child that never answers must not
+// strand the session forever.
+constexpr uint64_t kFinalizeGraceMs = 5000;
+
 constexpr UINT kTrayId = 1;
 constexpr UINT kMenuToggle = 100;
 constexpr UINT kMenuSettings = 101;
@@ -187,6 +192,7 @@ private:
 
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
+    void finish_dictation(const char* why);
 
     bool spawn_sidecar();
     void on_conn_state(kd::proto::ConnState s);
@@ -228,6 +234,8 @@ private:
     unsigned respawn_attempts_ = 0;
     bool sidecar_respawn_ = false;  // this spawn is §10.3's recovery, not the first launch
     bool settings_open_ = false;
+    bool finalizing_ = false;       // `stop` is out; the target is held until `stopped`
+    uint64_t finalize_deadline_ms_ = 0;
 
     std::mutex ipc_mutex_;
     std::deque<kd::proto::Message> ipc_queue_;
@@ -557,6 +565,11 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_TIMER:
             if (wp == kTickTimer) {
+                if (finalizing_ && clock_.now_ms() >= finalize_deadline_ms_) {
+                    KD_LOG_WARN("no `stopped` within %llu ms of `stop`; releasing the target",
+                                static_cast<unsigned long long>(kFinalizeGraceMs));
+                    finish_dictation("finalize grace expired");
+                }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
                 if (overlay_ != nullptr && anchor_dirty_.exchange(false, std::memory_order_acq_rel)) {
@@ -688,7 +701,16 @@ void App::drain_ipc_queue() {
             set_tray_state(kd::OverlayState::ModelLoading);
         }
 
-        apply(session_->on_message(m), &m);
+        const kd::SessionMachine::Outcome outcome = session_->on_message(m);
+        apply(outcome, &m);
+
+        // §6.2: `stopped` is terminal for the session, and only now is the target free. The
+        // verdict is what distinguishes it from a `stopped` for a session we have already moved
+        // on from, which §7.1 says to record and apply to nothing.
+        if (m.get_if<kd::proto::StoppedMsg>() != nullptr &&
+            outcome.verdict == kd::Verdict::Accept) {
+            finish_dictation("stopped");
+        }
     }
 }
 
@@ -846,6 +868,13 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
 
 void App::begin_dictation() {
     if (session_ == nullptr) return;
+    if (finalizing_) {
+        // §7.2: one session per connection. The previous one has been asked to stop and its
+        // `final` may still be in flight, so starting another now would be a fatal
+        // state_violation on the wire. Ignored and said out loud, rather than refused silently.
+        KD_LOG_WARN("hotkey pressed while the previous session was still finalising; ignored");
+        return;
+    }
 
     auto captured = kd::capture_foreground_target();
     if (!captured) {
@@ -898,8 +927,16 @@ void App::begin_dictation() {
                 target_->is_password_field ? 1 : 0, target_->is_console ? 1 : 0);
 }
 
+// The hotkey (or Esc, or stop-on-input) has ended the *user's* part of the session. The session
+// itself is not over: `stop` has only just gone out, and the `final` it asks for — the tail of the
+// utterance, the part nothing has committed yet — is still to come.
+//
+// So the target is deliberately NOT released here. It was released here once, and the effect was
+// that every session lost its last words: `final` arrived a few milliseconds later, perform_commit
+// found no target and returned, and the text went nowhere. The microphone closes now (nothing more
+// will be transcribed), the target closes at `stopped`.
 void App::end_dictation(kd::LocalEvent why) {
-    if (session_ == nullptr || !target_.has_value()) return;
+    if (session_ == nullptr || !target_.has_value() || finalizing_) return;
 
     KD_LOG_INFO("dictation ending: %s", kd::to_string(why));
     apply(session_->on_local(why));
@@ -909,6 +946,26 @@ void App::end_dictation(kd::LocalEvent why) {
         audio_running_ = false;
     }
     hotkey_->note_session_ended();
+
+    finalizing_ = true;
+    // A sidecar that never answers must not strand the target forever: a real model's flush can
+    // take a moment, so the grace is generous, but it is finite and it is logged when it expires.
+    finalize_deadline_ms_ = clock_.now_ms() + kFinalizeGraceMs;
+    set_tray_state(kd::OverlayState::Finalizing);
+    if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Finalizing);
+}
+
+// The session is over: `stopped` arrived, the child went away, or the grace expired.
+void App::finish_dictation(const char* why) {
+    if (!finalizing_ && !target_.has_value()) return;
+
+    KD_LOG_INFO("dictation finished: %s", why);
+    finalizing_ = false;
+    finalize_deadline_ms_ = 0;
+    if (audio_running_) {
+        capture_->stop();
+        audio_running_ = false;
+    }
     target_.reset();
     if (overlay_ != nullptr) {
         overlay_->set_text({}, {});
@@ -955,15 +1012,10 @@ void App::on_conn_state(kd::proto::ConnState s) {
 void App::on_sidecar_lost() {
     if (quitting_) return;
     KD_LOG_WARN("sidecar connection ended");
-    if (audio_running_) {
-        capture_->stop();
-        audio_running_ = false;
-    }
-    if (target_.has_value() && hotkey_ != nullptr) hotkey_->note_session_ended();
+    if (target_.has_value() && !finalizing_ && hotkey_ != nullptr) hotkey_->note_session_ended();
     // Committed text stays in the document — it was correct when it was written and the
     // invariant forbids taking it back. Only the uncommitted tail is lost.
-    target_.reset();
-    if (overlay_ != nullptr) overlay_->hide();
+    finish_dictation("sidecar connection ended");
     apply(session_->on_transport(kd::TransportEvent::BrokenPipe));
 }
 

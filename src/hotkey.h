@@ -222,6 +222,11 @@ private:
     [[nodiscard]] uint32_t current_mods(uint32_t ignore_vk) const noexcept;
     [[nodiscard]] bool chord_matches(const InputEvent& e) const noexcept;
 
+    // True when `vk` is one of the modifier keys this binding uses — either side, plus the
+    // neutral code SendInput produces. It is what stops the first half of the finalising chord
+    // from being read as the user typing; see the comment at its use.
+    [[nodiscard]] bool is_binding_modifier(uint32_t vk) const noexcept;
+
     // Snapshot the keys currently down. Called the instant the chord is recognised — NOT when
     // the owner later confirms via note_session_started(). See the comment in hotkey.cpp: the
     // chord's key-ups reach the hook long before the posted activation reaches the UI thread.

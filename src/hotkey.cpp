@@ -359,6 +359,27 @@ uint32_t InputFilter::current_mods(uint32_t ignore_vk) const noexcept {
     return m;
 }
 
+bool InputFilter::is_binding_modifier(uint32_t vk) const noexcept {
+    // Sided and neutral codes both count, for the same reason current_mods() accepts both: a real
+    // keystroke reports the sided code and SendInput-generated input carries the neutral one.
+    if ((spec_.mods & kModCtrl) != 0 &&
+        (vk == vk::kLControl || vk == vk::kRControl || vk == vk::kControl)) {
+        return true;
+    }
+    if ((spec_.mods & kModAlt) != 0 && (vk == vk::kLMenu || vk == vk::kRMenu || vk == vk::kMenu)) {
+        return true;
+    }
+    if ((spec_.mods & kModShift) != 0 &&
+        (vk == vk::kLShift || vk == vk::kRShift || vk == vk::kShift)) {
+        return true;
+    }
+    if ((spec_.mods & kModWin) != 0 &&
+        (vk == vk::kLWin || (!spec_.require_left_win && vk == vk::kRWin))) {
+        return true;
+    }
+    return false;
+}
+
 bool InputFilter::chord_matches(const InputEvent& e) const noexcept {
     if (e.vk != spec_.vk) return false;
     // EXACT match, not "at least these". Win+Shift+Y is somebody else's shortcut and must not
@@ -476,6 +497,19 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
     // would activate the session and then immediately stop it with the Win key's own repeat.
     // plan.md §1.8 states the rule for key-ups; this is the same rule where it actually bites.
     if (was_down && bit_test(down_at_activation_, e.vk)) return out;
+
+    // ── The first half of the binding chord ──────────────────────────────────────────────────
+    //
+    // Win+Y reaches the hook as LWIN down, *then* Y down — and the user pressing the binding a
+    // second time is asking to finish the session, not typing into it. Reading that LWIN as
+    // ordinary input ended the session on the modifier, and the Y a few milliseconds later then
+    // found no session running and started a new one. Observed as: press the hotkey to finish,
+    // and a second block of text appears instead.
+    //
+    // Only the modifiers the binding actually uses are excused, and only while a session is
+    // running. If the user goes on to press some other key (Win+E), that key still stops the
+    // session on the line below, which is the outcome plan.md §1.8 asks for.
+    if (is_binding_modifier(e.vk)) return out;
 
     // ── Anything else is the user doing something else ───────────────────────────────────────
     out.stop_on_input = true;
