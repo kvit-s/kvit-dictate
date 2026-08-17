@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -87,6 +88,43 @@ std::wstring widen(std::string_view utf8) {
     std::wstring w;
     kd::utf8::to_utf16(utf8, w, nullptr);
     return w;
+}
+
+// Where `-m <module>` can be imported from.
+//
+// The sidecar package is deliberately **not** installed into any of the interpreters
+// (server/README.md §2: the `mock` environment has nothing installed at all, which is the whole
+// point of it), so the launcher has to put the directory *containing* the package on the child's
+// PYTHONPATH. models.json cannot carry it, because that path is a property of where this build
+// happens to live, not of the model.
+//
+// Two layouts, in order: the package beside the executable (a deployed tree), then `server/`
+// under any ancestor (the source tree, where the exe sits in build-*/bin/<config>/).
+std::filesystem::path find_sidecar_root(std::string_view module) {
+    if (module.empty()) return {};
+    const std::filesystem::path pkg = std::filesystem::path(module) / "__init__.py";
+    std::error_code ec;
+    std::filesystem::path dir = kd::executable_directory();
+    for (int depth = 0; depth < 8 && !dir.empty(); ++depth) {
+        if (std::filesystem::exists(dir / pkg, ec)) return dir;
+        if (std::filesystem::exists(dir / "server" / pkg, ec)) return dir / "server";
+        std::filesystem::path parent = dir.parent_path();
+        if (parent == dir) break;  // the root; parent_path() of "C:\" is itself
+        dir = std::move(parent);
+    }
+    return {};
+}
+
+bool env_names_equal(std::string_view a, std::string_view b) {
+    // Windows environment variable names are case-insensitive. ASCII is enough here: the only
+    // name this is asked about is PYTHONPATH.
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const char ca = (a[i] >= 'a' && a[i] <= 'z') ? static_cast<char>(a[i] - 32) : a[i];
+        const char cb = (b[i] >= 'a' && b[i] <= 'z') ? static_cast<char>(b[i] - 32) : b[i];
+        if (ca != cb) return false;
+    }
+    return true;
 }
 
 // ─── The application ────────────────────────────────────────────────────────────────────────
@@ -274,6 +312,13 @@ bool App::startup() {
 
     kd::log::Config log_cfg;
     log_cfg.level = settings_.log_level;
+    if (settings_.diagnostics_file_enabled) {
+        // Opt-in only (plan.md §1.9): a diagnostics file records window titles and process names,
+        // which is close enough to the transcript line that it is off by default. The setting is
+        // parsed and offered in the dialog, so it has to actually reach the logger — an opt-in
+        // that silently does nothing is worse than no switch at all.
+        log_cfg.file = kd::default_log_directory() / L"kvit-dictate.log";
+    }
     kd::log::init(log_cfg);
     kd::log::set_transcript_policy(settings_.transcript);
 
@@ -283,6 +328,10 @@ bool App::startup() {
     } else {
         KD_LOG_ERROR("models.json: %s", m.status().message().c_str());
     }
+    // A first run has no settings.json, so nothing has chosen a model yet; models.json's
+    // `default_model` *is* that choice. Without this, the first launch resolves the empty id,
+    // reports "no model is selected" and never starts a sidecar at all.
+    if (settings_.model_id.empty()) settings_.model_id = manifest_.default_model;
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -353,19 +402,58 @@ bool App::startup() {
 }
 
 bool App::spawn_sidecar() {
-    const kd::ModelEntry* entry = manifest_.find(settings_.model_id);
-    if (entry == nullptr) {
-        KD_LOG_ERROR("no model '%s' in models.json", settings_.model_id.c_str());
+    // Everything that must be true before CreateProcess is worth attempting — the id resolves,
+    // the entry is enabled, the interpreter is on disk — checked here so the failure names the
+    // model and the missing path instead of surfacing as ERROR_FILE_NOT_FOUND.
+    if (const kd::Status st = kd::check_model_launchable(manifest_, settings_.model_id); !st.ok()) {
+        KD_LOG_ERROR("%s", st.message().c_str());
         set_tray_state(kd::OverlayState::Error);
         return false;
     }
+    const kd::ModelEntry* entry = manifest_.find(settings_.model_id);
+    if (entry == nullptr) return false;  // check_model_launchable already proved otherwise
 
     kd::ChildSpec spec;
     // Already a filesystem::path (settings.h keeps it typed so a relative or malformed
     // interpreter path is rejected at load time, not at CreateProcess time).
     spec.interpreter = entry->interpreter.wstring();
+    // `-m <module>`. IpcClient appends only the protocol-mandated arguments (--pipe, --proto,
+    // --parent-pid), so telling the interpreter *what to run* is this file's job — without it the
+    // child is launched as `python.exe --backend mock …` and dies on an unknown option.
+    if (!entry->module.empty()) {
+        spec.args.push_back(L"-m");
+        spec.args.push_back(widen(entry->module));
+    }
     for (const std::string& a : entry->args) spec.args.push_back(widen(a));
     spec.model_id = entry->id;
+
+    bool entry_sets_pythonpath = false;
+    for (const auto& kv : entry->env) {
+        spec.environment.emplace_back(widen(kv.first), widen(kv.second));
+        if (env_names_equal(kv.first, "PYTHONPATH")) entry_sets_pythonpath = true;
+    }
+
+    // The manifest wins if it names a PYTHONPATH: an entry that spells one out knows something
+    // this search does not.
+    if (!entry_sets_pythonpath) {
+        const std::filesystem::path root = find_sidecar_root(entry->module);
+        if (root.empty()) {
+            // Not fatal here — the child will say so far more precisely, with a traceback naming
+            // the module — but it is the likeliest cause of the failure that follows, and saying
+            // so now saves reading the child's stderr to find out.
+            KD_LOG_ERROR("cannot find a directory containing the '%s' package near %s; the "
+                         "sidecar will almost certainly fail to import",
+                         entry->module.c_str(),
+                         kd::executable_directory().string().c_str());
+        } else {
+            // Replaces any inherited PYTHONPATH rather than prepending to it. A stray global
+            // PYTHONPATH is far more likely to poison a locked per-model environment than to
+            // contribute anything to it (plan.md §5.1).
+            spec.environment.emplace_back(L"PYTHONPATH", root.wstring());
+            spec.working_directory = root.wstring();
+            KD_LOG_INFO("sidecar PYTHONPATH=%s", root.string().c_str());
+        }
+    }
 
     kd::IpcClient::Callbacks cb;
     // Every one of these runs on the I/O thread. They enqueue and wake; they never decide.

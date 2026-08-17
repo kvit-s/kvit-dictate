@@ -5,13 +5,13 @@
     {
       "id": "mock",
       "display_name": "Mock backend (no model, no GPU)",
-      "interpreter": "D:\\projects\\kvit-dictate\\envs\\mock\\Scripts\\python.exe",
+      "interpreter": "C:\\Python312\\python.exe",
       "module": "kvit_asr",
       "args": ["--backend", "mock"],
       "streaming_mode": "native-streaming",
       "requires": ["python>=3.12"],
       "env": {},
-      "notes": "Emits scripted partial/final messages from a fixed script with no audio decoding at all. It exists so the whole C++ side - handshake, session lifetime, seq ordering, stable_bytes monotonicity, commit engine, injection, overlay - can be exercised end to end without a GPU, and so that a failure is attributable to the C++ side rather than to a model. It also drives the deliberate protocol violations the fixtures require (a decreasing stable_bytes, a mutated stable prefix), which no real backend will produce on demand. This is the default because it is the only entry whose environment costs nothing to create.",
+      "notes": "Emits scripted partial/final messages from a fixed script with no audio decoding at all. It exists so the whole C++ side - handshake, session lifetime, seq ordering, stable_bytes monotonicity, commit engine, injection, overlay - can be exercised end to end without a GPU, and so that a failure is attributable to the C++ side rather than to a model. It also drives the deliberate protocol violations the fixtures require (a decreasing stable_bytes, a mutated stable prefix), which no real backend will produce on demand. This is the default because it is the only entry whose environment costs nothing to create: the backend is stdlib-only, so it points straight at the system interpreter and needs no venv at all.",
       "enabled": true
     },
     {
