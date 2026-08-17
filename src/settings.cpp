@@ -1365,6 +1365,16 @@ struct DialogState {
     std::vector<HWND> page_controls[kPageCount];
     HFONT font = nullptr;
     int dpi = 96;
+
+    //: One line of `font`, in *logical* px, measured rather than assumed.
+    //:
+    //: The explanatory notes under each section are plain STATIC controls given a fixed height of
+    //: `lines` × this. The height used to be the literal 13, which is smaller than Segoe UI 9pt
+    //: actually occupies at 96 DPI — so the last line of every multi-line note was cut in half,
+    //: and the dialog read as broken text rather than as a layout that had run out of room. It is
+    //: measured because the whole point of laying labels out above their controls (see `Cursor`)
+    //: is to survive a font or DPI this file did not anticipate.
+    int line_h = 15;
     bool accepted = false;
     bool running = true;
 };
@@ -1462,8 +1472,14 @@ struct Cursor {
     HWND add(const wchar_t* cls, const wchar_t* text, DWORD style, int logical_height, int id,
              DWORD ex = 0) {
         const int h = px(*st, logical_height);
-        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | style, x, y, w, h, dlg,
-                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, nullptr);
+        // WS_CLIPSIBLINGS because the three pages are stacked in the same rectangle: without it,
+        // painting or erasing one page's control is free to scribble over the identically-placed
+        // control of another page, and a hidden page's erase can blank a visible one. Created
+        // without WS_VISIBLE — `show_page` owns visibility, and a control that flashed up before
+        // its page was selected would be visible on the wrong tab.
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_CLIPSIBLINGS | style, x, y, w, h,
+                                 dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst,
+                                 nullptr);
         if (c) {
             SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(st->font), TRUE);
             st->page_controls[page].push_back(c);
@@ -1484,7 +1500,7 @@ struct Cursor {
     // Explanatory text. The two silence timers get one each, because the single most likely UI
     // defect here is a user reading "silence" and assuming there is one of them (plan.md §1.6).
     void note(const wchar_t* text, int lines = 2) {
-        add(L"STATIC", text, 0, 13 * lines, -1);
+        add(L"STATIC", text, 0, st->line_h * lines, -1);
         gap(2);
     }
 
@@ -2115,11 +2131,29 @@ void build_controls(HWND dlg, DialogState& st) {
     }
 }
 
-void show_page(DialogState& st, int page) {
+// Every page's controls occupy the same rectangle, so the three pages are stacked overlapping
+// siblings and only one is ever visible. That makes the *order* of the show/hide calls, and the
+// repaint afterwards, load-bearing rather than incidental — see the two comments below. Both were
+// wrong, and the symptom was a tab page that rendered completely blank while every one of its
+// controls reported `IsWindowVisible() == true` and sat at the right coordinates.
+void show_page(HWND dlg, DialogState& st, int page) {
+    // Hide the other pages FIRST. Hiding a control invalidates the parent region underneath it,
+    // and the parent's erase of that region paints over whatever is there — including controls
+    // shown a moment earlier. Showing first and hiding second therefore wipes the page that was
+    // just made visible, which is why returning to a page left it blank.
     for (int p = 0; p < kPageCount; ++p) {
-        const int cmd = (p == page) ? SW_SHOW : SW_HIDE;
-        for (HWND h : st.page_controls[p]) ShowWindow(h, cmd);
+        if (p == page) continue;
+        for (HWND h : st.page_controls[p]) ShowWindow(h, SW_HIDE);
     }
+    for (HWND h : st.page_controls[page]) ShowWindow(h, SW_SHOW);
+
+    // ShowWindow only marks a control for painting; the erase still pending from the hides above
+    // can be coalesced on top of it. One explicit, synchronous redraw of the dialog with
+    // RDW_ALLCHILDREN is what makes the switch deterministic instead of dependent on the order
+    // Windows happens to merge the invalid regions in. RDW_UPDATENOW rather than RDW_ERASENOW so
+    // the children repaint in this call rather than at the next idle.
+    RedrawWindow(dlg, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2136,7 +2170,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st) {
                 build_controls(hwnd, *st);
                 load_controls(hwnd, *st);
-                show_page(*st, 0);
+                show_page(hwnd, *st, 0);
             }
             return 0;
 
@@ -2145,7 +2179,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st && hdr && hdr->idFrom == kIdTabs && hdr->code == TCN_SELCHANGE) {
                 const int page =
                     static_cast<int>(SendMessageW(hdr->hwndFrom, TCM_GETCURSEL, 0, 0));
-                if (page >= 0 && page < kPageCount) show_page(*st, page);
+                if (page >= 0 && page < kPageCount) show_page(hwnd, *st, page);
             }
             return 0;
         }
@@ -2285,6 +2319,21 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     }
     st.font = CreateFontIndirectW(&ncm.lfMessageFont);
+
+    // Measure one line of that font and convert back to logical px, which is the unit `Cursor`
+    // lays out in. Falls back to the previous constant if the DC cannot be had, so a measurement
+    // failure costs the old clipping rather than a zero-height note.
+    if (HDC dc = GetDC(nullptr)) {
+        HGDIOBJ previous = SelectObject(dc, st.font);
+        TEXTMETRICW tm{};
+        if (GetTextMetricsW(dc, &tm)) {
+            const int device_line = static_cast<int>(tm.tmHeight + tm.tmExternalLeading);
+            const int logical_line = MulDiv(device_line, 96, st.dpi);
+            if (logical_line > 0) st.line_h = logical_line;
+        }
+        SelectObject(dc, previous);
+        ReleaseDC(nullptr, dc);
+    }
 
     RECT client{0, 0, px(st, kMargin * 2 + kPageWidth),
                 px(st, kMargin * 3 + kTabStrip + kPageHeight + 26 + kMargin)};
