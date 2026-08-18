@@ -22,7 +22,7 @@ all, source C landed within 0.12 line heights, three times over. The bad news mo
 where a line wrap puts the true insertion point *outside the capture region* — a limitation of
 `capture_region_for`, which the product uses by the same rule. What is still untrue of the
 product: **no real speech has ever been transcribed** — every word so far came from the mock's
-script — and no model has been downloaded. 804 tests pass across four suites at zero warnings.
+script — and no model has been downloaded. 806 tests pass across four suites at zero warnings.
 
 ---
 
@@ -31,7 +31,7 @@ script — and no model has been downloaded. 804 tests pass across four suites a
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 303 tests / 35863 checks
+build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 305 tests / 35875 checks
 cd build-windows-msvc-debug && ctest -C Debug              # 14 suites, none disabled
 
 python -m unittest discover -s server/tests -t server      # 372 tests  (run from repo root)
@@ -86,7 +86,7 @@ Four model entries matter:
 | Area | State |
 |---|---|
 | `docs/protocol.md` + 20 fixtures | Written; both endpoints execute the same corpus. |
-| C++ modules | All 13 implemented. 303 tests. |
+| C++ modules | All 13 implemented. 305 tests. |
 | `src/main.cpp` | Runs end to end against real targets. Still no test touches it. |
 | Python sidecar | 372 tests. All five backends registered and reachable by name; only `mock` has run. |
 | Bench harness | 129 tests. Never run against real data. |
