@@ -499,7 +499,21 @@ SessionMachine::Outcome SessionMachine::on_message(const proto::Message& m) {
         // stability window resets with it (plan.md §1.4 step 7).
         prev_stable_for_check = 0;
         have_prev_for_check = false;
-        out.effects.push_back(Effect::ResetCommitEngine);
+        // **No ResetCommitEngine here, deliberately.** That effect is session-scoped — the owner
+        // maps it onto `CommitEngine::reset()`, which calls `clear_session()` — and firing it at
+        // an utterance boundary destroyed two things that must survive one:
+        //
+        //   * `session_has_committed`, which is the *only* input to `CommitOp::leading_space`. So
+        //     the very event that is supposed to produce the space between utterances was the
+        //     event that made it impossible: "…the default modelopen src/protocol.h…". Observed
+        //     in a real session after the first fix for this had already been made and tested —
+        //     the test drove `begin_utterance()`, which no owner calls.
+        //   * a session-scoped violation latch, which §8.3 does not un-latch at an utterance.
+        //
+        // The utterance-scoped reset this comment is about is not needed from here at all:
+        // `CommitEngine::on_partial`/`on_final` compare the incoming `utterance_id` against their
+        // own and call `clear_utterance()` themselves, with the id, which this effect cannot
+        // carry.
     }
 
     // ── §8.2 stability ──────────────────────────────────────────────────────────────────────

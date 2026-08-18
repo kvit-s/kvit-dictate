@@ -550,6 +550,46 @@ KD_TEST(commit_engine, utterance_boundary_resets_everything) {
     KD_CHECK(!d.ops().front().leading_space);
 }
 
+KD_TEST(commit_engine, leading_space_survives_an_unannounced_utterance_change) {
+    // `utterance_boundary_resets_everything` above drives `begin_utterance()`, which **no owner
+    // calls**: src/main.cpp only ever calls on_partial / on_final / on_tick / reset(). So the
+    // boundary the product actually takes is the id-change-detected-by-the-engine path, and this
+    // pins that it preserves `session_has_committed`.
+    //
+    // Honest scope: this test passes with or without the fix that accompanied it — the engine was
+    // never the broken half. The defect was SessionMachine emitting the session-scoped
+    // ResetCommitEngine at an utterance boundary, and `session.an_utterance_boundary_does_not_
+    // reset_the_commit_engine` is the test with teeth for it. This one exists because the fix now
+    // *depends* on the behaviour below, which nothing else pinned.
+    Driver d(local_params(/*m=*/0));
+    d.partial("hello world abc");
+    d.partial("hello world abc");
+    KD_REQUIRE_EQ(d.engine().committed_text(), "hello world");
+    KD_REQUIRE(!d.ops().front().leading_space);  // first commit of a session: no space
+
+    // New utterance id, never announced through begin_utterance() — the engine detects it.
+    CommitOp op{};
+    bool got = false;
+    for (int i = 0; i < 2; ++i) {
+        kd::proto::PartialMsg m;
+        m.session_id = "s7";
+        m.utterance_id = 2;
+        m.seq = 90 + i;
+        m.text = "second one here";
+        const CommitEngine::Result r = d.engine().on_partial(m);
+        KD_REQUIRE(r.ok());
+        if (r.op.has_value()) {
+            op = *r.op;
+            got = true;
+        }
+    }
+    KD_REQUIRE(got);
+    KD_CHECK_EQ(op.utterance_id, uint64_t{2});
+    KD_CHECK_EQ(op.utterance_offset, uint64_t{0});
+    // plan.md §1.6: "resuming starts a new utterance appended after a space".
+    KD_CHECK(op.leading_space);
+}
+
 KD_TEST(commit_engine, an_unannounced_utterance_id_change_resets_the_window) {
     // SessionMachine is supposed to call begin_utterance(). If it does not, mixing hypotheses
     // across a boundary would compute a common prefix over two unrelated texts, so the engine

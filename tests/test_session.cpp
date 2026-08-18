@@ -181,6 +181,36 @@ KD_TEST(session, thinking_pause_ends_the_utterance_and_not_the_session) {
     KD_CHECK_EQ(m.state(), proto::ConnState::Running);
 }
 
+KD_TEST(session, an_utterance_boundary_does_not_reset_the_commit_engine) {
+    // ResetCommitEngine is SESSION-scoped: the owner maps it onto CommitEngine::reset(), which
+    // calls clear_session(). Emitting it at an utterance boundary wiped `session_has_committed`,
+    // the only input to CommitOp::leading_space — so the event that is supposed to produce the
+    // space between two utterances was the event that made it impossible, and Notepad3 received
+    // "…the default modelopen src/protocol.h…".
+    //
+    // The engine resets its own utterance state when it sees the id change (see
+    // commit_engine's leading_space_survives_an_unannounced_utterance_change), so nothing is
+    // lost by staying quiet here.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    const std::string sid = start_session(m);
+
+    auto out = m.on_message(partial_msg(sid, 1, 1, "can you change the default model", 12));
+    KD_REQUIRE_EQ(out.verdict, kd::Verdict::Accept);
+
+    // Same utterance: no reset either way.
+    out = m.on_message(partial_msg(sid, 1, 2, "can you change the default model", 20));
+    KD_CHECK(!out.has_effect(Effect::ResetCommitEngine));
+
+    // The utterance boundary itself.
+    out = m.on_message(partial_msg(sid, 2, 3, "open src/protocol.h", 4));
+    KD_REQUIRE_EQ(out.verdict, kd::Verdict::Accept);
+    KD_CHECK(!out.has_effect(Effect::ResetCommitEngine));
+    // The text still has to reach the engine — that is what carries the new utterance_id.
+    KD_CHECK(out.has_effect(Effect::ApplyText));
+}
+
 KD_TEST(session, session_silence_ends_the_session_with_stop) {
     kd::ManualClock clock(1000);
     kd::SessionConfig cfg;

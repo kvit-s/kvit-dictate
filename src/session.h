@@ -93,7 +93,10 @@ const char* to_string(Verdict v) noexcept;
 enum class Effect : uint8_t {
     LogGap,                 // a seq gap was accepted; log expected vs received
     ResetAnchorConfidence,  // §7.4 — the real consequence of a gap (plan.md §1.5)
-    ResetCommitEngine,      // utterance or session boundary; drop the stability window
+    ResetCommitEngine,      // SESSION boundary only — maps to CommitEngine::reset(), which
+                            // is session-scoped. An utterance boundary must NOT emit this:
+                            // the engine resets its own utterance state, and reset() would
+                            // clear session_has_committed (see session.cpp's new_utterance).
     ApplyText,              // hand this message to the commit engine
     FlushPendingAudio,      // before `stop`: §6.3's Client obligation
     DropQueuedAudio,        // before `cancel`
