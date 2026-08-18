@@ -659,6 +659,21 @@ int main(int argc, char** argv) {
         // insertion point the anchor is trying to predict, and after the text lands it has moved
         // to the end of what was typed. The log is cleared in the same call so `events_total`
         // afterwards counts this repetition's keystrokes and not the previous one's.
+        // Focus continuity across the whole measurement, not just at the moment of injection.
+        //
+        // `--require-exe` stops the text going somewhere it should not, which is the safety
+        // question. This is the *validity* question, and it is different: the capture is of a
+        // screen RECTANGLE, so if another window overlaps the target region during the before or
+        // after frame - a notification, an alt-tab, a focus flicker that returns - the diff
+        // contains someone else's pixels and the record looks perfectly normal. A measurement
+        // taken under those conditions is not wrong-looking, it is quietly wrong, which is worse.
+        //
+        // So each stage that can corrupt the result records whether the target still held the
+        // foreground, and the record carries the verdict rather than leaving a reader to assume.
+        const HWND target_hwnd = reinterpret_cast<HWND>(target.top_level);
+        bool fg_at_before_frame = (GetForegroundWindow() == target_hwnd);
+        bool fg_at_after_frame = true;
+
         TargetState before_state;
         bool have_before_state = false;
         // The caret AFTER the text lands. This, not the pre-injection caret, is what source C is
@@ -762,6 +777,8 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+
+        fg_at_after_frame = (GetForegroundWindow() == target_hwnd);
 
         const float confidence = kd::anchor::score_diff(diff, region, std::nullopt);
 
@@ -911,6 +928,25 @@ int main(int argc, char** argv) {
         cap.set("after_polls", kd::json::Value::number(static_cast<int64_t>(polls)));
         record.set("capture", std::move(cap));
 
+        {
+            const bool stable = fg_at_before_frame && fg_at_after_frame;
+            kd::json::Value v = kd::json::Value::object();
+            v.set("foreground_at_before_frame", kd::json::Value::boolean(fg_at_before_frame));
+            v.set("foreground_at_after_frame", kd::json::Value::boolean(fg_at_after_frame));
+            v.set("suspect", kd::json::Value::boolean(!stable));
+            if (!stable) {
+                v.set("suspect_reason",
+                      kd::json::Value::string(std::string(
+                          "the target did not hold the foreground for the whole measurement; the "
+                          "captured rectangle may contain another window's pixels, so the diff "
+                          "and every figure derived from it are unreliable. Exclude from "
+                          "aggregates and re-run.")));
+                std::printf("  SUSPECT: the target lost the foreground during the measurement "
+                            "(before=%s after=%s); this record is marked unreliable\n",
+                            fg_at_before_frame ? "ok" : "lost", fg_at_after_frame ? "ok" : "lost");
+            }
+            record.set("validity", std::move(v));
+        }
         record.set("notes", kd::json::Value::string(notes));
 
         const std::filesystem::path dir =

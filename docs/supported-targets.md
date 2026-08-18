@@ -569,6 +569,54 @@ The shape of the fix is two injections rather than one: REF-1 for §3.2 fidelity
 string that fits inside the capture region for §3.4 anchor error. Until that is decided, no §3.4
 figure should be filled in, and the A09 records already written carry `notes` saying so.
 
+### 5.9.2 First A09 results — 11 of 18 cells, `sendinput`, REF-2
+
+Measured 2026-08-18, automated against `tools/testtarget` with the side channel supplying ground
+truth. Three repetitions per cell, zero records flagged `suspect` (the target held the foreground
+throughout every measurement). Raw records under `bench/results/phase0b/A09/`.
+
+| Cell | Scenario | error_lh (3 reps) | |
+|---|---|---|---|
+| `S01` | empty field | 0.07, 0.07, 0.07 | within 1 lh |
+| `S02` | mid-line insertion | 9.33 ×3 | over |
+| `S03` | selection replacement | 11.67 ×3 | over |
+| `S04` | line wrap | 9.33, 9.33, 49.95 | over, and unstable |
+| `S07` | vertical scroll | 14.93 ×3 | over |
+| `S08` | horizontal scroll | 17.40 ×3 | over |
+| `S10` | steady self-drawn caret | 31.53, then no diff at all | over / no estimate |
+| `S11` | dark theme | 9.33 ×3 | over |
+| `S12` | light theme | 9.33 ×3 | over |
+| `S16` | RTL text | 0.13, 0.13, 0.24 | within 1 lh |
+| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test |
+
+**Read `error_lh` as source C's error, not the product's.** The probe scores `anchor_from_diff`
+unconditionally, while the product picks the best available source and ranks a real caret (0.95)
+above any diff (≤0.90). In every cell above except `S10`, `source_a.available` is true — these are
+Win32 edit controls with a real system caret — so the shipping product would have used the caret
+and been exact, and none of these figures would reach a user. The probe's `winner` field applies
+its own rule (prefer C whenever the diff is non-empty) and therefore does **not** answer §3.3;
+that is a defect in this harness, recorded rather than fixed.
+
+Which makes `S10` the cell that matters, and it is the bad news: it is the only row here with no
+system caret, so source C is the only anchor available — exactly the situation in VS Code, Slack
+and terminals, which is to say all the interesting targets — and source C produced 31.53 line
+heights on the first repetition and **no usable estimate at all** on the other two. The `S10`
+ground truth also came back at y = −226, which is off-screen and means the scenario setup itself
+needs work before that cell can be believed either way.
+
+The pattern in the other rows is coherent and matches what §2 predicted when the scenarios were
+written: `S02`/`S03` fail because text to the right of an interior insertion reflows, so the
+rightmost changed pixel is the end of the reflowed line rather than the insertion point; `S07`/
+`S08` fail while `looks_like_scroll` stays false, so scroll detection did not fire. `S11` and
+`S12` are identical to `S02` to the pixel, which is a real result: **theme does not affect the
+estimate**. `S16` passing is the surprise, and it should be treated with suspicion rather than
+celebrated — REF-2 is deliberately LTR-only, so this row currently measures an LTR injection into
+an RTL *control*, not RTL text, and the S16 that §2 describes has not been run.
+
+**Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an
+autocomplete popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or
+elevation state that was not changed unattended.
+
 ### 5.10 Incidental observations — **not measurements**
 
 Things seen while running the product for other reasons. They are recorded because they change
