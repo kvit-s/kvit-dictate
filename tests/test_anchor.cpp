@@ -604,12 +604,17 @@ KD_TEST(anchor, s10_the_second_commit_is_scored_WORSE_not_better) {
     const float first_commit = kd::anchor::score_diff(s10_diff(), kS10Region, std::nullopt);
     const float second_commit = kd::anchor::score_diff(second, kS10Region, previous);
 
-    // Having an incumbent to corroborate against makes the score WORSE, not better, and that is
-    // not a quirk of these numbers. The proximity term measures how far the new estimate is from
-    // the old one in units of LINE HEIGHT (kProxNearLines = 3, kProxFarLines = 15), and a commit
-    // of 25 characters moves the insertion point ~177 px = ~11 line heights *horizontally*. So
-    // ordinary typing is scored as "the anchor jumped", and any commit longer than about seven
-    // characters starts losing confidence for doing exactly what dictation does.
+    // Having an incumbent to corroborate against makes the score WORSE, not better. The proximity
+    // term measures how far the new estimate is from the old one in units of LINE HEIGHT
+    // (kProxNearLines = 3, kProxFarLines = 15), and a commit of 25 characters moves the insertion
+    // point ~177 px = ~11 line heights *horizontally*. So ordinary typing reads as "the anchor
+    // jumped", and every score is compressed toward the bottom of the range.
+    //
+    // That is a real weakness and it is NOT the reason the degradation gate is unwired — the
+    // measured sweep (docs/supported-targets.md §5.9.2.1) shows the compression hits *inaccurate*
+    // estimates harder, so accurate ones still separate cleanly at 0.3742–0.5000 against
+    // 0.1858–0.2941. What is wrong is min_confidence's 0.50 default, which is above both ranges.
+    // This test pins the compression so that a later fix to the units is visibly a change.
     KD_CHECK(second_commit < first_commit);
     KD_CHECK(second_commit < 0.5f);
 

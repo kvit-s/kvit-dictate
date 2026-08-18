@@ -83,11 +83,13 @@ const char* to_string(OverlayMode m) noexcept;
 // only when `current()` is absent or fails `is_usable(cfg.min_confidence)`".
 //
 // ⚠ **NOT CALLED BY THE PRODUCT YET (2026-08-18).** `App::apply_overlay_mode` in main.cpp is
-// where it goes and carries the full reason: applying it against today's `score_diff` would make
-// the inline preview unreachable on every target without a system caret, because the scorer
-// penalises ordinary typing (see tests/test_anchor.cpp, `s10_the_second_commit_is_scored_WORSE`).
-// The rule is correct; the numbers it would be fed are not yet. This function is kept, and
-// tested, so that recalibrating the scorer is the only work left to switch it on.
+// where it goes and carries the full reason. In short: the rule below is right and
+// `AnchorConfig::min_confidence`'s default of 0.50 is wrong — it sits above the range
+// `score_diff` actually produces, so enforcing it would degrade every commit on every target.
+// Measured in docs/supported-targets.md §5.9.2.1: accurate estimates score 0.3742–0.5000 and
+// inaccurate ones 0.1858–0.2941, so any threshold in (0.2941, 0.3742] gets all ten measured cells
+// right. Picking that number on one application's evidence is what is being deferred, not the
+// rule. This function is kept, and tested, so choosing the threshold is the only work left.
 //
 // This is that decision, and it is a free function rather than a few lines inside `App::on_tick`
 // because `src/main.cpp` has no tests. Until this existed, nothing in `src/` called

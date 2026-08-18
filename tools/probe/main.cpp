@@ -146,6 +146,10 @@ private:
 // ground-truth field that silently became 0,0 would read as a 40-line-height error later.
 struct TargetState {
     bool caret_available = false;
+    // True when the reported caret is one the TARGET drew and only the side channel can see.
+    // It is ground truth and must never be fed back into the estimator as though it were an
+    // anchor the product had: source A cannot see it, which is the entire point of scenario S10.
+    bool caret_self_drawn = false;
     kd::anchor::Rect caret{};
     std::string text;
     int32_t line_height = 0;
@@ -221,6 +225,8 @@ bool parse_target_state(const std::string& json_text, TargetState& out) {
     if (const kd::json::Value* caret = root.find("caret")) {
         const kd::json::Value* avail = caret->find("available");
         out.caret_available = avail != nullptr && avail->as_bool();
+        const kd::json::Value* self_drawn = caret->find("self_drawn");
+        out.caret_self_drawn = self_drawn != nullptr && self_drawn->as_bool();
         if (const kd::json::Value* r = caret->find("screen_rect")) {
             if (r->is_array() && r->size() == 4) {
                 out.caret.left = static_cast<int32_t>(r->at(0)->as_int());
@@ -829,7 +835,35 @@ int main(int argc, char** argv) {
 
         fg_at_after_frame = (GetForegroundWindow() == target_hwnd);
 
-        const float confidence = kd::anchor::score_diff(diff, region, std::nullopt);
+        // The incumbent anchor the product would be scoring against, which until now the probe
+        // did not supply at all.
+        //
+        // `score_diff`'s proximity term — the one term specifically meant to catch "the estimate
+        // jumped" — is inert without a `previous`, and so is `diff_insertion_point`'s
+        // leftward-growth RTL check. Passing std::nullopt therefore measured `score_diff` minus
+        // its main discriminator, and the first eleven cells' confidences are all missing it.
+        //
+        // The faithful stand-in is the caret as it was *before* the injection: that is where the
+        // product's published anchor sits at the moment a commit's diff is scored, whether it
+        // came from source A at session start or from the previous commit's own diff. When the
+        // target draws its own caret there is no such thing, and std::nullopt is then correct
+        // rather than a gap — it is exactly the state the product's first commit is in.
+        std::optional<kd::anchor::Anchor> previous;
+        // `caret_self_drawn` excluded deliberately: tools/testtarget reports the pane's caret
+        // because it drew it, and handing that back would give the estimator an oracle the
+        // product does not have. S10 exists to measure source C with NO anchor to start from.
+        if (have_before_state && before_state.caret_available && !before_state.caret_self_drawn) {
+            kd::anchor::Anchor p;
+            p.insertion_point = kd::anchor::Point{before_state.caret.left, before_state.caret.top};
+            p.line_height = before_state.line_height > 0 ? before_state.line_height
+                                                         : before_state.caret.height();
+            p.confidence = kd::anchor::kCaretConfidence;
+            p.source = kd::anchor::Source::Caret;
+            p.timestamp_ms = 0;
+            previous = p;
+        }
+
+        const float confidence = kd::anchor::score_diff(diff, region, previous);
 
         kd::json::Value anchor_obj = kd::json::Value::object();
         {
@@ -878,6 +912,17 @@ int main(int argc, char** argv) {
             c.set("last_changed_row", std::move(last));
             anchor_obj.set("source_c", std::move(c));
         }
+        // Which incumbent the score and the position were computed against. Records written
+        // before 2026-08-18 have no such field and were all scored with none, so they are not
+        // comparable with these and must not be aggregated together.
+        if (previous.has_value()) {
+            kd::json::Value prev = kd::json::Value::array();
+            prev.push_back(kd::json::Value::number(static_cast<int64_t>(previous->insertion_point.x)));
+            prev.push_back(kd::json::Value::number(static_cast<int64_t>(previous->insertion_point.y)));
+            anchor_obj.set("scored_against_previous", std::move(prev));
+        } else {
+            anchor_obj.set("scored_against_previous", kd::json::Value::null());
+        }
         anchor_obj.set("winner", kd::json::Value::string(std::string(
                                      diff.changed_pixels > 0 ? "C" : (caret_ok ? "A" : "none"))));
         anchor_obj.set("confidence", kd::json::Value::number(static_cast<double>(confidence)));
@@ -908,8 +953,12 @@ int main(int argc, char** argv) {
             // and a 96-dpi one are comparable. Scored through `anchor_from_diff` - the same
             // function the product uses - rather than a reimplementation here, because a probe
             // that measured its own arithmetic would report a number the product never produces.
+            // Same `previous` the confidence above was scored with. It changes the *position*
+            // too, not only the score: diff_insertion_point uses it to decide whether the change
+            // grew leftward, and an RTL verdict moves the reported insertion point to the other
+            // end of the changed band.
             const std::optional<kd::anchor::Anchor> est =
-                kd::anchor::anchor_from_diff(diff, region, std::nullopt, 0);
+                kd::anchor::anchor_from_diff(diff, region, previous, 0);
             const int32_t lh = after_state.line_height > 0 ? after_state.line_height
                                                             : before_state.line_height;
             if (est.has_value() && lh > 0) {

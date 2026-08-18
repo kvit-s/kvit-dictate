@@ -880,32 +880,32 @@ bool App::submit_before_frame() {
 // condition for turning it on written below. That is a dangerous shape in this codebase, which
 // is why it is spelled out at this length rather than left to a commit message.
 //
-// The gate was wired up and then unwired the same day, because wiring it made the confidence
-// scorer's calibration load-bearing and the calibration is wrong:
+// The gate was wired up and then unwired the same day, because wiring it made
+// `AnchorConfig::min_confidence` load-bearing and **its default of 0.50 is above the range
+// `score_diff` actually produces**. Enforcing it would degrade every commit on every target,
+// including ones the estimator gets right to a couple of pixels.
 //
-//   * A09/S10 — a self-drawn caret, source C the only anchor — has a *measured position error of
-//     0.12 line heights*, three repetitions, and scores 0.4999999702 on the first commit of a
-//     session and 0.3904 on every one after. Both below the 0.5 default.
-//   * The drop on the second commit is `score_diff`'s proximity term, which measures how far the
-//     new estimate is from the incumbent in units of LINE HEIGHT. A 25-character commit moves
-//     the insertion point ~177 px, about 11 line heights, *horizontally* — so ordinary dictation
-//     is scored as though the anchor had jumped, and any commit past roughly seven characters
-//     loses confidence for doing the one thing this product does.
+// The scorer itself is fine. docs/supported-targets.md §5.9.2.1 has the measurement: across the
+// ten measurable A09 cells, every estimate accurate to within one line height scored 0.3742–0.5000
+// and every inaccurate one scored 0.1858–0.2941, so any threshold in (0.2941, 0.3742] classifies
+// all ten correctly. 0.50 classifies none of them correctly. The discrimination is there; the
+// default is simply in the wrong place.
 //
-// So the estimate is accurate and the number attached to it is not. Enforcing the threshold
-// against that scorer would make the inline preview unreachable on precisely the targets
-// (VS Code, Slack, terminals) that S10 says source C handles well — a worse outcome than the
-// occasional mispositioned preview the gate exists to prevent. Targets with a real caret are
-// unaffected either way: source A scores 0.95.
+// **To turn it on:** lower `AnchorConfig::min_confidence` (src/anchor.h) to about 0.33, then
+// replace the line below with `kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_,
+// settings_.anchor)` under anchor_mutex_. What is deliberately NOT being done here on one
+// application's evidence is picking that number: the separating margin is 0.08 with `S03` at
+// 0.2941 the nearest false positive, and a second application could close it. That is open
+// question 7 in docs/supported-targets.md §9.
 //
-// **To turn it on:** recalibrate `kProx*` in anchor.cpp against Phase 0B measurements — anchor.h
-// already says of those constants "these are *priors chosen by hand*, not measurements: Phase 0B
-// is what will replace them with numbers" — then replace the line below with
-// `kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_, settings_.anchor)` under
-// anchor_mutex_, and re-run tests/test_anchor.cpp's `s10_*` cases, which will fail loudly and
-// correctly the moment the scorer changes. Until then this ships the pre-gate behaviour: the
-// overlay draws at whatever anchor it is handed, which is a known defect (handover.md §8) and
-// not an oversight.
+// Two related weaknesses are recorded there rather than fixed here, because neither blocks the
+// gate: `score_diff`'s proximity term measures horizontal movement in units of line height (so a
+// 25-character commit reads as an 11-line-height jump, compressing every score toward the bottom
+// of the range), and an estimate with NO incumbent to check against scores kProxNoPrevious 0.85 —
+// higher than a corroborated accurate one — which is backwards.
+//
+// Until then this ships the pre-gate behaviour: the overlay draws at whatever anchor it is handed,
+// which is a known defect (docs/supported-targets.md §9, open question 7) and not an oversight.
 void App::apply_overlay_mode() {
     if (overlay_ == nullptr) return;
     const kd::OverlayMode want = settings_.overlay_mode;  // see the block above before changing

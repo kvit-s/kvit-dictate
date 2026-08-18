@@ -579,71 +579,123 @@ Measured 2026-08-18 against `tools/testtarget`, with the side channel supplying 
 repetitions per cell; **every cell reproduced to the pixel across all three**, and no record is
 flagged `suspect`. Raw records under `bench/results/phase0b/A09/`.
 
-This replaces an earlier sweep the same day whose numbers are superseded: five of its eleven cells
-did not arrange the scenario their name claimed. Those records are still on disk and are accurate
-about what was on screen; §5.9.3 says what went wrong and why two of them looked like product
-defects and were not.
+These are the records carrying `anchor.scored_against_previous`. Two earlier sweeps the same day
+are superseded and their numbers must not be mixed with these — §5.9.3 and §5.9.4 say why each
+changed. Both changes were to the *harness*; the product's estimator has not been touched.
 
-| Cell | Scenario | error_lh (×3) | | conf | source A |
+| Cell | Scenario | error_lh (×3) | | conf | incumbent anchor |
 |---|---|---|---|---|---|
-| `S01` | empty field | **0.07** | exact | 0.50 | available |
-| `S02` | mid-line insertion | 9.80 | over | 0.35 | available |
-| `S03` | selection replacement | 11.67 | over | 0.50 | available |
-| `S04` | line wrap | **0.07** | exact | 0.50 | available |
-| `S07` | vertical scroll (wrap at the bottom) | **48.07** | far over | 0.50 | available |
-| `S08` | horizontal scroll | **0.24** | within 1 lh | 0.49 | available |
-| `S10` | steady self-drawn caret | **0.12** | within 1 lh | 0.50 | **unavailable** |
-| `S11` | dark theme | 9.80 | over | 0.35 | available |
-| `S12` | light theme | 9.80 | over | 0.35 | available |
-| `S16` | LTR appended to RTL text | **0.07** | exact | 0.50 | available |
-| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | 0.85 | available |
+| `S01` | empty field | **0.07** | exact | 0.3742 | source A caret |
+| `S04` | line wrap | **0.07** | exact | 0.3742 | source A caret |
+| `S10` | steady self-drawn caret | **0.12** | within 1 lh | 0.5000 | **none — no caret exists** |
+| `S02` | mid-line insertion | 9.33 | over | 0.2083 | source A caret |
+| `S11` | dark theme | 9.33 | over | 0.2083 | source A caret |
+| `S12` | light theme | 9.33 | over | 0.2083 | source A caret |
+| `S07` | vertical scroll (wrap at the bottom) | 9.54 | over | 0.1894 | source A caret |
+| `S03` | selection replacement | 11.67 | over | 0.2941 | source A caret |
+| `S16` | LTR appended to RTL text | 19.13 | over | 0.1912 | source A caret |
+| `S08` | horizontal scroll | 39.00 | over | 0.1858 | source A caret |
+| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | — | source A caret |
 
 **Read `error_lh` as source C's error, not the product's.** The probe scores `anchor_from_diff`
 unconditionally, while the product picks the best available source and ranks a real caret (0.95)
 above any diff (≤0.90). In every cell except `S10`, `source_a.available` is true — these are Win32
-edit controls with a real system caret — so the shipping product would have used the caret and
-been exact, and none of these figures would reach a user. The probe's `winner` field applies its
-own rule (prefer C whenever the diff is non-empty) and therefore does **not** answer §3.3; that is
-a defect in this harness, recorded rather than fixed.
+edit controls with a real system caret — so the shipping product would have used the caret and been
+exact. The probe's `winner` field applies its own rule (prefer C whenever the diff is non-empty)
+and therefore does **not** answer §3.3; that is a defect in this harness, recorded rather than
+fixed.
+
+#### 5.9.2.1 The scorer discriminates. The threshold is set outside its range.
+
+This is the row's most useful result, and it is about `min_confidence` rather than about any one
+cell.
+
+Sort the ten measurable cells by *true* error and the confidences fall into two non-overlapping
+groups:
+
+| | n | confidence range |
+|---|---|---|
+| accurate — true error < 1 line height | 3 | **0.3742 – 0.5000** |
+| wrong — true error ≥ 1 line height | 7 | **0.1858 – 0.2941** |
+
+**Any threshold in (0.2941, 0.3742] classifies all ten correctly**, with a margin of 0.08.
+`AnchorConfig::min_confidence` defaults to **0.50**, which is above the entire range of *good*
+scores and therefore rejects all ten — including the three the estimator got right to within a
+tenth of a line height.
+
+So the conclusion is not that `score_diff` needs retuning. On this evidence it is doing its job: it
+ranks every accurate estimate above every inaccurate one. What is wrong is the default threshold,
+which sits above the output range the function actually produces. Lowering `min_confidence` to
+~0.33 makes plan.md §1.5's degradation gate correct on every measured cell.
+
+Four caveats, because this is ten cells on one application:
+
+- **n = 10, one application, one injection method, one reference text.** `A09` is the calibration
+  row, so its numbers are the right ones to calibrate against — but a second application could
+  close the 0.08 margin, and `S03` at 0.2941 is the nearest false positive.
+- **`S10` is a different regime.** It has no incumbent anchor at all, so it scores
+  `kProxNoPrevious` (0.85) on the proximity term while a *corroborated accurate* estimate earns
+  less. An estimate with nothing to check itself against therefore scores higher than one that
+  agrees with its predecessor, which is backwards, and it is why `S10` lands at 0.50 while `S01` —
+  the same arrangement with a caret available — lands at 0.3742.
+- **The proximity term still penalises ordinary typing.** It measures distance from the incumbent
+  in units of *line height*, and a 25-character commit moves the insertion point ~11 line heights
+  *horizontally*. That compresses every score toward the bottom of the range. It happens to
+  penalise the wrong answers more, which is why the separation survives.
+- **`S17` scores 0.90** — `kMaxDiffConfidence`, from a single changed region — on a cell where
+  nothing was injected at all. The diff is the caret blinking. Injection is refused first so it
+  reaches nothing, but "a blinking caret alone scores maximum confidence" deserves a scenario of
+  its own.
 
 #### `S10`: source C alone is accurate on a target that draws its own caret
 
 **0.12 line heights — about 2 px — reproduced three times.** `S10` is the only cell with no system
-caret, so source C is the only anchor available: it is the VS Code / Slack / terminal situation,
-which is to say every target anyone actually cares about, and the one the previous sweep left
-looking hopeless at 31.53 line heights.
+caret, so source C is the only anchor available: the VS Code / Slack / terminal situation, which is
+to say every target anyone actually cares about.
 
-Two things make this a strong result rather than a lucky one. `S10` is deliberately `S01`'s
-arrangement with **one** variable changed — an empty field, a clean append, and a control that
-never calls `CreateCaret` — so the difference between 0.07 and 0.12 is attributable to the absence
-of source A and to nothing else. And because there was no caret to centre on, the capture region
-fell back to the whole window (`region_basis: window`, 980×820), which is exactly what
-`App::submit_before_frame` does on the first commit into such a target. The bootstrap path was
-measured, not bypassed.
+`S10` is deliberately `S01`'s arrangement with **one** variable changed — an empty field, a clean
+append, and a control that never calls `CreateCaret`. And because there was no caret to centre on,
+the capture region fell back to the whole window, which is exactly what `App::submit_before_frame`
+does on the first commit into such a target. The bootstrap path was measured, not bypassed.
+
+The probe deliberately does **not** feed the pane's own caret back in as an incumbent, even though
+the side channel reports it: `tools/testtarget` knows where it drew that caret and the product
+cannot, so using it would hand the estimator an oracle. That distinction is `caret_self_drawn` in
+the state report, and getting it wrong inflated this cell's confidence by 0.11 in one intermediate
+sweep.
 
 What it does **not** say: this is a clean append into an empty field. `S02`'s reflow error and
-`S07`'s below both apply to a self-drawn target as much as to an edit control, and neither has
-been measured without a system caret.
+`S07`'s region error both apply to a self-drawn target as much as to an edit control, and neither
+has been measured without a system caret.
 
-#### `S07`: the failure is the capture region, not the estimator
+#### `S08` and `S16`: the leftward-growth RTL heuristic is the largest source of position error
 
-48.07 line heights, and the cause is geometric rather than statistical. The arrangement fills the
-control past its height, scrolls it to the bottom, and pads the last line so that REF-2 wraps it:
-the insertion point moves from x = 1157 to x = 429 — **728 px leftward** — and the control scrolls
-up a line, leaving it on the same screen row.
+`diff_insertion_point` flags a change as RTL when it grew **leftward** from the incumbent anchor on
+the same line, and then reports the *left* edge of the changed band instead of the right. It fires
+on three cells here, none of which is RTL text:
 
-`capture_region_for` (`src/anchor.h`: 900 × 220 at 96 dpi, insertion point at 65 % of the width)
-extends **585 px behind** the previous insertion point and 315 px in front. The new insertion
-point was 143 px beyond that edge, so **the truth was outside the captured rectangle** and no
-estimator could have reported it. `looks_like_scroll` stayed false for a second geometric reason:
-the ordinary numbered lines are short and end left of the region entirely, so within the captured
-rectangle the scroll moved blank pixels and only the padded line changed.
+- **`S08`, 0.24 → 39.00 line heights.** In an `ES_AUTOHSCROLL` control at its right edge the caret
+  stays pinned while the text slides left, so `caret_before_injection == ground_truth` and the whole
+  changed band lies to the *left* of the incumbent. The heuristic reads that as bidi and moves the
+  estimate to the far end of the band.
+- **`S16`, 0.07 → 19.13.** The same shape in the right-aligned RTL control: the append point does
+  not move, so the band grows leftward.
+- **`S07`, 48.07 → 9.54.** The same flip, accidentally *toward* the truth.
 
-This is a **product** limitation and not a harness artefact — `App::submit_before_frame` chooses
-the region by the same rule, from the same function. The threshold is concrete: *when the previous
-insertion point is more than 585 px into a line at 96 dpi, a wrap can put the next one outside the
-capture region.* Re-running with `--settle-ms 600` reproduced 48.07 exactly, so it is not a
-partial-repaint artefact either.
+The comment on that heuristic already says it "sets a flag and costs confidence rather than claiming
+to have detected bidi text" — and the flag also *relocates the reported point*, which is the part
+that costs 39 line heights. Its confidence penalty (`kRtlPenalty` 0.65) is doing useful work: all
+three of these cells land in the rejected group. And **`S08` and `S16`'s previously published
+near-zero errors were artefacts of the probe not supplying an incumbent** — they are the two cells
+§5.9.3 already flagged as weak evidence for exactly the reason that turns out to break them.
+
+`S07`'s capture-region finding stands independently: `capture_region_for` reaches 585 px behind the
+previous insertion point (900 × 220 at 96 dpi, point at 65 % of the width) and the wrap moved the
+insertion point 728 px, so the truth was outside the captured rectangle. That is a product
+limitation — `src/main.cpp` chooses the region by the same rule — and the threshold is concrete: *an
+insertion point more than 585 px into a line at 96 dpi can wrap outside the capture region.*
+Re-running with `--settle-ms 600` reproduced the figure exactly, so none of this is a
+partial-repaint artefact.
 
 #### The rest
 
@@ -651,20 +703,14 @@ partial-repaint artefact either.
 insertion reflows, so the rightmost changed pixel is the end of the reflowed line rather than the
 insertion point. `S11` and `S12` match `S02` to the pixel — **theme does not affect the estimate**.
 
-`S04` at 0.07 is a **weaker result than it looks**: the long line already wraps when the scenario
-is arranged, so the injection appends to the last visual line without causing a new wrap. It
-measures an append inside a wrapped paragraph, not a wrap event. The wrap event is `S07`.
-
-`S08` and `S16` both have `caret_before_injection == ground_truth` — in a horizontally scrolling
-`ES_AUTOHSCROLL` control the caret stays pinned at the right edge while the text slides left, and
-in the right-aligned RTL control the append point does not move either. Their near-zero errors are
-therefore weak evidence: an estimator that simply returned the previous anchor would score the
-same. `S08` does confirm that a horizontal scroll does not *break* the estimate; `S16` still
-measures an LTR run appended to RTL text rather than RTL dictation, which REF-2 cannot produce.
+`S04` at 0.07 is a **weaker result than it looks**: the long line already wraps when the scenario is
+arranged, so the injection appends to the last visual line without causing a new wrap. It measures
+an append inside a wrapped paragraph, not a wrap event. The wrap event is `S07`.
 
 **Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an autocomplete
 popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or elevation
 state that was not changed unattended.
+
 
 ### 5.9.3 The superseded sweep, and why five of its cells were arranged wrongly
 
@@ -711,12 +757,33 @@ recorded no diff at all — there was nothing left on screen to change.
 the drift to 49.95 line heights on the third: by then the accumulated text had wrapped, and the
 scenario under measurement was no longer `S04`.
 
-The common thread is the one the handover has been recording for four sessions: **a contract
+The common thread has now recurred for five sessions running: **a contract
 implemented on one side and never checked from the other.** The sweep declared what each cell
 arranged; nothing ever asked the target whether that was what it had. `tools/testtarget` now
 reports `sel_start` / `sel_end` / `text_length` in its state, `kd_probe --dump-state` prints that
 state without injecting or capturing anything, and `verify-arrange.ps1` checks all eleven
 arrangements against declared expectations before any sweep is allowed to mean anything.
+
+### 5.9.4 The second superseded sweep — the probe scored against no incumbent anchor
+
+The sweep that produced 48.07 for `S07`, 0.24 for `S08` and 0.07 for `S16` called
+`score_diff(diff, region, std::nullopt)`. The product never does: at the moment a commit's diff is
+scored there is always a published anchor to compare against — source A's caret at session start,
+or the previous commit's own estimate. Passing `std::nullopt` disabled two things at once:
+
+- the **proximity term**, which is the only part of `score_diff` that can notice the estimate has
+  jumped, so every confidence in that sweep was missing its main discriminator; and
+- `diff_insertion_point`'s **leftward-growth RTL check**, which needs an incumbent to compare
+  against and which — once supplied — turns out to relocate the estimate on three cells.
+
+The probe now builds the incumbent from the pre-injection caret and records it as
+`anchor.scored_against_previous`. Records without that field are from the earlier sweeps and are
+not comparable. The self-drawn pane is excluded on purpose: `tools/testtarget` reports the caret it
+drew itself, and feeding that back would give the estimator an oracle the product cannot have.
+
+The lesson is the same one §5.9.3 records, one level further in: **a harness that is not faithful to
+the product measures a different function.** The first sweep arranged the wrong scenarios; this one
+arranged them correctly and then scored them with a call the product never makes.
 
 ### 5.10 Incidental observations — **not measurements**
 
@@ -733,7 +800,7 @@ a human watching a screen.
 
 | 2026-08-17 | **Windows Terminal** (`windowsterminal.exe`, standalone) | Three things, and the third is the useful one. (1) **Console detection works**: the session logged `console=1`, so the target was correctly classified and the console branch is live. (2) **The text arrived correctly** under `SendInput` at default pacing — no garbling of the Notepad kind. (3) **The overlay fell back to the floating pill, it appeared where the mouse pointer happened to be, and it never moved.** That is the §4.2 *Degraded* tier behaving exactly as designed, and for a console it is the expected outcome: there is no caret rectangle to be had from UIA or `GetGUIThreadInfo`, so source C is the only anchor available — and source C logged `empty diff after a visible commit` on every commit of that session, so it contributed nothing and confidence never rose above `min_confidence` 0.5. **Not a measurement**: `A03` is the cell for this target and it stays empty until the probe runs. What this row is for is that it makes `A03`'s likely verdict *Degraded rather than Unsupported* — the text lands, only the inline preview does not — and it says which of the two questions to put first. |
 
-| 2026-08-17 | **Windows' own dictation (`Win+H`)** — *third-party behaviour, for comparison* | **Shows a live preview in VS Code's integrated terminal, and none at all in Windows Terminal** — in the real console nothing appears until the utterance is finalised, and then the final text is applied in one go. The contrast is the whole value of this row: Microsoft's first-party dictation, with whatever private access it has, draws the same line we do, in the same place, between an Electron text surface and a real Win32 console. It is the closest thing to a control this project can get, and it says **the console is the constraint, not our implementation**. Note we degrade *less* badly there than it does — a floating pill with live text against no preview at all. This is the main argument for capping `A03`'s ambition at the §4.2 *Degraded* tier rather than spending the Windows.Graphics.Capture work (§6 / handover §6) on inline preview inside consoles. Not a measurement of anything we built and no cell may cite it; the mechanism was not investigated (likely TSF rather than synthetic input), so this is an observation about outcomes only. |
+| 2026-08-17 | **Windows' own dictation (`Win+H`)** — *third-party behaviour, for comparison* | **Shows a live preview in VS Code's integrated terminal, and none at all in Windows Terminal** — in the real console nothing appears until the utterance is finalised, and then the final text is applied in one go. The contrast is the whole value of this row: Microsoft's first-party dictation, with whatever private access it has, draws the same line we do, in the same place, between an Electron text surface and a real Win32 console. It is the closest thing to a control this project can get, and it says **the console is the constraint, not our implementation**. Note we degrade *less* badly there than it does — a floating pill with live text against no preview at all. This is the main argument for capping `A03`'s ambition at the §4.2 *Degraded* tier rather than spending the Windows.Graphics.Capture work (§6) on inline preview inside consoles. Not a measurement of anything we built and no cell may cite it; the mechanism was not investigated (likely TSF rather than synthetic input), so this is an observation about outcomes only. |
 
 None of these targets is in the §5 application list as a *measured* row.
 
@@ -947,6 +1014,56 @@ the answer is written here, in prose, next to the question.
 6. **Does any target rewrite our committed bytes after we commit them?** (Slack autoformat,
    Office autocorrect.) This is not an ICER violation by us, but it changes what "committed"
    means in that target, and the declaration should say so. — *Unanswered.*
+
+7. **What should `AnchorConfig::min_confidence` be?** — *Measured on `A09`; the number is a
+   decision that is still open.* §5.9.2.1 has the data: across the ten measurable cells every
+   estimate accurate to within one line height scored 0.3742–0.5000 and every inaccurate one scored
+   0.1858–0.2941, so **any threshold in (0.2941, 0.3742] classifies all ten correctly** and the
+   0.50 default classifies none of them correctly. `score_diff` discriminates; the default sits
+   above the range it produces.
+
+   This blocks plan.md §1.5's degradation gate, which is **written and tested but deliberately not
+   called** — `kd::overlay_mode_for()` in src/overlay.cpp, seven tests in tests/test_overlay.cpp,
+   and `App::apply_overlay_mode()` carries the full reason at the point where the call belongs.
+   Wiring it against 0.50 would degrade every commit on every target, including the three the
+   estimator gets right to a couple of pixels.
+
+   What is *not* being decided on one application's evidence is the number: the separating margin is
+   0.08 and `S03` (11.67 line heights of error, 0.2941) is the nearest false positive, so a second
+   application could close it. Either measure one first, or adopt ~0.33 as a calibrated-on-`A09`
+   default and say so where the setting is documented. **Until then the pre-gate defect ships: the
+   overlay draws at whatever anchor it is handed, including one the estimator scored 0.19.**
+
+   Two related weaknesses, neither of which blocks the above:
+
+   - `score_diff`'s proximity term measures horizontal movement in units of *line height*, so a
+     25-character commit reads as an ~11-line-height jump and every score is compressed toward the
+     bottom of the range. Pinned by `anchor.s10_the_second_commit_is_scored_WORSE_not_better`. It
+     penalises wrong answers harder, which is why the separation survives.
+   - An estimate with **no** incumbent to check itself against scores `kProxNoPrevious` 0.85 —
+     higher than a corroborated accurate one. `S10` at 0.50 against `S01` at 0.3742 is exactly
+     that, and it is backwards.
+
+8. **Should the leftward-growth RTL heuristic relocate the insertion point, or only cost
+   confidence?** — *Measured; the decision is open.* `diff_insertion_point` calls a change RTL when
+   it grew leftward from the incumbent on the same line, and then reports the *left* edge of the
+   changed band instead of the right. It fires on three `A09` cells and none of them is RTL text
+   (§5.9.2): `S08` at **39.00** line heights, `S16` at **19.13**, and `S07` where the same flip
+   lands accidentally near the truth. Its own comment says it "sets a flag and costs confidence
+   rather than claiming to have detected bidi text" — and the flag also moves the point, which is
+   the part that costs 39 line heights. The confidence penalty is working (all three are in the
+   rejected group), so the question is whether the relocation should happen at all.
+
+9. **Should the capture region widen, re-centre, or stay as it is?** — *Measured; the decision is
+   open.* `capture_region_for` reaches 585 px behind the previous insertion point (900 × 220 at
+   96 dpi, point at 65 % of the width). `A09`/`S07`'s wrap moved the insertion point 728 px
+   leftward, putting the truth outside the captured rectangle, so no estimator could have found it.
+   `src/main.cpp`'s `App::submit_before_frame` chooses the region by the same rule, so this is the
+   product's behaviour and not the harness's. The concrete threshold: *an insertion point more than
+   585 px into a line at 96 dpi can wrap outside the capture region.* Widening costs capture time
+   on every commit; the 65/35 rightward bias assumes text grows rightward, which is exactly
+   backwards when a wrap fires; or a low score here is the estimator correctly reporting "I do not
+   know" and question 7's gate should hold the previous anchor.
 
 ---
 

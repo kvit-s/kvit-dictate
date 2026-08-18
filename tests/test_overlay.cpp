@@ -19,15 +19,21 @@
 // estimator had *correctly* scored at 0.4953 — below the 0.5 default — and the product would
 // have drawn the preview at it regardless. The scoring was doing its job; nothing was listening.
 //
-// ⚠ These tests cover a function `src/main.cpp` does NOT yet call. That is deliberate and it is
-// recorded in three places — `App::apply_overlay_mode`, the declaration in overlay.h, and
-// handover.md §8 — because "tested but uncalled" is the exact shape of the twenty defects this
-// project has already had. The gate was wired, and unwiring it was a decision taken on evidence:
-// enforcing this threshold against today's `score_diff` makes the inline preview unreachable on
-// every target that has no system caret, because the scorer penalises ordinary typing. See
-// tests/test_anchor.cpp, `s10_first_commit_falls_a_hair_under_the_default_threshold` and
-// `s10_the_second_commit_is_scored_WORSE_not_better`. The rule below is right; the numbers it
-// would be fed are not calibrated yet, and calibrating them is what turns this on.
+// ⚠ These tests cover a function `src/main.cpp` does NOT yet call. That is deliberate, and it is
+// recorded in three other places — `App::apply_overlay_mode`, the declaration in overlay.h, and
+// docs/supported-targets.md §9 question 7 — because "tested but uncalled" is the exact shape of the
+// twenty defects this project has already had, and it must not be mistaken for another one.
+//
+// The gate was wired and then unwired on evidence. The rule below is right; what is wrong is
+// `AnchorConfig::min_confidence`'s default of 0.50, which sits **above the range `score_diff`
+// actually produces**, so enforcing it would degrade every commit on every target. The measured
+// A09 row (§5.9.2.1) separates cleanly — accurate estimates 0.3742–0.5000, inaccurate ones
+// 0.1858–0.2941 — so any threshold in (0.2941, 0.3742] classifies all ten cells correctly. The
+// scorer discriminates; picking that number on one application's evidence is what is deferred.
+//
+// Note the two cases below that quote **0.4953**: that is A09/S07's confidence from the sweep that
+// scored against no incumbent anchor. It is kept as a test input because it is a real number the
+// function must handle, not because it is still the published figure for that cell — see §5.9.4.
 
 #include "kd_test.h"
 
