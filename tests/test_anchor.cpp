@@ -14,6 +14,7 @@
 #include "anchor.h"
 
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -446,4 +447,98 @@ KD_TEST(anchor, an_unchanged_after_frame_publishes_nothing) {
     KD_CHECK(!listener.wait_for_one(std::chrono::milliseconds(400)));
     est.stop();
     KD_CHECK(listener.anchors().empty());
+}
+
+// ═══ The A09/S07 measurement, replayed ══════════════════════════════════════════════════════
+//
+// docs/supported-targets.md §5.9.2 measured 48.07 line heights of anchor error on a line wrap at
+// the bottom of a scrolling control, reproducibly, three times. These tests replay that exact
+// DiffResult and capture region so the consequences are pinned in code rather than argued from a
+// JSON file. Every number below is copied from
+// bench/results/phase0b/A09/S07/sendinput/*/result.json.
+//
+// The point is not that the estimator is inaccurate here — it cannot be accurate, because the
+// true insertion point is outside the rectangle that was captured. The point is what the rest of
+// the pipeline does with an answer it has itself scored as not good enough.
+
+namespace {
+
+// The measured region: capture_region_for() around the pre-injection insertion point (1157, 442),
+// 900 x 220 at 96 dpi with the point at 65 % of the width.
+constexpr Rect kS07Region{572, 332, 1472, 552};
+// Where the caret really was after the wrap. 728 px left of where it started, because the wrap
+// moved it to the beginning of a new visual line and the control scrolled up to compensate.
+constexpr kd::anchor::Point kS07Truth{429, 442};
+constexpr int32_t kS07LineHeight = 15;
+
+kd::anchor::DiffResult s07_diff() {
+    kd::anchor::DiffResult d;
+    d.changed_bounds = Rect{0, 98, 606, 125};
+    d.last_changed_row_extent = Rect{0, 113, 578, 125};
+    d.changed_rows = 24;
+    d.changed_regions = 2;
+    // Not recorded per-cell by the probe; any positive value drives the same branches, and the
+    // fraction-of-region term in score_diff is dominated by changed_rows.
+    d.changed_pixels = 4000;
+    d.looks_like_scroll = false;
+    return d;
+}
+
+}  // namespace
+
+KD_TEST(anchor, s07_wrap_puts_the_truth_outside_the_captured_region) {
+    // The measurement's own explanation, asserted rather than asserted-in-prose: the region
+    // reaches 585 px behind the previous insertion point, and the new one is further than that.
+    KD_CHECK(kS07Truth.x < kS07Region.left);
+    KD_CHECK_EQ(kS07Region.left - kS07Truth.x, 143);
+
+    const std::optional<Anchor> a =
+        kd::anchor::anchor_from_diff(s07_diff(), kS07Region, std::nullopt, 1000);
+    KD_REQUIRE(a.has_value());
+
+    // What the estimator reported, and it is not a wild jump: the right edge of the last changed
+    // text row, which is 7 px from where the caret was BEFORE the injection. So the failure mode
+    // is not "the overlay leaps across the screen" — it is "the overlay stays put while the text
+    // walks away from it". Those need different fixes, and the difference is only visible here.
+    KD_CHECK_EQ(a->insertion_point.x, 1150);
+    KD_CHECK_EQ(a->insertion_point.y, 445);
+
+    const double dx = static_cast<double>(a->insertion_point.x - kS07Truth.x);
+    const double dy = static_cast<double>(a->insertion_point.y - kS07Truth.y);
+    const double err_lh = std::sqrt(dx * dx + dy * dy) / kS07LineHeight;
+    KD_CHECK_NEAR(err_lh, 48.07, 0.02);  // the figure published in §5.9.2
+}
+
+KD_TEST(anchor, s07_scores_below_min_confidence_and_is_published_anyway) {
+    const std::optional<Anchor> a =
+        kd::anchor::anchor_from_diff(s07_diff(), kS07Region, std::nullopt, 1000);
+    KD_REQUIRE(a.has_value());
+
+    // The estimator's own verdict on this answer: BELOW the default threshold. §5.9.2 quotes it
+    // as 0.50 because the probe prints two decimals; it is 0.4953, and the distinction is the
+    // whole of this test.
+    kd::anchor::AnchorConfig cfg;
+    KD_CHECK_NEAR(a->confidence, 0.4953f, 0.001);
+    KD_CHECK(a->confidence < cfg.min_confidence);
+    KD_CHECK(!a->is_usable(cfg.min_confidence));
+
+    // And yet it replaces a previous source-C anchor, because should_replace_anchor treats a
+    // candidate from the SAME source as a refresh and returns true without consulting
+    // min_confidence at all. Nothing downstream re-checks: AnchorEstimator::publish() stores
+    // whatever should_replace_anchor accepts, and Overlay::set_anchor() takes whatever it is
+    // given.
+    Anchor previous;
+    previous.insertion_point = kd::anchor::Point{1157, 442};
+    previous.line_height = kS07LineHeight;
+    previous.confidence = 0.90f;  // a much better earlier diff
+    previous.source = kd::anchor::Source::CommitDiff;
+    previous.timestamp_ms = 900;
+
+    KD_CHECK(kd::anchor::should_replace_anchor(previous, *a, cfg, 1000));
+
+    // A caret, by contrast, is not displaced by it — the source ranking does hold.
+    Anchor caret_anchor = previous;
+    caret_anchor.source = kd::anchor::Source::Caret;
+    caret_anchor.confidence = kd::anchor::kCaretConfidence;
+    KD_CHECK(!kd::anchor::should_replace_anchor(caret_anchor, *a, cfg, 1000));
 }

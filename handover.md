@@ -288,31 +288,48 @@ drives the probe unattended must pass it.
 
 ## 8. Suggested order
 
-1. **`S07`'s capture region, which is now the one measured product defect.** A wrap can move the
-   insertion point outside the captured rectangle, and `src/main.cpp:841` chooses that rectangle
-   the same way the probe does. Three things to decide, in this order: whether the region should
-   widen (cheap, costs capture time on every commit), whether it should be re-centred on the
-   *previous* line's start rather than the caret (asymmetry is currently 65/35 rightward, on the
-   reasoning that text grows rightward — which is exactly backwards when a wrap fires), or whether
-   a low-confidence result here is simply correct behaviour and the overlay should hold its
-   previous anchor. **`score_diff` returned 0.50 for it**, i.e. above `min_confidence`, so the
-   product would currently move the overlay 48 line heights. That last point is the actual bug and
-   is worth checking first.
-2. **The two checks in §4** — one session each, both need a human.
-3. **Fix `S04` to construct a real wrap**, then measure `S02`'s reflow case and `S07`'s wrap case
+1. **`min_confidence` is dead configuration — nothing in `src/` reads it.** Found by replaying
+   the `S07` measurement through the product's own functions
+   (`tests/test_anchor.cpp`, `anchor.s07_*`, both passing). The chain:
+
+   * `anchor_from_diff` rejects only `confidence <= 0`, so `S07`'s 0.4953 survives.
+   * `should_replace_anchor` short-circuits on `candidate.source == current->source` with
+     "this is a refresh, not a switch" and returns **true** without consulting
+     `cfg.min_confidence`. On a target with no system caret, source C is always the incumbent, so
+     every subsequent source C answer is accepted at any confidence above zero.
+   * `Anchor::is_usable(threshold)` — the gate plan.md §1.5 describes — is referenced **only by
+     `tests/test_anchor.cpp`**. `AnchorEstimator::current_fallback()` is likewise called from
+     nowhere in `src/`; `overlay.cpp:569` has a comment saying `main.cpp` "is expected to call
+     `set_mode()` accordingly", and `main.cpp` does not.
+   * `Overlay::set_anchor` stores whatever it is handed.
+
+   So `settings.anchor.min_confidence` and `below_threshold` parse, validate, round-trip and do
+   nothing. This is the twentieth instance of the pattern in §6, and the most consequential:
+   plan.md §1.5's deterministic-degradation rule is unimplemented on the path `main.cpp` drives.
+
+2. **Then `S07`'s capture region.** A wrap can move the insertion point outside the captured
+   rectangle, and `src/main.cpp:841` chooses that rectangle the same way the probe does. Note the
+   failure mode is **not** a jump: the estimate lands at (1150, 445), 7 px from where the caret was
+   *before* the injection, so the overlay sits still while the text walks away from it. Options,
+   once the gate above exists: widen the region (costs capture time on every commit), re-centre it
+   (the 65/35 rightward bias assumes text grows rightward, which is backwards when a wrap fires),
+   or accept that 0.4953 is the estimator correctly reporting "I do not know" and let the gate hold
+   the previous anchor.
+3. **The two checks in §4** — one session each, both need a human.
+4. **Fix `S04` to construct a real wrap**, then measure `S02`'s reflow case and `S07`'s wrap case
    *without* a system caret. `S10` says source C handles a clean append into a self-drawn target;
    nothing says it handles the two cases that are known to be hard there. That is a small change
    to `arrange.ps1` plus one sweep.
-4. **The rest of the `A09` row**, then a second application. `A09` is the calibration row; a real
+5. **The rest of the `A09` row**, then a second application. `A09` is the calibration row; a real
    application's numbers are only interpretable against it, and it is not finished. Making the
    probe's `winner` follow the product's rule is the prerequisite for filling the §5 matrices,
    whose `Src` column it currently answers wrongly.
-5. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
+6. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
    the sidecar real. What remains is `envs/onnx`, the weights, and the first real `load()`. Expect
    `sherpa_onnx_streaming.py`'s eight recorded UNVERIFIED assumptions to be what that run is about.
    `UV_CACHE_DIR` must be on `D:` — uv hardlinks from cache into venvs and hardlinks cannot cross
    volumes.
-6. **Record the corpus** with `bench/record.py` — read its report first; it is written against the
+7. **Record the corpus** with `bench/record.py` — read its report first; it is written against the
    C++ capture path and may need an entry point `audio_capture` does not expose.
 
 Untouched and still open: **pre-roll dropped across the VAD seam** (§6 of the previous handover —
