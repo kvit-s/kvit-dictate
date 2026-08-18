@@ -154,6 +154,18 @@ struct AppState {
 
     bool dark = false;
     bool large_font = false;
+
+    // Whether the log LISTBOX is updated. The log itself always accumulates - `log_total` and the
+    // side channel's `events` are unaffected - because this switch exists to stop the pane
+    // REPAINTING, not to stop recording.
+    //
+    // Why it has to exist: this is the calibration target (§5.9), and its own instrumentation was
+    // contaminating the measurement it exists to enable. The pane takes an LB_ADDSTRING and an
+    // LB_SETTOPINDEX per received keystroke, so a 207-byte REF-1 repaints it several hundred
+    // times, and any capture region that overlaps it sees a diff dominated by scrolling log text
+    // rather than by the injected characters. Measured against A09/S01: 14-17 changed regions and
+    // ~40 line heights of apparent anchor error, none of it the estimator's doing.
+    bool log_visual = true;
     UINT dpi = 96;
 
     std::deque<LogEntry> log;
@@ -584,7 +596,7 @@ void log_event(int control_id, const wchar_t* message, std::wstring detail) {
     ++g.log_total;
     while (g.log.size() > kMaxLogEntries) g.log.pop_front();
 
-    if (g.log_list) {
+    if (g.log_visual && g.log_list) {
         const LRESULT count = SendMessageW(g.log_list, LB_GETCOUNT, 0, 0);
         if (count != LB_ERR && count > static_cast<LRESULT>(kMaxLogEntries)) {
             SendMessageW(g.log_list, LB_DELETESTRING, 0, 0);
@@ -762,6 +774,7 @@ std::string build_state_json() {
 
     root.set("caret", caret_report());
     root.set("theme", kd::json::Value::string(g.dark ? "dark" : "light"));
+    root.set("log_visual", kd::json::Value::boolean(g.log_visual));
     root.set("font_pt", kd::json::Value::number(static_cast<int64_t>(g.large_font ? 20 : 10)));
     root.set("dpi", kd::json::Value::number(static_cast<int64_t>(g.dpi)));
     root.set("scroll_mode",
@@ -797,6 +810,22 @@ void handle_command(const std::string& cmd) {
     }
     if (cmd.rfind("marker:", 0) == 0) {
         g.marker = kd::utf8::to_utf16_or_empty(cmd.substr(7));
+        return;
+    }
+    if (cmd.rfind("log-visual:", 0) == 0) {
+        // "log-visual:off" during a measurement, "on" to get the pane back. The probe sets this
+        // automatically for A09; a human debugging by eye wants it on.
+        const bool on = cmd.substr(11) != "off";
+        if (on != g.log_visual) {
+            g.log_visual = on;
+            if (!on && g.log_list) {
+                // Clear what is already drawn as well: leaving several hundred stale lines on
+                // screen would still be in the capture, just not changing.
+                SendMessageW(g.log_list, LB_RESETCONTENT, 0, 0);
+                InvalidateRect(g.log_list, nullptr, TRUE);
+                UpdateWindow(g.log_list);
+            }
+        }
         return;
     }
     if (cmd.rfind("focus:", 0) == 0) {

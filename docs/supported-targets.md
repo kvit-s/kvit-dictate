@@ -543,6 +543,32 @@ our heuristic must catch.
 
 ---
 
+### 5.9.1 Open methodology defect — **REF-1 cannot measure §3.4**
+
+Found on 2026-08-18 while making A09 self-measuring, and recorded before any sweep because it
+decides what every cell in §3.4 would mean.
+
+`REF-1` is a Unicode-fidelity torture string (§3.2's job) and it is being used as the injection
+for the anchor-error column (§3.4) as well. It cannot serve both:
+
+* **It does not fit the capture region.** 159 characters, ~1272 px in the target's Consolas 10 pt
+  against a 900 px capture region. The diff is therefore clipped at the region's right edge, and
+  "rightmost changed pixel" — which is how `anchor_from_diff` places the insertion point —
+  returns the *boundary of the region*, not the end of the text.
+* **It ends with an RTL run** (`العربية עברית`). After a bidi run the caret sits at the **left**
+  of it, which is the failure `S16` exists to measure. With REF-1 as the universal injection,
+  every row measures S16's failure mode underneath whatever it claims to be measuring.
+
+Measured on A09/S01, reproducible to the pixel across repetitions: estimate pinned at x=900
+(region edge), true post-commit caret at x=170, line height 15 → **48.68 line heights of error**,
+of which `(900-170)/15 = 48.7` is entirely accounted for by the two effects above. Nothing in that
+number is the estimator's doing, and A09 is the row §5.9 says calibrates all the others.
+
+**Not fixed here, because it is a change to what the matrix measures rather than a bug in code.**
+The shape of the fix is two injections rather than one: REF-1 for §3.2 fidelity, and a short LTR
+string that fits inside the capture region for §3.4 anchor error. Until that is decided, no §3.4
+figure should be filled in, and the A09 records already written carry `notes` saying so.
+
 ### 5.10 Incidental observations — **not measurements**
 
 Things seen while running the product for other reasons. They are recorded because they change

@@ -154,6 +154,53 @@ struct TargetState {
     int64_t events_total = 0;
 };
 
+bool parse_target_state(const std::string& json_text, TargetState& out);
+
+// Wait until the target has finished consuming the injection, then report its state.
+//
+// `Injector::inject()` returns once the events have been *sent*, not once the target has
+// processed them: SendInput queues into the target's input queue and a 207-byte REF-1 is several
+// hundred messages. Reading the side channel immediately caught one run with 34 of 207 bytes
+// present, and - worse than a short readback - it sampled the caret *mid-typing*, so the
+// "post-commit insertion point" that every error_lh is scored against was wherever the target had
+// got to. That is a silent, per-cell random bias, not a visible failure.
+//
+// Settling on the target's own counters rather than a fixed sleep: `events_total` and the text
+// length both stop moving exactly when it is done, whatever the machine's load.
+bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms) {
+    TargetState prev;
+    bool have_prev = false;
+    int stable = 0;
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
+    for (;;) {
+        const std::optional<std::string> reply = sc.query("state");
+        TargetState now;
+        if (reply.has_value() && parse_target_state(*reply, now)) {
+            if (have_prev && now.events_total == prev.events_total &&
+                now.text.size() == prev.text.size()) {
+                if (++stable >= 2) {  // two agreeing reads, ~80 ms apart
+                    out = now;
+                    return true;
+                }
+            } else {
+                stable = 0;
+            }
+            prev = now;
+            have_prev = true;
+        }
+        if (GetTickCount64() >= deadline) {
+            if (have_prev) {
+                out = prev;
+                std::printf("  side channel: target still busy at the settle deadline; the "
+                            "readback and ground truth for this repetition may be mid-injection\n");
+                return true;
+            }
+            return false;
+        }
+        Sleep(40);
+    }
+}
+
 bool parse_target_state(const std::string& json_text, TargetState& out) {
     kd::json::Value root;
     kd::json::Error err;
@@ -396,6 +443,13 @@ int main(int argc, char** argv) {
         } else {
             use_side_channel = true;
             std::printf("side channel: connected to tools/testtarget\n");
+            // Stop the target's log pane repainting for the duration of the run. It takes an
+            // LB_ADDSTRING per received keystroke, so any capture region overlapping it measures
+            // scrolling log text instead of the injected characters - A09/S01 reported 14-17
+            // changed regions and ~40 line heights of apparent error with it live. Events are
+            // still recorded; only the drawing stops, so `readback` and `events_total` are
+            // unaffected. Restored at the end of the run.
+            side_channel.query("log-visual:off");
         }
     }
 
@@ -570,8 +624,8 @@ int main(int argc, char** argv) {
             std::string readback = "unavailable";
             std::string readback_source = "operator";
             if (use_side_channel) {
-                if (const std::optional<std::string> reply = side_channel.query("state")) {
-                    if (parse_target_state(*reply, after_state)) {
+                {
+                    if (settle_target(side_channel, after_state, 4000)) {
                         have_after_state = true;
                         readback = after_state.text;
                         readback_source = "side-channel";
@@ -776,5 +830,6 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (use_side_channel) side_channel.query("log-visual:on");
     return 0;
 }
