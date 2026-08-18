@@ -428,6 +428,12 @@ int main(int argc, char** argv) {
     int repeat = 1;
     int countdown = 5;
     bool status_only = false;
+    // Ask tools/testtarget what state it is in and print the answer. Injects nothing, captures
+    // nothing and never touches the foreground, so it is the one probe mode that is safe to run
+    // while the machine is in use — and it is how a scenario arrangement gets checked without
+    // typing REF-2 into whatever is focused to find out.
+    bool dump_state = false;
+    std::string side_channel_cmd;
     std::string notes;
 
     for (int i = 1; i < argc; ++i) {
@@ -442,10 +448,18 @@ int main(int argc, char** argv) {
         else if (a == "--countdown") countdown = std::atoi(next().c_str());
         else if (a == "--notes") notes = next();
         else if (a == "--status") status_only = true;
+        else if (a == "--dump-state") dump_state = true;
+        else if (a == "--send") { side_channel_cmd = next(); dump_state = true; }
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "kd_probe — Phase 0B measurement harness (fixed text, no ASR)\n\n"
                 "  --status                 print the resumable coverage matrix and exit\n"
+                "  --dump-state             print tools/testtarget's state JSON and exit.\n"
+                "                           Injects nothing and does not touch the foreground.\n"
+                "  --send \"<cmd>\"           send one side-channel command (focus:<control>,\n"
+                "                           select:<a>:<b>, set-text:<utf8>, reset-log,\n"
+                "                           log-visual:on|off) and print the state that follows.\n"
+                "                           Implies --dump-state. Also injects nothing.\n"
                 "  --app A01..A09           application under test\n"
                 "  --scenario S01..S18      scenario under test\n"
                 "  --text ref1|ref2         ref1 = Unicode fidelity (§3.2, the default);\n"
@@ -467,6 +481,28 @@ int main(int argc, char** argv) {
 
     if (status_only) {
         print_matrix_status();
+        return 0;
+    }
+
+    if (dump_state) {
+        SideChannel sc;
+        if (!sc.open()) {
+            std::printf("could not create the side-channel window\n");
+            return 2;
+        }
+        if (!SideChannel::target_present()) {
+            std::printf("no kd_testtarget window; start build-*/bin/*/kd_testtarget.exe first\n");
+            return 2;
+        }
+        // "state" is not a real command — anything the target does not recognise falls through
+        // to a plain state report, which is exactly what an empty --send should produce.
+        const std::optional<std::string> reply =
+            sc.query(side_channel_cmd.empty() ? std::string("state") : side_channel_cmd);
+        if (!reply.has_value()) {
+            std::printf("no reply from kd_testtarget\n");
+            return 2;
+        }
+        std::printf("%s\n", reply->c_str());
         return 0;
     }
 

@@ -760,6 +760,30 @@ std::string build_state_json() {
           kd::json::Value::number(static_cast<int64_t>(fid == kIdSelfCaret
                                                            ? line_height_of(g.self_caret)
                                                            : line_height_of(focus))));
+    // Where the caret is IN THE TEXT, in UTF-16 code units, as distinct from where it is on
+    // screen. Four scenarios were arranged with EM_SETSEL(-1, -1) in the belief that it moved
+    // the caret to the end; it does not, and because nothing reported the offset, the only
+    // evidence that they had all injected at offset 0 instead was buried in a readback string
+    // inside a result file nobody re-read. A harness that reports where it put the caret can be
+    // checked before it measures anything.
+    {
+        int64_t sel_start = 0, sel_end = 0;
+        if (fid == kIdSelfCaret) {
+            sel_start = sel_end = static_cast<int64_t>(pane.caret);
+        } else if (focus) {
+            DWORD a = 0, b = 0;
+            SendMessageW(focus, EM_GETSEL, reinterpret_cast<WPARAM>(&a),
+                         reinterpret_cast<LPARAM>(&b));
+            sel_start = static_cast<int64_t>(a);
+            sel_end = static_cast<int64_t>(b);
+        }
+        f.set("sel_start", kd::json::Value::number(sel_start));
+        f.set("sel_end", kd::json::Value::number(sel_end));
+        f.set("text_length", kd::json::Value::number(static_cast<int64_t>(
+                                 fid == kIdSelfCaret ? pane.text.size()
+                                 : focus             ? static_cast<size_t>(GetWindowTextLengthW(focus))
+                                                     : 0u)));
+    }
     root.set("focus", std::move(f));
 
     std::string text;
@@ -970,6 +994,63 @@ void build_menu(HWND h) {
     SetMenu(h, bar);
 }
 
+// EM_SETSEL(-1, -1) does NOT put the caret at the end of an edit control. wParam = -1 means
+// "deselect"; the caret is left wherever the control already had it, which straight after
+// SetWindowTextW is offset 0. Four scenarios were arranged that way and every one of them
+// injected at the START of the text: S04 never approached the wrap point, S07 and S08 never
+// scrolled (the control was already showing offset 0, so there was nothing to scroll), and S16
+// inserted its LTR run before the RTL text rather than after it. Ask for the length and select
+// an empty range at it; that is unambiguous.
+void caret_to_end(HWND h) {
+    if (!h) return;
+    const int len = GetWindowTextLengthW(h);
+    SendMessageW(h, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
+}
+
+// Every branch must re-arm the pane completely: text, caret AND scroll offset. Leaving
+// pane.scroll_y alone is how a scroll leaked out of one scenario into the next — S07 turns on
+// ScrollMode::OnInject, S10 ran after it without turning it off, and 25 injected characters
+// walked the pane's content 25 line heights off the top of the window.
+void pane_set(const std::wstring& text, size_t caret) {
+    pane.text = text;
+    pane.caret = caret > text.size() ? text.size() : caret;
+    pane.scroll_y = 0;
+    InvalidateRect(g.self_caret, nullptr, TRUE);
+}
+
+// `prefix` padded with 'x' until it very nearly fills one wrapped line of `control`. The margin
+// is a handful of average character widths, so that any non-empty injection at the end of it
+// wraps, while the line itself does not wrap before the injection arrives.
+std::wstring pad_to_near_width(HWND control, const std::wstring& prefix) {
+    std::wstring out = prefix;
+    if (!control) return out;
+    RECT client{};
+    GetClientRect(control, &client);
+    HDC dc = GetDC(control);
+    if (!dc) return out;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0));
+    HGDIOBJ old = font ? SelectObject(dc, font) : nullptr;
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    // The EDIT keeps a small internal margin and, here, a vertical scrollbar; 4 average
+    // characters of slack covers both without needing either exactly.
+    const int limit = static_cast<int>(client.right - client.left) - tm.tmAveCharWidth * 4;
+    // Pad in whole words rather than characters. A single unbroken run would force the EDIT to
+    // break mid-word and shove the entire run onto the next line, which is a much larger change
+    // than the one visual line S07 is meant to add.
+    const std::wstring unit = L"pad ";
+    SIZE sz{0, 0};
+    while (out.size() < 4096) {
+        const std::wstring next = out + unit;
+        GetTextExtentPoint32W(dc, next.c_str(), static_cast<int>(next.size()), &sz);
+        if (sz.cx >= limit) break;
+        out = next;
+    }
+    if (old) SelectObject(dc, old);
+    ReleaseDC(control, dc);
+    return out;
+}
+
 void fill_scenario_text(UINT which) {
     const wchar_t* mid = L"the quick brown fox | jumps over the lazy dog";
     const wchar_t* long_line =
@@ -982,10 +1063,7 @@ void fill_scenario_text(UINT which) {
             for (HWND h : all) {
                 if (h) SetWindowTextW(h, L"");
             }
-            pane.text.clear();
-            pane.caret = 0;
-            pane.scroll_y = 0;
-            InvalidateRect(g.self_caret, nullptr, TRUE);
+            pane_set(L"", 0);
             break;
         }
         case kIdmTextMidLine: {
@@ -995,18 +1073,24 @@ void fill_scenario_text(UINT which) {
                 SetWindowTextW(h, mid);
                 SendMessageW(h, EM_SETSEL, 20, 20);
             }
-            pane.text = mid;
-            pane.caret = 20;
-            InvalidateRect(g.self_caret, nullptr, TRUE);
+            pane_set(mid, 20);
             break;
         }
-        case kIdmTextLongLine:
+        case kIdmTextLongLine: {
+            // Both edits, not only the single-line one. S08 measures the long line in
+            // g.edit_single and S04 measures the same line wrapping in g.edit_multi; filling
+            // only the former left S04's control holding whatever the previous repetition had
+            // typed into it. That is why S04's third repetition drifted to 49.95 line heights
+            // while the first two reproduced to the pixel — by then the accumulated text had
+            // wrapped, and the scenario under measurement was no longer S04.
+            const std::wstring line = long_line;
             SetWindowTextW(g.edit_single, long_line);
-            SendMessageW(g.edit_single, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
-            pane.text = long_line;
-            pane.caret = pane.text.size();
-            InvalidateRect(g.self_caret, nullptr, TRUE);
+            caret_to_end(g.edit_single);
+            SetWindowTextW(g.edit_multi, long_line);
+            caret_to_end(g.edit_multi);
+            pane_set(line, line.size());
             break;
+        }
         case kIdmTextManyLines: {
             std::wstring many;
             for (int i = 0; i < 60; ++i) {
@@ -1014,14 +1098,28 @@ void fill_scenario_text(UINT which) {
                 many += std::to_wstring(i);
                 many += L" — padding padding padding\r\n";
             }
+            // 60 short lines scrolled to the bottom are NOT enough to make S07 a scroll: an
+            // insertion at the end of the last one changes that line and nothing else, so the
+            // after-frame shows a normal append and `looks_like_scroll` is false — which is what
+            // the first three repetitions recorded, and it was the arrangement being wrong
+            // rather than the detector. (The ScrollOnInject menu item, which S07 also set, only
+            // ever drives the self-drawn pane; it cannot scroll an EDIT.) The last line is
+            // therefore padded to just under the control's width, so REF-2 wraps it onto a new
+            // visual line and a control already showing its bottom has to scroll up by one.
+            many += pad_to_near_width(g.edit_multi, L"last ");
             SetWindowTextW(g.edit_multi, many.c_str());
-            SendMessageW(g.edit_multi, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+            caret_to_end(g.edit_multi);
             SendMessageW(g.edit_multi, EM_SCROLLCARET, 0, 0);
+            // The pane gets the same content so it is not left holding the previous scenario's,
+            // but note it has no EM_SCROLLCARET equivalent: at scroll_y = 0 its caret sits below
+            // the visible area. S07 targets g.edit_multi, so that does not affect a measurement
+            // today; a pane-targeted scroll scenario would have to scroll to the caret first.
+            pane_set(many, many.size());
             break;
         }
         case kIdmTextRtl:
             SetWindowTextW(g.edit_rtl, L"العربية עברית mixed with latin");
-            SendMessageW(g.edit_rtl, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+            caret_to_end(g.edit_rtl);
             break;
         default:
             break;
