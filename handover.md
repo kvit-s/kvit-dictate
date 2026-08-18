@@ -1,9 +1,9 @@
 # Handover — kvit-dictate
 
 Written 2026-08-17, end of the second session. Commit `feeb92f` on `main`.
-Amended at the end of the third session (`c270faf`); see §9 for what that changed. The third
-session wrote no C++ and pressed no hotkey, so **everything in §4 is still unobserved** and §1's
-paragraph still stands.
+Amended at the end of the third session (`c270faf`, then `d2bac8b`); see §9 for what that
+changed and §10 for what a human then observed. **§4 checks 1 and 2 are now confirmed working**;
+3, 4 and 5 remain unobserved, and check 3 was described in a way that cannot work — see it.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -19,9 +19,11 @@ once — verified by a human watching it happen. That path had never run before 
 broken in nineteen places, none of which 691 passing tests could see. 728 tests now pass across
 four suites at zero warnings, with warnings as errors. What is still untrue of the product: **no
 real speech has ever been transcribed** (every word so far came from the mock's script), no model
-has been downloaded, no Phase 0B cell has been measured, and the inline overlay has never been
-seen doing its job. Windows 11's own Notepad garbles our injected keystrokes, which is a target
-finding and the first entry in the supported-targets matrix that came from running the product.
+has been downloaded, and no Phase 0B cell has been measured. ~~the inline overlay has never been
+seen doing its job~~ — **it has now**: it paints, it sits at the caret, and it follows the caret
+as text is committed (third session, §10). Windows 11's own Notepad garbles our injected
+keystrokes, which is a target finding and the first entry in the supported-targets matrix that
+came from running the product.
 
 ---
 
@@ -143,7 +145,8 @@ someone is using, focus moves.
 All four were committed **after** the last human test, so none has been seen working. All four are
 one dictation session each.
 
-Run with `model_id: "mock-ungated"` unless the check needs speech.
+Run with `model_id: "mock-ungated"` unless the check needs speech. **Checks 1, 2 and 4 only** —
+check 3 needs an utterance boundary, which `mock-ungated` cannot produce; see it for why.
 
 1. **The overlay actually paints.** `set_text` only marks the window dirty; `render()` draws.
    main.cpp called `render()` only when a new *anchor* arrived, so the preview was invisible for
@@ -155,7 +158,13 @@ Run with `model_id: "mock-ungated"` unless the check needs speech.
    in that commit is why this might now differ: anchor.h asks for `refresh_caret` "at session
    start **and after each commit**" and main.cpp only did the first, so even a perfect caret
    anchor went stale after `stale_after_ms` (3 s) and degraded for the rest of the session.
-3. **The space between utterances.** Dictate long enough for two sentences. Expect
+3. **The space between utterances.** ~~Dictate long enough for two sentences.~~ **Not testable
+   with `mock-ungated`, and the instruction above was wrong.** That entry passes `--vad none`, so
+   the session is one long utterance (connection.py's `make_vad` says exactly this), and the mock
+   resets `_utterance_index` to 0 on every SESSION_START/SESSION_END (mock.py:494). One session
+   therefore replays script line 1 and stops there, however long you wait — as a 42-second run in
+   the third session confirmed. An utterance boundary needs the VAD, so this check merges into
+   check 5 below: run it with `mock`, speak, pause, speak. Expect
    `…the default model open src/protocol.h…`, not `…modelopen…`.
 4. **The clipboard path, in Notepad.** `notepad.exe` now has an app policy selecting it, because
    Win11's Notepad garbles paced SendInput (§5.10 of the supported-targets doc). Two questions:
@@ -377,3 +386,38 @@ Nothing was done about the pre-roll dropped across the VAD seam (§6). §6 says 
 same pass as measuring whether it matters, and no measurement happened, so it was left alone.
 
 Test counts: **800** across four suites — 299 C++, 372 server, 129 bench — at zero warnings.
+
+---
+
+## 10. What a human observed at the end of the third session
+
+One dictation session into Notepad3 with `mock-ungated`, plus three shorter ones. The model was
+switched through the tray's Settings dialog, which is itself a first: that dialog had never been
+usable past the tab it opened on (see the `d2bac8b` fix), so every prior model change was a hand
+edit of settings.json.
+
+**§4.1 — the overlay paints. CONFIRMED.** The light box with dark grey text appeared, and the
+observer specifically confirmed it was not the blue-on-white box Notepad3's own autocomplete draws.
+`render()` on the 50 ms tick was the right fix.
+
+**§4.2 — the overlay is inline, and it stays there. CONFIRMED, and this is the bigger one.** It sat
+directly under the caret and *followed it* as text was committed. That is plan.md §1.5's inline
+anchor working as specified — not the floating-pill fallback — which means the caret anchor is
+scoring above `min_confidence` 0.5 against a real editor, and it means the `refresh_caret`
+after-each-commit fix holds. Phase 0B still has to measure this properly across the application
+matrix; one editor is one cell, not a result. But the mechanism is no longer hypothetical.
+
+**§4.3 — the space between utterances. STILL UNKNOWN, and not the observer's fault.** The
+instruction was impossible: see §4 check 3. It needs `mock` and real speech.
+
+**§4.4, §4.5 — not attempted.**
+
+Two things in the log worth carrying forward:
+
+* The finalising chord is being read correctly: the 42-second session ended `hotkey_pressed`, not
+  `stop_on_input`. §5.13's fix is holding against a real second press. (The three short sessions
+  after it ended `stop_on_input`, which is the click-or-keystroke rule working as designed.)
+* `anchor.cpp:1151 empty diff after a visible commit; keeping the previous anchor` fires after
+  commits. It is explicitly benign — the log line says so — but source C's commit differencing
+  finding nothing is exactly the thing §6's `WDA_EXCLUDEFROMCAPTURE`-vs-`BitBlt` question is about,
+  and it is now reproducible on demand. Worth pulling on before Phase 0B rather than during it.
