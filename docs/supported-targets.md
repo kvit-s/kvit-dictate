@@ -162,12 +162,30 @@ height**, so `0.4` means "within half a line". One line height is the gate unit 
 
 Ground truth:
 
-- `tools/testtarget` reports its own caret rectangle to the probe over a side channel. This is
-  the only cell family with **programmatic** ground truth and it calibrates everything else.
-- Third-party applications have no such channel. Ground truth is the operator clicking the caret
-  centre in the captured `after.png` in an annotation step. That introduces roughly a few pixels
-  of operator error, which at a typical editor line height is a small fraction of a line but is
-  **not zero**. Record the line height in pixels in Notes so the ratio can be re-derived.
+- `tools/testtarget` reports its own caret rectangle to the probe over a side channel. It
+  calibrates everything else, and it is the only source that can also report the text actually
+  received, the theme and the DPI.
+- **Any target backed by a real system caret is also self-measuring**, side channel or not:
+  `GetGUIThreadInfo` read from *outside* the process returns what the target reports about
+  itself. Checked against `tools/testtarget` two ways — the probe's external read of the
+  pre-injection caret matched the side channel's to the pixel on 11/11 records, and running seven
+  scenarios with `--no-side-channel` reproduced the side channel's `error_lh` **exactly on all
+  seven** (`S01` 0.07, `S02` 9.33, `S03` 11.67, `S04` 0.07, `S07` 9.54, `S08` 39.00, `S16` 0.00).
+  Records say which oracle they used in `ground_truth_source`.
+
+  The limitation is real and is recorded per-record in `ground_truth_caveat`: on such a cell
+  **source A is the oracle**, so nothing in it can assess source A's own accuracy and §3.3 —
+  which anchor source won — cannot be answered from it. Only source C's error against the caret.
+
+  It also requires the probe to wait for the caret to stop moving *before* capturing the
+  after-frame, because `inject()` returns when events are sent and the frame poll stops at the
+  first changed pixel. Without that wait the same cell scored 0.07, 0.87 and 1.94 line heights on
+  three identical repetitions.
+- **Operator annotation is needed only for targets that draw their own caret** — VS Code, Slack,
+  terminals, Chromium content areas. Ground truth is then the operator clicking the caret centre
+  in the captured `after.png`. That introduces roughly a few pixels of operator error, which at a
+  typical editor line height is a small fraction of a line but is **not zero**. Record the line
+  height in pixels in Notes so the ratio can be re-derived.
 
 Report the cell as `p50 / p95` over `N` repetitions (default `N = 20`), e.g. `0.2 / 0.6 (N=20)`.
 A single sample is not a measurement — the 95 % criterion in the gate is a distribution claim.

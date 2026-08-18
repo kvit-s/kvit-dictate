@@ -172,6 +172,65 @@ bool parse_target_state(const std::string& json_text, TargetState& out);
 //
 // Settling on the target's own counters rather than a fixed sleep: `events_total` and the text
 // length both stop moving exactly when it is done, whatever the machine's load.
+// The same job as settle_target, for a target that has no side channel: wait until the caret has
+// stopped moving before believing it is the post-commit insertion point.
+//
+// This is not optional and it is easy to skip. `Injector::inject()` returns when the events have
+// been *sent*, and the after-frame poll loop stops at the FIRST frame with any change at all, so
+// both can complete while the target is still consuming keystrokes. Reading the caret there gets
+// it mid-typing. Measured, rather than reasoned about: without this loop, A09/S01 scored 0.87 line
+// heights against the side channel's 0.07 and S04 0.40 against 0.07 — the caret was about two
+// characters short of where it ended up. That is small enough to look like ordinary estimator
+// error and would have been baked silently into every real-application row.
+//
+// `baseline` is the caret before the injection. As in settle_target, waiting for movement to STOP
+// is wrong on its own: two reads taken before the target has drained anything agree perfectly.
+// Wait for it to start first.
+bool settle_caret(kd::anchor::ICaretProvider& caret, uintptr_t window,
+                  const kd::anchor::Rect& baseline, bool have_baseline, kd::anchor::Rect& out,
+                  int timeout_ms) {
+    kd::anchor::Rect prev{};
+    bool have_prev = false;
+    bool moved = !have_baseline;  // nothing to move away from; accept the first stable reading
+    int stable = 0;
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
+    for (;;) {
+        kd::anchor::Rect now{};
+        if (caret.caret_rect(window, now) && !now.empty()) {
+            if (have_baseline && (now.left != baseline.left || now.top != baseline.top)) {
+                moved = true;
+            }
+            if (moved && have_prev && now.left == prev.left && now.top == prev.top) {
+                // Four agreeing reads, ~160 ms of stillness. Two was not enough: a target that
+                // pauses briefly mid-injection - the paced SendInput leaves 1 ms between batches
+                // and the target's message pump is not obliged to be prompt - produced two
+                // identical reads while still typing, and A09/S02 came back 0.93 line heights
+                // short of the side channel's answer while A09/S16 came back 0.87 short. Both are
+                // about two characters, which is what a stall of one batch looks like.
+                if (++stable >= 4) {
+                    out = now;
+                    return true;
+                }
+            } else {
+                stable = 0;
+            }
+            prev = now;
+            have_prev = true;
+        }
+        if (GetTickCount64() >= deadline) {
+            if (have_prev) {
+                out = prev;
+                std::printf("  caret: %s at the settle deadline; this repetition's ground truth is "
+                            "not trustworthy\n",
+                            moved ? "still moving" : "never moved from its pre-injection position");
+                return true;
+            }
+            return false;
+        }
+        Sleep(40);
+    }
+}
+
 bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms, int64_t baseline_events) {
     TargetState prev;
     bool have_prev = false;
@@ -473,6 +532,10 @@ int main(int argc, char** argv) {
     // nothing and never touches the foreground, so it is the one probe mode that is safe to run
     // while the machine is in use — and it is how a scenario arrangement gets checked without
     // typing REF-2 into whatever is focused to find out.
+    // Pretend tools/testtarget has no side channel, so an A09 run takes the same path a real
+    // application does. This is how the system-caret ground truth was validated without typing
+    // into anybody's document: same target, same scenario, two independent oracles, compare.
+    bool no_side_channel = false;
     bool dump_state = false;
     std::string side_channel_cmd;
     std::string notes;
@@ -491,6 +554,7 @@ int main(int argc, char** argv) {
         else if (a == "--notes") notes = next();
         else if (a == "--status") status_only = true;
         else if (a == "--dump-state") dump_state = true;
+        else if (a == "--no-side-channel") no_side_channel = true;
         else if (a == "--send") { side_channel_cmd = next(); dump_state = true; }
         else if (a == "--help" || a == "-h") {
             std::printf(
@@ -513,6 +577,10 @@ int main(int argc, char** argv) {
                 "                           ref4/ref5 produce no error figure by design.\n"
                 "  --inject sendinput|clipboard\n"
                 "  --repeat N               repetitions (default 1)\n"
+                "  --no-side-channel        ignore tools/testtarget's side channel, so an A09\n"
+                "                           run takes the same path a real application does and\n"
+                "                           ground truth comes from the system caret. A\n"
+                "                           validation aid, not a measurement mode.\n"
                 "  --settle-ms N            wait N ms after injecting before the first\n"
                 "                           after-frame capture (default 0). A target that\n"
                 "                           repaints in stages is otherwise diffed mid-repaint.\n"
@@ -600,7 +668,10 @@ int main(int argc, char** argv) {
     // message-only windows.
     SideChannel side_channel;
     bool use_side_channel = false;
-    if (app == "A09") {
+    if (app == "A09" && no_side_channel) {
+        std::printf("side channel: SUPPRESSED by --no-side-channel; ground truth will come from "
+                    "the system caret, as it does for a real application\n");
+    } else if (app == "A09") {
         if (!SideChannel::target_present()) {
             std::printf("A09 selected but no tools/testtarget window was found. Ground truth and "
                         "readback will be null and the operator has to supply them by hand, which "
@@ -869,6 +940,25 @@ int main(int argc, char** argv) {
                         kd::to_string(inject_result.status));
         }
 
+        // Wait for the target to finish consuming the injection BEFORE the after-frame is taken.
+        //
+        // With a side channel that already happened above (settle_target, on events_total). Without
+        // one it has to happen here, and skipping it is not a small error: `inject()` returns when
+        // the events have been *sent*, the poll loop below stops at the first frame with any change
+        // at all, and the two together capture a frame with the text half-painted. The diff then
+        // describes a partial repaint and the estimate moves run to run. Measured: with the caret
+        // settled only afterwards, A09/S01 scored 0.07, 0.87 and 1.94 line heights on three
+        // identical repetitions against a side-channel figure of 0.07 that reproduces to the pixel.
+        //
+        // The caret is the available proxy for "the target has caught up" when nothing else is.
+        kd::anchor::Rect caret_settled{};
+        bool caret_settled_ok = false;
+        if (!use_side_channel) {
+            caret_settled_ok =
+                settle_caret(*caret, target.focus != 0 ? target.focus : target.top_level,
+                             caret_rect, caret_ok, caret_settled, 4000);
+        }
+
         // ── Capture the after frame, polled ─────────────────────────────────────────────────
         //
         // Electron and WSLg render asynchronously: a single capture taken immediately after
@@ -927,7 +1017,41 @@ int main(int argc, char** argv) {
             p.source = kd::anchor::Source::Caret;
             p.timestamp_ms = 0;
             previous = p;
+        } else if (!have_before_state && caret_ok) {
+            // No side channel — a real application. The caret read before the injection is the
+            // same thing the product would be holding, so it is the right incumbent here too.
+            kd::anchor::Anchor p;
+            p.insertion_point = kd::anchor::Point{caret_rect.left, caret_rect.top};
+            p.line_height = caret_rect.height();
+            p.confidence = kd::anchor::kCaretConfidence;
+            p.source = kd::anchor::Source::Caret;
+            p.timestamp_ms = 0;
+            previous = p;
         }
+
+        // ── Ground truth without a side channel, for any target with a system caret ──────────
+        //
+        // §3.4 says third-party applications have no programmatic ground truth and that an
+        // operator must click the caret centre in the captured after-frame. That is true only of
+        // targets which draw their own caret. For anything backed by a real system caret,
+        // `GetGUIThreadInfo` read from *outside* the process returns exactly what the target
+        // reports about itself: checked against tools/testtarget across 11 cells, the probe's own
+        // read and the side channel's agreed **to the pixel every time** (`source_a.pt` ==
+        // `caret_before_injection` in every record carrying both).
+        //
+        // So the post-injection caret is ground truth for those targets, self-measured, and the
+        // operator-annotation step is needed only for the self-drawn ones (VS Code, Slack,
+        // terminals). That is what makes A02/A06/A07-class rows measurable unattended.
+        //
+        // The limitation this carries, and it is not small: **on such a cell source A is the
+        // oracle**, so nothing in it can assess source A's own accuracy, and §3.3's "which anchor
+        // source won" is unanswerable — the answer would be assumed rather than measured. Only
+        // source C's error against the caret is available. `ground_truth_source` records which
+        // kind of truth a record holds so the two are never aggregated as though they were alike.
+        // Already settled above, before the after-frame was captured. Re-reading here would only
+        // risk catching a blink or a later repaint.
+        const kd::anchor::Rect caret_after = caret_settled;
+        const bool caret_after_ok = caret_settled_ok && !caret_after.empty();
 
         const float confidence = kd::anchor::score_diff(diff, region, previous);
 
@@ -992,28 +1116,52 @@ int main(int argc, char** argv) {
         anchor_obj.set("winner", kd::json::Value::string(std::string(
                                      diff.changed_pixels > 0 ? "C" : (caret_ok ? "A" : "none"))));
         anchor_obj.set("confidence", kd::json::Value::number(static_cast<double>(confidence)));
-        // Ground truth: programmatic for A09 (§3.4), the operator's job everywhere else
-        // (§8.1 step 6). It stays null when it cannot be measured - a default of "0,0" would
-        // silently become a 40-line-height error in the aggregate, which is worse than a gap.
-        const bool gt_ok = have_after_state && after_state.caret_available;
+        // Ground truth, in falling order of authority: A09's side channel, then the target's own
+        // system caret read after the injection (see the block above), then nobody — the
+        // operator's job (§8.1 step 6). It stays null when it cannot be measured; a default of
+        // "0,0" would silently become a 40-line-height error in the aggregate, which is worse
+        // than a gap.
+        const bool gt_from_side_channel = have_after_state && after_state.caret_available;
+        const bool gt_from_system_caret = !gt_from_side_channel && caret_after_ok;
+        const bool gt_ok = gt_from_side_channel || gt_from_system_caret;
         if (gt_ok) {
-            const kd::anchor::Rect& truth = after_state.caret;
+            const kd::anchor::Rect& truth =
+                gt_from_side_channel ? after_state.caret : caret_after;
             kd::json::Value gt = kd::json::Value::array();
             gt.push_back(kd::json::Value::number(static_cast<int64_t>(truth.left)));
             gt.push_back(kd::json::Value::number(static_cast<int64_t>(truth.top)));
             anchor_obj.set("ground_truth", std::move(gt));
             // Kept so the two are never confused by a later reader, and so the distance between
             // them - the width of the committed text - is recoverable from the record.
-            if (have_before_state && before_state.caret_available) {
+            const bool have_pre = gt_from_side_channel
+                                      ? (have_before_state && before_state.caret_available)
+                                      : caret_ok;
+            if (have_pre) {
+                const kd::anchor::Rect& pre_rect =
+                    gt_from_side_channel ? before_state.caret : caret_rect;
                 kd::json::Value pre = kd::json::Value::array();
-                pre.push_back(
-                    kd::json::Value::number(static_cast<int64_t>(before_state.caret.left)));
-                pre.push_back(
-                    kd::json::Value::number(static_cast<int64_t>(before_state.caret.top)));
+                pre.push_back(kd::json::Value::number(static_cast<int64_t>(pre_rect.left)));
+                pre.push_back(kd::json::Value::number(static_cast<int64_t>(pre_rect.top)));
                 anchor_obj.set("caret_before_injection", std::move(pre));
             }
-            anchor_obj.set("ground_truth_source",
-                           kd::json::Value::string(std::string("testtarget-side-channel")));
+            anchor_obj.set(
+                "ground_truth_source",
+                kd::json::Value::string(std::string(gt_from_side_channel
+                                                        ? "testtarget-side-channel"
+                                                        : "system-caret-after-injection")));
+            // On a system-caret cell source A IS the oracle, so the record must not be read as
+            // saying anything about source A's own accuracy, and §3.3 cannot be answered from it.
+            if (gt_from_system_caret) {
+                anchor_obj.set(
+                    "ground_truth_caveat",
+                    kd::json::Value::string(std::string(
+                        "Ground truth is the target's own system caret, read with GetGUIThreadInfo "
+                        "after the injection settled. Validated against tools/testtarget: the "
+                        "probe's external read matched the side channel to the pixel on 11/11 "
+                        "cells. Source A is therefore the oracle here - this record measures "
+                        "source C's error against the caret and says NOTHING about source A's own "
+                        "accuracy, so it cannot answer §3.3 (which anchor source won).")));
+            }
 
             // §3.4's figure: the estimator's error in LINE HEIGHTS, not pixels, so a 4K target
             // and a 96-dpi one are comparable. Scored through `anchor_from_diff` - the same
@@ -1025,8 +1173,11 @@ int main(int argc, char** argv) {
             // end of the changed band.
             const std::optional<kd::anchor::Anchor> est =
                 kd::anchor::anchor_from_diff(diff, region, previous, 0);
-            const int32_t lh = after_state.line_height > 0 ? after_state.line_height
-                                                            : before_state.line_height;
+            // Line height: the side channel's when there is one, otherwise the caret's own
+            // height, which is what the caret rectangle is for.
+            int32_t lh = after_state.line_height > 0 ? after_state.line_height
+                                                     : before_state.line_height;
+            if (lh <= 0) lh = caret_after_ok ? caret_after.height() : caret_rect.height();
             if (est.has_value() && lh > 0) {
                 const double dx = static_cast<double>(est->insertion_point.x - truth.left);
                 const double dy = static_cast<double>(est->insertion_point.y - truth.top);
