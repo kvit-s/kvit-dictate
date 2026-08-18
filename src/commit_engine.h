@@ -140,6 +140,12 @@ struct Violation {
     [[nodiscard]] proto::ProtocolError to_protocol_error() const;
 };
 
+// Exposed for testing: the word-level alignment behind Result::salvage. Returns the part of
+// `incoming` that follows everything it agrees with in `committed`, comparing words with ASCII
+// case folding and edge punctuation removed, and returns all of `incoming` when they agree about
+// nothing.
+std::string salvage_tail(std::string_view committed, std::string_view incoming);
+
 // ─── Output ─────────────────────────────────────────────────────────────────────────────────
 
 // One append-only injection. There is no delete, no replace, no move — the type system is the
@@ -185,6 +191,27 @@ public:
         // When set, `op` is always absent: **the engine never emits an operation derived from a
         // message it rejected.**
         std::optional<Violation> violation;
+
+        // Best-effort recovery, set only alongside `violation` and never instead of `op`.
+        //
+        // Before this existed, a contradicted hypothesis cost the user the whole rest of the
+        // utterance: main.cpp logged the violation and returned, and every word after the
+        // divergence was silently dropped. That is the failure plan.md §1.4 ranks worst of all —
+        // text the user said, gone, with no way to know it was ever there.
+        //
+        // This carries the words of the incoming hypothesis that follow everything it still
+        // agrees with, so they can be appended after the committed text. It is deliberately NOT
+        // `op`: `op` means "derived from a message the engine accepted", and this is derived from
+        // one it rejected. The distinction is the point — a caller that wants the guarantee reads
+        // `op` and a caller that wants the user's words reads this, and neither can be mistaken
+        // for the other.
+        //
+        // The invariant is untouched. This appends and never rewrites: the contradicted text
+        // already in the document stays exactly as it is, wrong and visible, which is what §1.4
+        // requires. The alignment is word-level and crude (see salvage_tail), so the seam can
+        // duplicate or drop a word; when the two texts agree about nothing it appends everything,
+        // because visible duplication is recoverable by the user and silent loss is not.
+        std::optional<CommitOp> salvage;
 
         // The unstable tail — everything above the eligible prefix. This is what the overlay
         // renders as pending text (plan.md §1.5); it is where revisions are absorbed.

@@ -73,6 +73,42 @@ namespace {
 
 // ─── Small local helpers ────────────────────────────────────────────────────────────────────
 
+constexpr bool is_ascii_space(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+// Split on ASCII whitespace, returning (offset, length) so the original spelling is recoverable.
+void split_words(std::string_view s, std::vector<std::pair<size_t, size_t>>& out) {
+    size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && is_ascii_space(s[i])) ++i;
+        const size_t start = i;
+        while (i < s.size() && !is_ascii_space(s[i])) ++i;
+        if (i > start) out.emplace_back(start, i - start);
+    }
+}
+
+// Comparison key for salvage: ASCII case-folded, edge punctuation removed.
+//
+// Deliberately crude, and crude in the same way the Python base class's `_norm_word` is: the
+// revision this has to see through is "you" against "you?" and "how" against "How", which is what
+// a batch model produces when a later request tells it where the sentence ended. Anything
+// cleverer would silently align the wrong words. Non-ASCII compares verbatim — folding it
+// properly needs a case table this project does not carry, and a failed match falls into the
+// conservative branch rather than a wrong one.
+std::string salvage_key(std::string_view w) {
+    static constexpr std::string_view kEdge = ".,;:!?\"'()[]{}";
+    size_t b = 0;
+    size_t e = w.size();
+    while (b < e && kEdge.find(w[b]) != std::string_view::npos) ++b;
+    while (e > b && kEdge.find(w[e - 1]) != std::string_view::npos) --e;
+    std::string out(w.substr(b, e - b));
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+}
+
 // One-line, single-quoted, control-character-free rendering, so a violation record cannot break
 // the log format with a newline the model happened to emit.
 std::string escape_for_log(std::string_view s) {
@@ -157,6 +193,36 @@ struct Checkpoint {
 };
 
 }  // namespace
+
+// ─── salvage_tail ───────────────────────────────────────────────────────────────────────────
+//
+// See CommitEngine::Result::salvage for what this is for and why it is not `op`.
+std::string salvage_tail(std::string_view committed, std::string_view incoming) {
+    std::vector<std::pair<size_t, size_t>> cw;
+    std::vector<std::pair<size_t, size_t>> iw;
+    split_words(committed, cw);
+    split_words(incoming, iw);
+
+    // No words at all in the incoming text. The "agree about nothing" branch below would return
+    // it verbatim, which for a whitespace-only hypothesis means appending whitespace to the
+    // user's document for no reason.
+    if (iw.empty()) return std::string();
+
+    size_t p = 0;
+    while (p < cw.size() && p < iw.size() &&
+           salvage_key(committed.substr(cw[p].first, cw[p].second)) ==
+               salvage_key(incoming.substr(iw[p].first, iw[p].second))) {
+        ++p;
+    }
+
+    // They agree about nothing. Append all of it rather than dropping it: duplicated words are
+    // visible and the user can delete them, whereas words silently discarded are gone and the
+    // user never learns they were said. The Python driver's `_scrolled_off_words` makes the same
+    // call at its own seam, for the same reason.
+    if (p == 0) return std::string(incoming);
+    if (p >= iw.size()) return std::string();  // incoming adds nothing after the agreement
+    return std::string(incoming.substr(iw[p].first));
+}
 
 // ─── IcerCounters ───────────────────────────────────────────────────────────────────────────
 
@@ -552,7 +618,27 @@ CommitEngine::Result CommitEngine::on_partial(const proto::PartialMsg& m) {
             static_cast<uint64_t>(graphemes_or_zero(std::string_view(s.committed).substr(floor)));
         r.violation = s.latch(ViolationKind::CommittedTextContradicted, m.text, m.stable_bytes,
                               m.seq, diverge);
-        // No op. Not now, not later: there is no repair path in this module.
+        // No `op`. Not now, not later: there is no repair path in this module, and `op` carries a
+        // guarantee a rejected message cannot honour.
+        //
+        // `salvage` is the separate, weaker thing — the words of this hypothesis that follow
+        // everything it still agrees with, so the user keeps the rest of their sentence instead
+        // of losing it at the point of contradiction. It appends and never rewrites, so the
+        // document invariant is exactly as before; what changes is that the words after the
+        // divergence stop being silently discarded.
+        if (!s.committed.empty()) {
+            std::string tail = salvage_tail(s.committed, m.text);
+            if (!tail.empty()) {
+                CommitOp op;
+                op.text = std::move(tail);
+                op.utterance_offset = static_cast<uint64_t>(s.committed.size());
+                op.utterance_id = s.utterance_id;
+                op.session_id = s.session_id;
+                // The committed text ends mid-sentence, so the salvaged tail needs a separator.
+                op.leading_space = true;
+                r.salvage = std::move(op);
+            }
+        }
         return r;
     }
 

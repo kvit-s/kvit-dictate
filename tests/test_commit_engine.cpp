@@ -816,3 +816,70 @@ KD_TEST(commit_engine, speculative_unsafe_commits_ahead_of_stability_and_is_meas
     KD_CHECK(next.ok());
     KD_CHECK(next.op.has_value());
 }
+
+// ═══ salvage_tail — keeping the user's words after a contradiction ══════════════════════════
+//
+// A contradicted hypothesis used to cost the user the whole rest of the utterance: the engine
+// reported the violation, main.cpp returned, and every word after the divergence was dropped
+// with no trace. That is the failure plan.md §1.4 ranks worst — text the user said, gone,
+// with no way to know it was ever there.
+//
+// The document is still never repaired. `salvage` only ever *appends*, so the contradicted text
+// stays exactly where it is, wrong and visible. These tests pin the alignment that decides what
+// gets appended.
+
+KD_TEST(commit_engine, salvage_appends_only_what_follows_the_agreement) {
+    // The measured case, from the first real session against a batch ASR model: the final
+    // request sees the whole utterance for the first time and inserts sentence punctuation into
+    // text that was committed seconds earlier.
+    const std::string committed = "How are you I really";
+    const std::string incoming = "How are you? I really wanna know.";
+    KD_CHECK_EQ(kd::salvage_tail(committed, incoming), std::string("wanna know."));
+}
+
+KD_TEST(commit_engine, salvage_sees_through_case_and_edge_punctuation) {
+    // The two revisions a batch model actually makes. Neither is a different word, so neither
+    // may break the alignment.
+    KD_CHECK_EQ(kd::salvage_tail("how are you", "How are you, and more"), std::string("and more"));
+    KD_CHECK_EQ(kd::salvage_tail("one two three", "one two three! four"), std::string("four"));
+}
+
+KD_TEST(commit_engine, salvage_is_empty_when_the_incoming_text_adds_nothing) {
+    // Agreement that runs to the end of the incoming hypothesis: there is nothing after it to
+    // append, and appending the agreement itself would duplicate the document's text.
+    KD_CHECK(kd::salvage_tail("one two three", "one two three").empty());
+    KD_CHECK(kd::salvage_tail("one two three", "One, two, three!").empty());
+    KD_CHECK(kd::salvage_tail("one two three", "one two").empty());
+}
+
+KD_TEST(commit_engine, salvage_keeps_everything_when_nothing_matches) {
+    // No agreement at all — a genuinely different transcription. Duplication is visible and the
+    // user can delete it; silent loss is invisible and permanent, so this deliberately errs
+    // toward the recoverable failure.
+    KD_CHECK_EQ(kd::salvage_tail("how are you", "what time is it"),
+                std::string("what time is it"));
+}
+
+KD_TEST(commit_engine, salvage_diverging_midway_appends_from_the_divergence) {
+    // A real word changed rather than punctuation. Everything from that word on is appended,
+    // which duplicates the changed word's replacement rather than dropping the tail.
+    KD_CHECK_EQ(kd::salvage_tail("i really wanna know", "i really want to know"),
+                std::string("want to know"));
+}
+
+KD_TEST(commit_engine, salvage_handles_empty_and_whitespace_inputs) {
+    KD_CHECK(kd::salvage_tail("anything", "").empty());
+    KD_CHECK(kd::salvage_tail("anything", "   ").empty());
+    KD_CHECK_EQ(kd::salvage_tail("", "some words"), std::string("some words"));
+}
+
+KD_TEST(commit_engine, salvage_never_returns_a_prefix_of_the_committed_text) {
+    // The property that makes appending safe: whatever comes back must not re-state text the
+    // document already holds, because the caller appends it verbatim.
+    const std::string committed = "the quick brown fox";
+    for (const char* incoming : {"the quick brown fox jumps over", "The quick, brown fox! jumps",
+                                 "the quick brown fox", "the quick"}) {
+        const std::string tail = kd::salvage_tail(committed, incoming);
+        KD_CHECK(tail.empty() || committed.find(tail) != 0);
+    }
+}

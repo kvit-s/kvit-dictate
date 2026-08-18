@@ -948,6 +948,29 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         KD_LOG_ERROR("committed-prefix violation: %s", r.violation->to_log_line().c_str());
         set_tray_state(kd::OverlayState::Warning);
         if (overlay_ != nullptr) overlay_->flag_violation(r.violation->to_log_line());
+
+        // The violation is still reported and the document is still not repaired — but the rest
+        // of the sentence is no longer thrown away with it. `salvage` is the words the rejected
+        // hypothesis and the committed text still agree about the position of; appending them
+        // leaves the contradicted text exactly where it is and costs the user nothing further.
+        //
+        // Why this is the client's job rather than the backend's: the client owns the document
+        // and cannot assume a backend is well behaved. Asking backends not to contradict
+        // themselves would work only for the backends that comply, and the whole point of
+        // honour_server_stable_bytes and this check is that compliance is not assumed.
+        if (r.salvage.has_value() && !r.salvage->text.empty() && target_.has_value() &&
+            kd::validate_target(*target_)) {
+            std::string patch;
+            if (r.salvage->leading_space) patch.push_back(' ');
+            patch += r.salvage->text;
+            KD_LOG_WARN("salvaging %zu bytes after the contradiction; the text already in the "
+                        "document is left as it is",
+                        patch.size());
+            const kd::InjectResult ir = injector_->inject(*target_, patch);
+            if (ir.status != kd::InjectStatus::Ok) {
+                KD_LOG_WARN("salvage injection failed: %s", kd::to_string(ir.status));
+            }
+        }
         apply(session_->on_local(kd::LocalEvent::StabilityViolation));
         return;
     }
