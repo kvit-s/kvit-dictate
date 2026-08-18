@@ -410,6 +410,12 @@ const Named kApps[] = {
     {"A01", "VS Code"},      {"A02", "Chrome"},        {"A03", "Windows Terminal"},
     {"A04", "WSLg window"},  {"A05", "Slack"},         {"A06", "Explorer search box"},
     {"A07", "Office"},       {"A08", "kvit-notes"},    {"A09", "tools/testtarget"},
+    // Appended, never renumbered (§2's rule for scenario IDs, applied to applications). Notepad3
+    // earns a row on evidence rather than taste: it is the only application on this machine that
+    // exposes a system caret (§3.4's survey), so it is the ONLY real target that can be measured
+    // without an operator annotating every frame. It is also the editor every §5.10 observation
+    // is about and the one a human watched dictation work in end to end.
+    {"A10", "Notepad3"},
 };
 
 const Named kScenarios[] = {
@@ -577,7 +583,7 @@ int main(int argc, char** argv) {
                 "                           select:<a>:<b>, set-text:<utf8>, reset-log,\n"
                 "                           log-visual:on|off) and print the state that follows.\n"
                 "                           Implies --dump-state. Also injects nothing.\n"
-                "  --app A01..A09           application under test\n"
+                "  --app A01..A10           application under test\n"
                 "  --scenario S01..S18      scenario under test\n"
                 "  --text ref1|..|ref5      ref1 = Unicode fidelity (§3.2, the default)\n"
                 "                           ref2 = short LTR anchor probe (§3.4)\n"

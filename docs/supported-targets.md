@@ -1,20 +1,25 @@
 # Supported targets — per-application matrix
 
-**Status: NO APPLICATION HAS BEEN MEASURED. 13 of 162 cells exist, all of them on the calibration
-target.**
+**Status: ONE REAL APPLICATION MEASURED, IN TWO SCENARIOS. 15 of 180 cells exist.**
 
 Every result cell in the §5 per-application matrices reads `—`. That is not a placeholder for
-"works" or "probably fine"; it means *nobody has run the probe on that cell*. The only measurements
-that exist are `A09` — `tools/testtarget`, the harness's own calibration target — and they live in
-**§5.9.2**, not in the matrices, because the matrices' `Src` and `Uni` columns ask questions the
-probe does not yet answer. Do not cite this file as evidence that kvit-dictate supports any real
-application.
+"works" or "probably fine"; it means *nobody has run the probe on that cell*. The measurements that
+exist live in **§5.9.2** (`A09`, the calibration target, 13 scenarios) and **§5.11** (`A10`,
+Notepad3, 2 scenarios), not in the matrices, because the matrices' `Src` and `Uni` columns ask
+questions the probe does not yet answer. Do not cite this file as evidence that kvit-dictate
+supports any real application.
+
+**The headline finding so far is a negative one.** Source C's *position* is accurate on a clean
+append (0.07 line heights on both applications) and wrong by ten line heights on a mid-line
+insertion — and its *confidence score cannot tell those two apart*. Across the fourteen scored
+cells no threshold separates accurate estimates from inaccurate ones (§5.11.1), so plan.md §1.5's
+deterministic degradation cannot yet be switched on. §9 question 7 says what has to change.
 
 | | |
 |---|---|
 | Document version | v1 |
 | Phase | 0B — Windows feasibility spike (`plan.md` §3) |
-| Measurements taken | 2026-08-18 — `A09` only, 13 of 18 scenarios, `sendinput`, REF-2/3/4/5 (§5.9.2) |
+| Measurements taken | 2026-08-18 — `A09` 13 of 18 scenarios (§5.9.2); `A10` Notepad3, `S01`/`S02` (§5.11) |
 | Probe build | `dev` (unstamped; `probe_build` in every record) |
 | Machine | RTX 5090 / 64 GB / Windows 11 Pro (the target machine; see `plan.md` §5) |
 | Results directory | `bench/results/phase0b/` |
@@ -900,6 +905,77 @@ Two things this table deliberately does **not** say:
 
 ---
 
+### 5.11 `A10` — Notepad3, the first real application measured
+
+Measured 2026-08-18, `sendinput`, REF-2, three repetitions per cell, ground truth from the target's
+own system caret (§3.4). Two scenarios: without a side channel the document can only be arranged by
+typing into it, so only the scenarios reachable that way exist. `tools/phase0b/notepad3.ps1` is the
+harness; it launches a fresh `Untitled` window, refuses to proceed if the title carries Notepad3's
+unsaved-changes asterisk, and pins that window's `HWND` into every injection.
+
+| Cell | Scenario | error_lh (×3) | confidence (×3) |
+|---|---|---|---|
+| `S01` | empty document | **0.07, 0.07, 0.07** | 0.3962, 0.5021, 0.5021 |
+| `S02` | mid-line insertion, caret 20 of 45 | **10.27, 10.27, 10.27** | 0.3956, 0.3956, 0.3956 |
+
+The position figures agree with `A09` closely — 0.07 against 0.07 for a clean append, 10.27 against
+9.33 for a mid-line insertion — which is the first evidence that the calibration target predicts a
+real one at all. That is the good news and it is worth stating plainly: **source C behaves the same
+way in Scintilla as it does in a Win32 edit control.**
+
+#### 5.11.1 The confidence threshold does not survive a second application
+
+§5.9.2.1 found that across twelve `A09` cells, every accurate estimate scored above every
+inaccurate one, and that any threshold in (0.3415, 0.3742] classified all twelve correctly. It also
+warned that the margin had halved to 0.033 when two cells were added, and that "one more cell could
+close the band entirely, at which point the scorer needs retuning rather than re-aiming."
+
+That is what happened, on the first real application, in the first two cells:
+
+| | cell | true error | confidence |
+|---|---|---|---|
+| **wrong** | `A10/S02` | 10.27 line heights | **0.3956** |
+| accurate | `A09/S01`, `A09/S04` | 0.07 line heights | 0.3742 |
+| accurate | `A10/S01` (worst repetition) | 0.07 line heights | **0.3962** |
+
+`A10/S02` is wrong by ten line heights and scores **higher than both of `A09`'s accurate cells**, and
+higher than four of the five accurate cells overall. Against the one accurate cell it does not beat
+— its own application's `S01`, on that cell's worst repetition — it loses by **0.0006**.
+
+**No threshold separates accurate from inaccurate estimates across the fourteen cells now measured.**
+The answer to §9 question 7 is therefore not a number. Re-aiming `min_confidence` is not enough, and
+the two structural weaknesses §5.9.2.1 listed as "not blocking" are now the whole problem.
+
+#### 5.11.2 A real editor's own autocomplete moves the score by a third of the old margin
+
+`A10/S01` scored 0.3962 on its first repetition and 0.5021 on the other two, with identical
+arrangement, identical injection and an identical position error of 0.07 line heights. The
+difference is in the diff: 27 changed rows over 3 regions on the first, 15 over 2 on the rest.
+
+That is almost certainly §2.1's `S09` note happening by itself — "Notepad3 (Scintilla) opened its own
+word-completion list in response to the injected keystrokes, unprompted". An editor with
+autocompletion enters `S09` on ordinary dictation, and the popup's repaint costs **0.106 of
+confidence** on an otherwise perfect estimate.
+
+For scale: the entire separating band that twelve `A09` cells supported was 0.033 wide. A single
+unprompted popup in a real editor moves the score by three times that. Whatever replaces the current
+scorer has to be stable against a target repainting things that are not our text, because real
+editors do it unasked.
+
+#### 5.11.3 What A10 does not say
+
+- **Two scenarios, not eighteen.** Nothing here about scroll, wrap, selection replacement, theme, or
+  the invisible commits, because arranging them needs either a side channel or much more
+  keystroke plumbing.
+- **No readback.** There is no side channel, so `inject.readback` is null and the record carries the
+  operator TODO. The text arriving correctly is *not* established by these records — only the
+  caret's final position is. §3.1's rule stands: injection success is never inferred from pixels,
+  and it has not been established here by anything else either.
+- **Source A is the oracle** (§3.4), so these cells say nothing about source A's own accuracy and
+  cannot answer §3.3.
+
+---
+
 ## 7. The Phase 0B gate
 
 Restated **verbatim** from `plan.md` §3, Phase 0B ("Explicit gate — decided before Phase 1
@@ -1073,37 +1149,46 @@ the answer is written here, in prose, next to the question.
    Office autocorrect.) This is not an ICER violation by us, but it changes what "committed"
    means in that target, and the declaration should say so. — *Unanswered.*
 
-7. **What should `AnchorConfig::min_confidence` be?** — *Measured on `A09`; the number is a
-   decision that is still open.* §5.9.2.1 has the data: across the ten measurable cells every
-   estimate accurate to within one line height scored 0.3742–0.5000 and every inaccurate one scored
-   0.1858–0.3415, so **any threshold in (0.3415, 0.3742] classifies all twelve correctly** and the
-   0.50 default classifies none of them correctly. `score_diff` discriminates; the default sits
-   above the range it produces.
+7. **What should `AnchorConfig::min_confidence` be?** — **Answered, and the answer is that no value
+   works.** Measuring a real application closed the question in the way §5.9.2.1 warned it might.
 
-   This blocks plan.md §1.5's degradation gate, which is **written and tested but deliberately not
-   called** — `kd::overlay_mode_for()` in src/overlay.cpp, seven tests in tests/test_overlay.cpp,
-   and `App::apply_overlay_mode()` carries the full reason at the point where the call belongs.
-   Wiring it against 0.50 would degrade every commit on every target, including the three the
-   estimator gets right to a couple of pixels.
+   On the calibration target alone the picture looked good: across twelve `A09` cells every estimate
+   accurate to within one line height scored 0.3742–0.5000 and every inaccurate one 0.1858–0.3415,
+   so any threshold in (0.3415, 0.3742] classified all twelve correctly. The margin was 0.033 and
+   shrinking — it had been 0.080 before `S05` and `S06` were added.
 
-   What is *not* being decided on one application's evidence is the number, and that caution now has
-   data behind it: adding `S05` and `S06` (the invisible commits) took the separating margin from
-   **0.080 to 0.033** in a single sweep, and `S06` — three spaces, 11.67 line heights of error,
-   0.3415 — is the new nearest false positive. Five `A09` scenarios remain unmeasurable and no real
-   application has been measured; on this trend one more cell could close the band entirely, at
-   which point the scorer needs retuning rather than re-aiming. Either measure one first, or adopt ~0.33 as a calibrated-on-`A09`
-   default and say so where the setting is documented. **Until then the pre-gate defect ships: the
-   overlay draws at whatever anchor it is handed, including one the estimator scored 0.19.**
+   `A10` (Notepad3) closed it on its first two cells. **`A10/S02` is wrong by 10.27 line heights and
+   scores 0.3956**, above both of `A09`'s accurate cells (0.3742) and within **0.0006** of the worst
+   repetition of `A10`'s own accurate cell. Across the fourteen cells now measured, **no threshold
+   separates accurate estimates from inaccurate ones** (§5.11.1).
 
-   Two related weaknesses, neither of which blocks the above:
+   So `min_confidence` cannot be fixed by choosing a better number, and plan.md §1.5's degradation
+   gate — written, tested, and deliberately not called in `App::apply_overlay_mode` — stays
+   uncalled for a stronger reason than before. Three things have to happen first, and they are
+   ordered:
 
-   - `score_diff`'s proximity term measures horizontal movement in units of *line height*, so a
-     25-character commit reads as an ~11-line-height jump and every score is compressed toward the
-     bottom of the range. Pinned by `anchor.s10_the_second_commit_is_scored_WORSE_not_better`. It
-     penalises wrong answers harder, which is why the separation survives.
-   - An estimate with **no** incumbent to check itself against scores `kProxNoPrevious` 0.85 —
-     higher than a corroborated accurate one. `S10` at 0.50 against `S01` at 0.3742 is exactly
-     that, and it is backwards.
+   1. **`score_diff` needs to distinguish the failure it currently cannot.** The one that matters is
+      a mid-line insertion: text to the right reflows, so the rightmost changed pixel is the end of
+      the reflowed line rather than the insertion point (`A09/S02` 9.33, `A10/S02` 10.27, both
+      scoring in the accepted range). A diff whose changed band *starts* at the incumbent anchor and
+      extends right is an append; one that starts left of it and extends past it is a reflow. That
+      distinction is geometric, available, and unused — the same shape as the fix open question 8
+      identifies for the leftward-growth trigger.
+   2. **Whatever replaces it has to be stable against repaints that are not our text.** `A10/S01`
+      moved 0.106 between identical repetitions because Notepad3 opened its own word-completion
+      popup unbidden (§5.11.2) — three times the entire margin the `A09`-only analysis supported.
+   3. **Only then is a threshold worth choosing**, and it should be chosen over at least two
+      applications, because one application supported a band that a second destroyed.
+
+   The two weaknesses previously logged here as "not blocking" are part of the same problem and are
+   retained: the proximity term measures horizontal movement in units of line height, so a
+   25-character commit reads as an ~11-line-height jump and every score is compressed toward the
+   bottom of the range; and an estimate with **no** incumbent scores `kProxNoPrevious` 0.85, higher
+   than a corroborated accurate one.
+
+   **Meanwhile the pre-gate defect ships**: the overlay draws at whatever anchor it is handed. On
+   the evidence above that is right about as often as it is wrong, and the product cannot currently
+   tell which.
 
 8. **Should the leftward-growth RTL heuristic relocate the insertion point, or only cost
    confidence?** — **Answered: relocate. The trigger is what needs narrowing.** `S16` measured with
