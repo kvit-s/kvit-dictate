@@ -117,6 +117,11 @@ REGISTRY: dict[str, str] = {
     "zipformer": ".sherpa_adapter:ZipformerBackend",
     "transformers-whisper": ".whisper_transformers:WhisperTransformersBackend",
     "faster-whisper": ".faster_whisper:FasterWhisperBackend",
+    # Not a CANDIDATES.md row. A bring-up backend that posts to an OpenAI-compatible
+    # /v1/audio/transcriptions endpoint, so the client can be exercised against a real model with
+    # no environment to build and nothing to download. Its module is stdlib-only, so unlike every
+    # other row here it cannot raise BackendUnavailable for a missing runtime.
+    "openai-http": ".openai_http:OpenAiHttpBackend",
 }
 
 

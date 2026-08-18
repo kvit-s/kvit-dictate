@@ -7,9 +7,14 @@
       "display_name": "Mock backend (no model, no GPU)",
       "interpreter": "C:\\Python312\\python.exe",
       "module": "kvit_asr",
-      "args": ["--backend", "mock"],
+      "args": [
+        "--backend",
+        "mock"
+      ],
       "streaming_mode": "native-streaming",
-      "requires": ["python>=3.12"],
+      "requires": [
+        "python>=3.12"
+      ],
       "env": {},
       "notes": "Emits scripted partial/final messages from a fixed script with no audio decoding at all. It exists so the whole C++ side - handshake, session lifetime, seq ordering, stable_bytes monotonicity, commit engine, injection, overlay - can be exercised end to end without a GPU, and so that a failure is attributable to the C++ side rather than to a model. It also drives the deliberate protocol violations the fixtures require (a decreasing stable_bytes, a mutated stable prefix), which no real backend will produce on demand. This is the default because it is the only entry whose environment costs nothing to create: the backend is stdlib-only, so it points straight at the system interpreter and needs no venv at all.",
       "enabled": true
@@ -20,12 +25,17 @@
       "interpreter": "C:\\Python312\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "mock",
-        "--vad", "none",
-        "--backend-opt", "silence_peak_threshold=0"
+        "--backend",
+        "mock",
+        "--vad",
+        "none",
+        "--backend-opt",
+        "silence_peak_threshold=0"
       ],
       "streaming_mode": "native-streaming",
-      "requires": ["python>=3.12"],
+      "requires": [
+        "python>=3.12"
+      ],
       "env": {},
       "notes": "The `mock` entry above, with the two things that make it depend on the room removed. `--vad none` stops the endpointer gating the decoder, and silence_peak_threshold=0 stops the mock itself treating quiet audio as silence to stay quiet over - so the scripted text advances on whatever the microphone happens to be capturing, including nothing. That makes it the only configuration in which the whole C++ dictation path - hotkey, capture, session, stability, commit, injection, overlay - runs to injected characters with no human speaking and no model on disk, which is exactly what the mock exists for. Use `mock` instead when you want to exercise the endpointer, which needs real sound. Not a model: never report a measurement taken with this entry.",
       "enabled": true
@@ -36,17 +46,68 @@
       "interpreter": "C:\\Python312\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "mock",
-        "--vad", "none",
-        "--backend-opt", "silence_peak_threshold=0",
-        "--backend-opt", "hostile_stability=decrease",
-        "--backend-opt", "hostile_after_emissions=2",
+        "--backend",
+        "mock",
+        "--vad",
+        "none",
+        "--backend-opt",
+        "silence_peak_threshold=0",
+        "--backend-opt",
+        "hostile_stability=decrease",
+        "--backend-opt",
+        "hostile_after_emissions=2",
         "--allow-hostile-backend"
       ],
       "streaming_mode": "native-streaming",
-      "requires": ["python>=3.12"],
+      "requires": [
+        "python>=3.12"
+      ],
       "env": {},
       "notes": "`mock-ungated`, plus a sidecar that knowingly emits messages docs/protocol.md forbids. After two well-behaved emissions per utterance the reported stable_bytes goes BACKWARDS (section 8.2 requirement 3, first half), which is the input the Client's section 8.3 violation handling exists to reject and which no correct pipeline can produce - stability is the server's own computation, so the hole has to be drilled deliberately. Swap `hostile_stability=decrease` for `=mutate` to get the other half: the offset never decreases but the bytes below it change, which a receiver comparing only the numbers cannot see while text it has already typed into the document is retracted. --allow-hostile-backend is a separate flag from the --backend-opt pair on purpose, so a backend cannot authorise its own violations; every honoured override is logged at ERROR. TESTING ONLY. Never dictate into a real document with this entry, and never report a measurement taken with it.",
+      "enabled": true
+    },
+    {
+      "id": "qwen-asr-http",
+      "display_name": "Qwen3-ASR over HTTP (LAN, live preview)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend",
+        "openai-http",
+        "--model",
+        "Qwen/Qwen3-ASR-1.7B",
+        "--chunk-ms",
+        "1000"
+      ],
+      "streaming_mode": "pseudo-streaming",
+      "requires": [
+        "python>=3.12",
+        "network reachability of strixhalo.lan:10301"
+      ],
+      "env": {},
+      "notes": "Posts audio to an OpenAI-compatible /v1/audio/transcriptions endpoint on the operator's LAN (a Qwen3-ASR server on strixhalo). Its backend module is STDLIB-ONLY - urllib and wave - so unlike every other real backend it needs no environment, no download and no install, and it runs under the same bare CPython the mock uses. That is the whole point of it: it is the shortest path from 'the client works against a scripted mock' to 'the client works against a real ASR model'. TWO CAVEATS, both deliberate and both recorded rather than hidden. (1) plan.md section 2 guarantees no network access during dictation; this breaks the letter of that. The endpoint is hardware the operator owns, so audio never leaves their control and the privacy intent holds - but dictation now depends on another host being up, and that availability guarantee is genuinely given up. (2) It is a REMOTE BATCH model behind a streaming interface, so it is pseudo-streaming and its latency is a property of the network and the far end's queue rather than of an ASR architecture. It is not a bench/CANDIDATES.md section 4 candidate and its numbers must never appear in the plan.md section 4 bake-off. This entry re-transcribes the whole utterance-so-far once per second, so the overlay shows a live preview that revises itself. Measured round trip on this LAN: ~550 ms for 5 s of audio. feed() is synchronous by the Backend contract, so if the far end slows down the audio path blocks - prefer the finalize-only entry when the server is shared or busy.",
+      "enabled": true
+    },
+    {
+      "id": "qwen-asr-http-finalize",
+      "display_name": "Qwen3-ASR over HTTP (LAN, finalize-only)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend",
+        "openai-http",
+        "--model",
+        "Qwen/Qwen3-ASR-1.7B",
+        "--backend-opt",
+        "finalize_only=true"
+      ],
+      "streaming_mode": "pseudo-streaming",
+      "requires": [
+        "python>=3.12",
+        "network reachability of strixhalo.lan:10301"
+      ],
+      "env": {},
+      "notes": "Posts audio to an OpenAI-compatible /v1/audio/transcriptions endpoint on the operator's LAN (a Qwen3-ASR server on strixhalo). Its backend module is STDLIB-ONLY - urllib and wave - so unlike every other real backend it needs no environment, no download and no install, and it runs under the same bare CPython the mock uses. That is the whole point of it: it is the shortest path from 'the client works against a scripted mock' to 'the client works against a real ASR model'. TWO CAVEATS, both deliberate and both recorded rather than hidden. (1) plan.md section 2 guarantees no network access during dictation; this breaks the letter of that. The endpoint is hardware the operator owns, so audio never leaves their control and the privacy intent holds - but dictation now depends on another host being up, and that availability guarantee is genuinely given up. (2) It is a REMOTE BATCH model behind a streaming interface, so it is pseudo-streaming and its latency is a property of the network and the far end's queue rather than of an ASR architecture. It is not a bench/CANDIDATES.md section 4 candidate and its numbers must never appear in the plan.md section 4 bake-off. This entry sends EXACTLY ONE request per utterance, at the endpoint, so there is no live preview at all - text appears when you stop speaking. That is the 'finalize-only' UX plan.md section 3 names as one of the two outcomes of the Phase 0B gate, and it is the setting to use when the far end is shared: one request per utterance instead of one per second, and the audio path can never block mid-sentence.",
       "enabled": true
     },
     {
@@ -55,12 +116,19 @@
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "sherpa-onnx",
-        "--model", "csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25",
-        "--chunk-ms", "160"
+        "--backend",
+        "sherpa-onnx",
+        "--model",
+        "csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25",
+        "--chunk-ms",
+        "160"
       ],
       "streaming_mode": "native-streaming",
-      "requires": ["onnxruntime-gpu", "sherpa-onnx", "numpy"],
+      "requires": [
+        "onnxruntime-gpu",
+        "sherpa-onnx",
+        "numpy"
+      ],
       "env": {},
       "notes": "Phase 0A pick 1 - the streaming finalist candidate (bench/CANDIDATES.md section 4, row A'). No PyTorch. The published ONNX export is distributed as one repository per chunk size, which maps one-to-one onto the chunk_ms sweep in plan.md section 4; add a separate entry per chunk size rather than making chunk size a runtime setting, because the weights differ. Cannot be context-biased: greedy_search only (CANDIDATES.md section 5.1), so it must report context_supported:false in `ready` rather than silently ignoring start.context.",
       "enabled": true
@@ -71,12 +139,19 @@
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "sherpa-onnx",
-        "--model", "csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-320ms-2026-06-11",
-        "--chunk-ms", "320"
+        "--backend",
+        "sherpa-onnx",
+        "--model",
+        "csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-320ms-2026-06-11",
+        "--chunk-ms",
+        "320"
       ],
       "streaming_mode": "native-streaming",
-      "requires": ["onnxruntime-gpu", "sherpa-onnx", "numpy"],
+      "requires": [
+        "onnxruntime-gpu",
+        "sherpa-onnx",
+        "numpy"
+      ],
       "env": {},
       "notes": "Phase 0A pick 2 (row B'). Same adapter as the entry above, one model swap. Adds the 320 ms configuration that the English-only model's 160/560 gap does not cover. Kept as a variant, not a separate workstream: if it is not measurably better on the technical corpus, delete this entry.",
       "enabled": true
@@ -87,12 +162,19 @@
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",
       "module": "kvit_asr",
       "args": [
-        "--backend", "zipformer",
-        "--model", "sherpa-onnx-streaming-zipformer-en-2023-06-26",
-        "--decoding", "modified_beam_search"
+        "--backend",
+        "zipformer",
+        "--model",
+        "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        "--decoding",
+        "modified_beam_search"
       ],
       "streaming_mode": "native-streaming",
-      "requires": ["onnxruntime", "sherpa-onnx", "numpy"],
+      "requires": [
+        "onnxruntime",
+        "sherpa-onnx",
+        "numpy"
+      ],
       "env": {},
       "notes": "Phase 0A pick 3 (row C) - the context-biasing arm, and the ONLY natively-streaming candidate that supports vocabulary biasing (transducer hotwords, which require modified_beam_search rather than greedy_search). plan.md section 4 requires context-enabled and context-free modes to be compared separately; without this entry the context-enabled column has no native-streaming entrant at all. Expected to lose on raw WER - that is the point: it measures what biasing is worth. NOTE the backend is `zipformer`, not `sherpa-onnx`: biasing is a different class, not a flag, and the sherpa-onnx backend REFUSES modified_beam_search outright (bench/CANDIDATES.md section 5.1, k2-fsa/sherpa-onnx#3572), so `--backend sherpa-onnx --decoding modified_beam_search` - which this entry used to say - could only ever have failed at load.",
       "enabled": true
@@ -102,9 +184,18 @@
       "display_name": "Whisper large-v3-turbo (baseline, existing venv)",
       "interpreter": "D:\\projects\\wan-dancer\\.venv\\Scripts\\python.exe",
       "module": "kvit_asr",
-      "args": ["--backend", "transformers-whisper", "--model", "openai/whisper-large-v3-turbo"],
+      "args": [
+        "--backend",
+        "transformers-whisper",
+        "--model",
+        "openai/whisper-large-v3-turbo"
+      ],
       "streaming_mode": "pseudo-streaming",
-      "requires": ["transformers", "torch", "librosa"],
+      "requires": [
+        "transformers",
+        "torch",
+        "librosa"
+      ],
       "env": {
         "HF_HOME": "c:\\apps\\llama-swap\\gguf\\hf"
       },
