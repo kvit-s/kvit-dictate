@@ -2,8 +2,9 @@
 
 Written 2026-08-17, end of the second session. Commit `feeb92f` on `main`.
 Amended at the end of the third session (`c270faf`, then `d2bac8b`); see §9 for what that
-changed and §10 for what a human then observed. **§4 checks 1 and 2 are now confirmed working**;
-3, 4 and 5 remain unobserved, and check 3 was described in a way that cannot work — see it.
+changed and §10 for what a human then observed. **§4 checks 1, 2, 3 and 5 are now confirmed
+working** — 3 only after the defect it exposed was fixed (§5.20). Check 4 and `mock-hostile`
+remain unobserved.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -252,6 +253,21 @@ Found by a human at the keyboard:
 19. **`find_app_policy` had never been called**, so the whole per-application tier mechanism that
     `docs/supported-targets.md` is built around did nothing.
 
+20. **`Effect::ResetCommitEngine` fired at utterance boundaries as well as session boundaries.**
+    It is session-scoped — the owner maps it onto `CommitEngine::reset()`, which calls
+    `clear_session()` — so it cleared `session_has_committed`, the only input to
+    `CommitOp::leading_space`. The event that must produce the space between two utterances was
+    the event that destroyed the means of producing it, which is why §5.18 came back. It also
+    cleared a session-scoped §8.3 violation latch that an utterance must not touch. Fixed by not
+    emitting it there: the engine already detects the `utterance_id` change itself, with the id
+    the effect cannot carry.
+
+    **Why the §5.18 fix's test did not catch it, which is the part worth keeping:** the test drove
+    `CommitEngine::begin_utterance()`, and *nothing in the product calls `begin_utterance()`*.
+    `main.cpp` only ever calls `on_partial` / `on_final` / `on_tick` / `reset()`. The test covered
+    a path the product does not take — §5's pattern one layer down, and a reminder that "covered
+    by a test" and "covered on the path main.cpp drives" are different claims.
+
 **The pattern, stated because it will repeat:** every one of 12–19 is a contract written down in a
 header, implemented on one side, and never called from the other. The modules are not the problem;
 `main.cpp` is where they were supposed to meet, and it is the one file nothing tests. When
@@ -407,10 +423,18 @@ scoring above `min_confidence` 0.5 against a real editor, and it means the `refr
 after-each-commit fix holds. Phase 0B still has to measure this properly across the application
 matrix; one editor is one cell, not a result. But the mechanism is no longer hypothetical.
 
-**§4.3 — the space between utterances. STILL UNKNOWN, and not the observer's fault.** The
-instruction was impossible: see §4 check 3. It needs `mock` and real speech.
+**§4.5 — the endpointer. CONFIRMED.** With `mock` and real speech: speak, pause, speak, and a
+second script line appears. The mock only advances when an utterance closes, so a second sentence
+*is* the proof that a `final` closed utterance 1 while the session kept running — plan.md §1.6
+working. (The first attempt at this ran against `mock-ungated` because nobody checked which model
+was loaded before spending a session on it. The log answers that in one line; check it first.)
 
-**§4.4, §4.5 — not attempted.**
+**§4.3 — the space between utterances. FOUND BROKEN, FIXED, THEN CONFIRMED.** The first run
+produced `…the default modelopen src/protocol.h…` — §5.18 again, after it had already been fixed
+once in `feeb92f` and covered by a passing test. Root cause and the reusable lesson are in `9b5edb4`
+and in §5.20 below. The re-run produced `…the default model open src/protocol.h…`.
+
+**§4.4 — not attempted.** Neither has `mock-hostile` (§9).
 
 Two things in the log worth carrying forward:
 
