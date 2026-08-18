@@ -773,6 +773,21 @@ void App::drain_audio_queue() {
 // ─── Applying the state machine's decisions ─────────────────────────────────────────────────
 
 void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* src) {
+    // The session machine's own diagnosis, which was being thrown away.
+    //
+    // `Effect::SurfaceWarning` reaches the overlay with a fixed string, and it is raised from six
+    // different places in session.cpp — a §8.2 stability violation with an offset, a refusal, a
+    // non-fatal error frame from the child, and others. Without this line all six look identical
+    // in the log, and the first real failure was misread because of it: "overlay flagged a
+    // committed-prefix violation" was taken for the commit engine's contradiction check when in
+    // fact that check never ran, and the abort came from the protocol-level check upstream of it.
+    // `o.error` already carries the code, the message and the offset; it just had no reader.
+    if (o.error.has_value()) {
+        KD_LOG_ERROR("session error: code=%s fatal=%d at_offset=%llu %s",
+                     kd::proto::to_string(o.error->code), o.error->fatal ? 1 : 0,
+                     static_cast<unsigned long long>(o.error->at_offset), o.error->msg.c_str());
+    }
+
     for (const kd::proto::Message& m : o.to_send) {
         if (ipc_ != nullptr) ipc_->send_control(m);
     }
@@ -1152,6 +1167,21 @@ void App::finish_dictation(const char* why) {
     KD_LOG_INFO("dictation finished: %s", why);
     finalizing_ = false;
     finalize_deadline_ms_ = 0;
+
+    // Tell the input filter, here, on the ONE path every session ends through.
+    //
+    // It was told only in end_dictation(), which the abort paths never reach — a §8.2 stability
+    // violation goes perform_commit -> StabilityViolation -> the session machine -> here, and
+    // end_dictation is skipped entirely. The filter was then left believing a session was still
+    // running, permanently, with two visible consequences: every subsequent keystroke posted a
+    // stop-on-input for a session that did not exist, and **the hotkey stopped working** —
+    // `chord_matches` reads `session_active_` and sends `toggle_finalize` instead of `activate`,
+    // so Win+Y silently finalised nothing rather than starting a session. The only way out was to
+    // restart the process. Reported as "Win+Y no longer works" after the first abort.
+    //
+    // Safe to call twice: it clears a flag and some key state, and end_dictation still calls it
+    // at the moment the microphone closes, which is earlier and is what the user's gesture means.
+    if (hotkey_ != nullptr) hotkey_->note_session_ended();
     // Drop any per-application override, so the next session starts from the user's own settings
     // rather than from whatever the last target happened to need.
     if (injector_ != nullptr) injector_->set_config(settings_.inject);
