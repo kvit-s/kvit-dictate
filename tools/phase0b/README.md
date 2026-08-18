@@ -5,6 +5,23 @@ target's side channel, verifies focus, runs the probe, and leaves the target in 
 Only `A09` can be driven this way — it is the one target with a side channel and menu commands to
 arrange itself (docs/supported-targets.md §3.4, §5.9).
 
+## Verify the arrangement before you measure it
+
+```powershell
+tools\phase0b\verify-arrange.ps1          # all cells
+tools\phase0b\verify-arrange.ps1 -Only S10
+```
+
+This arranges each cell exactly as the sweep does, then asks the target what state it is actually
+in and checks it against the cell's declared `expect` block: which control holds the focus, where
+the caret sits **in the text**, what the text is, the theme, whether a system caret exists, and
+that no previous cell's pane scroll mode leaked in. It injects nothing, captures nothing and never
+touches the foreground, so unlike the sweep it is safe to run while using the machine.
+
+It exists because the first eleven measured cells included five whose arrangement did not match
+their name, and nothing in the pipeline noticed — see docs/supported-targets.md §5.9.3. **Run it
+before any sweep.** A cell that fails here produces a measurement that means nothing.
+
 ```powershell
 # every scenario this harness can arrange, three repetitions, anchor-error injection
 tools\phase0b\sweep.ps1 -Repeat 3 -Text ref2
@@ -41,7 +58,7 @@ any aggregate.
 
 ## Which scenarios this covers
 
-`$plan` in `sweep.ps1` holds one entry per scenario the harness can arrange: S01, S02, S03, S04,
+`$plan` in `arrange.ps1` holds one entry per scenario the harness can arrange: S01, S02, S03, S04,
 S07, S08, S10, S11, S12, S16, S17. Deliberately absent:
 
 * **S05, S06** — need an injection other than REF-1/REF-2 (newline-only, whitespace-only). The
@@ -53,8 +70,12 @@ S07, S08, S10, S11, S12, S16, S17. Deliberately absent:
 
 ## Files
 
-* `sweep.ps1` — the scenario table and the loop. Re-arms the target's state before **every**
-  repetition; the probe's own `--repeat` would leave the previous repetition's text in the control,
-  so an "empty field" is only empty the first time.
+* `arrange.ps1` — the scenario table (`$plan`), the baseline every cell starts from, and
+  `Arrange`. Dot-sourced by both of the below, so what gets verified is literally what gets
+  measured. Each cell re-arms from the baseline before **every** repetition: the probe's own
+  `--repeat` would leave the previous repetition's text in the control, so an "empty field" is
+  only empty the first time, and a mode one cell switches on is a mode the next cell inherits.
+* `verify-arrange.ps1` — checks the arrangement without injecting. Run this first.
+* `sweep.ps1` — the measurement loop. Takes over the foreground.
 * `runcell.ps1` — one scenario, for iterating on a single cell.
-* `focus.ps1` — the foreground helper, dot-sourced by both.
+* `focus.ps1` — the foreground helper.

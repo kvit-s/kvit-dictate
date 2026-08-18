@@ -569,25 +569,32 @@ The shape of the fix is two injections rather than one: REF-1 for §3.2 fidelity
 string that fits inside the capture region for §3.4 anchor error. Until that is decided, no §3.4
 figure should be filled in, and the A09 records already written carry `notes` saying so.
 
-### 5.9.2 First A09 results — 11 of 18 cells, `sendinput`, REF-2
+### 5.9.2 First A09 results — 11 of 18 cells, `sendinput`, REF-2 — **five of them superseded**
 
 Measured 2026-08-18, automated against `tools/testtarget` with the side channel supplying ground
 truth. Three repetitions per cell, zero records flagged `suspect` (the target held the foreground
 throughout every measurement). Raw records under `bench/results/phase0b/A09/`.
 
-| Cell | Scenario | error_lh (3 reps) | |
-|---|---|---|---|
-| `S01` | empty field | 0.07, 0.07, 0.07 | within 1 lh |
-| `S02` | mid-line insertion | 9.33 ×3 | over |
-| `S03` | selection replacement | 11.67 ×3 | over |
-| `S04` | line wrap | 9.33, 9.33, 49.95 | over, and unstable |
-| `S07` | vertical scroll | 14.93 ×3 | over |
-| `S08` | horizontal scroll | 17.40 ×3 | over |
-| `S10` | steady self-drawn caret | 31.53, then no diff at all | over / no estimate |
-| `S11` | dark theme | 9.33 ×3 | over |
-| `S12` | light theme | 9.33 ×3 | over |
-| `S16` | RTL text | 0.13, 0.13, 0.24 | within 1 lh |
-| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test |
+> **Read the "arranged" column before any number in this table.** Reviewing these results the
+> same day found that five of the eleven cells did not arrange the scenario their name claims.
+> The measurements are real and the records are kept — they are accurate about what was actually
+> on screen — but for those five, what was on screen was not the scenario. §5.9.3 says what went
+> wrong; `tools/phase0b/verify-arrange.ps1` now checks every arrangement before a sweep runs, so
+> this particular way of being wrong cannot recur silently.
+
+| Cell | Scenario | error_lh (3 reps) | | arranged? |
+|---|---|---|---|---|
+| `S01` | empty field | 0.07, 0.07, 0.07 | within 1 lh | yes |
+| `S02` | mid-line insertion | 9.33 ×3 | over | yes |
+| `S03` | selection replacement | 11.67 ×3 | over | yes |
+| `S04` | line wrap | 9.33, 9.33, 49.95 | over, and unstable | **no** — injected at offset 0, and the control was never re-armed between repetitions |
+| `S07` | vertical scroll | 14.93 ×3 | over | **no** — nothing scrolled |
+| `S08` | horizontal scroll | 17.40 ×3 | over | **no** — nothing scrolled |
+| `S10` | steady self-drawn caret | 31.53, then no diff at all | over / no estimate | **no** — the pane scrolled 25 line heights per repetition |
+| `S11` | dark theme | 9.33 ×3 | over | yes |
+| `S12` | light theme | 9.33 ×3 | over | yes |
+| `S16` | RTL text | 0.13, 0.13, 0.24 | within 1 lh | **no** — the LTR run went in *before* the RTL text |
+| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | yes |
 
 **Read `error_lh` as source C's error, not the product's.** The probe scores `anchor_from_diff`
 unconditionally, while the product picks the best available source and ranks a real caret (0.95)
@@ -597,25 +604,58 @@ and been exact, and none of these figures would reach a user. The probe's `winne
 its own rule (prefer C whenever the diff is non-empty) and therefore does **not** answer §3.3;
 that is a defect in this harness, recorded rather than fixed.
 
-Which makes `S10` the cell that matters, and it is the bad news: it is the only row here with no
-system caret, so source C is the only anchor available — exactly the situation in VS Code, Slack
-and terminals, which is to say all the interesting targets — and source C produced 31.53 line
-heights on the first repetition and **no usable estimate at all** on the other two. The `S10`
-ground truth also came back at y = −226, which is off-screen and means the scenario setup itself
-needs work before that cell can be believed either way.
+**What the six sound cells say.** `S01` is exact. `S02` and `S03` fail exactly as §2 predicted
+when the scenarios were written: text to the right of an interior insertion reflows, so the
+rightmost changed pixel is the end of the reflowed line rather than the insertion point. `S11` and
+`S12` are identical to `S02` to the pixel, which is a real result — **theme does not affect the
+estimate**. `S17` refuses, correctly. Those five numbers and the refusal stand.
 
-The pattern in the other rows is coherent and matches what §2 predicted when the scenarios were
-written: `S02`/`S03` fail because text to the right of an interior insertion reflows, so the
-rightmost changed pixel is the end of the reflowed line rather than the insertion point; `S07`/
-`S08` fail while `looks_like_scroll` stays false, so scroll detection did not fire. `S11` and
-`S12` are identical to `S02` to the pixel, which is a real result: **theme does not affect the
-estimate**. `S16` passing is the surprise, and it should be treated with suspicion rather than
-celebrated — REF-2 is deliberately LTR-only, so this row currently measures an LTR injection into
-an RTL *control*, not RTL text, and the S16 that §2 describes has not been run.
+**What the five superseded cells do not say.** Nothing about scroll rejection, line wrap, RTL, or
+the self-drawn-caret case. In particular `S10` — the only cell with no system caret, and therefore
+the only one that speaks to VS Code, Slack and terminals — measured a target that was scrolling
+itself off the screen, so **the question it exists to answer is still open**. Nothing here
+supports a claim about source C's error on a target that draws its own caret, in either direction.
 
 **Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an
 autocomplete popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or
 elevation state that was not changed unattended.
+
+### 5.9.3 Why five of those cells were arranged wrongly
+
+Kept because the shape recurs, and because two of these look from the outside like product defects
+and are not.
+
+**`EM_SETSEL(-1, -1)` does not move an edit control's caret to the end.** `wParam = -1` means
+"deselect"; the caret stays wherever the control already had it, which straight after
+`SetWindowTextW` is offset 0. Four scenarios were arranged that way, so all four injected at the
+*start* of their text:
+
+* `S07` and `S08` never scrolled. `looks_like_scroll` was false because **nothing scrolled** — the
+  control was already showing offset 0 and the insertion happened there. This reads in the raw
+  records as a scroll-detection failure and is not one; scroll detection has still never been
+  exercised. (`S07` also set the `ScrollOnInject` menu item, which only ever drove the self-drawn
+  pane and could not scroll an EDIT at all.)
+* `S04` never approached the wrap point.
+* `S16` inserted its LTR run before the RTL text rather than after it, so it measures even less
+  about bidi than §5.9.2 originally claimed.
+
+**Scenario state leaked from one cell into the next.** `S07` switched the pane's "scroll on each
+insertion" mode on and nothing switched it off, so `S10` ran with it live: each of REF-2's 25
+characters scrolled the pane by a line, walking its content 25 line heights off the top of the
+window. That is why `S10`'s ground truth came back at y = −226 and why repetitions 2 and 3
+recorded no diff at all — there was nothing left on screen to change.
+
+**`S04` was never re-armed between repetitions.** Its text menu item filled `edit-single` while
+`S04` measures `edit-multi`, so each repetition typed into the previous one's leftovers. That is
+the drift to 49.95 line heights on the third: by then the accumulated text had wrapped, and the
+scenario under measurement was no longer `S04`.
+
+The common thread is the one the handover has been recording for four sessions: **a contract
+implemented on one side and never checked from the other.** The sweep declared what each cell
+arranged; nothing ever asked the target whether that was what it had. `tools/testtarget` now
+reports `sel_start` / `sel_end` / `text_length` in its state, `kd_probe --dump-state` prints that
+state without injecting or capturing anything, and `verify-arrange.ps1` checks all eleven
+arrangements against declared expectations before any sweep is allowed to mean anything.
 
 ### 5.10 Incidental observations — **not measurements**
 
