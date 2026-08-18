@@ -542,3 +542,77 @@ KD_TEST(anchor, s07_scores_below_min_confidence_and_is_published_anyway) {
     caret_anchor.confidence = kd::anchor::kCaretConfidence;
     KD_CHECK(!kd::anchor::should_replace_anchor(caret_anchor, *a, cfg, 1000));
 }
+
+// ═══ The A09/S10 measurement, and what the gate does to it ══════════════════════════════════
+//
+// S10 is the good result — 0.12 line heights with no system caret at all, the VS Code / Slack /
+// terminal case (docs/supported-targets.md §5.9.2). Its recorded confidence is 0.4999999702,
+// which sits a hair BELOW the default min_confidence of 0.5, so once the degradation gate exists
+// the obvious worry is that the best thing source C ever measured is still not good enough to
+// draw inline.
+//
+// It is not, on the first commit of a session, and it is on every one after. The reason is that
+// `kd_probe` always passes `previous = nullopt`, so every published figure carries
+// kProxNoPrevious (0.85) rather than the full proximity term a corroborated estimate earns. The
+// probe therefore *understates* what the product scores in its steady state, and no number in
+// §5.9.2 should be read as the confidence a user would actually get after the first commit.
+
+namespace {
+
+// region [416,416 980x820] — the whole-window fallback, because a self-drawn caret gives
+// capture_region_for() nothing to centre on.
+constexpr Rect kS10Region{416, 416, 1396, 1236};
+
+kd::anchor::DiffResult s10_diff() {
+    kd::anchor::DiffResult d;
+    d.changed_bounds = Rect{22, 457, 199, 472};
+    d.last_changed_row_extent = Rect{22, 457, 199, 472};
+    d.changed_rows = 15;
+    d.changed_regions = 3;
+    d.changed_pixels = 900;
+    d.looks_like_scroll = false;
+    return d;
+}
+
+}  // namespace
+
+KD_TEST(anchor, s10_first_commit_falls_a_hair_under_the_default_threshold) {
+    // Exactly the figure in the record, to the float. If the scorer is retuned this is the test
+    // that says the published table needs re-reading.
+    const float first = kd::anchor::score_diff(s10_diff(), kS10Region, std::nullopt);
+    KD_CHECK_NEAR(first, 0.4999999702f, 1e-6);
+
+    kd::anchor::AnchorConfig cfg;
+    KD_CHECK(first < cfg.min_confidence);  // by 3e-8 — arithmetic, not judgement
+}
+
+KD_TEST(anchor, s10_the_second_commit_is_scored_WORSE_not_better) {
+    // The state the second commit of a session is actually in: the previous anchor is where the
+    // FIRST commit left the caret (615, 873 — region.left + band.right of the diff above), and
+    // this commit's text starts there and runs the same width to the right.
+    kd::anchor::DiffResult second = s10_diff();
+    second.changed_bounds = Rect{199, 457, 376, 472};
+    second.last_changed_row_extent = Rect{199, 457, 376, 472};
+
+    Anchor previous;
+    previous.insertion_point = kd::anchor::Point{615, 873};
+    previous.line_height = 16;
+    previous.confidence = 0.49f;
+    previous.source = kd::anchor::Source::CommitDiff;
+    previous.timestamp_ms = 900;
+
+    const float first_commit = kd::anchor::score_diff(s10_diff(), kS10Region, std::nullopt);
+    const float second_commit = kd::anchor::score_diff(second, kS10Region, previous);
+
+    // Having an incumbent to corroborate against makes the score WORSE, not better, and that is
+    // not a quirk of these numbers. The proximity term measures how far the new estimate is from
+    // the old one in units of LINE HEIGHT (kProxNearLines = 3, kProxFarLines = 15), and a commit
+    // of 25 characters moves the insertion point ~177 px = ~11 line heights *horizontally*. So
+    // ordinary typing is scored as "the anchor jumped", and any commit longer than about seven
+    // characters starts losing confidence for doing exactly what dictation does.
+    KD_CHECK(second_commit < first_commit);
+    KD_CHECK(second_commit < 0.5f);
+
+    // Recorded rather than asserted loosely, so retuning kProx* is visible here.
+    KD_CHECK_NEAR(second_commit, 0.3904f, 0.005);
+}
