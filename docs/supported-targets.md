@@ -1088,9 +1088,26 @@ the answer is written here, in prose, next to the question.
    share a signature the real RTL case does not: **the incumbent caret did not move.** A genuine RTL
    commit moves the insertion point leftward *away* from the incumbent; a horizontally scrolling LTR
    control leaves it exactly where it was while the text moves underneath. That distinction is
-   available where the decision is taken and is not currently used. — *Open: narrow the trigger, and
-   re-measure `S07`, `S08` and `S16` together, because a change that fixes two of them by breaking
-   the third is not a fix.*
+   available where the decision is taken and is not currently used.
+
+   — *Deprioritised, 2026-08-18.* Two reasons, in order of weight. **This product is English-only**
+   (`bench/CANDIDATES.md`: "English-only is our entire scope and multilingual capacity is dead
+   weight"; plan.md §694 lists multi-language as a non-goal), so the case the relocation gets right
+   will never occur and only the misfires matter. And **the misfires are already handled** by
+   question 7's gate: `S07` scores 0.1894 and `S08` 0.1858, both far below any threshold in the
+   candidate band, so once the gate exists neither wrong position is ever drawn. A wrong estimate
+   that is correctly labelled as untrustworthy is not a bug.
+
+   Note also that deleting the branch is **not** the safe simplification it looks like. It would
+   take `S08` to 0.24 — that is the figure from the sweep with no incumbent, where the check could
+   not fire — but it would also remove `kRtlPenalty` (0.65), which is part of what pushes `S07` and
+   `S08` below the threshold in the first place. `S07`'s position without the flip is 48.07 line
+   heights out. Raising a badly wrong anchor's confidence into the *accepted* band is strictly worse
+   than today.
+
+   Worth keeping in mind if this is ever picked up: the trigger is misnamed rather than misplaced.
+   Its own comment concedes it fires on right-aligned LTR text as well as bidi, and right-aligned
+   English fields (numeric inputs, spreadsheet cells) are in scope even though RTL is not.
 
 9. **Should the capture region widen, re-centre, or stay as it is?** — *Measured; the decision is
    open.* `capture_region_for` reaches 585 px behind the previous insertion point (900 × 220 at
