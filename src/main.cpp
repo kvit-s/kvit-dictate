@@ -886,17 +886,18 @@ bool App::submit_before_frame() {
 // including ones the estimator gets right to a couple of pixels.
 //
 // The scorer itself is fine. docs/supported-targets.md §5.9.2.1 has the measurement: across the
-// ten measurable A09 cells, every estimate accurate to within one line height scored 0.3742–0.5000
-// and every inaccurate one scored 0.1858–0.2941, so any threshold in (0.2941, 0.3742] classifies
-// all ten correctly. 0.50 classifies none of them correctly. The discrimination is there; the
-// default is simply in the wrong place.
+// twelve measurable A09 cells, every estimate accurate to within one line height scored
+// 0.3742–0.5000 and every inaccurate one scored 0.1858–0.3415, so any threshold in
+// (0.3415, 0.3742] classifies all twelve correctly. 0.50 classifies none of them correctly. The
+// discrimination is there; the default is simply in the wrong place.
 //
 // **To turn it on:** lower `AnchorConfig::min_confidence` (src/anchor.h) to about 0.33, then
 // replace the line below with `kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_,
 // settings_.anchor)` under anchor_mutex_. What is deliberately NOT being done here on one
-// application's evidence is picking that number: the separating margin is 0.08 with `S03` at
-// 0.2941 the nearest false positive, and a second application could close it. That is open
-// question 7 in docs/supported-targets.md §9.
+// application's evidence is picking that number, and the caution has data behind it: adding two
+// cells (`S05`/`S06`, the invisible commits) took the margin from 0.080 to 0.033 in one sweep,
+// and `S06` at 0.3415 is the nearest false positive. That is open question 7 in
+// docs/supported-targets.md §9.
 //
 // Two related weaknesses are recorded there rather than fixed here, because neither blocks the
 // gate: `score_diff`'s proximity term measures horizontal movement in units of line height (so a

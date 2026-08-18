@@ -1,6 +1,6 @@
 # Supported targets — per-application matrix
 
-**Status: NO APPLICATION HAS BEEN MEASURED. 11 of 162 cells exist, all of them on the calibration
+**Status: NO APPLICATION HAS BEEN MEASURED. 13 of 162 cells exist, all of them on the calibration
 target.**
 
 Every result cell in the §5 per-application matrices reads `—`. That is not a placeholder for
@@ -14,7 +14,7 @@ application.
 |---|---|
 | Document version | v1 |
 | Phase | 0B — Windows feasibility spike (`plan.md` §3) |
-| Measurements taken | 2026-08-18 — `A09` only, 11 of 18 scenarios, `sendinput`, REF-2 (§5.9.2) |
+| Measurements taken | 2026-08-18 — `A09` only, 13 of 18 scenarios, `sendinput`, REF-2/3/4/5 (§5.9.2) |
 | Probe build | `dev` (unstamped; `probe_build` in every record) |
 | Machine | RTX 5090 / 64 GB / Windows 11 Pro (the target machine; see `plan.md` §5) |
 | Results directory | `bench/results/phase0b/` |
@@ -567,91 +567,139 @@ Measured on A09/S01, reproducible to the pixel across repetitions: estimate pinn
 of which `(900-170)/15 = 48.7` is entirely accounted for by the two effects above. Nothing in that
 number is the estimator's doing, and A09 is the row §5.9 says calibrates all the others.
 
-**Not fixed here, because it is a change to what the matrix measures rather than a bug in code.**
-The shape of the fix is two injections rather than one: REF-1 for §3.2 fidelity, and a short LTR
-string that fits inside the capture region for §3.4 anchor error. Until that is decided, no §3.4
-figure should be filled in, and the A09 records already written carry `notes` saying so.
+**Fixed, in the shape this section proposed and then some.** The probe now takes five reference
+strings rather than one: **REF-1** for §3.2 fidelity, **REF-2** a short LTR string that fits inside
+the capture region for §3.4 anchor error, **REF-3** its right-to-left counterpart so `S16` can
+measure the case it is named for, and **REF-4**/**REF-5** — a lone newline and three spaces — so
+`S05` and `S06` exist at all. Every record carries `text_id`, and `error_lh_valid_for_3_4` marks the
+figures that may not be aggregated into §3.4 together with the reason.
 
-### 5.9.2 A09 results — 11 of 18 cells, `sendinput`, REF-2
+### 5.9.2 A09 results — 13 of 18 cells, `sendinput`
 
 Measured 2026-08-18 against `tools/testtarget`, with the side channel supplying ground truth and
-`verify-arrange.ps1` confirming every arrangement beforehand (11 cells checked, 0 failing). Three
+`verify-arrange.ps1` confirming every arrangement beforehand (13 cells checked, 0 failing). Three
 repetitions per cell; **every cell reproduced to the pixel across all three**, and no record is
 flagged `suspect`. Raw records under `bench/results/phase0b/A09/`.
 
-These are the records carrying `anchor.scored_against_previous`. Two earlier sweeps the same day
-are superseded and their numbers must not be mixed with these — §5.9.3 and §5.9.4 say why each
-changed. Both changes were to the *harness*; the product's estimator has not been touched.
+These are the records carrying `anchor.scored_against_previous`. Two earlier sweeps the same day are
+superseded and their numbers must not be mixed with these — §5.9.3 and §5.9.4 say why each changed.
+Both changes were to the *harness*; the product's estimator has not been touched.
 
-| Cell | Scenario | error_lh (×3) | | conf | incumbent anchor |
-|---|---|---|---|---|---|
-| `S01` | empty field | **0.07** | exact | 0.3742 | source A caret |
-| `S04` | line wrap | **0.07** | exact | 0.3742 | source A caret |
-| `S10` | steady self-drawn caret | **0.12** | within 1 lh | 0.5000 | **none — no caret exists** |
-| `S02` | mid-line insertion | 9.33 | over | 0.2083 | source A caret |
-| `S11` | dark theme | 9.33 | over | 0.2083 | source A caret |
-| `S12` | light theme | 9.33 | over | 0.2083 | source A caret |
-| `S07` | vertical scroll (wrap at the bottom) | 9.54 | over | 0.1894 | source A caret |
-| `S03` | selection replacement | 11.67 | over | 0.2941 | source A caret |
-| `S16` | LTR appended to RTL text | 19.13 | over | 0.1912 | source A caret |
-| `S08` | horizontal scroll | 39.00 | over | 0.1858 | source A caret |
-| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | — | source A caret |
+| Cell | Scenario | text | error_lh (×3) | | conf | incumbent |
+|---|---|---|---|---|---|---|
+| `S16` | RTL text into an RTL control | REF-3 | **0.00** | exact | 0.4099 | source A caret |
+| `S01` | empty field | REF-2 | **0.07** | exact | 0.3742 | source A caret |
+| `S04` | line wrap | REF-2 | **0.07** | exact | 0.3742 | source A caret |
+| `S10` | steady self-drawn caret | REF-2 | **0.12** | within 1 lh | 0.5000 | **none — no caret exists** |
+| `S02` | mid-line insertion | REF-2 | 9.33 | over | 0.2083 | source A caret |
+| `S11` | dark theme | REF-2 | 9.33 | over | 0.2083 | source A caret |
+| `S12` | light theme | REF-2 | 9.33 | over | 0.2083 | source A caret |
+| `S07` | vertical scroll (wrap at the bottom) | REF-2 | 9.54 | over | 0.1894 | source A caret |
+| `S03` | selection replacement | REF-2 | 11.67 | over | 0.2941 | source A caret |
+| `S06` | whitespace-only commit | REF-5 | 11.67 † | over | 0.3415 | source A caret |
+| `S05` | newline-only commit | REF-4 | 21.02 † | over | 0.3091 | source A caret |
+| `S08` | horizontal scroll | REF-2 | 39.00 | over | 0.1858 | source A caret |
+| `S17` | password field | REF-2 | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | — | source A caret |
+
+† `S05` and `S06` carry `error_lh_valid_for_3_4: false`. They are **excluded from the published
+§3.4 accuracy figure** — a distance computed from a diff that is deliberately near-empty measures
+noise, and "how accurate is the estimator" is not a well-posed question for an invisible commit.
+They are **included in the threshold analysis below**, because the question *that* asks is "should
+this anchor be trusted", and for an invisible commit the answer is plainly no. Two different
+questions, two different inclusion rules.
 
 **Read `error_lh` as source C's error, not the product's.** The probe scores `anchor_from_diff`
 unconditionally, while the product picks the best available source and ranks a real caret (0.95)
 above any diff (≤0.90). In every cell except `S10`, `source_a.available` is true — these are Win32
 edit controls with a real system caret — so the shipping product would have used the caret and been
-exact. The probe's `winner` field applies its own rule (prefer C whenever the diff is non-empty)
-and therefore does **not** answer §3.3; that is a defect in this harness, recorded rather than
-fixed.
+exact. The probe's `winner` field applies its own rule (prefer C whenever the diff is non-empty) and
+therefore does **not** answer §3.3; that is a defect in this harness, recorded rather than fixed.
 
-#### 5.9.2.1 The scorer discriminates. The threshold is set outside its range.
+#### 5.9.2.1 The scorer discriminates, but the margin is thin and shrinking
 
-This is the row's most useful result, and it is about `min_confidence` rather than about any one
-cell.
-
-Sort the ten measurable cells by *true* error and the confidences fall into two non-overlapping
-groups:
+Sort by *true* error and the confidences still fall into two non-overlapping groups:
 
 | | n | confidence range |
 |---|---|---|
-| accurate — true error < 1 line height | 3 | **0.3742 – 0.5000** |
-| wrong — true error ≥ 1 line height | 7 | **0.1858 – 0.2941** |
+| accurate — true error < 1 line height | 4 | **0.3742 – 0.5000** |
+| wrong — true error ≥ 1 line height | 8 | **0.1858 – 0.3415** |
 
-**Any threshold in (0.2941, 0.3742] classifies all ten correctly**, with a margin of 0.08.
-`AnchorConfig::min_confidence` defaults to **0.50**, which is above the entire range of *good*
-scores and therefore rejects all ten — including the three the estimator got right to within a
-tenth of a line height.
+**Any threshold in (0.3415, 0.3742] classifies all twelve correctly.** `min_confidence` defaults to
+**0.50**, above the entire range of *good* scores, so enforcing it today rejects all twelve —
+including the four the estimator gets right to within a tenth of a line height. `score_diff`
+discriminates; the default is in the wrong place.
 
-So the conclusion is not that `score_diff` needs retuning. On this evidence it is doing its job: it
-ranks every accurate estimate above every inaccurate one. What is wrong is the default threshold,
-which sits above the output range the function actually produces. Lowering `min_confidence` to
-~0.33 makes plan.md §1.5's degradation gate correct on every measured cell.
+**But the margin halved when two cells were added.** With ten cells the separating band was
+(0.2941, 0.3742], a margin of 0.0801. `S05` and `S06` — the invisible commits — arrived at 0.3091
+and **0.3415**, and `S06` is now the nearest false positive with an error of 11.67 line heights.
+The band is (0.3415, 0.3742]: **a margin of 0.033, down from 0.080, from two cells.**
 
-Four caveats, because this is ten cells on one application:
+That is the argument for not picking the number yet, and it is now an empirical argument rather
+than a cautious one. Five `A09` scenarios remain unmeasurable here (`S09`, `S13`–`S15`, `S18`) and
+no real application has been measured at all; on this trend one more cell could close the band
+entirely, at which point no single threshold works and the scorer really does need retuning rather
+than re-aiming.
 
-- **n = 10, one application, one injection method, one reference text.** `A09` is the calibration
-  row, so its numbers are the right ones to calibrate against — but a second application could
-  close the 0.08 margin, and `S03` at 0.2941 is the nearest false positive.
-- **`S10` is a different regime.** It has no incumbent anchor at all, so it scores
-  `kProxNoPrevious` (0.85) on the proximity term while a *corroborated accurate* estimate earns
-  less. An estimate with nothing to check itself against therefore scores higher than one that
-  agrees with its predecessor, which is backwards, and it is why `S10` lands at 0.50 while `S01` —
-  the same arrangement with a caret available — lands at 0.3742.
-- **The proximity term still penalises ordinary typing.** It measures distance from the incumbent
-  in units of *line height*, and a 25-character commit moves the insertion point ~11 line heights
-  *horizontally*. That compresses every score toward the bottom of the range. It happens to
-  penalise the wrong answers more, which is why the separation survives.
-- **`S17` scores 0.90** — `kMaxDiffConfidence`, from a single changed region — on a cell where
-  nothing was injected at all. The diff is the caret blinking. Injection is refused first so it
-  reaches nothing, but "a blinking caret alone scores maximum confidence" deserves a scenario of
-  its own.
+Two structural weaknesses stand, neither of which breaks the separation:
+
+- **The proximity term measures horizontal movement in units of line height.** A 25-character commit
+  moves the insertion point ~11 line heights *horizontally*, so ordinary typing reads as a jump and
+  every score is compressed toward the bottom of the range. Pinned by
+  `anchor.s10_the_second_commit_is_scored_WORSE_not_better`. It compresses wrong answers harder,
+  which is the only reason the separation survives.
+- **An estimate with no incumbent scores higher than a corroborated one.** `kProxNoPrevious` is 0.85
+  where a corroborated accurate estimate earns less, which is why `S10` lands at 0.5000 and `S01` —
+  the same arrangement with a caret available — at 0.3742. Backwards.
+
+And one cell to write: **`S17` scores 0.90** (`kMaxDiffConfidence`, one changed region) on a cell
+where nothing was injected. The diff is the caret blinking. Injection is refused first so it reaches
+nothing, but "a blinking caret alone scores maximum confidence" deserves a scenario of its own.
+
+#### `S16`: the RTL relocation is right, and it is the misfires that are wrong
+
+**0.00 line heights, three repetitions, with REF-3 — genuinely RTL text in an RTL control.** This is
+the first measurement that has ever put right-to-left text in front of the estimator: REF-1 cannot
+measure §3.4 at all (§5.9.1) and REF-2 is LTR by construction, so `S16`'s earlier figures described
+an LTR run appended *after* RTL text, which is a different scenario and was labelled as such.
+
+`diff_insertion_point` calls a change RTL when it grew **leftward** from the incumbent on the same
+line and then reports the *left* edge of the changed band. Exactly right here, and exactly what §2
+asks `S16` to check — "insertion point is at the **left** edge of the changed region. Bidi runs make
+'rightmost changed pixel' actively wrong."
+
+So the answer to §9 question 8 is **not** "remove the relocation". It is that the relocation is
+correct for the case it was written for and the *trigger* is too loose. It also fires on two LTR
+cells where the caret happened not to move:
+
+- **`S08`, 39.00 line heights.** In an `ES_AUTOHSCROLL` control at its right edge the caret stays
+  pinned while the text slides left, so `caret_before_injection == ground_truth` and the whole
+  changed band lies to the left of the incumbent. Read as bidi; relocated to the far end.
+- **`S07`, 9.54.** The same flip, landing accidentally nearer the truth than the alternative.
+
+Both misfires share a signature the real RTL case does not: the incumbent caret **did not move**.
+A genuine RTL commit moves the insertion point leftward *away* from the incumbent; a horizontally
+scrolling LTR control leaves it exactly where it was while the text moves underneath. That
+distinction is available at the point the decision is made and is not currently used.
+
+REF-3 also lands a Unicode-fidelity data point for free: Hebrew survived `SendInput` +
+`KEYEVENTF_UNICODE` verbatim, 28 bytes in, present in the readback.
+
+#### `S05` and `S06`: the invisible commits arrive, and are not misread as failures
+
+Both readbacks report the injection **present verbatim** from the side channel, and neither record
+claims a failure — which is the rule under test (plan.md §1.5: "an empty diff does *not* prove
+injection failed"). That part passes.
+
+What they also show is that source C cannot place an invisible commit and does not know it:
+`S06` inserts three spaces, moves the true caret 11.67 line heights' worth of distance, and scores
+0.3415 — the highest score of any wrong cell in the row. `S05`'s newline reflows six changed
+regions and still scores 0.3091. These are the cells that make the threshold question hard, and
+they are the ones most likely to be common in real dictation.
 
 #### `S10`: source C alone is accurate on a target that draws its own caret
 
 **0.12 line heights — about 2 px — reproduced three times.** `S10` is the only cell with no system
-caret, so source C is the only anchor available: the VS Code / Slack / terminal situation, which is
-to say every target anyone actually cares about.
+caret, so source C is the only anchor available: the VS Code / Slack / terminal situation.
 
 `S10` is deliberately `S01`'s arrangement with **one** variable changed — an empty field, a clean
 append, and a control that never calls `CreateCaret`. And because there was no caret to centre on,
@@ -668,34 +716,15 @@ What it does **not** say: this is a clean append into an empty field. `S02`'s re
 `S07`'s region error both apply to a self-drawn target as much as to an edit control, and neither
 has been measured without a system caret.
 
-#### `S08` and `S16`: the leftward-growth RTL heuristic is the largest source of position error
+#### `S07`: the capture region, independent of the RTL flip
 
-`diff_insertion_point` flags a change as RTL when it grew **leftward** from the incumbent anchor on
-the same line, and then reports the *left* edge of the changed band instead of the right. It fires
-on three cells here, none of which is RTL text:
-
-- **`S08`, 0.24 → 39.00 line heights.** In an `ES_AUTOHSCROLL` control at its right edge the caret
-  stays pinned while the text slides left, so `caret_before_injection == ground_truth` and the whole
-  changed band lies to the *left* of the incumbent. The heuristic reads that as bidi and moves the
-  estimate to the far end of the band.
-- **`S16`, 0.07 → 19.13.** The same shape in the right-aligned RTL control: the append point does
-  not move, so the band grows leftward.
-- **`S07`, 48.07 → 9.54.** The same flip, accidentally *toward* the truth.
-
-The comment on that heuristic already says it "sets a flag and costs confidence rather than claiming
-to have detected bidi text" — and the flag also *relocates the reported point*, which is the part
-that costs 39 line heights. Its confidence penalty (`kRtlPenalty` 0.65) is doing useful work: all
-three of these cells land in the rejected group. And **`S08` and `S16`'s previously published
-near-zero errors were artefacts of the probe not supplying an incumbent** — they are the two cells
-§5.9.3 already flagged as weak evidence for exactly the reason that turns out to break them.
-
-`S07`'s capture-region finding stands independently: `capture_region_for` reaches 585 px behind the
-previous insertion point (900 × 220 at 96 dpi, point at 65 % of the width) and the wrap moved the
-insertion point 728 px, so the truth was outside the captured rectangle. That is a product
-limitation — `src/main.cpp` chooses the region by the same rule — and the threshold is concrete: *an
-insertion point more than 585 px into a line at 96 dpi can wrap outside the capture region.*
-Re-running with `--settle-ms 600` reproduced the figure exactly, so none of this is a
-partial-repaint artefact.
+`capture_region_for` reaches 585 px behind the previous insertion point (900 × 220 at 96 dpi, point
+at 65 % of the width) and the wrap moved the insertion point 728 px leftward, so the truth was
+outside the captured rectangle and nothing inside it could have found it. `src/main.cpp`'s
+`App::submit_before_frame` chooses the region by the same rule, so this is the product's behaviour.
+The threshold is concrete: *an insertion point more than 585 px into a line at 96 dpi can wrap
+outside the capture region.* Re-running with `--settle-ms 600` reproduced the figure exactly, so
+none of it is a partial-repaint artefact.
 
 #### The rest
 
@@ -707,9 +736,8 @@ insertion point. `S11` and `S12` match `S02` to the pixel — **theme does not a
 arranged, so the injection appends to the last visual line without causing a new wrap. It measures
 an append inside a wrapped paragraph, not a wrap event. The wrap event is `S07`.
 
-**Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an autocomplete
-popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or elevation
-state that was not changed unattended.
+**Not measured:** `S09` needs an autocomplete popup, which `tools/testtarget` cannot raise;
+`S13`/`S14`/`S15`/`S18` need display or elevation state that was not changed unattended.
 
 
 ### 5.9.3 The superseded sweep, and why five of its cells were arranged wrongly
@@ -1018,7 +1046,7 @@ the answer is written here, in prose, next to the question.
 7. **What should `AnchorConfig::min_confidence` be?** — *Measured on `A09`; the number is a
    decision that is still open.* §5.9.2.1 has the data: across the ten measurable cells every
    estimate accurate to within one line height scored 0.3742–0.5000 and every inaccurate one scored
-   0.1858–0.2941, so **any threshold in (0.2941, 0.3742] classifies all ten correctly** and the
+   0.1858–0.3415, so **any threshold in (0.3415, 0.3742] classifies all twelve correctly** and the
    0.50 default classifies none of them correctly. `score_diff` discriminates; the default sits
    above the range it produces.
 
@@ -1028,9 +1056,12 @@ the answer is written here, in prose, next to the question.
    Wiring it against 0.50 would degrade every commit on every target, including the three the
    estimator gets right to a couple of pixels.
 
-   What is *not* being decided on one application's evidence is the number: the separating margin is
-   0.08 and `S03` (11.67 line heights of error, 0.2941) is the nearest false positive, so a second
-   application could close it. Either measure one first, or adopt ~0.33 as a calibrated-on-`A09`
+   What is *not* being decided on one application's evidence is the number, and that caution now has
+   data behind it: adding `S05` and `S06` (the invisible commits) took the separating margin from
+   **0.080 to 0.033** in a single sweep, and `S06` — three spaces, 11.67 line heights of error,
+   0.3415 — is the new nearest false positive. Five `A09` scenarios remain unmeasurable and no real
+   application has been measured; on this trend one more cell could close the band entirely, at
+   which point the scorer needs retuning rather than re-aiming. Either measure one first, or adopt ~0.33 as a calibrated-on-`A09`
    default and say so where the setting is documented. **Until then the pre-gate defect ships: the
    overlay draws at whatever anchor it is handed, including one the estimator scored 0.19.**
 
@@ -1045,14 +1076,21 @@ the answer is written here, in prose, next to the question.
      that, and it is backwards.
 
 8. **Should the leftward-growth RTL heuristic relocate the insertion point, or only cost
-   confidence?** — *Measured; the decision is open.* `diff_insertion_point` calls a change RTL when
-   it grew leftward from the incumbent on the same line, and then reports the *left* edge of the
-   changed band instead of the right. It fires on three `A09` cells and none of them is RTL text
-   (§5.9.2): `S08` at **39.00** line heights, `S16` at **19.13**, and `S07` where the same flip
-   lands accidentally near the truth. Its own comment says it "sets a flag and costs confidence
-   rather than claiming to have detected bidi text" — and the flag also moves the point, which is
-   the part that costs 39 line heights. The confidence penalty is working (all three are in the
-   rejected group), so the question is whether the relocation should happen at all.
+   confidence?** — **Answered: relocate. The trigger is what needs narrowing.** `S16` measured with
+   REF-3 — genuinely right-to-left text in an RTL control, the first time any measurement has put
+   RTL text in front of the estimator — gives **0.00 line heights of error, three repetitions**. So
+   `diff_insertion_point` reporting the *left* edge of the changed band is exactly right for the
+   case it was written for, and removing it would break the one cell it gets perfect.
+
+   The remaining defect is that the trigger also fires on two LTR cells: `S08` at **39.00** line
+   heights, where an `ES_AUTOHSCROLL` caret stays pinned at the right edge while the text slides
+   left, and `S07` at 9.54 where the same flip lands accidentally nearer the truth. Both misfires
+   share a signature the real RTL case does not: **the incumbent caret did not move.** A genuine RTL
+   commit moves the insertion point leftward *away* from the incumbent; a horizontally scrolling LTR
+   control leaves it exactly where it was while the text moves underneath. That distinction is
+   available where the decision is taken and is not currently used. — *Open: narrow the trigger, and
+   re-measure `S07`, `S08` and `S16` together, because a change that fixes two of them by breaking
+   the third is not a fix.*
 
 9. **Should the capture region widen, re-centre, or stay as it is?** — *Measured; the decision is
    open.* `capture_region_for` reaches 585 px behind the previous insertion point (900 × 220 at

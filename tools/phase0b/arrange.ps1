@@ -61,12 +61,14 @@ $Baseline = @($M.ScrollNone, $M.CaretBlink, $M.ThemeLight, $M.FontSmall, $M.Text
 
 # One entry per scenario this harness can arrange without changing the display configuration.
 # S13 (mixed DPI), S14 (multi-monitor), S15 (HDR) and S18 (elevated) are deliberately absent:
-# they need machine state that will not be changed unattended. S05/S06 need an injection text
-# other than REF-1/REF-2, which the probe does not accept. S09 needs an autocomplete popup, which
-# testtarget has no way to raise.
+# they need machine state that will not be changed unattended. S09 needs an autocomplete popup,
+# which testtarget has no way to raise.
 #
 # `expect` is what verify-arrange.ps1 checks the arranged state against, so a cell that stops
 # arranging what its name says fails a check rather than quietly measuring something else.
+# `text` overrides the sweep's -Text for that cell, for the cells whose scenario is defined by
+# WHICH string is injected rather than by how the control is arranged.
+#
 #   focus       the control that must hold the focus
 #   caret_at    "end" | "start" | an integer offset — where in `text` the caret must sit
 #   sel         "<a>:<b>" instead of caret_at, for the one cell that wants a live selection
@@ -115,8 +117,24 @@ $plan = @(
   @{ id = "S12"; control = "edit-multiline"; menu = @($M.TextMidLine, $M.ThemeLight); note = "light theme"
      expect = @{ focus = "edit-multiline"; caret_at = 20; text_head = "the quick brown fox | jumps"; theme = "light" } }
 
-  @{ id = "S16"; control = "edit-rtl";       menu = @($M.TextRtl);   note = "RTL text"
+  # REF-3, not the sweep's default: S16 is "the insertion point is at the LEFT edge of the
+  # changed region", and an LTR injection cannot produce that however RTL the control is. The
+  # earlier S16 figures measured an LTR run appended to RTL text and said so. This is the cell
+  # that makes docs/supported-targets.md §9 question 8 answerable.
+  @{ id = "S16"; control = "edit-rtl";       menu = @($M.TextRtl);   text = "ref3"
+     note = "RTL text injected into an RTL control (REF-3)"
      expect = @{ focus = "edit-rtl"; caret_at = "end"; text_head = "" } }
+
+  # S05 and S06 test one rule from two directions (plan.md §1.5): an empty or near-empty diff must
+  # NOT be read as an injection failure. Both use the mid-line arrangement so there is surrounding
+  # text for a reflow to be visible against if one happens.
+  @{ id = "S05"; control = "edit-multiline"; menu = @($M.TextMidLine); text = "ref4"
+     note = "newline-only commit (REF-4); layout below the caret shifts, the caret line barely changes"
+     expect = @{ focus = "edit-multiline"; caret_at = 20; text_head = "the quick brown fox | jumps" } }
+
+  @{ id = "S06"; control = "edit-multiline"; menu = @($M.TextMidLine); text = "ref5"
+     note = "whitespace-only commit (REF-5); an invisible change that must not read as failure"
+     expect = @{ focus = "edit-multiline"; caret_at = 20; text_head = "the quick brown fox | jumps" } }
 
   @{ id = "S17"; control = "edit-password";  menu = @();
      note = "password field - refusal is the behaviour under test"

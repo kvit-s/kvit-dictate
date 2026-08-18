@@ -87,9 +87,10 @@ const char* to_string(OverlayMode m) noexcept;
 // `AnchorConfig::min_confidence`'s default of 0.50 is wrong — it sits above the range
 // `score_diff` actually produces, so enforcing it would degrade every commit on every target.
 // Measured in docs/supported-targets.md §5.9.2.1: accurate estimates score 0.3742–0.5000 and
-// inaccurate ones 0.1858–0.2941, so any threshold in (0.2941, 0.3742] gets all ten measured cells
-// right. Picking that number on one application's evidence is what is being deferred, not the
-// rule. This function is kept, and tested, so choosing the threshold is the only work left.
+// inaccurate ones 0.1858–0.3415, so any threshold in (0.3415, 0.3742] gets all twelve measured
+// cells right. Picking that number is what is being deferred, not the rule — the margin fell from
+// 0.080 to 0.033 when two cells were added. This function is kept, and tested, so choosing the
+// threshold is the only work left.
 //
 // This is that decision, and it is a free function rather than a few lines inside `App::on_tick`
 // because `src/main.cpp` has no tests. Until this existed, nothing in `src/` called

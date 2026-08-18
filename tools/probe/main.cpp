@@ -296,6 +296,40 @@ const char kRef2Text[] = "the quick brown fox jumps";
 
 std::string ref2() { return std::string(kRef2Text); }
 
+// ─── REF-3, the RTL anchor probe (S16) ──────────────────────────────────────────────────────
+//
+// REF-2's rules with one deliberate change: right-to-left. `S16` says "insertion point is at the
+// **left** edge of the changed region. Bidi runs make 'rightmost changed pixel' actively wrong",
+// and until this existed nothing could test that, because REF-1 is unusable for §3.4 (§5.9.1) and
+// REF-2 is LTR by construction. `S16` measured with REF-2 injects an LTR run into an RTL
+// *control*, which is a different thing and was labelled as such in §5.9.2.
+//
+// This is the string that makes docs/supported-targets.md §9 question 8 answerable: whether
+// `diff_insertion_point`'s leftward-growth heuristic should relocate the reported point or only
+// cost confidence. On the measured LTR cells the relocation only ever hurt (`S08` 39.00 line
+// heights, `S16` 19.13) — but no measurement has ever put genuinely RTL text in front of it, so
+// "it has never helped" is not yet "it never helps".
+//
+// Hebrew rather than Arabic on purpose: Arabic is cursive and its glyphs shape contextually, so
+// the advance width of a run depends on its neighbours and the changed band's extent stops being
+// a clean function of the text. Hebrew has no shaping. No niqqud, for the same reason REF-2 has
+// no accents — combining marks would drag §3.2 back into a §3.4 measurement.
+const char kRef3Text[] = "\xD7\xA2\xD7\x91\xD7\xA8\xD7\x99\xD7\xAA \xD7\x9E\xD7\x94\xD7\x99\xD7\xA8\xD7\x94 \xD7\x9B\xD7\x90\xD7\x9F";
+
+// ─── REF-4 and REF-5, the invisible commits (S05, S06) ──────────────────────────────────────
+//
+// `S05` is a newline-only commit and `S06` a whitespace-only one. Both exist to test the same
+// rule, from plan.md §1.5 and restated in §2 of the supported-targets doc: **an empty diff must
+// not be read as injection failure.** A space can be accepted with no visible change at all, and
+// a newline changes layout below the insertion point rather than at it.
+//
+// So for these two cells the expected `error_lh` is *null* and the expected `looks_like_scroll`
+// for S05 is plausibly true — and neither of those is a failure. What would be a failure is the
+// record claiming the injection did not arrive: readback comes from the side channel, never from
+// pixels, and that separation is the thing under test.
+const char kRef4Text[] = "\n";
+const char kRef5Text[] = "   ";
+
 std::string ref1() {
     std::string s;
     for (size_t i = 0; i < std::size(kRef1); ++i) {
@@ -470,9 +504,13 @@ int main(int argc, char** argv) {
                 "                           Implies --dump-state. Also injects nothing.\n"
                 "  --app A01..A09           application under test\n"
                 "  --scenario S01..S18      scenario under test\n"
-                "  --text ref1|ref2         ref1 = Unicode fidelity (§3.2, the default);\n"
-                "                           ref2 = short LTR anchor probe (§3.4). See §5.9.1:\n"
-                "                           ref1 cannot measure anchor error on any target.\n"
+                "  --text ref1|..|ref5      ref1 = Unicode fidelity (§3.2, the default)\n"
+                "                           ref2 = short LTR anchor probe (§3.4)\n"
+                "                           ref3 = short RTL anchor probe (§3.4, S16)\n"
+                "                           ref4 = newline only (S05)\n"
+                "                           ref5 = whitespace only (S06)\n"
+                "                           §5.9.1: ref1 cannot measure anchor error, and\n"
+                "                           ref4/ref5 produce no error figure by design.\n"
                 "  --inject sendinput|clipboard\n"
                 "  --repeat N               repetitions (default 1)\n"
                 "  --settle-ms N            wait N ms after injecting before the first\n"
@@ -518,15 +556,43 @@ int main(int argc, char** argv) {
     }
 
     for (char& c : text_id) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (text_id != "ref1" && text_id != "ref2") {
-        std::printf("--text must be ref1 or ref2, got '%s'\n", text_id.c_str());
+    std::string text;
+    std::string text_label;
+    // Which reference strings produce a figure that may be aggregated into §3.4. REF-1 may not
+    // (§5.9.1: it exceeds the capture region and ends in a bidi run). REF-4 and REF-5 may not
+    // either, but for the opposite reason — they are *designed* to produce little or no visible
+    // change, so an error figure from them would be measuring noise, and their result is the
+    // readback and the refusal-to-misread, not a distance.
+    bool measuring_anchor = false;
+    const char* measures = "";
+    if (text_id == "ref1") {
+        text = ref1();
+        text_label = "REF-1";
+        measures = "Unicode fidelity (\xC2\xA7""3.2)";
+    } else if (text_id == "ref2") {
+        text = ref2();
+        text_label = "REF-2";
+        measuring_anchor = true;
+        measures = "LTR anchor error (\xC2\xA7""3.4)";
+    } else if (text_id == "ref3") {
+        text = kRef3Text;
+        text_label = "REF-3";
+        measuring_anchor = true;
+        measures = "RTL anchor error (\xC2\xA7""3.4, S16)";
+    } else if (text_id == "ref4") {
+        text = kRef4Text;
+        text_label = "REF-4";
+        measures = "newline-only commit (S05) - an empty diff is NOT a failure";
+    } else if (text_id == "ref5") {
+        text = kRef5Text;
+        text_label = "REF-5";
+        measures = "whitespace-only commit (S06) - an empty diff is NOT a failure";
+    } else {
+        std::printf("--text must be ref1|ref2|ref3|ref4|ref5, got '%s'\n", text_id.c_str());
         return 2;
     }
-    const bool measuring_anchor = (text_id == "ref2");
-    const std::string text = measuring_anchor ? ref2() : ref1();
-    const std::string text_label = measuring_anchor ? "REF-2" : "REF-1";
     std::printf("injection: %s (%zu bytes) - measures %s\n", text_label.c_str(), text.size(),
-                measuring_anchor ? "anchor error (§3.4)" : "Unicode fidelity (§3.2)");
+                measures);
 
     // The side channel is A09's alone: it is tools/testtarget's own protocol, and asking any
     // other application for it would find no window and quietly do nothing. Opened once for the
@@ -974,12 +1040,18 @@ int main(int argc, char** argv) {
                 anchor_obj.set("error_lh_valid_for_3_4",
                                kd::json::Value::boolean(measuring_anchor));
                 if (!measuring_anchor) {
-                    anchor_obj.set(
-                        "error_lh_caveat",
-                        kd::json::Value::string(std::string(
-                            "REF-1 exceeds the capture region and ends with an RTL run; this "
-                            "figure is not an estimator measurement (see §5.9.1). Re-run with "
-                            "--text ref2.")));
+                    // Which reason, so a reader does not have to know the reference strings by
+                    // heart to know why the figure beside them is disqualified.
+                    const char* why =
+                        text_id == "ref1"
+                            ? "REF-1 exceeds the capture region and ends with an RTL run; this "
+                              "figure is not an estimator measurement (see §5.9.1). Re-run with "
+                              "--text ref2 (LTR) or ref3 (RTL)."
+                            : "REF-4/REF-5 are designed to produce little or no visible change, so "
+                              "a distance computed from their diff measures noise. The result for "
+                              "S05/S06 is the readback plus the fact that an empty diff was not "
+                              "reported as an injection failure - not an error figure.";
+                    anchor_obj.set("error_lh_caveat", kd::json::Value::string(std::string(why)));
                 }
                 std::printf("  ground truth: post-commit caret (%d,%d) lh=%d -> estimator "
                             "error %.2f line heights\n",

@@ -18,6 +18,9 @@ if (-not $cell) {
   exit 2
 }
 
+# The cell's own reference string wins unless -Text was passed explicitly on the command line.
+if ($cell.ContainsKey("text") -and -not $PSBoundParameters.ContainsKey("Text")) { $Text = $cell.text }
+
 $t = Find-TestTarget
 
 for ($i = 1; $i -le $Repeat; $i++) {
