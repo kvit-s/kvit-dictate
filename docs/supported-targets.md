@@ -556,7 +556,18 @@ a human watching a screen.
 | 2026-08-17 | **Notepad3** (Scintilla) | Typed the same text exactly, at the same pacing. Also opened its own word-completion popup unbidden — see the `S09` note in §2.1. |
 | 2026-08-17 | **VS Code's integrated terminal** (`code.exe`) | Dictated into it incidentally and the text arrived correctly, with `SendInput` at the default pacing. The session log records `console=0`, which is **right**: VS Code's terminal is an xterm.js widget inside Electron, not a Win32 console, so it takes synthetic key events like any other Electron text surface. **This says nothing about real consoles.** `A03` (Windows Terminal / conhost) is the case `console_session`, the Ctrl+Shift+V paste chord and the whole console branch exist for, and it remains unmeasured — reading this row as "terminals work" is the specific mistake it is written to prevent. It also does **not** fill `A01`: that is a measured cell over the full scenario list, and this was one unscripted utterance into one surface of the application. |
 
-None of these targets is in the §5 application list as a *measured* row. Notepad is a strong candidate for it: it is the
+| 2026-08-17 | **Windows Terminal** (`windowsterminal.exe`, standalone) | Three things, and the third is the useful one. (1) **Console detection works**: the session logged `console=1`, so the target was correctly classified and the console branch is live. (2) **The text arrived correctly** under `SendInput` at default pacing — no garbling of the Notepad kind. (3) **The overlay fell back to the floating pill, it appeared where the mouse pointer happened to be, and it never moved.** That is the §4.2 *Degraded* tier behaving exactly as designed, and for a console it is the expected outcome: there is no caret rectangle to be had from UIA or `GetGUIThreadInfo`, so source C is the only anchor available — and source C logged `empty diff after a visible commit` on every commit of that session, so it contributed nothing and confidence never rose above `min_confidence` 0.5. **Not a measurement**: `A03` is the cell for this target and it stays empty until the probe runs. What this row is for is that it makes `A03`'s likely verdict *Degraded rather than Unsupported* — the text lands, only the inline preview does not — and it says which of the two questions to put first. |
+
+None of these targets is in the §5 application list as a *measured* row.
+
+**A diagnostic gap this exposed, recorded so the next session does not re-derive it.** Across every
+session run so far the log contains 8 `empty diff after a visible commit` and 4 `before-frame
+capture failed` events from source C, **and not one line reporting a source-C success** — the
+success path in `anchor.cpp` (`anchor_from_diff`, ~line 1162) logs nothing. So the log cannot
+currently distinguish "source C ran and produced a good anchor" from "source C has never once
+produced one", and the second would be a significant hole under Phase 0B, whose §3.3 column is
+*which anchor source won*. One DEBUG line naming the winning source and its confidence would
+settle it; until then, no claim either way belongs in this document. Notepad is a strong candidate for it: it is the
 first thing anyone tries, it ships with Windows, and it is now known to break the default method.
 
 These are not measurement failures. They are refusals the product makes on purpose, each with a
