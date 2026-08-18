@@ -147,3 +147,88 @@ KD_TEST(overlay, the_threshold_is_read_from_the_config_not_hardcoded) {
     KD_CHECK_EQ(static_cast<int>(overlay_mode_for(OverlayMode::Inline, anchor_at(0.2f), lax)),
                 static_cast<int>(OverlayMode::Inline));
 }
+
+// ═══ layout_overlay — the screen-edge margin ════════════════════════════════════════════════
+//
+// From the first human run against a real model. The report was "the pill is all the way down,
+// mostly below screen", and the placement log said why::
+//
+//     overlay placed: mode=FloatingPill rect=[1906,2135 28x19] work=[0,0 3840x2160] dpi=96
+//
+// 19 px tall, because a finalize-only session has no preview text and the pill is a bare status
+// dot; bottom edge at 2154 on a 2160-pixel monitor, i.e. **six pixels of clearance**, which is
+// inside the strip an auto-hide taskbar reveals itself in. The margin was `gap * 2` and `gap`
+// derives from the overlay's own height, so the smaller the pill the closer to the edge it went —
+// exactly backwards.
+
+namespace {
+
+kd::anchor::Anchor plain_anchor() {
+    Anchor a;
+    a.insertion_point = kd::anchor::Point{400, 400};
+    a.line_height = 15;
+    a.confidence = 0.9f;
+    a.source = Source::Caret;
+    return a;
+}
+
+// The reporter's monitor.
+constexpr kd::anchor::Rect k4k{0, 0, 3840, 2160};
+
+}  // namespace
+
+KD_TEST(overlay, a_tiny_pill_still_clears_the_screen_edge) {
+    // The exact case that was reported: a 28x19 status dot on a 4K monitor.
+    const kd::anchor::Rect r =
+        kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
+    KD_REQUIRE(!r.empty());
+
+    // Comfortably clear of the edge rather than technically inside it. The old behaviour put the
+    // bottom at 2154; anything under ~40 px of clearance is inside auto-hide taskbar territory.
+    const int32_t clearance = k4k.bottom - r.bottom;
+    KD_CHECK(clearance >= 40);
+    KD_CHECK(r.bottom <= k4k.bottom);   // still on the monitor
+    KD_CHECK(r.top >= k4k.top);
+}
+
+KD_TEST(overlay, the_edge_margin_does_not_shrink_with_the_overlay) {
+    // The defect in one assertion: a shorter overlay must not sit closer to the edge. Deriving
+    // the margin from text_height_px is what made it do so.
+    const kd::anchor::Rect small =
+        kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
+    const kd::anchor::Rect large =
+        kd::layout_overlay(plain_anchor(), 600, 120, k4k, OverlayMode::FloatingPill);
+    KD_CHECK_EQ(k4k.bottom - small.bottom, k4k.bottom - large.bottom);
+}
+
+KD_TEST(overlay, the_edge_margin_scales_with_the_monitor_not_the_dpi_argument) {
+    // layout_overlay is given no DPI on purpose. The margin still has to be bigger on a bigger
+    // display, which it gets from the work area — physical pixels, so a denser monitor has
+    // proportionally more of them.
+    constexpr kd::anchor::Rect k1080{0, 0, 1920, 1080};
+    const int32_t c4k =
+        k4k.bottom - kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill).bottom;
+    const int32_t c1080 =
+        k1080.bottom -
+        kd::layout_overlay(plain_anchor(), 28, 19, k1080, OverlayMode::FloatingPill).bottom;
+    KD_CHECK(c4k > c1080);
+    KD_CHECK(c1080 >= 20);  // still clear of the edge on a smaller screen
+}
+
+KD_TEST(overlay, the_status_indicator_clears_two_edges) {
+    // StatusOnly is a corner indicator, so it has to clear the right edge as well as the bottom.
+    const kd::anchor::Rect r =
+        kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::StatusOnly);
+    KD_CHECK(k4k.bottom - r.bottom >= 40);
+    KD_CHECK(k4k.right - r.right >= 40);
+}
+
+KD_TEST(overlay, an_unknown_work_area_still_produces_a_rect) {
+    // No monitor info: the final clamp is skipped entirely, which is the one path by which the
+    // pill can genuinely leave the screen. It must still return something placeable rather than
+    // an empty rect, and the placement log now records that this happened.
+    const kd::anchor::Rect none{};
+    const kd::anchor::Rect r =
+        kd::layout_overlay(plain_anchor(), 28, 19, none, OverlayMode::FloatingPill);
+    KD_CHECK(!r.empty());
+}

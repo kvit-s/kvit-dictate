@@ -1254,6 +1254,23 @@ anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int3
     const anchor::Rect& work = monitor_work_area;
     const int32_t gap = std::max<int32_t>(2, text_height_px / 6);
 
+    // How far the screen-edge modes sit from the edge.
+    //
+    // This deliberately does NOT derive from `text_height_px` the way `gap` does. The inline gap
+    // is a distance from a line of text, so scaling it with the overlay's own height is right.
+    // The distance from the bottom of the screen is not: a status-only pill with no preview text
+    // is about 19 px tall, so `gap * 2` placed it **6 px** above the bottom of a 3840x2160
+    // monitor — inside the strip an auto-hide taskbar reveals itself in, and reported by the
+    // first human to see it as "the pill is all the way down, mostly below screen".
+    //
+    // Deriving it from the work area keeps the DPI-independence the `gap` comment is really
+    // after: the work area is in physical pixels, so a 150 % monitor has proportionally more of
+    // them and the margin grows to match without this function knowing the DPI. 1/24 of the
+    // height is ~90 px at 2160 and ~45 px at 1080. The `gap * 2` floor keeps the old behaviour
+    // when the work area is unknown.
+    const int32_t edge_margin =
+        work.empty() ? gap * 2 : std::max<int32_t>(gap * 2, work.height() / 24);
+
     int32_t left = 0;
     int32_t top = 0;
 
@@ -1297,7 +1314,7 @@ anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int3
                 top = a.insertion_point.y;
             } else {
                 left = work.left + (work.width() - text_width_px) / 2;
-                top = work.bottom - text_height_px - gap * 2;
+                top = work.bottom - text_height_px - edge_margin;
             }
             break;
         }
@@ -1309,8 +1326,8 @@ anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int3
                 left = a.insertion_point.x;
                 top = a.insertion_point.y;
             } else {
-                left = work.right - text_width_px - gap * 2;
-                top = work.bottom - text_height_px - gap * 2;
+                left = work.right - text_width_px - edge_margin;
+                top = work.bottom - text_height_px - edge_margin;
             }
             break;
         }
