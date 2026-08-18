@@ -30,6 +30,7 @@
 
 #include <shellscalingapi.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <optional>
@@ -167,16 +168,23 @@ bool parse_target_state(const std::string& json_text, TargetState& out);
 //
 // Settling on the target's own counters rather than a fixed sleep: `events_total` and the text
 // length both stop moving exactly when it is done, whatever the machine's load.
-bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms) {
+bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms, int64_t baseline_events) {
     TargetState prev;
     bool have_prev = false;
+    bool progressed = false;
     int stable = 0;
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms);
     for (;;) {
         const std::optional<std::string> reply = sc.query("state");
         TargetState now;
         if (reply.has_value() && parse_target_state(*reply, now)) {
-            if (have_prev && now.events_total == prev.events_total &&
+            // Wait for the target to START before waiting for it to STOP. Two reads taken before
+            // the input queue has been drained at all agree perfectly, which the first version of
+            // this loop accepted as "settled" - so a 25-byte REF-2 read back as 0 bytes on two of
+            // three repetitions. Progress past the pre-injection event count is what distinguishes
+            // "finished" from "not started".
+            if (now.events_total > baseline_events) progressed = true;
+            if (progressed && have_prev && now.events_total == prev.events_total &&
                 now.text.size() == prev.text.size()) {
                 if (++stable >= 2) {  // two agreeing reads, ~80 ms apart
                     out = now;
@@ -191,8 +199,10 @@ bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms) {
         if (GetTickCount64() >= deadline) {
             if (have_prev) {
                 out = prev;
-                std::printf("  side channel: target still busy at the settle deadline; the "
-                            "readback and ground truth for this repetition may be mid-injection\n");
+                std::printf("  side channel: %s at the settle deadline; the readback and ground "
+                            "truth for this repetition are not trustworthy\n",
+                            progressed ? "target still busy"
+                                       : "target never consumed the injection");
                 return true;
             }
             return false;
@@ -256,6 +266,29 @@ const Segment kRef1[] = {
     {"emoji-zwj", "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB"},
     {"rtl", "\xD8\xA7\xD9\x84\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\xD8\xA9 \xD7\xA2\xD7\x91\xD7\xA8\xD7\x99\xD7\xAA"},
 };
+
+// ─── REF-2, the anchor probe (docs/supported-targets.md §5.9.1) ────────────────────────
+//
+// REF-1 measures Unicode fidelity (§3.2) and is the wrong instrument for anchor error (§3.4),
+// for two reasons that are properties of the string rather than of any target:
+//
+//   * At 159 characters (~1272 px in a 10 pt fixed-pitch face) it does not fit the capture
+//     region, which is 900 px wide with the insertion point at 65 % of it — about 315 px, or ~39
+//     characters, of room to the right. The diff is clipped at the region edge, so the rightmost
+//     changed pixel that `anchor_from_diff` keys on is the *boundary*, not the end of the text.
+//   * It ends with an RTL run, after which the caret sits at the LEFT of that run. That is the
+//     failure S16 exists to isolate; with REF-1 as the universal injection every row measures it.
+//
+// REF-2 is deliberately dull: short, ASCII, left-to-right, no combining marks, no bidi, and well
+// inside the room to the right of the insertion point. It is also closer to what the product
+// actually commits — plan.md §1.4 flushes a stability-eligible prefix, a few words at a time, not
+// a paragraph — so the anchor figures describe the case that happens rather than a torture case
+// that never does.
+//
+// Keep it ASCII. The moment REF-2 acquires an accent it starts measuring §3.2 again.
+const char kRef2Text[] = "the quick brown fox jumps";
+
+std::string ref2() { return std::string(kRef2Text); }
 
 std::string ref1() {
     std::string s;
@@ -386,6 +419,11 @@ int main(int argc, char** argv) {
 
     std::string app = "A09";
     std::string scenario = "S01";
+    // Which reference string to inject. REF-1 is the default because it is what every existing
+    // record used; a sweep measuring §3.4 must pass --text ref2.
+    std::string text_id = "ref1";
+    // Refuse to inject unless the foreground process is this one. See the block that uses it.
+    std::string require_exe;
     std::string method = "sendinput";
     int repeat = 1;
     int countdown = 5;
@@ -397,6 +435,8 @@ int main(int argc, char** argv) {
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
         if (a == "--app") app = next();
         else if (a == "--scenario") scenario = next();
+        else if (a == "--text") text_id = next();
+        else if (a == "--require-exe") require_exe = next();
         else if (a == "--inject") method = next();
         else if (a == "--repeat") repeat = std::atoi(next().c_str());
         else if (a == "--countdown") countdown = std::atoi(next().c_str());
@@ -408,9 +448,16 @@ int main(int argc, char** argv) {
                 "  --status                 print the resumable coverage matrix and exit\n"
                 "  --app A01..A09           application under test\n"
                 "  --scenario S01..S18      scenario under test\n"
+                "  --text ref1|ref2         ref1 = Unicode fidelity (§3.2, the default);\n"
+                "                           ref2 = short LTR anchor probe (§3.4). See §5.9.1:\n"
+                "                           ref1 cannot measure anchor error on any target.\n"
                 "  --inject sendinput|clipboard\n"
                 "  --repeat N               repetitions (default 1)\n"
                 "  --countdown N            seconds to focus the target (default 5)\n"
+                "  --require-exe NAME.exe   refuse to inject unless the foreground process is\n"
+                "                           NAME.exe. STRONGLY recommended for unattended runs:\n"
+                "                           without it the probe types REF-1 into whatever the\n"
+                "                           operator happened to focus during the countdown.\n"
                 "  --notes \"...\"            free text stored in the record\n\n"
                 "Focus the target window during the countdown. The probe injects REF-1, captures\n"
                 "before/after frames, scores the diff, and writes one JSON record per repetition.\n");
@@ -423,7 +470,16 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const std::string text = ref1();
+    for (char& c : text_id) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (text_id != "ref1" && text_id != "ref2") {
+        std::printf("--text must be ref1 or ref2, got '%s'\n", text_id.c_str());
+        return 2;
+    }
+    const bool measuring_anchor = (text_id == "ref2");
+    const std::string text = measuring_anchor ? ref2() : ref1();
+    const std::string text_label = measuring_anchor ? "REF-2" : "REF-1";
+    std::printf("injection: %s (%zu bytes) - measures %s\n", text_label.c_str(), text.size(),
+                measuring_anchor ? "anchor error (§3.4)" : "Unicode fidelity (§3.2)");
 
     // The side channel is A09's alone: it is tools/testtarget's own protocol, and asking any
     // other application for it would find no window and quietly do nothing. Opened once for the
@@ -471,6 +527,28 @@ int main(int argc, char** argv) {
             continue;
         }
         const kd::TargetIdentity target = captured.value();
+
+        // The probe types into whatever holds the foreground when the countdown expires. A
+        // caller that checks focus *before* launching the probe has not checked anything: the
+        // countdown is a whole second during which a human clicks back into their own work, and
+        // then REF-1 lands in it. That happened - an automated sweep typed into the operator's
+        // editor - and no amount of care in the launching script can close the gap, because the
+        // gap is inside this process.
+        //
+        // So the check belongs here, against the target this repetition is actually about to use,
+        // and it is a refusal rather than a warning.
+        if (!require_exe.empty()) {
+            std::string got = target.process_name;
+            std::string want = require_exe;
+            for (char& c : got) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (got != want) {
+                std::printf("  REFUSING to inject: foreground is '%s', --require-exe is '%s'. "
+                            "Nothing was typed.\n",
+                            target.process_name.c_str(), require_exe.c_str());
+                continue;
+            }
+        }
 
         kd::json::Value record = kd::json::Value::object();
         record.set("probe_build", kd::json::Value::string(std::string("dev")));
@@ -603,6 +681,15 @@ int main(int argc, char** argv) {
         }
 
         // ── Inject ──────────────────────────────────────────────────────────────────────────
+        // Second check, immediately before the events go out. Between capturing the target and
+        // this line the probe captured a screen frame and read the caret, which is milliseconds
+        // but not zero, and a focus change in that window would send the text somewhere else.
+        if (!require_exe.empty() && GetForegroundWindow() != reinterpret_cast<HWND>(target.top_level)) {
+            std::printf("  REFUSING to inject: the foreground window changed after the target was "
+                        "captured. Nothing was typed.\n");
+            continue;
+        }
+
         kd::InjectResult inject_result;
         if (supported == kd::InjectStatus::Ok) {
             const ULONGLONG t0 = GetTickCount64();
@@ -611,7 +698,12 @@ int main(int argc, char** argv) {
 
             kd::json::Value inj = kd::json::Value::object();
             inj.set("method", kd::json::Value::string(method));
-            inj.set("text_id", kd::json::Value::string(std::string("REF-1")));
+            inj.set("text_id", kd::json::Value::string(text_label));
+            // Which column this repetition is evidence for. Recorded rather than left to the
+            // reader, because the two are not interchangeable and averaging them would produce a
+            // number that describes neither (§5.9.1).
+            inj.set("measures", kd::json::Value::string(std::string(
+                                    measuring_anchor ? "anchor-error" : "unicode-fidelity")));
             inj.set("bytes_sent", kd::json::Value::number(static_cast<int64_t>(text.size())));
             inj.set("elapsed_ms", kd::json::Value::number(static_cast<int64_t>(t1 - t0)));
             inj.set("status", kd::json::Value::string(std::string(kd::to_string(inject_result.status))));
@@ -625,14 +717,16 @@ int main(int argc, char** argv) {
             std::string readback_source = "operator";
             if (use_side_channel) {
                 {
-                    if (settle_target(side_channel, after_state, 4000)) {
+                    const int64_t baseline =
+                        have_before_state ? before_state.events_total : 0;
+                    if (settle_target(side_channel, after_state, 4000, baseline)) {
                         have_after_state = true;
                         readback = after_state.text;
                         readback_source = "side-channel";
                         const bool exact = readback.find(text) != std::string::npos;
-                        std::printf("  readback: %s (%zu bytes, %lld events)\n",
-                                    exact ? "REF-1 present verbatim"
-                                          : "DOES NOT contain REF-1 verbatim",
+                        std::printf("  readback: %s %s (%zu bytes, %lld events)\n",
+                                    text_label.c_str(),
+                                    exact ? "present verbatim" : "NOT present verbatim",
                                     readback.size(),
                                     static_cast<long long>(after_state.events_total));
                     }
@@ -757,6 +851,21 @@ int main(int argc, char** argv) {
                 const double dy = static_cast<double>(est->insertion_point.y - truth.top);
                 const double dist = std::sqrt(dx * dx + dy * dy);
                 anchor_obj.set("error_lh", kd::json::Value::number(dist / static_cast<double>(lh)));
+                // §5.9.1: an error_lh computed from REF-1 measures region clipping plus S16's
+                // bidi failure, not the estimator. It is still recorded - throwing away a
+                // measurement is worse than labelling it - but it must never be aggregated into
+                // the §3.4 column, and the record says so rather than relying on the reader
+                // remembering which string was injected.
+                anchor_obj.set("error_lh_valid_for_3_4",
+                               kd::json::Value::boolean(measuring_anchor));
+                if (!measuring_anchor) {
+                    anchor_obj.set(
+                        "error_lh_caveat",
+                        kd::json::Value::string(std::string(
+                            "REF-1 exceeds the capture region and ends with an RTL run; this "
+                            "figure is not an estimator measurement (see §5.9.1). Re-run with "
+                            "--text ref2.")));
+                }
                 std::printf("  ground truth: post-commit caret (%d,%d) lh=%d -> estimator "
                             "error %.2f line heights\n",
                             truth.left, truth.top, lh, dist / static_cast<double>(lh));
