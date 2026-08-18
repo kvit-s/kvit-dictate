@@ -694,6 +694,13 @@ void App::drain_hook_queue() {
                 end_dictation(kd::LocalEvent::EscPressed);
                 break;
             case HookNote::Kind::StopInput:
+                // The reason is known here and was being dropped one line later: end_dictation
+                // takes a LocalEvent, so the log read "dictation ending: stop_on_input" and left
+                // the user's actual gesture unrecorded. "A click stopped it" and "a keystroke
+                // stopped it" call for completely different answers - the first is plan.md §1.8
+                // working as designed when someone clicks into the window they are dictating
+                // into, the second is worth investigating.
+                KD_LOG_INFO("stop-on-input: %s", kd::to_string(n.reason));
                 end_dictation(kd::LocalEvent::StopOnInput);
                 break;
             case HookNote::Kind::LeftClick:
