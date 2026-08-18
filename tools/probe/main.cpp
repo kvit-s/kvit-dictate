@@ -427,6 +427,7 @@ int main(int argc, char** argv) {
     std::string method = "sendinput";
     int repeat = 1;
     int countdown = 5;
+    int settle_ms = 0;
     bool status_only = false;
     // Ask tools/testtarget what state it is in and print the answer. Injects nothing, captures
     // nothing and never touches the foreground, so it is the one probe mode that is safe to run
@@ -446,6 +447,7 @@ int main(int argc, char** argv) {
         else if (a == "--inject") method = next();
         else if (a == "--repeat") repeat = std::atoi(next().c_str());
         else if (a == "--countdown") countdown = std::atoi(next().c_str());
+        else if (a == "--settle-ms") settle_ms = std::atoi(next().c_str());
         else if (a == "--notes") notes = next();
         else if (a == "--status") status_only = true;
         else if (a == "--dump-state") dump_state = true;
@@ -467,6 +469,9 @@ int main(int argc, char** argv) {
                 "                           ref1 cannot measure anchor error on any target.\n"
                 "  --inject sendinput|clipboard\n"
                 "  --repeat N               repetitions (default 1)\n"
+                "  --settle-ms N            wait N ms after injecting before the first\n"
+                "                           after-frame capture (default 0). A target that\n"
+                "                           repaints in stages is otherwise diffed mid-repaint.\n"
                 "  --countdown N            seconds to focus the target (default 5)\n"
                 "  --require-exe NAME.exe   refuse to inject unless the foreground process is\n"
                 "                           NAME.exe. STRONGLY recommended for unattended runs:\n"
@@ -797,6 +802,14 @@ int main(int argc, char** argv) {
         // Electron and WSLg render asynchronously: a single capture taken immediately after
         // SendInput returns often shows the frame BEFORE the text appeared, which reads as "the
         // injection produced no visible change" and is simply a race.
+        // The loop below breaks on the FIRST frame with any change at all, which is right for
+        // "did anything appear" and wrong for a target that repaints in stages: a control that
+        // scrolls may paint the caret's own line first and the rest of the scroll a frame later,
+        // and the diff then describes a partial repaint. --settle-ms N waits N ms before the
+        // first capture, so that reading can be tested rather than assumed. Default 0: it does
+        // not change what any previous record measured.
+        if (settle_ms > 0) Sleep(static_cast<DWORD>(settle_ms));
+
         kd::anchor::DiffResult diff;
         int polls = 0;
         std::vector<uint8_t> after_pixels;
@@ -962,6 +975,9 @@ int main(int argc, char** argv) {
         // assert an answer to the open question in docs/supported-targets.md §9.
         cap.set("wgc_indicator_seen", kd::json::Value::null());
         cap.set("after_polls", kd::json::Value::number(static_cast<int64_t>(polls)));
+        // Recorded so a settled after-frame is distinguishable from one caught mid-repaint
+        // without having to know which command line produced the record.
+        cap.set("settle_ms", kd::json::Value::number(static_cast<int64_t>(settle_ms)));
         record.set("capture", std::move(cap));
 
         {

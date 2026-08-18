@@ -1,18 +1,21 @@
 # Supported targets — per-application matrix
 
-**Status: v1 TEMPLATE. NO MEASUREMENTS HAVE BEEN TAKEN YET.**
+**Status: NO APPLICATION HAS BEEN MEASURED. 11 of 162 cells exist, all of them on the calibration
+target.**
 
-Every result cell in this document reads `—`. That is not a placeholder for "works" or
-"probably fine"; it means *nobody has run the probe on that cell*. Do not cite this file as
-evidence of support until the cells contain measurements and the header below records a
-measurement date and a probe build hash.
+Every result cell in the §5 per-application matrices reads `—`. That is not a placeholder for
+"works" or "probably fine"; it means *nobody has run the probe on that cell*. The only measurements
+that exist are `A09` — `tools/testtarget`, the harness's own calibration target — and they live in
+**§5.9.2**, not in the matrices, because the matrices' `Src` and `Uni` columns ask questions the
+probe does not yet answer. Do not cite this file as evidence that kvit-dictate supports any real
+application.
 
 | | |
 |---|---|
-| Document version | v1 (template) |
+| Document version | v1 |
 | Phase | 0B — Windows feasibility spike (`plan.md` §3) |
-| Measurements taken | *none* |
-| Probe build | *n/a* |
+| Measurements taken | 2026-08-18 — `A09` only, 11 of 18 scenarios, `sendinput`, REF-2 (§5.9.2) |
+| Probe build | `dev` (unstamped; `probe_build` in every record) |
 | Machine | RTX 5090 / 64 GB / Windows 11 Pro (the target machine; see `plan.md` §5) |
 | Results directory | `bench/results/phase0b/` |
 
@@ -569,61 +572,119 @@ The shape of the fix is two injections rather than one: REF-1 for §3.2 fidelity
 string that fits inside the capture region for §3.4 anchor error. Until that is decided, no §3.4
 figure should be filled in, and the A09 records already written carry `notes` saying so.
 
-### 5.9.2 First A09 results — 11 of 18 cells, `sendinput`, REF-2 — **five of them superseded**
+### 5.9.2 A09 results — 11 of 18 cells, `sendinput`, REF-2
 
-Measured 2026-08-18, automated against `tools/testtarget` with the side channel supplying ground
-truth. Three repetitions per cell, zero records flagged `suspect` (the target held the foreground
-throughout every measurement). Raw records under `bench/results/phase0b/A09/`.
+Measured 2026-08-18 against `tools/testtarget`, with the side channel supplying ground truth and
+`verify-arrange.ps1` confirming every arrangement beforehand (11 cells checked, 0 failing). Three
+repetitions per cell; **every cell reproduced to the pixel across all three**, and no record is
+flagged `suspect`. Raw records under `bench/results/phase0b/A09/`.
 
-> **Read the "arranged" column before any number in this table.** Reviewing these results the
-> same day found that five of the eleven cells did not arrange the scenario their name claims.
-> The measurements are real and the records are kept — they are accurate about what was actually
-> on screen — but for those five, what was on screen was not the scenario. §5.9.3 says what went
-> wrong; `tools/phase0b/verify-arrange.ps1` now checks every arrangement before a sweep runs, so
-> this particular way of being wrong cannot recur silently.
+This replaces an earlier sweep the same day whose numbers are superseded: five of its eleven cells
+did not arrange the scenario their name claimed. Those records are still on disk and are accurate
+about what was on screen; §5.9.3 says what went wrong and why two of them looked like product
+defects and were not.
 
-| Cell | Scenario | error_lh (3 reps) | | arranged? |
-|---|---|---|---|---|
-| `S01` | empty field | 0.07, 0.07, 0.07 | within 1 lh | yes |
-| `S02` | mid-line insertion | 9.33 ×3 | over | yes |
-| `S03` | selection replacement | 11.67 ×3 | over | yes |
-| `S04` | line wrap | 9.33, 9.33, 49.95 | over, and unstable | **no** — injected at offset 0, and the control was never re-armed between repetitions |
-| `S07` | vertical scroll | 14.93 ×3 | over | **no** — nothing scrolled |
-| `S08` | horizontal scroll | 17.40 ×3 | over | **no** — nothing scrolled |
-| `S10` | steady self-drawn caret | 31.53, then no diff at all | over / no estimate | **no** — the pane scrolled 25 line heights per repetition |
-| `S11` | dark theme | 9.33 ×3 | over | yes |
-| `S12` | light theme | 9.33 ×3 | over | yes |
-| `S16` | RTL text | 0.13, 0.13, 0.24 | within 1 lh | **no** — the LTR run went in *before* the RTL text |
-| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | yes |
+| Cell | Scenario | error_lh (×3) | | conf | source A |
+|---|---|---|---|---|---|
+| `S01` | empty field | **0.07** | exact | 0.50 | available |
+| `S02` | mid-line insertion | 9.80 | over | 0.35 | available |
+| `S03` | selection replacement | 11.67 | over | 0.50 | available |
+| `S04` | line wrap | **0.07** | exact | 0.50 | available |
+| `S07` | vertical scroll (wrap at the bottom) | **48.07** | far over | 0.50 | available |
+| `S08` | horizontal scroll | **0.24** | within 1 lh | 0.49 | available |
+| `S10` | steady self-drawn caret | **0.12** | within 1 lh | 0.50 | **unavailable** |
+| `S11` | dark theme | 9.80 | over | 0.35 | available |
+| `S12` | light theme | 9.80 | over | 0.35 | available |
+| `S16` | LTR appended to RTL text | **0.07** | exact | 0.50 | available |
+| `S17` | password field | injection **refused** (`password_field`) | correct — refusal is the behaviour under test | 0.85 | available |
 
 **Read `error_lh` as source C's error, not the product's.** The probe scores `anchor_from_diff`
 unconditionally, while the product picks the best available source and ranks a real caret (0.95)
-above any diff (≤0.90). In every cell above except `S10`, `source_a.available` is true — these are
-Win32 edit controls with a real system caret — so the shipping product would have used the caret
-and been exact, and none of these figures would reach a user. The probe's `winner` field applies
-its own rule (prefer C whenever the diff is non-empty) and therefore does **not** answer §3.3;
-that is a defect in this harness, recorded rather than fixed.
+above any diff (≤0.90). In every cell except `S10`, `source_a.available` is true — these are Win32
+edit controls with a real system caret — so the shipping product would have used the caret and
+been exact, and none of these figures would reach a user. The probe's `winner` field applies its
+own rule (prefer C whenever the diff is non-empty) and therefore does **not** answer §3.3; that is
+a defect in this harness, recorded rather than fixed.
 
-**What the six sound cells say.** `S01` is exact. `S02` and `S03` fail exactly as §2 predicted
-when the scenarios were written: text to the right of an interior insertion reflows, so the
-rightmost changed pixel is the end of the reflowed line rather than the insertion point. `S11` and
-`S12` are identical to `S02` to the pixel, which is a real result — **theme does not affect the
-estimate**. `S17` refuses, correctly. Those five numbers and the refusal stand.
+#### `S10`: source C alone is accurate on a target that draws its own caret
 
-**What the five superseded cells do not say.** Nothing about scroll rejection, line wrap, RTL, or
-the self-drawn-caret case. In particular `S10` — the only cell with no system caret, and therefore
-the only one that speaks to VS Code, Slack and terminals — measured a target that was scrolling
-itself off the screen, so **the question it exists to answer is still open**. Nothing here
-supports a claim about source C's error on a target that draws its own caret, in either direction.
+**0.12 line heights — about 2 px — reproduced three times.** `S10` is the only cell with no system
+caret, so source C is the only anchor available: it is the VS Code / Slack / terminal situation,
+which is to say every target anyone actually cares about, and the one the previous sweep left
+looking hopeless at 31.53 line heights.
 
-**Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an
-autocomplete popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or
-elevation state that was not changed unattended.
+Two things make this a strong result rather than a lucky one. `S10` is deliberately `S01`'s
+arrangement with **one** variable changed — an empty field, a clean append, and a control that
+never calls `CreateCaret` — so the difference between 0.07 and 0.12 is attributable to the absence
+of source A and to nothing else. And because there was no caret to centre on, the capture region
+fell back to the whole window (`region_basis: window`, 980×820), which is exactly what
+`App::submit_before_frame` does on the first commit into such a target. The bootstrap path was
+measured, not bypassed.
 
-### 5.9.3 Why five of those cells were arranged wrongly
+What it does **not** say: this is a clean append into an empty field. `S02`'s reflow error and
+`S07`'s below both apply to a self-drawn target as much as to an edit control, and neither has
+been measured without a system caret.
 
-Kept because the shape recurs, and because two of these look from the outside like product defects
-and are not.
+#### `S07`: the failure is the capture region, not the estimator
+
+48.07 line heights, and the cause is geometric rather than statistical. The arrangement fills the
+control past its height, scrolls it to the bottom, and pads the last line so that REF-2 wraps it:
+the insertion point moves from x = 1157 to x = 429 — **728 px leftward** — and the control scrolls
+up a line, leaving it on the same screen row.
+
+`capture_region_for` (`src/anchor.h`: 900 × 220 at 96 dpi, insertion point at 65 % of the width)
+extends **585 px behind** the previous insertion point and 315 px in front. The new insertion
+point was 143 px beyond that edge, so **the truth was outside the captured rectangle** and no
+estimator could have reported it. `looks_like_scroll` stayed false for a second geometric reason:
+the ordinary numbered lines are short and end left of the region entirely, so within the captured
+rectangle the scroll moved blank pixels and only the padded line changed.
+
+This is a **product** limitation and not a harness artefact — `App::submit_before_frame` chooses
+the region by the same rule, from the same function. The threshold is concrete: *when the previous
+insertion point is more than 585 px into a line at 96 dpi, a wrap can put the next one outside the
+capture region.* Re-running with `--settle-ms 600` reproduced 48.07 exactly, so it is not a
+partial-repaint artefact either.
+
+#### The rest
+
+`S02`/`S03` fail as §2 predicted when the scenarios were written: text to the right of an interior
+insertion reflows, so the rightmost changed pixel is the end of the reflowed line rather than the
+insertion point. `S11` and `S12` match `S02` to the pixel — **theme does not affect the estimate**.
+
+`S04` at 0.07 is a **weaker result than it looks**: the long line already wraps when the scenario
+is arranged, so the injection appends to the last visual line without causing a new wrap. It
+measures an append inside a wrapped paragraph, not a wrap event. The wrap event is `S07`.
+
+`S08` and `S16` both have `caret_before_injection == ground_truth` — in a horizontally scrolling
+`ES_AUTOHSCROLL` control the caret stays pinned at the right edge while the text slides left, and
+in the right-aligned RTL control the append point does not move either. Their near-zero errors are
+therefore weak evidence: an estimator that simply returned the previous anchor would score the
+same. `S08` does confirm that a horizontal scroll does not *break* the estimate; `S16` still
+measures an LTR run appended to RTL text rather than RTL dictation, which REF-2 cannot produce.
+
+**Not measured:** `S05`/`S06` need an injection other than REF-1/REF-2; `S09` needs an autocomplete
+popup, which `tools/testtarget` cannot raise; `S13`/`S14`/`S15`/`S18` need display or elevation
+state that was not changed unattended.
+
+### 5.9.3 The superseded sweep, and why five of its cells were arranged wrongly
+
+The first automated sweep of 2026-08-18 produced these figures, which §5.9.2 replaces:
+
+| Cell | superseded | now | why it changed |
+|---|---|---|---|
+| `S01` | 0.07 | 0.07 | unchanged — was arranged correctly |
+| `S02` | 9.33 | 9.80 | unchanged in kind |
+| `S03` | 11.67 | 11.67 | unchanged — was arranged correctly |
+| `S04` | 9.33, 9.33, 49.95 | 0.07 | injected at offset 0, and never re-armed between repetitions |
+| `S07` | 14.93 | 48.07 | nothing scrolled; now it does |
+| `S08` | 17.40 | 0.24 | nothing scrolled; now it does |
+| `S10` | 31.53, then no estimate | 0.12 | the pane scrolled 25 line heights per repetition |
+| `S11`/`S12` | 9.33 | 9.80 | unchanged in kind |
+| `S16` | 0.13-0.24 | 0.07 | the LTR run went in *before* the RTL text |
+| `S17` | refused | refused | unchanged — correct both times |
+
+Kept because the shape recurs, and because two of the old readings looked from the outside like
+product defects and were not.
 
 **`EM_SETSEL(-1, -1)` does not move an edit control's caret to the end.** `wParam = -1` means
 "deselect"; the caret stays wherever the control already had it, which straight after
