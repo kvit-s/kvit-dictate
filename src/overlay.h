@@ -77,6 +77,25 @@ enum class OverlayMode : uint8_t {
 
 const char* to_string(OverlayMode m) noexcept;
 
+// plan.md §1.5: "Below a confidence threshold the overlay degrades deterministically: floating
+// pill near the target, or no preview at all, configurable. **This is a defined state, not a
+// bug.**" anchor.h states the same rule from the other end — `current_fallback()` is "consulted
+// only when `current()` is absent or fails `is_usable(cfg.min_confidence)`".
+//
+// This is that decision, and it is a free function rather than a few lines inside `App::on_tick`
+// because `src/main.cpp` has no tests. Until this existed, nothing in `src/` called
+// `is_usable()`, `min_confidence` or `current_fallback()` at all: the threshold parsed,
+// validated and round-tripped through settings.json and then did nothing, and an anchor the
+// estimator had itself scored at 0.4953 was handed to the overlay as if it were trustworthy.
+// See docs/supported-targets.md §5.9.2's `S07` row for the measurement that exposed it.
+//
+// `configured` is the user's `settings.overlay_mode`. Only `Inline` depends on the anchor, so a
+// user who asked for the pill is never *upgraded* to inline by a confident estimate — degrading
+// is the only direction this function moves in.
+[[nodiscard]] OverlayMode overlay_mode_for(OverlayMode configured,
+                                           const std::optional<anchor::Anchor>& current,
+                                           const anchor::AnchorConfig& cfg) noexcept;
+
 // What the session is doing, so the overlay can be unambiguous about the microphone. plan.md
 // §1.6: "The mic stays open across a long pause, so listening state must be unambiguous."
 enum class OverlayState : uint8_t {

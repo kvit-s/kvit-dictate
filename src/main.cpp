@@ -190,6 +190,7 @@ private:
     void apply_text(const kd::proto::Message& m);
     void perform_commit(const kd::CommitEngine::Result& r);
     bool submit_before_frame();
+    void apply_overlay_mode();
 
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
@@ -230,6 +231,9 @@ private:
 
     std::optional<kd::TargetIdentity> target_;
     kd::OverlayState tray_state_ = kd::OverlayState::Idle;
+    // What apply_overlay_mode() last pushed to the overlay, so the transition is logged
+    // once rather than on every tick that carries an anchor.
+    kd::OverlayMode overlay_mode_applied_ = kd::OverlayMode::Hidden;
     std::string loaded_model_;
     bool audio_running_ = false;
     unsigned respawn_attempts_ = 0;
@@ -382,7 +386,9 @@ bool App::startup() {
                      st.message().c_str());
         overlay_.reset();
     } else {
-        overlay_->set_mode(settings_.overlay_mode);
+        // No anchor yet, so this resolves to the configured fallback rather than Inline. That is
+        // the contract in anchor.h: current_fallback() is consulted when current() is absent.
+        apply_overlay_mode();
     }
 
     screen_capture_ = kd::anchor::make_bitblt_capture(true);
@@ -575,8 +581,14 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
                 if (overlay_ != nullptr) {
                     if (anchor_dirty_.exchange(false, std::memory_order_acq_rel)) {
-                        std::lock_guard<std::mutex> lock(anchor_mutex_);
-                        overlay_->set_anchor(latest_anchor_);
+                        {
+                            std::lock_guard<std::mutex> lock(anchor_mutex_);
+                            overlay_->set_anchor(latest_anchor_);
+                        }
+                        // plan.md §1.5's deterministic degradation. Until this call existed the
+                        // anchor went to the overlay and the overlay trusted it, whatever the
+                        // estimator had scored it — see apply_overlay_mode().
+                        apply_overlay_mode();
                     }
                     // Unconditionally, and cheaply: render() returns immediately unless something
                     // is dirty or the visibility no longer matches. Rendering only when an *anchor*
@@ -856,6 +868,34 @@ bool App::submit_before_frame() {
     if (region.empty()) return false;
     anchor_->submit_before_frame(region, target_->top_level);
     return true;
+}
+
+// plan.md §1.5's deterministic degradation, and the ONLY place the overlay's mode is chosen —
+// startup, a settings change and every anchor all come through here, so the three cannot drift.
+//
+// This is the call that was missing. `AnchorConfig::min_confidence` and `below_threshold` parsed,
+// validated and round-tripped through settings.json, `Anchor::is_usable()` existed and was
+// tested, `AnchorEstimator::current_fallback()` existed, and *nothing in src/ called any of
+// them* — so a diff the estimator had itself scored at 0.4953 was handed to the overlay and
+// drawn inline as though it were a caret reading. docs/supported-targets.md §5.9.2's `S07` row
+// is the measurement that exposed it; tests/test_overlay.cpp pins the decision function, because
+// this file has no tests and that is exactly why the gap survived four sessions.
+void App::apply_overlay_mode() {
+    if (overlay_ == nullptr) return;
+    kd::OverlayMode want = kd::OverlayMode::Hidden;
+    {
+        std::lock_guard<std::mutex> lock(anchor_mutex_);
+        want = kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_, settings_.anchor);
+    }
+    if (want != overlay_mode_applied_) {
+        // At INFO, not DEBUG: this is a change the user can see, and "why is it a pill today"
+        // is a question the log has to be able to answer.
+        KD_LOG_INFO("overlay mode -> %s (configured %s, min_confidence %.2f)", kd::to_string(want),
+                    kd::to_string(settings_.overlay_mode),
+                    static_cast<double>(settings_.anchor.min_confidence));
+        overlay_mode_applied_ = want;
+    }
+    overlay_->set_mode(want);
 }
 
 void App::perform_commit(const kd::CommitEngine::Result& r) {
@@ -1172,7 +1212,9 @@ void App::apply_settings(kd::Settings next) {
     if (session_ != nullptr) session_->set_config(settings_.session);
     if (overlay_ != nullptr) {
         overlay_->set_style(settings_.overlay_style);
-        overlay_->set_mode(settings_.overlay_mode);
+        // Re-derived, not copied: the user may have changed overlay_mode, min_confidence or
+        // below_threshold in the dialog that just closed, and all three feed this.
+        apply_overlay_mode();
     }
 
     if (hotkey_ != nullptr) {

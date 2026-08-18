@@ -349,6 +349,29 @@ const char* to_string(OverlayMode m) noexcept {
     return "Hidden";
 }
 
+OverlayMode overlay_mode_for(OverlayMode configured, const std::optional<anchor::Anchor>& current,
+                             const anchor::AnchorConfig& cfg) noexcept {
+    // Only the inline mode is anchored, so it is the only one a bad anchor can invalidate.
+    if (configured != OverlayMode::Inline) return configured;
+
+    // is_usable() requires BOTH a real source and the threshold, so a reset_confidence() anchor
+    // (§7.4 — a `seq` gap, meaning we can no longer believe the pixels came from our text) drops
+    // out here too, without this function needing to know why the confidence went to zero.
+    if (current.has_value() && current->is_usable(cfg.min_confidence)) return OverlayMode::Inline;
+
+    switch (cfg.below_threshold) {
+        case anchor::Fallback::NoPreview:
+            // StatusOnly rather than Hidden. The fallback is named "no *preview*", and Hidden
+            // suppresses everything — including the Unsupported and Warning states that §1.1 of
+            // the supported-targets doc requires be surfaced before the user speaks. Removing
+            // the text preview is the degradation; going silent is a different thing.
+            return OverlayMode::StatusOnly;
+        case anchor::Fallback::FloatingPill:
+            break;
+    }
+    return OverlayMode::FloatingPill;
+}
+
 const char* to_string(OverlayState s) noexcept {
     switch (s) {
         case OverlayState::Idle: return "Idle";

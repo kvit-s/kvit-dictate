@@ -268,6 +268,7 @@ if(KD_BUILD_TESTS)
         tests/test_ipc.cpp
         tests/test_hotkey.cpp
         tests/test_anchor.cpp
+        tests/test_overlay.cpp
         tests/test_injector.cpp
         tests/test_fixtures.cpp
     )
@@ -316,6 +317,7 @@ if(KD_BUILD_TESTS)
         audio           # src/audio_capture.cpp — AudioConverter, incl. the anti-alias response
         ipc             # src/ipc_client.cpp — pipe naming and the DACL
         anchor          # src/anchor.cpp — diff scorer and DPI maths on synthetic bitmaps
+        overlay         # src/overlay.cpp — overlay_mode_for, plan.md §1.5's degradation rule
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module
     # starts here, disabled and visible, instead of being silently uncovered.
