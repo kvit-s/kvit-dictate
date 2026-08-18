@@ -18,6 +18,16 @@
 // supported-targets.md §5.9.2) produced an anchor 48 line heights from the truth which the
 // estimator had *correctly* scored at 0.4953 — below the 0.5 default — and the product would
 // have drawn the preview at it regardless. The scoring was doing its job; nothing was listening.
+//
+// ⚠ These tests cover a function `src/main.cpp` does NOT yet call. That is deliberate and it is
+// recorded in three places — `App::apply_overlay_mode`, the declaration in overlay.h, and
+// handover.md §8 — because "tested but uncalled" is the exact shape of the twenty defects this
+// project has already had. The gate was wired, and unwiring it was a decision taken on evidence:
+// enforcing this threshold against today's `score_diff` makes the inline preview unreachable on
+// every target that has no system caret, because the scorer penalises ordinary typing. See
+// tests/test_anchor.cpp, `s10_first_commit_falls_a_hair_under_the_default_threshold` and
+// `s10_the_second_commit_is_scored_WORSE_not_better`. The rule below is right; the numbers it
+// would be fed are not calibrated yet, and calibrating them is what turns this on.
 
 #include "kd_test.h"
 

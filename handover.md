@@ -22,7 +22,7 @@ all, source C landed within 0.12 line heights, three times over. The bad news mo
 where a line wrap puts the true insertion point *outside the capture region* — a limitation of
 `capture_region_for`, which the product uses by the same rule. What is still untrue of the
 product: **no real speech has ever been transcribed** — every word so far came from the mock's
-script — and no model has been downloaded. 806 tests pass across four suites at zero warnings.
+script — and no model has been downloaded. 815 tests pass across four suites at zero warnings.
 
 ---
 
@@ -31,8 +31,8 @@ script — and no model has been downloaded. 806 tests pass across four suites a
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 305 tests / 35875 checks
-cd build-windows-msvc-debug && ctest -C Debug              # 14 suites, none disabled
+build-windows-msvc-debug\bin\Debug\kd_tests.exe            # 314 tests / 35895 checks
+cd build-windows-msvc-debug && ctest -C Debug              # 15 suites, none disabled
 
 python -m unittest discover -s server/tests -t server      # 372 tests  (run from repo root)
 python -m unittest discover -s bench/tests  -t .           # 129 tests  (run from repo root)
@@ -86,7 +86,7 @@ Four model entries matter:
 | Area | State |
 |---|---|
 | `docs/protocol.md` + 20 fixtures | Written; both endpoints execute the same corpus. |
-| C++ modules | All 13 implemented. 305 tests. |
+| C++ modules | All 13 implemented. 314 tests. |
 | `src/main.cpp` | Runs end to end against real targets. Still no test touches it. |
 | Python sidecar | 372 tests. All five backends registered and reachable by name; only `mock` has run. |
 | Bench harness | 129 tests. Never run against real data. |
@@ -102,6 +102,11 @@ Four model entries matter:
 * **The clipboard injection path has never executed.** Selected by policy for `notepad.exe`.
 * **`mock-hostile` has never run against the C++ side.**
 * **151 of 162 Phase 0B cells unmeasured**, including every row except `A09`.
+* **plan.md §1.5's degradation gate is written and tested but not wired.** `overlay_mode_for`
+  exists, `App::apply_overlay_mode` does not call it, and that is a decision with evidence
+  rather than an oversight — see §8 item 1. It is listed here because "tested but uncalled"
+  is the exact shape of the twenty defects in §6, and the next session should be able to see
+  it without reading the code.
 
 ---
 
@@ -288,24 +293,46 @@ drives the probe unattended must pass it.
 
 ## 8. Suggested order
 
-1. **`min_confidence` is dead configuration — nothing in `src/` reads it.** Found by replaying
-   the `S07` measurement through the product's own functions
-   (`tests/test_anchor.cpp`, `anchor.s07_*`, both passing). The chain:
+1. **Recalibrate `score_diff`, then switch on the degradation gate that is already written.**
+   These are one task, and the order matters. The gate was implemented and then deliberately left
+   unwired the same day — the decision and its evidence are below, and the same text is in
+   `App::apply_overlay_mode`, `overlay.h` and `tests/test_overlay.cpp` so it cannot be read as an
+   oversight.
 
-   * `anchor_from_diff` rejects only `confidence <= 0`, so `S07`'s 0.4953 survives.
-   * `should_replace_anchor` short-circuits on `candidate.source == current->source` with
-     "this is a refresh, not a switch" and returns **true** without consulting
-     `cfg.min_confidence`. On a target with no system caret, source C is always the incumbent, so
-     every subsequent source C answer is accepted at any confidence above zero.
-   * `Anchor::is_usable(threshold)` — the gate plan.md §1.5 describes — is referenced **only by
-     `tests/test_anchor.cpp`**. `AnchorEstimator::current_fallback()` is likewise called from
-     nowhere in `src/`; `overlay.cpp:569` has a comment saying `main.cpp` "is expected to call
-     `set_mode()` accordingly", and `main.cpp` does not.
-   * `Overlay::set_anchor` stores whatever it is handed.
+   **What is done.** `kd::overlay_mode_for()` (overlay.cpp) is plan.md §1.5's rule: an anchor that
+   is absent, sourceless or below `min_confidence` degrades the overlay to `below_threshold`.
+   Seven tests in `tests/test_overlay.cpp`, a new ctest suite. `App::apply_overlay_mode()` is now
+   the single place the overlay's mode is set, so startup, a settings change and every anchor can
+   no longer drift apart.
 
-   So `settings.anchor.min_confidence` and `below_threshold` parse, validate, round-trip and do
-   nothing. This is the twentieth instance of the pattern in §6, and the most consequential:
-   plan.md §1.5's deterministic-degradation rule is unimplemented on the path `main.cpp` drives.
+   **What is not, and why.** `apply_overlay_mode` sets `settings_.overlay_mode` directly instead
+   of calling the gate. Wiring it made the scorer's calibration load-bearing, and the calibration
+   is wrong — measured, not guessed (`tests/test_anchor.cpp`, `anchor.s10_*`):
+
+   * `S10` has a **measured position error of 0.12 line heights** and scores **0.4999999702** on
+     the first commit of a session — 3e-8 under the 0.5 default.
+   * On the second commit it scores **0.3904**. Having an incumbent to corroborate against makes
+     it *worse*, because `score_diff`'s proximity term measures distance from the previous
+     estimate in units of **line height**, and a 25-character commit moves the insertion point
+     ~177 px ≈ 11 line heights **horizontally**. Ordinary dictation reads as "the anchor jumped";
+     any commit past about seven characters loses confidence for doing the one thing this product
+     does.
+
+   So enforcing the threshold would make the inline preview unreachable on exactly the targets
+   (VS Code, Slack, terminals) `S10` says source C handles well — worse than the occasional
+   mispositioned preview the gate exists to prevent. Targets with a real caret are unaffected
+   either way: source A scores 0.95.
+
+   **The unblock.** anchor.h already says of `kProxNearLines` / `kProxFarLines` / `kProxFloor`:
+   *"these are priors chosen by hand, not measurements: Phase 0B is what will replace them with
+   numbers."* This is that moment. The obvious defect is the unit — horizontal movement within a
+   line is measured in line heights — but fixing it on one cell is why this was stopped rather
+   than done. Once the constants change, `anchor.s10_*` will fail loudly and correctly; update
+   them, then replace the marked line in `apply_overlay_mode` with the `overlay_mode_for` call.
+
+   **Meanwhile the pre-gate defect still ships**, and it is the one `S07` found: the overlay draws
+   at whatever anchor it is handed, including one the estimator scored 0.4953. Known, recorded,
+   not an oversight.
 
 2. **Then `S07`'s capture region.** A wrap can move the insertion point outside the captured
    rectangle, and `src/main.cpp:841` chooses that rectangle the same way the probe does. Note the

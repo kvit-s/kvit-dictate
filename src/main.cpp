@@ -585,9 +585,9 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                             std::lock_guard<std::mutex> lock(anchor_mutex_);
                             overlay_->set_anchor(latest_anchor_);
                         }
-                        // plan.md §1.5's deterministic degradation. Until this call existed the
-                        // anchor went to the overlay and the overlay trusted it, whatever the
-                        // estimator had scored it — see apply_overlay_mode().
+                        // This is where plan.md §1.5's degradation gate belongs, and
+                        // apply_overlay_mode() explains at length why it is not applied yet.
+                        // The call stays so the seam is real rather than hypothetical.
                         apply_overlay_mode();
                     }
                     // Unconditionally, and cheaply: render() returns immediately unless something
@@ -870,29 +870,51 @@ bool App::submit_before_frame() {
     return true;
 }
 
-// plan.md §1.5's deterministic degradation, and the ONLY place the overlay's mode is chosen —
-// startup, a settings change and every anchor all come through here, so the three cannot drift.
+// The ONLY place the overlay's mode is chosen — startup, a settings change and every anchor all
+// come through here, so the three cannot drift apart.
 //
-// This is the call that was missing. `AnchorConfig::min_confidence` and `below_threshold` parsed,
-// validated and round-tripped through settings.json, `Anchor::is_usable()` existed and was
-// tested, `AnchorEstimator::current_fallback()` existed, and *nothing in src/ called any of
-// them* — so a diff the estimator had itself scored at 0.4953 was handed to the overlay and
-// drawn inline as though it were a caret reading. docs/supported-targets.md §5.9.2's `S07` row
-// is the measurement that exposed it; tests/test_overlay.cpp pins the decision function, because
-// this file has no tests and that is exactly why the gap survived four sessions.
+// ─── plan.md §1.5's degradation gate is DELIBERATELY NOT APPLIED HERE (2026-08-18) ───────────
+//
+// `kd::overlay_mode_for()` is that gate. It is written, it is documented in overlay.h and it is
+// covered by tests/test_overlay.cpp — and this function does not call it, on purpose, with a
+// condition for turning it on written below. That is a dangerous shape in this codebase, which
+// is why it is spelled out at this length rather than left to a commit message.
+//
+// The gate was wired up and then unwired the same day, because wiring it made the confidence
+// scorer's calibration load-bearing and the calibration is wrong:
+//
+//   * A09/S10 — a self-drawn caret, source C the only anchor — has a *measured position error of
+//     0.12 line heights*, three repetitions, and scores 0.4999999702 on the first commit of a
+//     session and 0.3904 on every one after. Both below the 0.5 default.
+//   * The drop on the second commit is `score_diff`'s proximity term, which measures how far the
+//     new estimate is from the incumbent in units of LINE HEIGHT. A 25-character commit moves
+//     the insertion point ~177 px, about 11 line heights, *horizontally* — so ordinary dictation
+//     is scored as though the anchor had jumped, and any commit past roughly seven characters
+//     loses confidence for doing the one thing this product does.
+//
+// So the estimate is accurate and the number attached to it is not. Enforcing the threshold
+// against that scorer would make the inline preview unreachable on precisely the targets
+// (VS Code, Slack, terminals) that S10 says source C handles well — a worse outcome than the
+// occasional mispositioned preview the gate exists to prevent. Targets with a real caret are
+// unaffected either way: source A scores 0.95.
+//
+// **To turn it on:** recalibrate `kProx*` in anchor.cpp against Phase 0B measurements — anchor.h
+// already says of those constants "these are *priors chosen by hand*, not measurements: Phase 0B
+// is what will replace them with numbers" — then replace the line below with
+// `kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_, settings_.anchor)` under
+// anchor_mutex_, and re-run tests/test_anchor.cpp's `s10_*` cases, which will fail loudly and
+// correctly the moment the scorer changes. Until then this ships the pre-gate behaviour: the
+// overlay draws at whatever anchor it is handed, which is a known defect (handover.md §8) and
+// not an oversight.
 void App::apply_overlay_mode() {
     if (overlay_ == nullptr) return;
-    kd::OverlayMode want = kd::OverlayMode::Hidden;
-    {
-        std::lock_guard<std::mutex> lock(anchor_mutex_);
-        want = kd::overlay_mode_for(settings_.overlay_mode, latest_anchor_, settings_.anchor);
-    }
+    const kd::OverlayMode want = settings_.overlay_mode;  // see the block above before changing
     if (want != overlay_mode_applied_) {
-        // At INFO, not DEBUG: this is a change the user can see, and "why is it a pill today"
-        // is a question the log has to be able to answer.
-        KD_LOG_INFO("overlay mode -> %s (configured %s, min_confidence %.2f)", kd::to_string(want),
-                    kd::to_string(settings_.overlay_mode),
-                    static_cast<double>(settings_.anchor.min_confidence));
+        // At INFO, not DEBUG: this is a change the user can see, and "why is it a pill today" is
+        // a question the log has to be able to answer once the gate is live.
+        KD_LOG_INFO("overlay mode -> %s (configured %s; confidence gate not applied — see "
+                    "App::apply_overlay_mode)",
+                    kd::to_string(want), kd::to_string(settings_.overlay_mode));
         overlay_mode_applied_ = want;
     }
     overlay_->set_mode(want);

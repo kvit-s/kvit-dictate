@@ -82,6 +82,13 @@ const char* to_string(OverlayMode m) noexcept;
 // bug.**" anchor.h states the same rule from the other end — `current_fallback()` is "consulted
 // only when `current()` is absent or fails `is_usable(cfg.min_confidence)`".
 //
+// ⚠ **NOT CALLED BY THE PRODUCT YET (2026-08-18).** `App::apply_overlay_mode` in main.cpp is
+// where it goes and carries the full reason: applying it against today's `score_diff` would make
+// the inline preview unreachable on every target without a system caret, because the scorer
+// penalises ordinary typing (see tests/test_anchor.cpp, `s10_the_second_commit_is_scored_WORSE`).
+// The rule is correct; the numbers it would be fed are not yet. This function is kept, and
+// tested, so that recalibrating the scorer is the only work left to switch it on.
+//
 // This is that decision, and it is a free function rather than a few lines inside `App::on_tick`
 // because `src/main.cpp` has no tests. Until this existed, nothing in `src/` called
 // `is_usable()`, `min_confidence` or `current_fallback()` at all: the threshold parsed,
