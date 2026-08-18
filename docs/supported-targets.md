@@ -181,8 +181,20 @@ Ground truth:
   after-frame, because `inject()` returns when events are sent and the frame poll stops at the
   first changed pixel. Without that wait the same cell scored 0.07, 0.87 and 1.94 line heights on
   three identical repetitions.
+- **Surveyed, 2026-08-18, and the unattended path turns out to be narrow.** `tools/phase0b/
+  caret-survey.ps1` reads `GetGUIThreadInfo` for every running window and types nothing. On this
+  machine exactly one application exposed a caret: **Notepad3** (Scintilla). **Chrome, Edge, VS
+  Code, File Explorer, Windows Terminal and SumatraPDF all reported none** — including `A06`,
+  whose whole appeal was being a plain Win32 edit box. Win11's File Explorer is WinUI and its
+  search field is not a classic `EDIT`.
+
+  Read that as a **lower bound**, not a verdict: the survey reports the caret of whichever control
+  has focus when a window is raised, which for a browser is the page and for Explorer is the file
+  list. Chrome's omnibox and Explorer's search box would each need their focus chord sent first
+  before "no caret" could be claimed of the application rather than of its default focus.
+
 - **Operator annotation is needed only for targets that draw their own caret** — VS Code, Slack,
-  terminals, Chromium content areas. Ground truth is then the operator clicking the caret centre
+  terminals, Chromium content areas — but on the evidence above that is nearly all of them. Ground truth is then the operator clicking the caret centre
   in the captured `after.png`. That introduces roughly a few pixels of operator error, which at a
   typical editor line height is a small fraction of a line but is **not zero**. Record the line
   height in pixels in Notes so the ratio can be re-derived.

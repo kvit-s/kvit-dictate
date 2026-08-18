@@ -33,6 +33,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <filesystem>
 #include <fstream>
@@ -523,6 +524,12 @@ int main(int argc, char** argv) {
     std::string text_id = "ref1";
     // Refuse to inject unless the foreground process is this one. See the block that uses it.
     std::string require_exe;
+    // Exactly which window, not merely which program. --require-exe is enough for A09, where the
+    // only kd_testtarget.exe on the machine is the harness's own. It is NOT enough for a real
+    // application, where the operator may have several windows of it open and unsaved work in one
+    // of them: surveying this machine found three Notepad3 windows, two with unsaved changes, and
+    // an exe-level guard would happily have typed REF-2 into either. 0 means unset.
+    uintptr_t require_hwnd = 0;
     std::string method = "sendinput";
     int repeat = 1;
     int countdown = 5;
@@ -547,6 +554,10 @@ int main(int argc, char** argv) {
         else if (a == "--scenario") scenario = next();
         else if (a == "--text") text_id = next();
         else if (a == "--require-exe") require_exe = next();
+        else if (a == "--require-hwnd") {
+            const std::string v = next();
+            require_hwnd = static_cast<uintptr_t>(std::strtoull(v.c_str(), nullptr, 0));
+        }
         else if (a == "--inject") method = next();
         else if (a == "--repeat") repeat = std::atoi(next().c_str());
         else if (a == "--countdown") countdown = std::atoi(next().c_str());
@@ -585,6 +596,10 @@ int main(int argc, char** argv) {
                 "                           after-frame capture (default 0). A target that\n"
                 "                           repaints in stages is otherwise diffed mid-repaint.\n"
                 "  --countdown N            seconds to focus the target (default 5)\n"
+                "  --require-hwnd 0xHHHH    refuse to inject unless the foreground window is\n"
+                "                           EXACTLY this one. Use for any real application: an\n"
+                "                           exe-level guard cannot tell one window of an editor\n"
+                "                           from another that holds unsaved work.\n"
                 "  --require-exe NAME.exe   refuse to inject unless the foreground process is\n"
                 "                           NAME.exe. STRONGLY recommended for unattended runs:\n"
                 "                           without it the probe types REF-1 into whatever the\n"
@@ -721,6 +736,15 @@ int main(int argc, char** argv) {
         //
         // So the check belongs here, against the target this repetition is actually about to use,
         // and it is a refusal rather than a warning.
+        // Window identity first: it is the stricter of the two, and its failure mode is the one
+        // that damages somebody's document rather than merely wasting a repetition.
+        if (require_hwnd != 0 && target.top_level != require_hwnd) {
+            std::printf("  REFUSING to inject: foreground window is 0x%p, --require-hwnd is 0x%p. "
+                        "Nothing was typed.\n",
+                        reinterpret_cast<void*>(target.top_level),
+                        reinterpret_cast<void*>(require_hwnd));
+            continue;
+        }
         if (!require_exe.empty()) {
             std::string got = target.process_name;
             std::string want = require_exe;
