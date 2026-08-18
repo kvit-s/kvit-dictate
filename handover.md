@@ -1,6 +1,6 @@
 # Handover — kvit-dictate
 
-Written 2026-08-18, end of the fourth session. Commit `def679f` on `main`.
+Written 2026-08-18, end of the fifth session. Commit `9ea874c` on `main`.
 
 Read this with `plan.md` (the specification), `README.md` (current status) and
 `docs/protocol.md` (the wire contract). This file covers only what those three do not: where the
@@ -15,11 +15,14 @@ speak, pause, speak again: the first utterance is punctuated and committed, a `f
 without ending the session, the second utterance is appended after a space, and an inline overlay
 sits at the caret and follows it. Four of the five checks the last handover left open are
 confirmed; the fifth (clipboard into Windows 11 Notepad) is untried. **Phase 0B has started**: 11
-of 162 cells measured, all on `A09`, and the harness that produced them was rebuilt three times
-before its numbers meant anything. What is still untrue of the product: **no real speech has ever
-been transcribed** — every word so far came from the mock's script — no model has been downloaded,
-and the anchor's behaviour on targets that draw their own caret (VS Code, Slack, terminals) is
-measured as *bad* and not yet understood. 804 tests pass across four suites at zero warnings.
+of 162 cells measured, all on `A09`, and they were measured twice — the first sweep's numbers are
+superseded because five of its eleven cells did not arrange the scenario they were named for.
+**The self-drawn-caret case is now the good news rather than the bad**: with no system caret at
+all, source C landed within 0.12 line heights, three times over. The bad news moved to `S07`,
+where a line wrap puts the true insertion point *outside the capture region* — a limitation of
+`capture_region_for`, which the product uses by the same rule. What is still untrue of the
+product: **no real speech has ever been transcribed** — every word so far came from the mock's
+script — and no model has been downloaded. 804 tests pass across four suites at zero warnings.
 
 ---
 
@@ -88,7 +91,7 @@ Four model entries matter:
 | Python sidecar | 372 tests. All five backends registered and reachable by name; only `mock` has run. |
 | Bench harness | 129 tests. Never run against real data. |
 | `tools/testtarget` | Now self-measuring: side channel wired to the probe, log pane suppressible. |
-| `tools/probe` | **11 of 162 cells measured.** `tools/phase0b/` automates the `A09` row. |
+| `tools/probe` | **11 of 162 cells measured, twice** — the first set is superseded (§5.3). `--dump-state`/`--send` read the target without injecting; `--settle-ms` tests for mid-repaint diffs. |
 
 ### Explicitly NOT done
 
@@ -125,55 +128,109 @@ the codec level and has never run against a live sidecar. **Do not point this at
 ## 5. Where Phase 0B actually stands
 
 `kd_probe.exe --status` prints the matrix. `tools/phase0b/README.md` explains the automation and
-its one hard rule (it takes over the foreground; do not run it while using the machine).
+its one hard rule (`sweep.ps1` takes over the foreground; do not run it while using the machine).
+**`verify-arrange.ps1` is not that** — it injects nothing and never touches the foreground, so it
+is safe at any time. Run it before every sweep.
 
 ### 5.1 The results, and the honest reading
 
-`A09`, `sendinput`, REF-2, three repetitions each, zero records flagged `suspect`:
+`A09`, `sendinput`, REF-2, three repetitions each, every cell reproducing **to the pixel**, zero
+records flagged `suspect`, all eleven arrangements verified before the sweep:
 
 | Cell | error_lh | Cell | error_lh |
 |---|---|---|---|
-| S01 empty field | **0.07** | S08 horizontal scroll | 17.40 |
-| S02 mid-line | 9.33 | S10 self-drawn caret | 31.53, then no estimate |
-| S03 selection | 11.67 | S11 dark / S12 light | 9.33 each |
-| S04 line wrap | 9.33, 9.33, 49.95 | S16 RTL control | **0.13–0.24** |
-| S07 vertical scroll | 14.93 | S17 password | **refused, correctly** |
+| S01 empty field | **0.07** | S08 horizontal scroll | **0.24** |
+| S02 mid-line | 9.80 | S10 self-drawn caret | **0.12** |
+| S03 selection | 11.67 | S11 dark / S12 light | 9.80 each |
+| S04 line wrap (see below) | **0.07** | S16 LTR into RTL control | **0.07** |
+| S07 wrap at the viewport bottom | **48.07** | S17 password | **refused, correctly** |
 
 **Read those as source C's error, not the product's.** The probe scores `anchor_from_diff`
 unconditionally; the product ranks a real caret (0.95) above any diff (≤0.90), and `source_a` was
 available in every cell except `S10`. The shipping product would have used the caret and been
 exact in all of them.
 
-**Which makes `S10` the cell that matters, and the next thing to work on.** It is the only row with
-no system caret, so source C is the only anchor — the VS Code / Slack / terminal situation, i.e.
-every target anyone cares about. It produced 31.53 line heights once and *no usable estimate at
-all* twice, and its ground truth came back at `y = -226`, off-screen, which means the scenario
-setup is wrong as well. Both have to be untangled before the number means anything.
+**`S10` is answered, and the answer is good.** It is the only row with no system caret, so source C
+is the only anchor — the VS Code / Slack / terminal situation. **0.12 line heights, about 2 px,
+three times over.** It is `S01`'s arrangement with exactly one variable changed, so the gap between
+0.07 and 0.12 is the absence of source A and nothing else; and with no caret to centre on, the
+capture region fell back to the whole window, which is the same bootstrap path
+`App::submit_before_frame` takes. Caveat: it is a clean append into an empty field. `S02`'s reflow
+error and `S07`'s below apply to a self-drawn target too, and neither has been measured there.
 
-`S02`/`S03` fail exactly as §2 of the supported-targets doc predicted when the scenarios were
-written: text to the right of an interior insertion reflows, so the rightmost changed pixel is the
-end of the line, not the insertion point. `S07`/`S08` fail with `looks_like_scroll` **false**, so
-scroll detection did not fire — worth a look, it is supposed to score those ~0 and hold the
-previous anchor. `S11` and `S12` are identical to the pixel: theme does not affect the estimate.
-`S16` passing is not a win — REF-2 is LTR-only, so it measures an LTR injection into an RTL
-*control*, not RTL text.
+**`S07` is where the real problem moved, and it is the product's, not the estimator's.** The wrap
+moves the insertion point 728 px leftward; `capture_region_for` (900×220 at 96 dpi, insertion point
+at 65 % of the width) reaches only 585 px behind the previous one, so the truth was 143 px outside
+the captured rectangle and nothing inside it could have found it. `looks_like_scroll` stayed false
+for a second geometric reason: the short numbered lines end left of the region, so within it the
+scroll moved blank pixels. `--settle-ms 600` reproduces 48.07 exactly, so it is not a partial
+repaint. `src/main.cpp:841` picks the region by the same rule. **The threshold is concrete: an
+insertion point more than 585 px into a line at 96 dpi can wrap outside the capture region.**
+
+`S02`/`S03` fail exactly as §2 of the supported-targets doc predicted: text to the right of an
+interior insertion reflows, so the rightmost changed pixel is the end of the line. `S11` and `S12`
+are identical to the pixel: theme does not affect the estimate.
+
+**Two of the good numbers are weaker than they look.** `S04`'s long line *already wraps* when the
+scenario is arranged, so the injection appends to the last visual line and never causes a wrap —
+0.07 measures an append inside a wrapped paragraph. And `S08`/`S16` both have
+`caret_before_injection == ground_truth` (the `ES_AUTOHSCROLL` caret stays pinned at the right edge
+while text slides left; the right-aligned RTL control's append point does not move), so an
+estimator that just returned the previous anchor would score the same.
 
 ### 5.2 Known defects in the harness itself
 
 * **`winner` does not follow the product's rule.** The probe prefers source C whenever the diff is
   non-empty, so the field does not answer §3.3 ("anchor source that won"). Recorded, not fixed.
+  This is now the main thing stopping the §5 matrices in the supported-targets doc from being
+  filled in at all.
 * **`S05`/`S06` need a third injection** (newline-only, whitespace-only). `--text` has no value
   for them.
 * **`S09` cannot be arranged** — `tools/testtarget` cannot raise an autocomplete popup.
-* **`S04`'s third repetition drifted** (49.95 against 9.33 twice), so its state is not being fully
-  re-armed. The other cells reproduce to the pixel, so it is specific to that setup.
+* **`S04` does not construct the wrap it is named for** (see above). Fixing it means padding the
+  long line to the control's width the way `TextManyLines` now does for `S07`.
+
+### 5.3 The first sweep of the day is superseded — do not cite its numbers
+
+Five of its eleven cells did not arrange the scenario they were named for, and
+docs/supported-targets.md §5.9.3 records why in full. The short version, because the shape is the
+one this project keeps hitting: **`EM_SETSEL(-1, -1)` does not move an edit control's caret to the
+end** — `wParam = -1` means "deselect" — so `S04`, `S07`, `S08` and `S16` all injected at offset 0.
+`S07` and `S08` therefore never scrolled at all, which read in the records as a scroll-detection
+failure and was not one. Separately, `S07` switched on the pane's "scroll on each insertion" mode
+and nothing switched it off, so `S10` ran with it live and walked itself off the screen.
+
+The guard against a repeat is `verify-arrange.ps1`, which checks each cell's arranged state —
+focus, caret offset *in the text*, text, theme, system-caret presence, leaked scroll mode — against
+a declared `expect` block in `tools/phase0b/arrange.ps1`. `arrange.ps1` is dot-sourced by the
+verifier, the sweep and `runcell.ps1` alike, so what is verified is what is measured.
 
 ---
 
 ## 6. Defects found this session, and the pattern that produced them
 
 Every one is the same shape as the nineteen before it: **a contract implemented on one side and
-never called from the other.** It is now four sessions in a row.
+never called from the other.** It is now five sessions in a row.
+
+### 6.0 The fifth session's, all in the measurement harness
+
+The sweep *declared* what each cell arranged and nothing ever asked the target whether that was
+what it had — the same shape, one level up: a contract asserted on one side and never checked from
+the other. Full detail in §5.3 and docs/supported-targets.md §5.9.3. Worth carrying forward:
+
+* **A measurement harness is code, and it needs its own oracle.** Eleven cells, three repetitions
+  each, zero suspect records, numbers stable to the pixel — and five of them were measuring
+  something other than what they were labelled. Reproducibility said nothing about validity;
+  the arrangements were reproducibly wrong.
+* **Two of the wrong readings pointed at the product.** "Scroll detection did not fire" was
+  "nothing scrolled", and "the estimator is hopeless without a system caret" was "the target
+  scrolled itself off the screen". A bad harness does not just lose information, it manufactures
+  plausible defects in code that is fine.
+* **`--dump-state` earns its keep.** Being able to ask the target what state it is in, without
+  injecting or capturing anything, turned a foreground-stealing guess-and-check loop into a check
+  that runs in two seconds while the machine is in use.
+
+### 6.1 The fourth session's
 
 1. **The four real backends were unreachable.** ~3800 lines of finished adapter; the registry
    listed only the mock. `open_backend` documented a `from_backend_config` hook nothing provided,
@@ -231,19 +288,31 @@ drives the probe unattended must pass it.
 
 ## 8. Suggested order
 
-1. **`S10`, and what it means.** The only measured cell where source C is the sole anchor is also
-   the one that failed and whose setup is wrong. Until that is understood, nothing is known about
-   the targets the product is for. Start by fixing the scenario (`y = -226` is not a caret), then
-   decide whether 31 line heights is the estimator or the harness.
+1. **`S07`'s capture region, which is now the one measured product defect.** A wrap can move the
+   insertion point outside the captured rectangle, and `src/main.cpp:841` chooses that rectangle
+   the same way the probe does. Three things to decide, in this order: whether the region should
+   widen (cheap, costs capture time on every commit), whether it should be re-centred on the
+   *previous* line's start rather than the caret (asymmetry is currently 65/35 rightward, on the
+   reasoning that text grows rightward — which is exactly backwards when a wrap fires), or whether
+   a low-confidence result here is simply correct behaviour and the overlay should hold its
+   previous anchor. **`score_diff` returned 0.50 for it**, i.e. above `min_confidence`, so the
+   product would currently move the overlay 48 line heights. That last point is the actual bug and
+   is worth checking first.
 2. **The two checks in §4** — one session each, both need a human.
-3. **The rest of the `A09` row**, then a second application. `A09` is the calibration row; a real
-   application's numbers are only interpretable against it, and it is not finished.
-4. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
+3. **Fix `S04` to construct a real wrap**, then measure `S02`'s reflow case and `S07`'s wrap case
+   *without* a system caret. `S10` says source C handles a clean append into a self-drawn target;
+   nothing says it handles the two cases that are known to be hard there. That is a small change
+   to `arrange.ps1` plus one sweep.
+4. **The rest of the `A09` row**, then a second application. `A09` is the calibration row; a real
+   application's numbers are only interpretable against it, and it is not finished. Making the
+   probe's `winner` follow the product's rule is the prerequisite for filling the §5 matrices,
+   whose `Src` column it currently answers wrongly.
+5. **Fetch the ONNX model** (`bench/CANDIDATES.md` pick 1, a few hundred MB, no PyTorch) and make
    the sidecar real. What remains is `envs/onnx`, the weights, and the first real `load()`. Expect
    `sherpa_onnx_streaming.py`'s eight recorded UNVERIFIED assumptions to be what that run is about.
    `UV_CACHE_DIR` must be on `D:` — uv hardlinks from cache into venvs and hardlinks cannot cross
    volumes.
-5. **Record the corpus** with `bench/record.py` — read its report first; it is written against the
+6. **Record the corpus** with `bench/record.py` — read its report first; it is written against the
    C++ capture path and may need an entry point `audio_capture` does not expose.
 
 Untouched and still open: **pre-roll dropped across the VAD seam** (§6 of the previous handover —
@@ -262,7 +331,13 @@ leading fraction of the first word). It belongs in the same pass as measuring wh
 * `..\wan-dancer\.venv` is **read-only**. Run its Whisper baseline; install nothing into it.
 * Comments explain *why*. Where something is unverified, the code says so rather than asserting.
 * **Measurements and observations are different things**, and `docs/supported-targets.md` keeps
-  them in different sections. Nothing that was not taken with the probe may fill in a cell. §5.9.1
-  and §5.9.2 are worth reading before adding any: they record why REF-1 cannot measure anchor
-  error, and what the first eleven cells do and do not say.
+  them in different sections. Nothing that was not taken with the probe may fill in a cell. §5.9.1,
+  §5.9.2 and §5.9.3 are worth reading before adding any: they record why REF-1 cannot measure
+  anchor error, what the A09 cells do and do not say, and how five of them came to be measured
+  under the wrong names.
+* **Never run a sweep without `verify-arrange.ps1` passing first.** A measurement of an
+  unverified arrangement is not a weak measurement, it is a measurement of an unknown scenario —
+  and it will be stable to the pixel while being wrong, which is what makes it dangerous.
+* **Superseded measurements stay on disk.** They are accurate about what was on screen; it is the
+  label that was wrong. Deleting them would hide why the published numbers changed.
 * Empty test suites are registered `DISABLED` in `CMakeLists.txt` rather than omitted.
