@@ -628,6 +628,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                                   nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
                 case kMenuQuit:
+                    // Every exit path logs why. Without this the process can vanish and leave
+                    // nothing behind but a hotkey that no longer answers, which is precisely how
+                    // it presented the first time a human ran it against a real model: three
+                    // symptoms - no settings dialog, no pill, no response to the chord - all of
+                    // which were one dead process, and the log could not say so.
+                    KD_LOG_INFO("exiting: Quit chosen from the tray menu");
                     quitting_ = true;
                     DestroyWindow(hwnd_);
                     return 0;
@@ -640,16 +646,23 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_QUERYENDSESSION:
+            KD_LOG_INFO("exiting: Windows is logging off or shutting down (WM_QUERYENDSESSION)");
             // Log-off or shutdown. Release the microphone and kill the child now: a sidecar left
             // holding VRAM through a shutdown is exactly what the job object exists to prevent.
             shutdown();
             return TRUE;
 
         case WM_ENDSESSION:
+            KD_LOG_INFO("exiting: WM_ENDSESSION");
             shutdown();
             return 0;
 
         case WM_DESTROY:
+            // Reached from the tray Quit above, and from anything else that destroys the window.
+            // `quitting_` tells the two apart, and the difference matters: an unexplained destroy
+            // is a bug report, a chosen one is not.
+            KD_LOG_INFO("exiting: window destroyed (%s)",
+                        quitting_ ? "requested via the tray" : "NOT via the tray - unexplained");
             shutdown();
             PostQuitMessage(0);
             return 0;

@@ -420,6 +420,9 @@ struct OverlayCore {
     bool capture_excluded = false;
 
     uint32_t dpi = USER_DEFAULT_SCREEN_DPI;
+    // Last rectangle reported to the log, so placement is logged on change rather than on
+    // every frame. See paint_once().
+    anchor::Rect last_logged_rect{};
 
     DibSurface surface;
     ComRef<ID2D1Factory> d2d;
@@ -798,6 +801,26 @@ HRESULT OverlayCore::paint_once() {
     const anchor::Rect rect = layout_overlay(placement, box_w_px, box_h_px, work, em);
     if (rect.empty()) {
         return S_OK;
+    }
+
+    // Where the overlay actually went, logged when it changes.
+    //
+    // "The pill is below the screen, I can barely see a sliver" is not a diagnosable report, and
+    // it was the first thing a human said about the floating pill. Nothing recorded the work
+    // area, the chosen monitor or the resulting rectangle, so the difference between "the layout
+    // arithmetic is wrong", "the anchor picked a monitor the user is not looking at" and "the
+    // work area came back empty so the final clamp was skipped" could not be told apart after
+    // the fact. All three are one line of evidence apart.
+    if (rect.left != last_logged_rect.left || rect.top != last_logged_rect.top ||
+        rect.right != last_logged_rect.right || rect.bottom != last_logged_rect.bottom) {
+        last_logged_rect = rect;
+        KD_LOG_INFO("overlay placed: mode=%s rect=[%d,%d %dx%d] work=[%d,%d %dx%d]%s "
+                    "anchor=%s(%d,%d) dpi=%u",
+                    to_string(em), rect.left, rect.top, rect.width(), rect.height(), work.left,
+                    work.top, work.width(), work.height(),
+                    work.empty() ? " EMPTY WORK AREA - the final clamp was skipped" : "",
+                    anchor.has_value() ? anchor::to_string(anchor->source) : "none",
+                    placement.insertion_point.x, placement.insertion_point.y, dpi);
     }
 
     // ── Draw ────────────────────────────────────────────────────────────────────────────────
