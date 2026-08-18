@@ -568,8 +568,14 @@ capture failed` events from source C, **and not one line reporting a source-C su
 success path in `anchor.cpp` (`anchor_from_diff`, ~line 1162) logs nothing. So the log cannot
 currently distinguish "source C ran and produced a good anchor" from "source C has never once
 produced one", and the second would be a significant hole under Phase 0B, whose §3.3 column is
-*which anchor source won*. One DEBUG line naming the winning source and its confidence would
-settle it; until then, no claim either way belongs in this document. Notepad is a strong candidate for it: it is the
+*which anchor source won*. **Both halves are now closed.** `anchor.cpp`'s `publish()` logs the
+winning source and its confidence whenever the source changes, and logs a losing candidate when a
+*different* source is rejected — so "source C works but the caret outranks it" and "source C
+produced nothing" are distinguishable in the field. And `tests/test_anchor.cpp` now drives
+`AnchorEstimator` end to end against a scripted capture: **source C demonstrably can publish a
+usable anchor with no caret available**, so the empty diffs in this log are the targets not
+changing visibly in the captured region, not a dead code path. What remains unknown is how often
+it succeeds against *real* targets, which is the probe's job. Notepad is a strong candidate for it: it is the
 first thing anyone tries, it ships with Windows, and it is now known to break the default method.
 
 These are not measurement failures. They are refusals the product makes on purpose, each with a

@@ -968,12 +968,45 @@ struct AnchorEstimator::Impl {
     // thread, and sources A and B are read on the UI thread.
     void publish(const Anchor& a) {
         bool notify = false;
+        // Captured under the lock, logged outside it. Phase 0B §3.3's column is *which anchor
+        // source won*, and nothing used to record that: only the two failure branches of the
+        // commit-diff path logged anything, so a log full of "empty diff" could not be
+        // distinguished from a log in which source C had never once succeeded. This is the one
+        // place every source funnels through, so it is the only place that can answer it.
+        //
+        // Deliberately quiet: a publish that neither changes the winning source nor is rejected
+        // in favour of a different one says nothing new, and the caret is re-read often enough
+        // that logging every call would bury the session.
+        bool replaced = false;
+        Source was = Source::None;
+        float was_conf = 0.0f;
         {
             std::lock_guard<std::mutex> lk(m);
-            if (!should_replace_anchor(current, a, cfg, a.timestamp_ms)) return;
-            current = a;
-            notify = running && listener != nullptr;
+            if (current.has_value()) {
+                was = current->source;
+                was_conf = current->confidence;
+            }
+            replaced = should_replace_anchor(current, a, cfg, a.timestamp_ms);
+            if (replaced) {
+                current = a;
+                notify = running && listener != nullptr;
+            }
         }
+        if (replaced) {
+            if (a.source != was) {
+                KD_LOG_DEBUG("anchor source -> %s (confidence %.2f, was %s at %.2f)",
+                             to_string(a.source), static_cast<double>(a.confidence),
+                             to_string(was), static_cast<double>(was_conf));
+            }
+        } else if (a.source != was) {
+            // A genuinely competing source lost. This is how "source C works but the caret
+            // outranks it" is told apart from "source C never produced anything" — the two look
+            // identical from the outside and imply completely different Phase 0B work.
+            KD_LOG_DEBUG("anchor %s (confidence %.2f) rejected; %s at %.2f stands",
+                         to_string(a.source), static_cast<double>(a.confidence), to_string(was),
+                         static_cast<double>(was_conf));
+        }
+        if (!replaced) return;
         if (notify) {
             Job j;
             j.kind = Job::Kind::Notify;
@@ -1168,6 +1201,12 @@ struct AnchorEstimator::Impl {
                          best.changed_rows, best.changed_regions, best.looks_like_scroll ? 1 : 0);
             return;
         }
+        // Source C produced something. Logged unconditionally — unlike the caret it is driven by
+        // commits rather than by a poll, so the volume is bounded, and it is the source whose
+        // liveness is actually in question (docs/supported-targets.md §5.10).
+        KD_LOG_DEBUG("commit diff -> anchor (confidence %.2f, rows=%d regions=%d changed_px=%d)",
+                     static_cast<double>(candidate->confidence), best.changed_rows,
+                     best.changed_regions, static_cast<int>(best.changed_pixels));
         publish(*candidate);
     }
 };

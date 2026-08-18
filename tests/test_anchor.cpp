@@ -13,7 +13,10 @@
 
 #include "anchor.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -321,4 +324,126 @@ KD_TEST(anchor, usability_requires_both_a_source_and_the_threshold) {
     good.confidence = 0.5f;
     good.source = kd::anchor::Source::Caret;
     KD_CHECK(good.is_usable(0.5f));  // at the threshold, not merely above it
+}
+
+// ═══ The estimator, end to end ══════════════════════════════════════════════════════════════
+//
+// Everything above this line tests pure functions. That left `AnchorEstimator` itself — the
+// worker thread, the before/after polling, and `publish()` — with no coverage at all, and it is
+// the half that decides whether source C is alive.
+//
+// That gap had a cost. After several real dictation sessions the diagnostics log held eight
+// "empty diff" and four "capture failed" lines from source C and *not one* recording a success,
+// because the success path logged nothing — so "source C works and the caret simply outranks it"
+// and "source C has never once produced an anchor" were indistinguishable, and they imply very
+// different Phase 0B work (docs/supported-targets.md §5.10). A log line was added for the field;
+// this is the part that settles it here instead, where it cannot regress unnoticed.
+
+class ScriptedCapture : public kd::anchor::IScreenCapture {
+public:
+    ScriptedCapture(Canvas before, Canvas after) : before_(std::move(before)), after_(std::move(after)) {}
+
+    kd::Result<BitmapView> capture(const Rect&) override {
+        // First call is the before-frame, every later one the after-frame — which is exactly the
+        // order the estimator uses.
+        return kd::Result<BitmapView>{(calls_++ == 0 ? before_ : after_).view()};
+    }
+    [[nodiscard]] bool last_capture_was_black() const override { return false; }
+    [[nodiscard]] const char* name() const override { return "scripted"; }
+
+private:
+    Canvas before_;
+    Canvas after_;
+    int calls_ = 0;
+};
+
+class NoCaret : public kd::anchor::ICaretProvider {
+public:
+    bool caret_rect(uintptr_t, Rect&) override { return false; }
+};
+
+class RecordingListener : public kd::anchor::IAnchorListener {
+public:
+    void on_anchor(const Anchor& a) override {
+        std::lock_guard<std::mutex> lk(m_);
+        anchors_.push_back(a);
+        cv_.notify_all();
+    }
+
+    // The listener fires on the worker thread, so the test waits rather than sleeping a guessed
+    // interval — a fixed sleep here would be flaky on a loaded machine and slow on an idle one.
+    bool wait_for_one(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(m_);
+        return cv_.wait_for(lk, timeout, [this] { return !anchors_.empty(); });
+    }
+
+    std::vector<Anchor> anchors() {
+        std::lock_guard<std::mutex> lk(m_);
+        return anchors_;
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::vector<Anchor> anchors_;
+};
+
+KD_TEST(anchor, the_estimator_publishes_an_anchor_from_a_commit_diff) {
+    // A blank region, then the same region with a short dark run on one row: the shape a
+    // committed word actually makes.
+    Canvas before(200, 60, 0xFF);
+    Canvas after(200, 60, 0xFF);
+    after.fill_rect(Rect{20, 24, 96, 38}, 0x10);
+
+    ScriptedCapture capture(std::move(before), std::move(after));
+    NoCaret caret;
+    RecordingListener listener;
+
+    kd::anchor::AnchorConfig cfg;
+    cfg.after_frame_poll_ms = 200;  // bounded: the scripted after-frame differs on the first poll
+    kd::anchor::AnchorEstimator est(cfg, &capture, &caret, &listener);
+    KD_REQUIRE(est.start().ok());
+
+    est.submit_before_frame(Rect{100, 100, 300, 160});
+    est.submit_after_frame("hello world");
+
+    KD_REQUIRE(listener.wait_for_one(std::chrono::seconds(5)));
+    est.stop();
+
+    const std::vector<Anchor> got = listener.anchors();
+    KD_REQUIRE(!got.empty());
+    const Anchor& a = got.front();
+    // The whole point: source C, on its own, with no caret available, produced a usable anchor.
+    KD_CHECK_EQ(static_cast<int>(a.source), static_cast<int>(kd::anchor::Source::CommitDiff));
+    KD_CHECK(a.confidence > 0.0f);
+    KD_CHECK(a.confidence <= kd::anchor::kMaxDiffConfidence);
+    KD_CHECK(a.is_usable(cfg.min_confidence));
+    // Placed inside the region that was actually submitted, not in bitmap-local coordinates —
+    // getting this wrong would put the overlay at the top-left of the screen.
+    KD_CHECK(a.insertion_point.x >= 100 && a.insertion_point.x <= 300);
+    KD_CHECK(a.insertion_point.y >= 100 && a.insertion_point.y <= 160);
+}
+
+KD_TEST(anchor, an_unchanged_after_frame_publishes_nothing) {
+    // The "empty diff" branch, which is what every real session has logged so far. It must stay
+    // silent rather than publish a degenerate anchor — keeping the previous one is the defined
+    // behaviour and the overlay's fallback depends on it.
+    Canvas before(200, 60, 0xFF);
+    Canvas after(200, 60, 0xFF);  // identical
+
+    ScriptedCapture capture(std::move(before), std::move(after));
+    NoCaret caret;
+    RecordingListener listener;
+
+    kd::anchor::AnchorConfig cfg;
+    cfg.after_frame_poll_ms = 50;
+    kd::anchor::AnchorEstimator est(cfg, &capture, &caret, &listener);
+    KD_REQUIRE(est.start().ok());
+
+    est.submit_before_frame(Rect{100, 100, 300, 160});
+    est.submit_after_frame("hello world");
+
+    KD_CHECK(!listener.wait_for_one(std::chrono::milliseconds(400)));
+    est.stop();
+    KD_CHECK(listener.anchors().empty());
 }
