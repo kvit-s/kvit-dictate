@@ -30,7 +30,9 @@
 
 #include <shellscalingapi.h>
 
+#include <cmath>
 #include <cstdio>
+#include <optional>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -42,6 +44,148 @@
 #include "util/utf8.h"
 
 namespace {
+
+// ─── tools/testtarget's side channel (A09 only) ────────────────────────────────────────
+//
+// docs/supported-targets.md §3.4 calls `A09` *the only cell family with programmatic ground
+// truth*, and tools/testtarget implements exactly that: a WM_COPYDATA channel reporting the true
+// caret rectangle, the text actually in the control, the line height, the theme, the DPI and the
+// code points it received. The probe never called it — `readback` was hard-coded to
+// "unavailable" and `ground_truth` to null on every record, including A09's. So the one row whose
+// numbers every other row is interpreted against would have needed the same manual operator pass
+// as the eight applications we cannot instrument, which is the whole thing testtarget was built
+// to avoid.
+//
+// Protocol, from tools/testtarget/main.cpp: send WM_COPYDATA with `dwData = kSideChannelRequest`
+// and `wParam` = our own window; the target answers by *sending* WM_COPYDATA back to that window
+// with `dwData = kSideChannelReply` and a JSON body. The reply therefore arrives re-entrantly
+// while we are still blocked inside our own SendMessageTimeout — Windows dispatches inbound sent
+// messages to a thread that is itself blocked in a send — so by the time the call returns the
+// reply is already captured. PostMessage cannot be used in either direction: WM_COPYDATA's buffer
+// is only valid for the duration of the send.
+constexpr DWORD kSideChannelRequest = 0x4B440101u;
+constexpr DWORD kSideChannelReply = 0x4B440102u;
+constexpr wchar_t kTestTargetClass[] = L"KdTestTargetWindow";
+constexpr wchar_t kProbeChannelClass[] = L"KdProbeSideChannel";
+
+class SideChannel {
+public:
+    ~SideChannel() { close(); }
+
+    bool open() {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = &SideChannel::proc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kProbeChannelClass;
+        RegisterClassExW(&wc);  // benign if already registered
+        hwnd_ = CreateWindowExW(0, kProbeChannelClass, L"kd_probe", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                nullptr, wc.hInstance, nullptr);
+        if (hwnd_ == nullptr) return false;
+        SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        return true;
+    }
+
+    void close() {
+        if (hwnd_ != nullptr) {
+            DestroyWindow(hwnd_);
+            hwnd_ = nullptr;
+        }
+    }
+
+    // True when a testtarget is running. Checked per call rather than cached: the operator may
+    // start it after the probe.
+    [[nodiscard]] static bool target_present() {
+        return FindWindowW(kTestTargetClass, nullptr) != nullptr;
+    }
+
+    // Send a command, return the JSON state reply. `cmd` may be "state", "reset-log",
+    // "focus:<control>", "set-text:<utf8>" or "select:<a>:<b>"; anything unrecognised by the
+    // target is answered with a plain state report, which is why "state" needs no special case.
+    std::optional<std::string> query(const std::string& cmd) {
+        HWND t = FindWindowW(kTestTargetClass, nullptr);
+        if (t == nullptr || hwnd_ == nullptr) return std::nullopt;
+        reply_.clear();
+        got_reply_ = false;
+        COPYDATASTRUCT cds{};
+        cds.dwData = kSideChannelRequest;
+        cds.cbData = static_cast<DWORD>(cmd.size());
+        cds.lpData = const_cast<char*>(cmd.data());
+        DWORD_PTR unused = 0;
+        if (SendMessageTimeoutW(t, WM_COPYDATA, reinterpret_cast<WPARAM>(hwnd_),
+                                reinterpret_cast<LPARAM>(&cds), SMTO_ABORTIFHUNG, 3000,
+                                &unused) == 0) {
+            return std::nullopt;
+        }
+        if (!got_reply_) return std::nullopt;
+        return reply_;
+    }
+
+private:
+    static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        if (msg == WM_COPYDATA) {
+            auto* self = reinterpret_cast<SideChannel*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+            const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+            if (self != nullptr && cds != nullptr && cds->dwData == kSideChannelReply) {
+                self->reply_.assign(static_cast<const char*>(cds->lpData), cds->cbData);
+                self->got_reply_ = true;
+                return 1;
+            }
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+
+    HWND hwnd_ = nullptr;
+    std::string reply_;
+    bool got_reply_ = false;
+};
+
+// Pull the four things a Phase 0B record needs out of a state reply. Returns false when the
+// payload is not the schema this was written against, rather than filling in defaults — a
+// ground-truth field that silently became 0,0 would read as a 40-line-height error later.
+struct TargetState {
+    bool caret_available = false;
+    kd::anchor::Rect caret{};
+    std::string text;
+    int32_t line_height = 0;
+    std::string theme;
+    int32_t dpi = 0;
+    bool is_password = false;
+    int64_t events_total = 0;
+};
+
+bool parse_target_state(const std::string& json_text, TargetState& out) {
+    kd::json::Value root;
+    kd::json::Error err;
+    if (!kd::json::parse_object(json_text, root, err)) return false;
+    const kd::json::Value* schema = root.find("schema");
+    if (schema == nullptr || schema->as_string() != "kd-testtarget-state/1") return false;
+
+    if (const kd::json::Value* caret = root.find("caret")) {
+        const kd::json::Value* avail = caret->find("available");
+        out.caret_available = avail != nullptr && avail->as_bool();
+        if (const kd::json::Value* r = caret->find("screen_rect")) {
+            if (r->is_array() && r->size() == 4) {
+                out.caret.left = static_cast<int32_t>(r->at(0)->as_int());
+                out.caret.top = static_cast<int32_t>(r->at(1)->as_int());
+                out.caret.right = static_cast<int32_t>(r->at(2)->as_int());
+                out.caret.bottom = static_cast<int32_t>(r->at(3)->as_int());
+            }
+        }
+    }
+    if (const kd::json::Value* t = root.find("text")) out.text = std::string(t->as_string());
+    if (const kd::json::Value* f = root.find("focus")) {
+        if (const kd::json::Value* lh = f->find("line_height_px")) {
+            out.line_height = static_cast<int32_t>(lh->as_int());
+        }
+        if (const kd::json::Value* pw = f->find("is_password")) out.is_password = pw->as_bool();
+    }
+    if (const kd::json::Value* th = root.find("theme")) out.theme = std::string(th->as_string());
+    if (const kd::json::Value* d = root.find("dpi")) out.dpi = static_cast<int32_t>(d->as_int());
+    if (const kd::json::Value* e = root.find("events_total")) out.events_total = e->as_int();
+    return true;
+}
+
 
 // ─── REF-1, defined once (docs/supported-targets.md §4.2) ───────────────────────────────────
 //
@@ -234,6 +378,27 @@ int main(int argc, char** argv) {
 
     const std::string text = ref1();
 
+    // The side channel is A09's alone: it is tools/testtarget's own protocol, and asking any
+    // other application for it would find no window and quietly do nothing. Opened once for the
+    // whole run rather than per repetition, so `--repeat 20` does not create and destroy twenty
+    // message-only windows.
+    SideChannel side_channel;
+    bool use_side_channel = false;
+    if (app == "A09") {
+        if (!SideChannel::target_present()) {
+            std::printf("A09 selected but no tools/testtarget window was found. Ground truth and "
+                        "readback will be null and the operator has to supply them by hand, which "
+                        "is the thing A09 exists to avoid. Start kd_testtarget.exe first.\n");
+        } else if (!side_channel.open()) {
+            std::printf("A09 selected but the probe could not create its side-channel window "
+                        "(err=%lu); falling back to operator-supplied ground truth.\n",
+                        GetLastError());
+        } else {
+            use_side_channel = true;
+            std::printf("side channel: connected to tools/testtarget\n");
+        }
+    }
+
     for (int rep = 0; rep < repeat; ++rep) {
         std::printf("\n[%s/%s/%s] repetition %d of %d\n", app.c_str(), scenario.c_str(),
                     method.c_str(), rep + 1, repeat);
@@ -309,7 +474,36 @@ int main(int argc, char** argv) {
 
         RECT wr{};
         GetWindowRect(reinterpret_cast<HWND>(target.top_level), &wr);
-        const kd::anchor::Rect region{wr.left, wr.top, wr.right, wr.bottom};
+        // The capture region must be the one the PRODUCT uses, not the whole window.
+        // src/main.cpp calls `capture_region_for()` on the current insertion point; a probe that
+        // captured the entire window would score a diff the product never computes, and would
+        // report the estimator as far worse than it is. The first A09 run measured 70.6 line
+        // heights of error with a window-sized region against tools/testtarget, whose own event
+        // log repaints on every keystroke and dominated the diff - a number that says nothing
+        // about the estimator and would have falsely indicted it, since A09 is the calibration
+        // row (§5.9: "if A09 cannot hit one line height, the estimator is broken, not the
+        // target").
+        //
+        // The caret read a few lines below is what the product would anchor on at session start,
+        // so it is the honest basis. Without one there is nothing better than the window, and the
+        // record says which was used so the two are never averaged together.
+        kd::anchor::Rect caret_for_region;
+        const bool have_caret_for_region =
+            caret->caret_rect(target.focus != 0 ? target.focus : target.top_level,
+                              caret_for_region);
+        kd::anchor::AnchorConfig region_cfg;
+        const bool region_from_caret = have_caret_for_region && !caret_for_region.empty();
+        const kd::anchor::Point caret_pt{caret_for_region.left, caret_for_region.top};
+        const kd::anchor::Rect region =
+            region_from_caret
+                ? kd::anchor::capture_region_for(caret_pt, region_cfg,
+                                                 kd::anchor::monitor_geometry_for(caret_pt))
+                : kd::anchor::Rect{wr.left, wr.top, wr.right, wr.bottom};
+        std::printf("  capture region: %s [%d,%d %dx%d]\n",
+                    region_from_caret ? "around the caret (as the product does)"
+                                      : "whole window (no caret available)",
+                    region.left, region.top, region.right - region.left,
+                    region.bottom - region.top);
 
         std::vector<uint8_t> before_pixels;
         kd::anchor::BitmapView before_view;
@@ -329,6 +523,31 @@ int main(int argc, char** argv) {
         const bool caret_ok = caret->caret_rect(target.focus != 0 ? target.focus : target.top_level,
                                                 caret_rect);
 
+        // Ground truth, for A09 only. Taken *before* the injection for the caret - that is the
+        // insertion point the anchor is trying to predict, and after the text lands it has moved
+        // to the end of what was typed. The log is cleared in the same call so `events_total`
+        // afterwards counts this repetition's keystrokes and not the previous one's.
+        TargetState before_state;
+        bool have_before_state = false;
+        // The caret AFTER the text lands. This, not the pre-injection caret, is what source C is
+        // trying to predict: the estimator's whole job is to say where the *next* text goes, and
+        // the overlay draws the pending preview there. Scoring against the pre-injection caret
+        // measures the width of what was just typed and calls it estimator error - a systematic
+        // bias that would have been baked into all 162 cells and read as "the estimator is poor".
+        TargetState after_state;
+        bool have_after_state = false;
+        if (use_side_channel) {
+            if (const std::optional<std::string> reply = side_channel.query("reset-log")) {
+                have_before_state = parse_target_state(*reply, before_state);
+                if (!have_before_state) {
+                    std::printf("  side channel: reply was not kd-testtarget-state/1; treating "
+                                "ground truth as unavailable\n");
+                }
+            } else {
+                std::printf("  side channel: no reply from tools/testtarget\n");
+            }
+        }
+
         // ── Inject ──────────────────────────────────────────────────────────────────────────
         kd::InjectResult inject_result;
         if (supported == kd::InjectStatus::Ok) {
@@ -345,9 +564,28 @@ int main(int argc, char** argv) {
             // Readback is NOT inferred here. tools/testtarget logs the code points it actually
             // received; every other application needs the operator to compare. Either way the
             // record says which, so a later reader cannot mistake a guess for a measurement.
-            inj.set("readback", kd::json::Value::string(std::string("unavailable")));
-            inj.set("readback_source",
-                    kd::json::Value::string(std::string(app == "A09" ? "side-channel" : "operator")));
+            // Readback is measured where it can be and declared unavailable where it cannot;
+            // the record always says which, so a later reader cannot mistake a guess for a
+            // measurement.
+            std::string readback = "unavailable";
+            std::string readback_source = "operator";
+            if (use_side_channel) {
+                if (const std::optional<std::string> reply = side_channel.query("state")) {
+                    if (parse_target_state(*reply, after_state)) {
+                        have_after_state = true;
+                        readback = after_state.text;
+                        readback_source = "side-channel";
+                        const bool exact = readback.find(text) != std::string::npos;
+                        std::printf("  readback: %s (%zu bytes, %lld events)\n",
+                                    exact ? "REF-1 present verbatim"
+                                          : "DOES NOT contain REF-1 verbatim",
+                                    readback.size(),
+                                    static_cast<long long>(after_state.events_total));
+                    }
+                }
+            }
+            inj.set("readback", kd::json::Value::string(readback));
+            inj.set("readback_source", kd::json::Value::string(readback_source));
             inj.set("lossy_segments", kd::json::Value::array());
             record.set("inject", std::move(inj));
             std::printf("  injected %zu bytes in %llu ms (%s)\n", text.size(),
@@ -429,16 +667,79 @@ int main(int argc, char** argv) {
         anchor_obj.set("winner", kd::json::Value::string(std::string(
                                      diff.changed_pixels > 0 ? "C" : (caret_ok ? "A" : "none"))));
         anchor_obj.set("confidence", kd::json::Value::number(static_cast<double>(confidence)));
-        // Ground truth is the operator's job (§8.1 step 6) and stays null until they supply it.
-        // A default of "0,0" would silently become a 40-line-height error in the aggregate.
-        anchor_obj.set("ground_truth", kd::json::Value::null());
-        anchor_obj.set("ground_truth_source", kd::json::Value::null());
-        anchor_obj.set("error_lh", kd::json::Value::null());
+        // Ground truth: programmatic for A09 (§3.4), the operator's job everywhere else
+        // (§8.1 step 6). It stays null when it cannot be measured - a default of "0,0" would
+        // silently become a 40-line-height error in the aggregate, which is worse than a gap.
+        const bool gt_ok = have_after_state && after_state.caret_available;
+        if (gt_ok) {
+            const kd::anchor::Rect& truth = after_state.caret;
+            kd::json::Value gt = kd::json::Value::array();
+            gt.push_back(kd::json::Value::number(static_cast<int64_t>(truth.left)));
+            gt.push_back(kd::json::Value::number(static_cast<int64_t>(truth.top)));
+            anchor_obj.set("ground_truth", std::move(gt));
+            // Kept so the two are never confused by a later reader, and so the distance between
+            // them - the width of the committed text - is recoverable from the record.
+            if (have_before_state && before_state.caret_available) {
+                kd::json::Value pre = kd::json::Value::array();
+                pre.push_back(
+                    kd::json::Value::number(static_cast<int64_t>(before_state.caret.left)));
+                pre.push_back(
+                    kd::json::Value::number(static_cast<int64_t>(before_state.caret.top)));
+                anchor_obj.set("caret_before_injection", std::move(pre));
+            }
+            anchor_obj.set("ground_truth_source",
+                           kd::json::Value::string(std::string("testtarget-side-channel")));
+
+            // §3.4's figure: the estimator's error in LINE HEIGHTS, not pixels, so a 4K target
+            // and a 96-dpi one are comparable. Scored through `anchor_from_diff` - the same
+            // function the product uses - rather than a reimplementation here, because a probe
+            // that measured its own arithmetic would report a number the product never produces.
+            const std::optional<kd::anchor::Anchor> est =
+                kd::anchor::anchor_from_diff(diff, region, std::nullopt, 0);
+            const int32_t lh = after_state.line_height > 0 ? after_state.line_height
+                                                            : before_state.line_height;
+            if (est.has_value() && lh > 0) {
+                const double dx = static_cast<double>(est->insertion_point.x - truth.left);
+                const double dy = static_cast<double>(est->insertion_point.y - truth.top);
+                const double dist = std::sqrt(dx * dx + dy * dy);
+                anchor_obj.set("error_lh", kd::json::Value::number(dist / static_cast<double>(lh)));
+                std::printf("  ground truth: post-commit caret (%d,%d) lh=%d -> estimator "
+                            "error %.2f line heights\n",
+                            truth.left, truth.top, lh, dist / static_cast<double>(lh));
+            } else {
+                // No source-C anchor to score, or no line height. Null rather than 0.
+                anchor_obj.set("error_lh", kd::json::Value::null());
+            }
+            kd::json::Value env = kd::json::Value::object();
+            env.set("theme", kd::json::Value::string(after_state.theme.empty()
+                                                         ? before_state.theme
+                                                         : after_state.theme));
+            env.set("dpi", kd::json::Value::number(static_cast<int64_t>(before_state.dpi)));
+            env.set("line_height_px",
+                    kd::json::Value::number(static_cast<int64_t>(before_state.line_height)));
+            env.set("is_password", kd::json::Value::boolean(before_state.is_password));
+            record.set("target_state", std::move(env));
+        } else {
+            anchor_obj.set("ground_truth", kd::json::Value::null());
+            anchor_obj.set("ground_truth_source", kd::json::Value::null());
+            anchor_obj.set("error_lh", kd::json::Value::null());
+        }
         anchor_obj.set("fallback_mode",
                        kd::json::Value::string(std::string(confidence >= 0.5f ? "inline" : "pill")));
         record.set("anchor", std::move(anchor_obj));
 
         kd::json::Value cap = kd::json::Value::object();
+        {
+            kd::json::Value rr = kd::json::Value::array();
+            rr.push_back(kd::json::Value::number(static_cast<int64_t>(region.left)));
+            rr.push_back(kd::json::Value::number(static_cast<int64_t>(region.top)));
+            rr.push_back(kd::json::Value::number(static_cast<int64_t>(region.right)));
+            rr.push_back(kd::json::Value::number(static_cast<int64_t>(region.bottom)));
+            cap.set("region", std::move(rr));
+            // Never averaged across bases: a window-sized region measures a different thing.
+            cap.set("region_basis",
+                    kd::json::Value::string(std::string(region_from_caret ? "caret" : "window")));
+        }
         cap.set("path", kd::json::Value::string(std::string(capture->name())));
         cap.set("all_black", kd::json::Value::boolean(before_black || capture->last_capture_was_black()));
         // Null, not false: nobody has run the WGC desktop path yet, and recording "false" would
@@ -468,8 +769,11 @@ int main(int argc, char** argv) {
                         "still an open question (docs/supported-targets.md §9).\n");
         }
         std::printf("  wrote %ls\n", out.c_str());
-        std::printf("  TODO for the operator: compare what arrived against REF-1, and click the "
-                    "true caret position, then fill readback/ground_truth in the record.\n");
+        if (!have_before_state) {
+            std::printf("  TODO for the operator: compare what arrived against REF-1, and click "
+                        "the true caret position, then fill readback/ground_truth in the "
+                        "record.\n");
+        }
     }
 
     return 0;
