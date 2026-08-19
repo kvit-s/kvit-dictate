@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-18. Commit `eef533e` on `main`.
+Written 2026-08-18. Commit `4805a1d` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -23,8 +23,9 @@ posts audio to an OpenAI-compatible `/v1/audio/transcriptions` endpoint and is *
 loads under the same bare CPython the mock uses. `envs/` still does not exist and no model has
 been downloaded.
 
-**It is not yet reliable.** A long sentence aborts partway with a protocol-level stability
-violation and the tail of the sentence is lost. See §3.
+**The one bug that made it unreliable is fixed but unconfirmed.** A long sentence used to abort
+partway and lose its tail; it was diagnosed from the log and the two sources, and fixed, without a
+repro. **Nobody has dictated into it since.** See §3, and §6 item 1 for what to look for.
 
 ---
 
@@ -46,10 +47,10 @@ violation and the tail of the sentence is lost. See §3.
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 326 tests / 35920 checks
+build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 327 tests / 35940 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
-python -m unittest discover -s server/tests -t server  # 372 tests   (from the repo root)
+python -m unittest discover -s server/tests -t server  # 377 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
@@ -69,45 +70,63 @@ Model entries that matter:
 
 | id | what it is |
 |---|---|
-| `qwen-asr-http` | LAN Qwen3-ASR, re-transcribes once a second → live preview that revises. **Trips the stability abort (§3).** |
+| `qwen-asr-http` | LAN Qwen3-ASR, re-transcribes once a second → live preview that revises. Used to trip the stability abort; fixed in `89d012e`, **not yet confirmed by a human** (§3). |
 | `qwen-asr-http-finalize` | one request per utterance, no live preview. Cannot trip it. The reliable one. |
 | `mock` | scripted; the only entry that needs nothing at all. Still the way to test the C++ side in isolation. |
 | `whisper-large-v3-turbo` | zero-install baseline: the weights (1.6 GB) and the venv both already exist on this machine. Never run. |
 
 ---
 
-## 3. The open bug, and it is the one that matters
+## 3. The bug that mattered — diagnosed and fixed, not yet confirmed by a human
 
-**A long sentence aborts mid-way and loses its tail.** Reproduced twice. The session ends, the
-overlay flags a violation, and everything not yet committed is discarded.
+**A long sentence aborted mid-way and lost its tail.** Reproduced twice, on 2026-08-18 at 15:53
+and 17:56. Fixed in `89d012e`; **the fix has not yet been through a real dictation.** See §6.1.
 
-What is known:
+### What it actually was
 
-* It is a **protocol-level §8.2 stability violation** — the sidecar's own `stable_bytes` went
-  backwards or its stable prefix mutated — raised in `session.cpp`, **not** the commit engine's
-  `CommittedTextContradicted` check. `grep -c "committed-prefix violation:"` over the whole log is
-  **zero**: that check has never fired.
-* The cause is structural. A batch model re-transcribing the whole window every second
-  re-punctuates and re-cases earlier words once it sees where the sentence ended — `how are you`
-  becomes `How are you?` — and that revises text below the published stable mark.
-* `qwen-asr-http-finalize` cannot hit it: one transcription per utterance, nothing to contradict.
+Diagnosed without a repro, by reading both sides and replaying the sequence offline. The chain:
 
-What was done about it today:
+1. `qwen-asr-http` re-transcribes the **whole utterance** every second. A growing-window batch
+   model does not extend its previous hypothesis, it replaces it — so once it can see where the
+   sentence ended it re-cases the opening word and inserts the punctuation it was unsure of, and
+   `so I was thinking we` comes back as `So I was thinking, we`.
+2. `StabilityTracker` had already published a mark covering those bytes. §8.2 binds a new
+   hypothesis against the *previously published* mark, so `_evaluate`'s step 0 raised
+   `STABLE_PREFIX_MUTATED` — correctly, and with no value of `stable_bytes` that would have made
+   the message conforming.
+3. `Session._fail_session` turned that into `error{code:decode_failed, fatal:false}` + `stopped`.
+4. `session.cpp`'s non-fatal `error`-frame branch aborted the session — and set **no** `o.error`.
 
-* `main.cpp` now logs `o.error` — code, message and byte offset. The session machine had always
-  built a precise diagnosis and nothing read it, which is why this was misdiagnosed once already.
-  **The next occurrence will name the exact rule and offset.** Get that line before designing a fix.
-* `CommitEngine::Result::salvage` appends the words a rejected hypothesis still agrees the position
-  of, instead of dropping the rest of the sentence. Correct, tested (7 cases), and **not** on this
-  path — it is in the commit-engine branch that never runs. It will matter once this one is fixed.
+**The diverging offset is 0.** The *first word* was revised, so no non-zero mark was ever safe.
 
-The likely shape of the fix, in the order to try it:
+### Two things §3 used to say that were wrong
 
-1. Read the new `session error:` line. Which of the three §8.2 rules broke, and at what offset?
-2. If the sidecar is publishing a `stable_bytes` its own next hypothesis contradicts, that is the
-   Python side over-claiming stability. `SessionConfig.stability_n/m/hold_ms` (2 / 3 / 200 ms) are
-   tuned for a natively-streaming model, not for one that revises punctuation at the end.
-3. Only then consider whether the client should tolerate it rather than abort.
+* **It was not the C++ §8.2 check.** That check (`session.cpp`, the `check_stability` call) never
+  ran, and neither did the commit engine's. Both aborts came through the error-frame branch four
+  paragraphs up. The tell was in the log all along: `31 byte reason` is the length of the fixed
+  string `committed text was contradicted`, which only `main.cpp`'s `SurfaceWarning` handler
+  passes — `perform_commit` passes a much longer one.
+* **Reading the new `session error:` line would not have worked.** That branch populated no
+  `o.error`, so the next occurrence would have logged exactly what the last two did. Fixed in
+  `4805a1d`; the branch now carries the child's code, message and session_id out.
+
+### The fix, and why the other candidate could not have worked
+
+`SessionConfig.publish_stable_partials`, derived in `ConnectionSession._start` from the backend's
+own declared `pseudo-streaming` mode. A backend in that class publishes **no mark before the
+`final`**; the tracker is not fed during partials at all.
+
+Tuning `stability_n/m/hold_ms` — the first fix this file proposed — **cannot** work, and the
+offset is the proof. The three knobs delay the mark; delaying a mark that will be contradicted at
+byte 0 changes when the abort happens, not whether it does.
+
+**The live preview survives.** `partial` still carries the full revising text and the client
+renders everything above the mark as pending (plan.md §1.5), so with the mark pinned at 0 that is
+the whole hypothesis. The words still appear as they are spoken; they land in the document at the
+endpoint instead of a few hundred ms earlier. This is *not* `qwen-asr-http-finalize`, which has no
+live preview at all.
+
+`CommitEngine::Result::salvage` (7 tests) is still correct and still not on this path.
 
 ---
 
@@ -162,13 +181,21 @@ problem.
 
 ## 6. What to do next
 
-1. **Reproduce the §3 abort and read the new `session error:` line.** One dictation, one log line,
-   and the fix stops being guesswork. Everything else in this list is smaller.
-2. **Tune the sidecar's stability for a revising backend** (`--stability-n`, `--stability-m`,
-   `--stability-hold-ms`), or make the Python side stop publishing a `stable_bytes` its own next
-   hypothesis will contradict.
+1. **Dictate the sentence that used to abort, with `qwen-asr-http`.** This is the only item that
+   needs a human, and everything in §3 is unconfirmed until it happens. What to look for:
+   * The sentence completes and its tail is not lost.
+   * No `overlay flagged a committed-prefix violation` in the log.
+   * Text now lands **at the end of each utterance** rather than mid-sentence. That is the fix
+     working, not a regression — see §3 on why the preview is unaffected but the commit is not.
+   * If it *does* still abort, there will now be a `session error: code=... at_offset=...` line.
+     Read it: the branch that had no reader is the one that has been fixed.
+2. ~~Tune the sidecar's stability for a revising backend.~~ **Ruled out** — §3 says why the three
+   knobs cannot fix a revision at byte 0. Done instead by pinning the mark to 0 for the whole
+   class of backend.
 3. **Point the VAD at a local `silero_vad.onnx`.** Cheap, and it improves both endpointing and the
-   silence-hallucination exposure.
+   silence-hallucination exposure. Now the largest known defect, given §3 is fixed — and it got
+   *more* load-bearing, not less: with nothing committed until the endpoint, the endpointer is
+   what decides when the user's words reach the document.
 4. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4**, with whatever
    numbers exist. The picks table currently recommends models the operator has rejected.
 5. **Decide what the product does when the far end is unreachable.** This backend has no local
@@ -199,7 +226,21 @@ problem.
 
 ## 8. The recurring failure mode, five sessions running
 
-**A contract implemented on one side and never called from the other.** Today's instances:
+**A contract implemented on one side and never called from the other.** The clearest instance yet
+is §3's, because the failure mode struck *twice over* on the same incident and the second strike
+was the fix for the first:
+
+* `session.cpp`'s non-fatal `error` branch discarded the child's whole diagnosis. The sidecar had
+  built it, sent it over the wire, and the receiver dropped it at one line.
+* So the previous session added a reader for `o.error` — and added it to a path this abort does
+  not take. The fix for "a diagnosis nobody reads" was itself never reached. **That is what made
+  §6 item 1 wrong**: it prescribed one dictation to produce a log line that could not appear.
+
+The habit that would have caught it: the log said `31 byte reason`, and 31 is the length of the
+fixed string on one specific branch. The evidence identifying the true path was already in the
+file that was being read for evidence.
+
+Earlier instances:
 
 * `min_confidence`, `is_usable()` and `current_fallback()` all existed, were tested, and were
   called from nowhere in `src/` — the degradation rule was implemented *nowhere*.
