@@ -68,6 +68,13 @@ immediately, which is two symptoms of one cause.
 as `settings.json.before-real-model`. The log at
 `%LOCALAPPDATA%\kvit-dictate\logs\kvit-dictate.log` is the first thing to read after any session.
 
+**Commit frequency does not live in `settings.json`.** Its `session.endpoint_silence_ms` is a
+*hint* — `session.cpp:752` says so, and `close_utterance()` only flips a bool; audio keeps
+flowing. The authoritative utterance boundary is the sidecar's, so the knob is
+`--endpoint-silence-ms` in **`models.json`**, currently **1500 ms** for both qwen entries (was the
+800 ms default, which split sentences at every breath). The client-side value is kept at 1500 to
+match, purely so the two do not read as disagreeing.
+
 Model entries that matter:
 
 | id | what it is |
@@ -131,6 +138,45 @@ endpoint instead of a few hundred ms earlier. This is *not* `qwen-asr-http-final
 live preview at all.
 
 `CommitEngine::Result::salvage` (7 tests) is still correct and still not on this path.
+
+---
+
+## 3b. The far end has a cliff, and it sets a hard product limit
+
+**Measured** 2026-08-19 against `strixhalo.lan:10301`, three requests per size, median:
+
+| audio | median | vs realtime |
+|---|---|---|
+| 4 s | 332 ms | 12.1× |
+| 8 s | 547 ms | 14.6× |
+| **12 s** | **6796 ms** | 1.8× |
+| 20 s | 6763 ms | 3.0× |
+| 30 s | 13661 ms | 2.2× |
+
+Not a scaling curve — a **discontinuity between 8 s and 12 s**, 12× the time for 1.5× the audio.
+Synthetic audio (a modulated harmonic stack), so these are a **lower bound**: real speech
+generates more output tokens and will be slower. Whatever the far end is doing differently past
+~8 s was not investigated; the operational fact is enough.
+
+The consequences are not small:
+
+* **`window_ms` cannot be raised.** The hop re-uploads and re-decodes the *whole* window every
+  second. Its 8000 default is not conservative — it is the edge of the only fast regime. At 12 s
+  the far end takes ~7× the hop, so requests pile up and the preview falls permanently behind.
+* **The product's real limit is ~8 s of continuous speech**, roughly 20 words at 150 wpm — about
+  one sentence. **Sentence-level accumulation is the maximum this backend can do at any setting.**
+  Paragraph-level is not available.
+* Longer *pauses* are free, though, and that is what made 1500 ms cheap: silence is gated out
+  before the decoder (`session.py::_route`, plan.md §1.6), so the window bounds continuous speech
+  and not wall-clock.
+
+Past the ceiling the wrapper freezes the scrolled-out text and stitches by word overlap.
+`base.py` is blunt that the stitch finds *"no exact overlap at all"* for a model that recases or
+repunctuates across the boundary — Qwen, per §3 — then *"freezes the entire pre-slide
+transcript"*, and that the result is *"not stable in the §1.4 sense … merely unrecoverable"*. The
+stability machinery cannot protect the document from it. It is now a `window_slide` WARN, once per
+utterance (`connection.py::_note_window_slide`, 5 tests) — **if that line appears in a log, the
+text around it is suspect and the sentence was too long, not mis-heard.**
 
 ---
 
