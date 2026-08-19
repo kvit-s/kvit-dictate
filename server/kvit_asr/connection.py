@@ -56,11 +56,16 @@ from typing import Any, Callable, Sequence
 
 from kvit_asr import session as session_mod
 from kvit_asr import vad as vad_mod
-from kvit_asr.backends.base import ResetReason
+from kvit_asr.backends.base import ResetReason, StreamingMode
 from kvit_asr.config import BackendConfig, SessionConfig as CliSessionConfig
 from kvit_asr.stability import StabilityParams
 
 __all__ = ["ConnectionSession", "LoadedBackend", "VadAdapter", "open_backend"]
+
+# The one streaming mode whose backends re-decode the whole utterance and may therefore revise
+# text they have already published. Spelled from the enum so the wire value has a single source;
+# `LoadedBackend.mode` is the plain string, which is what it is compared against.
+_REVISING_MODE = StreamingMode.PSEUDO_STREAMING.value
 
 
 # ─── Seam 2: the backend ────────────────────────────────────────────────────────────────────
@@ -495,6 +500,14 @@ class ConnectionSession:
                     hold_ms_t=cli.stability_hold_ms,
                 ),
                 context=context,
+                # Read off the backend's own declaration, not a setting. `pseudo-streaming` is
+                # defined in backends/base.py as "a batch model driven by a sliding or growing
+                # window **that we built**" — which is exactly the class of backend that replaces
+                # its previous hypothesis instead of extending it. See
+                # `SessionConfig.publish_stable_partials` for why no stability tuning substitutes
+                # for this. A backend that mislabels its mode gets the wrong answer here, which is
+                # one more reason base.py calls the field "not decoration".
+                publish_stable_partials=(self._backend.mode != _REVISING_MODE),
             ),
             **({} if self._clock is None else {"clock": self._clock}),
         )

@@ -188,6 +188,28 @@ class SessionConfig:
     # exists for.
     inline_decode: bool = True
 
+    # Whether a `partial` may carry a non-zero `stable_bytes` at all.
+    #
+    # **Set this False for any backend that re-decodes the whole utterance from scratch.** A
+    # growing-window batch model does not extend its previous hypothesis, it replaces it: once it
+    # can see where the sentence ended it re-cases the opening word and inserts the punctuation it
+    # was not yet sure of, so `so I was thinking we` becomes `So I was thinking, we`. That revises
+    # byte 0 — and §8.2 binds a new hypothesis against the *previously published* mark, so once a
+    # non-zero mark is out there, no value of `stable_bytes` makes the next message conforming.
+    # `StabilityTracker` is right to raise; the mistake is upstream, in having published at all.
+    #
+    # Note what this is NOT: it is not a stability parameter that trades latency for safety.
+    # `stability_n/m/hold_ms` delay the mark, and delaying a mark that will later be contradicted
+    # at byte 0 only changes when the abort happens. There is no setting of the three knobs that
+    # makes a revising backend safe, which is why this is a separate switch and not a tuning.
+    #
+    # The cost is that nothing commits until the utterance ends. The live preview is unaffected —
+    # `partial` still carries the full revising text, the Client renders everything above the
+    # stable mark as pending (plan.md §1.5), and with the mark pinned at 0 that is the whole
+    # hypothesis. So the user still watches the words arrive; they land in the document at the
+    # endpoint instead of a few hundred milliseconds earlier.
+    publish_stable_partials: bool = True
+
 
 # ─── The session ────────────────────────────────────────────────────────────────────────────────
 
@@ -434,6 +456,11 @@ class Session:
             # would publish the tracker's own value over the top of the forced one. See
             # `_stable_bytes_for`.
             return
+        if not self._cfg.publish_stable_partials:
+            # The dwell has nothing to mature: `_stable_bytes_for` never fed the tracker, so
+            # poll() would evaluate a hypothesis it has never seen. Stand down for the same reason
+            # the forced case does — this session publishes no mark before the `final`.
+            return
         try:
             stable = self._stability.poll()
         except StabilityViolation as v:
@@ -532,6 +559,14 @@ class Session:
         if override is not None:
             self._stability_forced = True
             return override
+        # Checked after the override so `--allow-hostile-backend` still reaches the wire: the
+        # hostile path exists precisely to emit a non-conforming frame, and a backend that forces
+        # a value has said it owns this utterance's sequence whatever the mode.
+        if not self._cfg.publish_stable_partials:
+            # Deliberately without `observe()`: feeding the tracker would build a window and a
+            # candidate for a mark that is never published, and the next revision would then raise
+            # about a contradiction of something that never left this process.
+            return 0
         if self._stability_forced:
             # The backend went quiet about it mid-utterance. Hold the last published value rather
             # than resuming a computation whose state no longer describes what was sent.
