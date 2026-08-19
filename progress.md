@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-18. Commit `4805a1d` on `main`.
+Written 2026-08-18. Commit `9fd3096` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -23,9 +23,11 @@ posts audio to an OpenAI-compatible `/v1/audio/transcriptions` endpoint and is *
 loads under the same bare CPython the mock uses. `envs/` still does not exist and no model has
 been downloaded.
 
-**The one bug that made it unreliable is fixed but unconfirmed.** A long sentence used to abort
-partway and lose its tail; it was diagnosed from the log and the two sources, and fixed, without a
-repro. **Nobody has dictated into it since.** See §3, and §6 item 1 for what to look for.
+**The one bug that made it unreliable is fixed, and confirmed by a human.** A long sentence used
+to abort partway and lose its tail. Diagnosed from the log and the two sources and fixed without a
+repro, then verified in a real dictation on 2026-08-18 at 22:09 — 47 seconds into Notepad3, seven
+utterances committed, no violation. The two sessions it used to fail in died after about five. §3
+has the mechanism.
 
 ---
 
@@ -70,17 +72,19 @@ Model entries that matter:
 
 | id | what it is |
 |---|---|
-| `qwen-asr-http` | LAN Qwen3-ASR, re-transcribes once a second → live preview that revises. Used to trip the stability abort; fixed in `89d012e`, **not yet confirmed by a human** (§3). |
+| `qwen-asr-http` | LAN Qwen3-ASR, re-transcribes once a second → live preview that revises. Used to trip the stability abort; fixed in `89d012e` and confirmed working (§3). Commits once per utterance, at the endpoint. |
 | `qwen-asr-http-finalize` | one request per utterance, no live preview. Cannot trip it. The reliable one. |
 | `mock` | scripted; the only entry that needs nothing at all. Still the way to test the C++ side in isolation. |
 | `whisper-large-v3-turbo` | zero-install baseline: the weights (1.6 GB) and the venv both already exist on this machine. Never run. |
 
 ---
 
-## 3. The bug that mattered — diagnosed and fixed, not yet confirmed by a human
+## 3. The bug that mattered — diagnosed, fixed, and confirmed
 
 **A long sentence aborted mid-way and lost its tail.** Reproduced twice, on 2026-08-18 at 15:53
-and 17:56. Fixed in `89d012e`; **the fix has not yet been through a real dictation.** See §6.1.
+and 17:56. Fixed in `89d012e`, confirmed by a human dictation at 22:09 the same day: 47 seconds
+into Notepad3, seven utterances committed at their endpoints, no violation and no `session error:`
+line. Both failing sessions had died after roughly five seconds.
 
 ### What it actually was
 
@@ -181,23 +185,22 @@ problem.
 
 ## 6. What to do next
 
-1. **Dictate the sentence that used to abort, with `qwen-asr-http`.** This is the only item that
-   needs a human, and everything in §3 is unconfirmed until it happens. What to look for:
-   * The sentence completes and its tail is not lost.
-   * No `overlay flagged a committed-prefix violation` in the log.
-   * Text now lands **at the end of each utterance** rather than mid-sentence. That is the fix
-     working, not a regression — see §3 on why the preview is unaffected but the commit is not.
-   * If it *does* still abort, there will now be a `session error: code=... at_offset=...` line.
-     Read it: the branch that had no reader is the one that has been fixed.
+1. ~~Dictate the sentence that used to abort.~~ **Done, 2026-08-18 22:09.** Clean: no violation,
+   no `session error:` line, seven utterances committed over 47 seconds. §3 is confirmed.
 2. ~~Tune the sidecar's stability for a revising backend.~~ **Ruled out** — §3 says why the three
    knobs cannot fix a revision at byte 0. Done instead by pinning the mark to 0 for the whole
    class of backend.
 3. **Point the VAD at a local `silero_vad.onnx`.** Cheap, and it improves both endpointing and the
-   silence-hallucination exposure. Now the largest known defect, given §3 is fixed — and it got
-   *more* load-bearing, not less: with nothing committed until the endpoint, the endpointer is
-   what decides when the user's words reach the document.
+   silence-hallucination exposure. **Now the largest known defect** — and §3's fix made it *more*
+   load-bearing, not less: with nothing committed until the endpoint, the endpointer is what
+   decides when the user's words reach the document. A false endpoint on keyboard noise now splits
+   a sentence into two commits; a missed one holds the whole sentence back.
 4. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4**, with whatever
-   numbers exist. The picks table currently recommends models the operator has rejected.
+   numbers exist. The picks table currently recommends models the operator has rejected. §3 raises
+   the stakes on this: if the quality winner really is a *batch* model, then
+   `publish_stable_partials=False` — commit at the endpoint, never mid-sentence — is the product's
+   permanent latency profile rather than a workaround, and that belongs in the picks table where
+   the decision gets made.
 5. **Decide what the product does when the far end is unreachable.** This backend has no local
    fallback, and plan.md §2's "no network access during dictation" is broken in the letter by it —
    see the module docstring for the full argument. If the LAN endpoint is the long-term plan rather
