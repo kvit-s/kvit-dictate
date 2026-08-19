@@ -77,7 +77,9 @@
         "--model",
         "Qwen/Qwen3-ASR-1.7B",
         "--chunk-ms",
-        "1000"
+        "1000",
+        "--endpoint-silence-ms",
+        "1500"
       ],
       "streaming_mode": "pseudo-streaming",
       "requires": [
@@ -85,7 +87,7 @@
         "network reachability of strixhalo.lan:10301"
       ],
       "env": {},
-      "notes": "Posts audio to an OpenAI-compatible /v1/audio/transcriptions endpoint on the operator's LAN (a Qwen3-ASR server on strixhalo). Its backend module is STDLIB-ONLY - urllib and wave - so unlike every other real backend it needs no environment, no download and no install, and it runs under the same bare CPython the mock uses. That is the whole point of it: it is the shortest path from 'the client works against a scripted mock' to 'the client works against a real ASR model'. TWO CAVEATS, both deliberate and both recorded rather than hidden. (1) plan.md section 2 guarantees no network access during dictation; this breaks the letter of that. The endpoint is hardware the operator owns, so audio never leaves their control and the privacy intent holds - but dictation now depends on another host being up, and that availability guarantee is genuinely given up. (2) It is a REMOTE BATCH model behind a streaming interface, so it is pseudo-streaming and its latency is a property of the network and the far end's queue rather than of an ASR architecture. It is not a bench/CANDIDATES.md section 4 candidate and its numbers must never appear in the plan.md section 4 bake-off. This entry re-transcribes the whole utterance-so-far once per second, so the overlay shows a live preview that revises itself. Measured round trip on this LAN: ~550 ms for 5 s of audio. feed() is synchronous by the Backend contract, so if the far end slows down the audio path blocks - prefer the finalize-only entry when the server is shared or busy. OBSERVED 2026-08-18, first human run: this entry produced a COMMITTED-PREFIX VIOLATION (plan.md section 1.4) within seconds. The cause is structural, not a bug in the wiring - a batch model re-transcribing the whole window every hop re-punctuates and re-cases earlier words as later context arrives, so 'how are you' becomes 'How are you?' after the prefix has already been committed, and the invariant forbids taking committed text back. Prefer qwen-asr-http-finalize until the stability settings are tuned for a revising backend; this entry is for experimenting with that tuning, not for dictating into a document you care about.",
+      "notes": "Posts audio to an OpenAI-compatible /v1/audio/transcriptions endpoint on the operator's LAN (a Qwen3-ASR server on strixhalo). Its backend module is STDLIB-ONLY - urllib and wave - so unlike every other real backend it needs no environment, no download and no install, and it runs under the same bare CPython the mock uses. That is the whole point of it: it is the shortest path from 'the client works against a scripted mock' to 'the client works against a real ASR model'. TWO CAVEATS, both deliberate and both recorded rather than hidden. (1) plan.md section 2 guarantees no network access during dictation; this breaks the letter of that. The endpoint is hardware the operator owns, so audio never leaves their control and the privacy intent holds - but dictation now depends on another host being up, and that availability guarantee is genuinely given up. (2) It is a REMOTE BATCH model behind a streaming interface, so it is pseudo-streaming and its latency is a property of the network and the far end's queue rather than of an ASR architecture. It is not a bench/CANDIDATES.md section 4 candidate and its numbers must never appear in the plan.md section 4 bake-off. This entry re-transcribes the whole utterance-so-far once per second, so the overlay shows a live preview that revises itself. Measured round trip on this LAN: ~550 ms for 5 s of audio. feed() is synchronous by the Backend contract, so if the far end slows down the audio path blocks - prefer the finalize-only entry when the server is shared or busy. OBSERVED 2026-08-18, first human run: this entry produced a COMMITTED-PREFIX VIOLATION (plan.md section 1.4) within seconds. The cause is structural, not a bug in the wiring - a batch model re-transcribing the whole window every hop re-punctuates and re-cases earlier words as later context arrives, so 'how are you' becomes 'How are you?' after the prefix has already been committed, and the invariant forbids taking committed text back. Prefer qwen-asr-http-finalize until the stability settings are tuned for a revising backend; this entry is for experimenting with that tuning, not for dictating into a document you care about. TIMING, measured 2026-08-19 against strixhalo and not guessed: this endpoint has a cliff between 8 s and 12 s of audio -- 8 s returns in ~550 ms, 12 s in ~6.8 s, 30 s in ~13.7 s (synthetic audio, so a LOWER bound; real speech generates more tokens). The hop re-uploads and re-decodes the whole window, so window_ms MUST stay at its 8000 default: at 12 s the far end takes ~7x the hop and requests pile up until the preview is permanently behind. --endpoint-silence-ms is 1500 rather than the 800 default so a breath mid-sentence does not split the utterance, which is what gives the model a whole sentence to punctuate and case. That costs nothing against the window: silence is gated out before the decoder (session.py _route), so the window bounds continuous SPEECH, about 8 s or ~20 words. Longer accumulation than one sentence is not available from this backend at any setting.",
       "enabled": true
     },
     {
@@ -99,7 +101,9 @@
         "--model",
         "Qwen/Qwen3-ASR-1.7B",
         "--backend-opt",
-        "finalize_only=true"
+        "finalize_only=true",
+        "--endpoint-silence-ms",
+        "1500"
       ],
       "streaming_mode": "pseudo-streaming",
       "requires": [

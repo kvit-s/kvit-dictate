@@ -107,11 +107,14 @@ class LoadedBackend:
         self._allow_hostile = bool(allow_hostile)
         self._pending_override: int | None = None
         self._refused_overrides = 0
+        # One `window_slide` warning per utterance. See `_note_window_slide`.
+        self._slide_warned = False
 
     # ── Router-facing ───────────────────────────────────────────────────────────────────────
 
     def begin_session(self, context: Sequence[str] = ()) -> None:
         self._apply_context(context)
+        self._slide_warned = False
         self._backend.reset(ResetReason.SESSION_START)
 
     def end_session(self, cancelled: bool = False) -> None:
@@ -133,6 +136,7 @@ class LoadedBackend:
             else ResetReason.UTTERANCE_BOUNDARY
         )
         self._next_reset_is_discontinuity = False
+        self._slide_warned = False   # a new utterance gets a fresh window and a fresh warning
         self._backend.reset(reason)
 
     def accept_audio(self, pcm: bytes) -> str | None:
@@ -144,6 +148,7 @@ class LoadedBackend:
         corrupts every document the tool touches.
         """
         hypotheses = self._backend.feed(pcm)
+        self._note_window_slide()
         if not hypotheses:
             self._pending_override = None
             return None
@@ -167,6 +172,45 @@ class LoadedBackend:
         return self._pending_override
 
     # ── internals ───────────────────────────────────────────────────────────────────────────
+
+    def _note_window_slide(self) -> None:
+        """Say so, once per utterance, when audio has scrolled out of a sliding window.
+
+        `PseudoStreamingBackend` keeps only the last `window_ms` of speech. Past that it freezes
+        the text whose audio has gone and stitches the rest on by word overlap — and its own
+        docstring is blunt about the failure mode: *"a model that repunctuates or recases across
+        the boundary produces no exact overlap at all, in which case the fallback freezes the
+        entire pre-slide transcript"*, and *"the frozen prefix is not 'stable' in the §1.4 sense
+        -- no stability computation blessed it -- it is merely unrecoverable."*
+
+        Qwen is exactly such a model; that is the §3 finding. So this is a real quality cliff that
+        the stability machinery cannot protect the document from, and until now it was crossed in
+        complete silence -- no message, no log line, nothing distinguishing a mis-stitched
+        sentence from a badly transcribed one. That is the failure mode this codebase keeps
+        rediscovering, so: one line, at WARN, naming the window it belongs to.
+
+        Once per utterance, not per hop: a long utterance slides on every hop thereafter, and a
+        line per hop would bury the first one that mattered.
+        """
+        if self._log is None or self._slide_warned:
+            return
+        frozen = getattr(self._backend, "frozen_prefix", "")
+        if not frozen:
+            return
+        self._slide_warned = True
+        window_ms = getattr(self._backend, "window_ms", 0)
+        # The text itself is not logged: recognised text never enters the diagnostic channel
+        # (plan.md §1.9). Its size is what says how much is now unrevisable.
+        self._log.warning(
+            "window_slide",
+            window_ms=window_ms,
+            frozen_bytes=len(frozen.encode("utf-8")),
+            detail=(
+                "speech has outrun the re-transcription window; text before this point can no "
+                "longer be revised and was stitched on by word overlap, which is unreliable for "
+                "a model that recases or repunctuates across the boundary"
+            ),
+        )
 
     def _take_override(self, hypothesis: Any) -> int | None:
         """`Hypothesis.stable_bytes_override`, if this server was told it may honour one.

@@ -33,6 +33,7 @@ from kvit_asr.backends.base import (
     Backend,
     BackendCapabilities,
     Hypothesis,
+    PseudoStreamingBackend,
     ResetReason,
     StreamingMode,
 )
@@ -185,3 +186,102 @@ class TestRevisingBackendAborts(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ─── The other hazard of the same backend class: the window slides in silence ────────────────
+
+
+class SlidingBackend(PseudoStreamingBackend):
+    """A real `PseudoStreamingBackend` with a tiny window, so a slide is cheap to provoke.
+
+    `_transcribe_batch` names each 100 ms of audio by its **absolute** position in the session, so
+    the text genuinely tracks the window: as audio scrolls out, leading words disappear from the
+    hypothesis and the wrapper's overlap stitch has something real to find. A fixed synthetic
+    string would slide the buffer without ever changing the text, and the frozen prefix — the
+    thing under test — would never form.
+    """
+
+    SLOT_BYTES = 16000 * 2 // 10   # 100 ms of 16 kHz mono s16le
+
+    def __init__(self, window_ms=1000, hop_ms=500):
+        super().__init__(window_ms=window_ms, hop_ms=hop_ms)
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            model_id="sliding", mode=StreamingMode.PSEUDO_STREAMING, natural_chunk_ms=0
+        )
+
+    def _load(self, progress=None) -> None:
+        pass
+
+    def _transcribe_batch(self, pcm: bytes) -> str:
+        end = self._audio_ms // 100
+        start = max(0, end - len(pcm) // self.SLOT_BYTES)
+        return " ".join(f"w{i}" for i in range(start, end))
+
+
+class TestWindowSlideIsReported(unittest.TestCase):
+    """Speech outrunning the re-transcription window must not be silent.
+
+    Past `window_ms` the wrapper freezes the text whose audio has gone and stitches the rest on by
+    word overlap. Its own docstring says that stitch produces "no exact overlap at all" for a model
+    that recases or repunctuates across the boundary — Qwen, per this module's header — and that
+    the frozen prefix is "not stable in the §1.4 sense ... merely unrecoverable". So it is a
+    quality cliff the stability machinery cannot protect the document from, and it used to be
+    crossed with nothing written anywhere.
+
+    This matters more since `--endpoint-silence-ms` went to 1500: fewer splits means more speech
+    per utterance, which means closer to the ceiling.
+    """
+
+    def setUp(self):
+        self.events = []
+        events = self.events
+
+        class _Log:
+            def warning(self, ev, **f): events.append((ev, f))
+            def info(self, ev, **f): pass
+            def debug(self, ev, **f): pass
+            def error(self, ev, **f): pass
+
+        backend = SlidingBackend()
+        backend.load()
+        self.facade = LoadedBackend(backend, log=_Log())
+        self.facade.begin_session()
+
+    def feed_hops(self, n):
+        """One hop of audio per call, so the window fills and then slides the way a session does."""
+        for _ in range(n):
+            self.facade.accept_audio(speech(500))
+
+    def slides(self):
+        return [f for ev, f in self.events if ev == "window_slide"]
+
+    def test_no_warning_while_inside_the_window(self):
+        self.feed_hops(2)   # 1000 ms fed into a 1000 ms window: full, nothing gone yet
+        self.assertEqual(self.slides(), [], "warned before any audio had scrolled out")
+
+    def test_a_slide_is_warned_about(self):
+        self.feed_hops(6)
+        slides = self.slides()
+        self.assertEqual(len(slides), 1, f"expected exactly one warning, got {self.events}")
+        self.assertEqual(slides[0]["window_ms"], 1000)
+        self.assertGreater(slides[0]["frozen_bytes"], 0)
+
+    def test_the_warning_carries_no_recognised_text(self):
+        """plan.md §1.9: the size of the frozen prefix, never the words in it."""
+        self.feed_hops(6)
+        blob = repr(self.slides()[0])
+        self.assertNotIn("w0", blob)
+        self.assertNotIn("w1", blob)
+
+    def test_it_warns_once_per_utterance_not_once_per_hop(self):
+        self.feed_hops(12)
+        self.assertEqual(len(self.slides()), 1, "a line per hop would bury the one that mattered")
+
+    def test_a_new_utterance_can_warn_again(self):
+        self.feed_hops(6)
+        self.facade.reset()          # utterance boundary: fresh window, fresh warning
+        self.feed_hops(6)
+        self.assertEqual(len(self.slides()), 2)
