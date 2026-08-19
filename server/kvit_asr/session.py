@@ -733,10 +733,27 @@ class Session:
 
 
 def _violation_msg(v: StabilityViolation) -> str:
-    """§8.3 step 3's log line: both texts and the diverging byte offset."""
+    """§8.3 step 3's diagnosis, in the one form that is safe to put on the wire.
+
+    This string travels in ``error.msg``, and the Client logs it verbatim into a file the user
+    keeps. So it must carry no recognised text: plan.md §1.9 and ``src/util/log.h`` both say
+    transcripts never enter a diagnostic channel, and the Client cannot redact prose it did not
+    compose. Everything identifying *which* rule broke and *where* is a number and survives; the
+    words do not, and are available on this side under ``--log-transcripts``.
+
+    §8.3 step 3 does ask a receiver to log both texts, and this is not that case — the Server is
+    reporting a violation it caught in its own next message rather than one it received, so the
+    only copy of those texts that matters is here, where the privacy gate already exists.
+
+    ``diverge_offset`` is the load-bearing field. Zero means the backend revised the *first word*,
+    which is the signature of a model that re-decodes the whole utterance rather than extending
+    it, and it is the difference between "tune the stability knobs" and "this backend must never
+    publish a mark before the final" (see ``SessionConfig.publish_stable_partials``).
+    """
     return (
         f"server-side stability violation ({v.kind}): utterance_id={v.utterance_id} "
         f"previous_stable_bytes={v.previous_stable_bytes} "
         f"diverge_offset={v.diverge_offset} "
-        f"published_prefix={v.previous_prefix!r} incoming_text={v.incoming_text!r}"
+        f"published_prefix=<{len(v.previous_prefix)}B redacted> "
+        f"incoming_text=<{len(v.incoming_text.encode('utf-8'))}B redacted>"
     )

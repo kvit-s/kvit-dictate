@@ -310,6 +310,50 @@ KD_TEST(session, stopped_and_error_for_a_stale_session_are_bookkeeping_only) {
     KD_CHECK_EQ(m.current_session_id(), sid);
 }
 
+// The child's diagnosis has to survive into `Outcome::error`, because on this path it is the only
+// diagnosis there is.
+//
+// A sidecar that catches its *own* would-be §8.2 violation refuses to send the offending frame and
+// reports `decode_failed` instead — §11.3 has no server-sent code for "I caught myself". That
+// makes this branch, not the §8.2 check further down, the one a real abort actually comes through.
+// It used to set no `error` at all, so the entire incident reached the log as the fixed string
+// `committed text was contradicted` and nothing else: which rule, which offset and which session
+// were all discarded at this line. Two dictations were lost to it and the log could not tell it
+// apart from a refusal.
+KD_TEST(session, a_non_fatal_error_for_the_live_session_carries_its_diagnosis_out) {
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    const std::string sid = start_session(m);
+
+    proto::ErrorMsg em;
+    em.code = proto::ErrorCode::decode_failed;
+    em.code_raw = "decode_failed";
+    em.fatal = false;
+    em.msg = "server-side stability violation (stable_prefix_mutated): utterance_id=1 "
+             "previous_stable_bytes=33 diverge_offset=0";
+    em.session_id = sid;
+
+    const auto out = m.on_message(proto::Message::of(em));
+    KD_CHECK_EQ(out.verdict, Verdict::Accept);
+    KD_CHECK(out.has_effect(Effect::SurfaceWarning));
+
+    // The point of the test. KD_REQUIRE, not KD_CHECK: everything below dereferences the
+    // optional, and a non-fatal check would let a regression here reach `out.error->code` on an
+    // empty optional — which under a Debug MSVC runtime is a modal assertion dialog, i.e. a test
+    // run that hangs forever instead of failing. Found the honest way, by removing the fix.
+    KD_REQUIRE(out.error.has_value());
+    KD_CHECK_EQ(out.error->code, proto::ErrorCode::decode_failed);
+    KD_CHECK(!out.error->fatal);          // §11.1: the session dies, the connection lives
+    KD_CHECK_EQ(out.error->msg, em.msg);  // verbatim; main.cpp logs it
+    KD_REQUIRE(out.error->session_id.has_value());
+    KD_CHECK_EQ(*out.error->session_id, sid);
+
+    // Non-fatal means the connection survives, so none of the fatal teardown fires.
+    KD_CHECK(!out.has_effect(Effect::KillChild));
+    KD_CHECK(!out.has_effect(Effect::SurfaceFatal));
+}
+
 KD_TEST(session, duplicate_and_out_of_order_seq_change_nothing) {
     kd::ManualClock clock(1000);
     kd::SessionMachine m(clock, kd::SessionConfig{});

@@ -432,6 +432,25 @@ SessionMachine::Outcome SessionMachine::on_message(const proto::Message& m) {
             }
             // Non-fatal: the named session is aborted, the connection survives (§11.1). Text
             // already injected stays; nothing further is applied for this session.
+            //
+            // Carry the child's diagnosis out. This branch is where a sidecar reports that its
+            // *own* next message would have violated §8.2 — it refuses to send the offending
+            // frame and sends `decode_failed` instead, which is the only conforming way to say it
+            // (§11.3 has no server-sent code for "I caught myself"). That made it, in practice,
+            // the most common cause of a real abort, and it was also the one path through this
+            // function that produced no `out.error` at all: the whole incident reached the log as
+            // `overlay flagged a committed-prefix violation (31 byte reason)` and nothing else.
+            // Two dictations were lost to it and the log could not distinguish it from a refusal.
+            //
+            // The fatal branch above has always populated `out.error` via `die`. This is the same
+            // information from the same message; only the lifetime differs.
+            proto::ProtocolError err;
+            err.code = em->code;
+            err.fatal = false;
+            err.msg = em->msg;
+            err.session_id = em->session_id;
+            out.error = std::move(err);
+
             s.discarding = true;
             s.enter(proto::ConnState::Finalizing);
             out.effects.push_back(Effect::SurfaceWarning);
