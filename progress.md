@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-18. Commit `9fd3096` on `main`.
+Written 2026-08-19. Commit `c5a65bb` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -52,7 +52,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 327 tests / 35940 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
-python -m unittest discover -s server/tests -t server  # 377 tests   (from the repo root)
+python -m unittest discover -s server/tests -t server  # 382 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
