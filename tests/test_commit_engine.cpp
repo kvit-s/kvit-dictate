@@ -145,11 +145,43 @@ const char* const kZwj = "\xE2\x80\x8D";        // U+200D
 
 }  // namespace
 
+// Cadence::EndOfSession, on the half of it this engine owns.
+//
+// The other half is App::flush_deferred_commits, which cannot be reached from here — so what this
+// pins is exactly the boundary: the partial path never flushes, and `on_final` still produces its
+// op regardless, because a caller that buffers needs something to buffer. An engine that
+// suppressed the final op too would leave the text with nowhere to come from and the feature
+// would be silently dead.
+KD_TEST(commit_engine, end_of_session_suppresses_partial_flushes_but_not_the_final) {
+    StabilityParams p = local_params(/*m=*/0, /*t=*/0);
+    p.cadence = Cadence::EndOfSession;
+    Driver d(p);
+
+    // Enough hypotheses, and enough elapsed time, that an Immediate cadence would certainly have
+    // committed by now.
+    d.partial("the quick brown fox", 19);
+    d.advance(1000);
+    d.tick();
+    d.partial("the quick brown fox jumps", 25);
+    d.advance(1000);
+    d.tick();
+    KD_CHECK_EQ(d.injected(), "");   // nothing typed, however eligible it became
+
+    // The final still yields the whole utterance for the caller to accumulate.
+    const auto r = d.final_msg("the quick brown fox jumps");
+    KD_CHECK(r.ok());
+    KD_REQUIRE(r.op.has_value());
+    KD_CHECK_EQ(r.op->text, "the quick brown fox jumps");
+}
+
 // ─── Spellings ──────────────────────────────────────────────────────────────────────────────
 
 KD_TEST(commit_engine, to_string_spellings) {
     KD_CHECK_EQ(kd::to_string(Cadence::Immediate), "immediate");
     KD_CHECK_EQ(kd::to_string(Cadence::Periodic), "periodic");
+    // The settings file writes this spelling; changing it silently orphans every settings.json
+    // that already contains it (settings.cpp's kCadences reads the same strings).
+    KD_CHECK_EQ(kd::to_string(Cadence::EndOfSession), "end-of-session");
     KD_CHECK_EQ(kd::to_string(ViolationKind::None), "none");
     KD_CHECK_EQ(kd::to_string(ViolationKind::CommittedTextContradicted),
                 "committed_text_contradicted");

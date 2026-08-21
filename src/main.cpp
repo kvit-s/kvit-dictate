@@ -195,6 +195,9 @@ private:
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
     void finish_dictation(const char* why);
+    // Empties `deferred_` into the document, or onto the clipboard when the target is gone.
+    // Safe to call with nothing deferred: it returns having done nothing.
+    void flush_deferred_commits(const char* why);
 
     bool spawn_sidecar();
     void on_conn_state(kd::proto::ConnState s);
@@ -230,6 +233,13 @@ private:
     std::unique_ptr<kd::anchor::AnchorEstimator> anchor_;
 
     std::optional<kd::TargetIdentity> target_;
+
+    // Cadence::EndOfSession: committed ops accumulate here instead of going straight into the
+    // document, and `flush_deferred_commits` empties it exactly once per session. It holds the
+    // TEXT rather than the ops because that is all the injector needs, and because the leading
+    // space between utterances is decided by `CommitOp::leading_space` in the one place that
+    // already decides it (plan.md §1.6) rather than re-derived later from a list of ops.
+    std::string deferred_;
     kd::OverlayState tray_state_ = kd::OverlayState::Idle;
     // What apply_overlay_mode() last pushed to the overlay, so the transition is logged
     // once rather than on every tick that carries an anchor.
@@ -1015,6 +1025,21 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     if (r.op->leading_space) text.push_back(' ');
     text += r.op->text;
 
+    // Cadence::EndOfSession (plan.md §1.4): accumulate, do not type. The engine has already
+    // decided this text is eligible and the invariant is untouched — deferring can only commit
+    // *less*, never more, and never rewrites anything.
+    //
+    // Nothing anchor-shaped happens here on purpose. Source C detects a commit by pixel
+    // differencing around the caret, and source A re-reads the caret "after each commit"; with
+    // nothing injected the document has not changed and the caret has not moved, so submitting a
+    // before/after frame pair would ask the estimator to find a change that does not exist.
+    if (settings_.stability.cadence == kd::Cadence::EndOfSession) {
+        deferred_ += text;
+        KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
+                     text.size(), deferred_.size());
+        return;
+    }
+
     // Source C's before/after pair, captured from a rectangle around where we expect the text to
     // land. It used to pass an empty Rect, which fails every capture — "capture region is empty"
     // on every injection — so commit differencing never ran once and the anchor could never do
@@ -1144,6 +1169,16 @@ void App::end_dictation(kd::LocalEvent why) {
     if (session_ == nullptr || !target_.has_value() || finalizing_) return;
 
     KD_LOG_INFO("dictation ending: %s", kd::to_string(why));
+
+    // Esc is the one gesture that means "throw this away" (plan.md §1.8 cancels rather than
+    // finalises, so the undecoded tail is dropped too). Under Cadence::EndOfSession that has to
+    // discard the accumulated buffer as well, or Esc would type in everything the user just asked
+    // to abandon — the exact opposite of what they pressed.
+    if (why == kd::LocalEvent::EscPressed && !deferred_.empty()) {
+        KD_LOG_INFO("discarding %zu deferred bytes: Esc cancels the session", deferred_.size());
+        deferred_.clear();
+    }
+
     apply(session_->on_local(why));
 
     if (audio_running_) {
@@ -1160,11 +1195,53 @@ void App::end_dictation(kd::LocalEvent why) {
     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Finalizing);
 }
 
+void App::flush_deferred_commits(const char* why) {
+    if (deferred_.empty()) return;
+    std::string text;
+    text.swap(deferred_);   // taken first, so no path can flush the same text twice
+
+    // The target has to be revalidated here for the same reason perform_commit revalidates:
+    // SendInput types into whatever is focused *now*, not into the window we were aiming at.
+    // `validate_target` requires that window to still be the foreground one, so once focus has
+    // moved there is no way to put the text where it was meant to go.
+    if (target_.has_value() && kd::validate_target(*target_)) {
+        const kd::InjectResult res = injector_->inject(*target_, text);
+        if (res.status == kd::InjectStatus::Ok) {
+            KD_LOG_INFO("flushed %zu deferred bytes on %s", text.size(), why);
+            if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
+            return;
+        }
+        KD_LOG_ERROR("deferred flush failed to inject: %s", kd::to_string(res.status));
+    } else {
+        KD_LOG_WARN("target is gone at flush time (%s); the document cannot receive the text",
+                    why);
+    }
+
+    // Whatever went wrong, a whole session of dictation is in hand and there is nowhere to type
+    // it. Dropping it silently is the one unacceptable outcome — the longer the buffer, the more
+    // it costs — so it goes to the clipboard and the tray says so. Deliberately NOT restored
+    // afterwards, unlike the clipboard *injection* path: the point is for the user to be able to
+    // paste it, which means it has to stay.
+    if (kd::set_clipboard_text(text)) {
+        KD_LOG_WARN("%zu bytes placed on the clipboard instead; press Ctrl+V to recover them",
+                    text.size());
+        set_tray_state(kd::OverlayState::Warning);
+    } else {
+        KD_LOG_ERROR("could not reach the clipboard either; %zu bytes are lost", text.size());
+        set_tray_state(kd::OverlayState::Error);
+    }
+}
+
 // The session is over: `stopped` arrived, the child went away, or the grace expired.
 void App::finish_dictation(const char* why) {
     if (!finalizing_ && !target_.has_value()) return;
 
     KD_LOG_INFO("dictation finished: %s", why);
+
+    // Before target_ is cleared below, and before the overlay is torn down: this is the one path
+    // every session ends through, so it is the one place a deferred buffer is guaranteed to be
+    // dealt with rather than dropped.
+    flush_deferred_commits(why);
     finalizing_ = false;
     finalize_deadline_ms_ = 0;
 

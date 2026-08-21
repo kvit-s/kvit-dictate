@@ -75,6 +75,22 @@ namespace kd {
 enum class Cadence : uint8_t {
     Immediate,  // flush an eligible prefix as soon as it exists
     Periodic,   // flush at most every `cadence_ms`; delays only, never promotes
+
+    // Flush nothing until the session ends, then inject the whole thing in one operation.
+    //
+    // Still a *cadence* in §1.4's sense — it delays a flush and can never widen one — but note
+    // where it is implemented, because it is not here. This engine's cadence gate is consulted
+    // on the partial path only (`cadence_allows`, one call site); `on_final` deliberately never
+    // asks, because a `final` is complete by definition. And since a revising backend publishes
+    // `stable_bytes = 0` on every partial (server-side `publish_stable_partials`), *every* op
+    // for such a backend is produced by `on_final`. A cadence implemented purely in this file
+    // would therefore have no effect whatsoever on the backend it was added for.
+    //
+    // So the engine keeps emitting ops exactly as it always has, and `App` accumulates them and
+    // injects once. The value lives in this enum because it is one concept and belongs in one
+    // place; the engine honours the half it owns (never flushing early on the partial path) and
+    // `App::flush_deferred_commits` owns the rest.
+    EndOfSession,
 };
 
 const char* to_string(Cadence c) noexcept;

@@ -53,6 +53,7 @@ const char* to_string(Cadence c) noexcept {
     switch (c) {
         case Cadence::Immediate: return "immediate";
         case Cadence::Periodic: return "periodic";
+        case Cadence::EndOfSession: return "end-of-session";
     }
     return "?";
 }
@@ -182,6 +183,9 @@ ViolationKind kind_of(proto::StabilityCheck c) noexcept {
 // Returns whether the clock permits a flush now. It can only ever say "not yet".
 bool cadence_allows(const StabilityParams& p, Millis now, Millis last_flush) noexcept {
     if (p.cadence == Cadence::Immediate) return true;
+    // Nothing flushes early. The engine still *produces* the op — `on_final` does not consult
+    // this gate — and App holds it until the session ends. See Cadence::EndOfSession.
+    if (p.cadence == Cadence::EndOfSession) return false;
     if (p.cadence_ms == 0) return true;
     return now - last_flush >= static_cast<Millis>(p.cadence_ms);
 }

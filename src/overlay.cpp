@@ -250,7 +250,18 @@ constexpr uint32_t kDotError = 0xFFC62828;
 // the utterance covers the document it is annotating; OverlayStyle::max_width_dip caps the
 // width, this caps the height, and text beyond both is elided from the *front* because the
 // newest words are the ones the user is checking.
-constexpr uint32_t kMaxLines = 3;
+//
+// Front-elision is what makes this a scrolled view rather than a truncated one: the box always
+// shows the newest `kMaxLines` worth of text, which is the bottom of a transcript that only ever
+// grows. There is no scrollbar and no way to look further back — under Cadence::EndOfSession a
+// whole session accumulates behind this window and only the tail is visible.
+//
+// Three lines suited a preview that emptied into the document every sentence. It does not suit a
+// buffer that holds a whole session, so this is eight — about a paragraph. Note the interaction
+// with overlay mode: eight lines *at the caret* covers the document being dictated into, which is
+// what the paragraph above warns about, so the floating pill is the mode that pairs with a large
+// value here.
+constexpr uint32_t kMaxLines = 8;
 
 // Starting budget, in UTF-16 code units, for the front-elision loop below.
 constexpr size_t kInitialDisplayBudget = 512;
@@ -782,7 +793,15 @@ HRESULT OverlayCore::paint_once() {
     const float body_h = body_layout ? body_metrics.height : 0.0f;
     const float note_h = note_layout ? note_metrics.height : 0.0f;
 
-    const float content_w = std::max(body_w, note_w);
+    // The pill does not resize with its contents. It sits in one fixed place at the bottom of the
+    // monitor, so a box that grew and shrank on every revision would jitter under the eye for no
+    // information gain — and with a session-long buffer behind it, the width would otherwise be
+    // pinned at the maximum nearly all the time anyway. The inline overlay keeps shrinking to fit,
+    // because there it is a label attached to a caret and its size is what keeps it out of the way.
+    const float measured_w = std::max(body_w, note_w);
+    const float content_w = (mode == OverlayMode::FloatingPill && measured_w > 0.0f)
+                                ? max_text_w
+                                : measured_w;
     const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f);
 
     // A minimum height so a bare status dot still reads as a control and not as a speck.

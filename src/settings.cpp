@@ -323,7 +323,25 @@ constexpr EnumName kOverlayModes[] = {
 constexpr EnumName kCadences[] = {
     {"immediate", static_cast<int>(Cadence::Immediate)},
     {"periodic", static_cast<int>(Cadence::Periodic)},
+    {"end-of-session", static_cast<int>(Cadence::EndOfSession)},
 };
+
+// The cadence combo's item order, in one place. The dialog populates, reads back and enables the
+// interval field off this, so a reordered combo cannot silently start meaning something else --
+// which is what a bare `CB_GETCURSEL == 1` was one edit away from.
+constexpr Cadence kCadenceOrder[] = {Cadence::Immediate, Cadence::Periodic, Cadence::EndOfSession};
+
+inline int cadence_index(Cadence c) noexcept {
+    for (int i = 0; i < static_cast<int>(std::size(kCadenceOrder)); ++i) {
+        if (kCadenceOrder[i] == c) return i;
+    }
+    return 0;
+}
+
+inline Cadence cadence_at(LRESULT sel) noexcept {
+    if (sel < 0 || sel >= static_cast<LRESULT>(std::size(kCadenceOrder))) return Cadence::Immediate;
+    return kCadenceOrder[sel];
+}
 
 constexpr EnumName kFallbacks[] = {
     {"floating-pill", static_cast<int>(anchor::Fallback::FloatingPill)},
@@ -785,6 +803,8 @@ void Settings::normalise() {
     // Cadence::Immediate ignores cadence_ms; zeroing it keeps the serialised file from carrying a
     // number that has no effect and would read as if it did.
     if (stability.cadence == Cadence::Immediate) stability.cadence_ms = 0;
+    // EndOfSession has no interval either: "when the session ends" is not a number of ms.
+    if (stability.cadence == Cadence::EndOfSession) stability.cadence_ms = 0;
     if (stability.cadence == Cadence::Periodic && stability.cadence_ms == 0) {
         stability.cadence_ms = 500;
     }
@@ -1729,7 +1749,8 @@ void load_controls(HWND dlg, DialogState& st) {
     SendMessageW(cad, CB_RESETCONTENT, 0, 0);
     combo_add(cad, L"immediate — flush as soon as a prefix is eligible");
     combo_add(cad, L"periodic — delay the flush, never widen it");
-    SendMessageW(cad, CB_SETCURSEL, s.stability.cadence == Cadence::Periodic ? 1u : 0u, 0);
+    combo_add(cad, L"end-of-session — accumulate, then type it all once");
+    SendMessageW(cad, CB_SETCURSEL, static_cast<WPARAM>(cadence_index(s.stability.cadence)), 0);
     set_int(GetDlgItem(dlg, kIdCadenceMs), s.stability.cadence_ms);
     EnableWindow(GetDlgItem(dlg, kIdCadenceMs), s.stability.cadence == Cadence::Periodic);
 
@@ -1857,9 +1878,9 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     if (!read_uint(dlg, kIdStabT, L"Hold time (T)", 0, 5000, n)) return false;
     s.stability.hold_ms_t = static_cast<uint32_t>(n);
 
-    const bool periodic =
-        SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) == 1;
-    s.stability.cadence = periodic ? Cadence::Periodic : Cadence::Immediate;
+    s.stability.cadence =
+        cadence_at(SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0));
+    const bool periodic = s.stability.cadence == Cadence::Periodic;
     if (periodic) {
         if (!read_uint(dlg, kIdCadenceMs, L"Cadence interval", 50, 5000, n)) return false;
         s.stability.cadence_ms = static_cast<uint32_t>(n);

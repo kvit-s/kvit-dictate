@@ -1065,6 +1065,17 @@ bool validate_target(const TargetIdentity& t) {
     return true;
 }
 
+bool set_clipboard_text(std::string_view utf8) {
+    if (utf8.empty()) return false;
+    // The guard state is required by the shared helper and discarded here: it exists to decide
+    // whether a later *restore* is safe, and this path never restores. See the header.
+    ClipboardGuardState ignored;
+    uint32_t os_error = 0;
+    if (injector_detail::clipboard_set_utf8(utf8, ignored, &os_error)) return true;
+    KD_LOG_WARN("clipboard rescue failed: os_error=%lu", static_cast<unsigned long>(os_error));
+    return false;
+}
+
 bool secure_desktop_active() {
     // ─── What this can and cannot promise ───────────────────────────────────────────────────
     //

@@ -140,6 +140,20 @@ bool validate_target(const TargetIdentity& t);
 // True when the secure desktop is active (UAC / lock screen). Injection is refused outright.
 bool secure_desktop_active();
 
+// Put text on the clipboard and leave it there. **Not** part of the injection path.
+//
+// The clipboard *injection* method sets, pastes and then restores the previous contents
+// (ClipboardGuardState). This does the opposite deliberately: it is the last resort for text that
+// has nowhere else to go — a whole session accumulated under Cadence::EndOfSession when the
+// target window has since lost focus — so the user can press Ctrl+V and get it back. Restoring
+// would defeat the entire purpose, which is why this is a separate entry point rather than a flag
+// on the other one.
+//
+// Overwrites whatever the user had copied. That is a real cost, and it is the lesser one against
+// silently discarding minutes of dictation; the caller is expected to say so in the log and the
+// tray. UI thread only, like everything else here.
+bool set_clipboard_text(std::string_view utf8);
+
 // ─── Self-injection marking ─────────────────────────────────────────────────────────────────
 //
 // The handshake between this module and the hooks. Before injecting, the injector publishes a
