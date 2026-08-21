@@ -121,6 +121,58 @@
       "enabled": true
     },
     {
+      "id": "windows-speech",
+      "display_name": "Windows AI Speech (on-device, no network)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend",
+        "windows-speech",
+        "--endpoint-silence-ms",
+        "1500"
+      ],
+      "streaming_mode": "pseudo-streaming",
+      "requires": [
+        "python>=3.12",
+        "Windows 11 24H2 (build 26100) or later",
+        ".NET 9 runtime",
+        "tools/kvit-speech built (dotnet build -c Release tools/kvit-speech)",
+        "the optional Windows speech model (kvit-speech.exe --ensure-model)"
+      ],
+      "env": {},
+      "notes": "The on-device Windows AI speech model - Whisper Small quantized to int8, shipped by Microsoft as an optional Windows component and driven through Microsoft.Windows.AI.Speech. THIS IS THE ONLY REAL MODEL THAT KEEPS plan.md SECTION 2 INTACT: the qwen entries send audio to another host, and while that host is the operator's own hardware it is still a machine that has to be up. This one needs nothing but this PC, so it is what to use when strixhalo is down, when dictating away from that LAN, or when the availability dependency is simply not wanted. The WinRT API cannot be reached from stdlib-only CPython, so the sidecar spawns tools/kvit-speech (C#) and talks to it over a small framed protocol; see server/kvit_asr/backends/windows_speech.py for the whole rationale. THREE MEASURED CAVEATS, all recorded rather than hidden. (1) IT IS SLOWER THAN THE LAN. Decode costs about 1350 ms fixed plus 0.30x real time on this i7-14700K, so a 5 s utterance is ~3.0 s versus the ~550 ms strixhalo takes for the same audio. The fixed floor is why finalize_only is the default and why there is no live preview here - a one-second hop would need a 1.7 s decode every second and could only fall further behind. (2) THE API IS EXPERIMENTAL. Microsoft.Windows.AI.Speech exists only in the Windows App SDK experimental channel; stable 2.4.0 ships no Speech projection at all, despite the documentation claiming 1.7.1+. tools/kvit-speech pins the experimental package and carries the runtime beside the exe, so using this entry does NOT require installing a preview runtime system-wide. (3) IT HALLUCINATES OVER SILENCE, exactly as plan.md section 1.6 says Whisper does - two seconds of digital silence returned a fluent Welsh sentence. The server's VAD gate is what normally prevents that window ever being built; the backend's own silence_peak_threshold is the second line of defence and must not be set to 0 outside a test. Runs on a Copilot+ NPU where one exists and on the CPU otherwise, chosen by Windows with no opt-in either way.",
+      "enabled": true
+    },
+    {
+      "id": "windows-speech-preview",
+      "display_name": "Windows AI Speech, on-device, live preview (lags on purpose)",
+      "interpreter": "C:\\Python312\\python.exe",
+      "module": "kvit_asr",
+      "args": [
+        "--backend",
+        "windows-speech",
+        "--chunk-ms",
+        "2000",
+        "--endpoint-silence-ms",
+        "1500",
+        "--backend-opt",
+        "finalize_only=false",
+        "--backend-opt",
+        "window_ms=15000"
+      ],
+      "streaming_mode": "pseudo-streaming",
+      "requires": [
+        "python>=3.12",
+        "Windows 11 24H2 (build 26100) or later",
+        ".NET 9 runtime",
+        "tools/kvit-speech built (dotnet build -c Release tools/kvit-speech)",
+        "the optional Windows speech model (kvit-speech.exe --ensure-model)"
+      ],
+      "env": {},
+      "notes": "The `windows-speech` entry with the hop turned back on, so the overlay shows a preview that revises itself instead of one commit at the endpoint. THE LAG IS A PROPERTY OF THE MODEL, NOT A SETTING THAT NEEDS TUNING. Decode has a ~1350 ms floor on this machine, so even a 2 s hop is re-decoding a growing window that already takes longer than the hop to transcribe once it passes ~2 s of audio; the preview will trail the speaker and the gap will widen within a sentence. It exists because it is the honest way to see that for yourself, and because a faster machine - or an NPU - moves the arithmetic. Prefer `windows-speech` for real dictation. Same model, same caveats: read that entry's notes, all three apply here unchanged.",
+      "enabled": true
+    },
+    {
       "id": "nemotron-streaming-en-0.6b-onnx-160ms",
       "display_name": "Nemotron Streaming EN 0.6B (ONNX, 160 ms)",
       "interpreter": "D:\\projects\\kvit-dictate\\envs\\onnx\\Scripts\\python.exe",

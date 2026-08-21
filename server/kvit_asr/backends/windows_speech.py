@@ -257,25 +257,40 @@ class _Helper:
         self.terminate()
 
     def terminate(self, grace_s: float = 3.0) -> None:
-        if self._proc.poll() is not None:
-            return
-        try:
-            if self._proc.stdin is not None and not self._proc.stdin.closed:
-                try:
-                    self._proc.stdin.write(struct.pack("<I", 1) + _TAG_QUIT)
-                    self._proc.stdin.flush()
-                except OSError:
-                    pass
-                try:
-                    self._proc.stdin.close()
-                except OSError:
-                    pass
-            self._proc.wait(timeout=grace_s)
-        except (subprocess.TimeoutExpired, OSError):
+        if self._proc.poll() is None:
             try:
-                self._proc.kill()
-            except OSError:
-                pass
+                if self._proc.stdin is not None and not self._proc.stdin.closed:
+                    try:
+                        self._proc.stdin.write(struct.pack("<I", 1) + _TAG_QUIT)
+                        self._proc.stdin.flush()
+                    except OSError:
+                        pass
+                    try:
+                        self._proc.stdin.close()
+                    except OSError:
+                        pass
+                self._proc.wait(timeout=grace_s)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+                try:
+                    self._proc.wait(timeout=grace_s)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+
+        # Close the pipes explicitly. The two reader threads are daemons and may still be sitting
+        # in read(), so leaving this to the garbage collector means the handles survive until it
+        # runs — which shows up as a ResourceWarning per load/unload cycle and, in a process that
+        # outlives many of them, as handles that are simply never returned. The threads see the
+        # close as EOF or as an exception, both of which they already handle.
+        for pipe in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if pipe is not None and not pipe.closed:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
 
 class WindowsSpeechBackend(PseudoStreamingBackend):
@@ -292,6 +307,7 @@ class WindowsSpeechBackend(PseudoStreamingBackend):
         startup_timeout_s: float = 60.0,
         silence_peak_threshold: int = 200,
         ensure_model: bool = False,
+        helper_args: Optional[list[str]] = None,
     ) -> None:
         # Same device as openai-http's: a hop no shorter than the window means the only decode is
         # the one finalize() forces, which is one request per utterance and no live preview.
@@ -305,6 +321,13 @@ class WindowsSpeechBackend(PseudoStreamingBackend):
         self._startup_timeout_s = float(startup_timeout_s)
         self._silence_peak_threshold = int(silence_peak_threshold)
         self._ensure_model = bool(ensure_model)
+        # Arguments placed before the ones this backend derives. Constructor-only — there is no
+        # `--backend-opt` spelling, because a list cannot survive one. It is the seam the tests
+        # use to put `python fake_speech_helper.py` where the real executable goes, so that the
+        # process handling here — startup, framing, timeouts, a helper that dies mid-decode — is
+        # covered on a machine with no .NET SDK and no speech model. Naming it as the test hook it
+        # is, rather than leaving it to look like a general feature.
+        self._helper_args = list(helper_args or ())
         self._helper: Optional[_Helper] = None
         self._native_folder = ""
 
@@ -373,7 +396,9 @@ class WindowsSpeechBackend(PseudoStreamingBackend):
         self._exe = exe
 
         self._report(progress, "spawn", 10)
-        args = ["--ensure-model"] if self._ensure_model else []
+        args = [*self._helper_args]
+        if self._ensure_model:
+            args.append("--ensure-model")
         try:
             helper = _Helper(exe, args)
         except OSError as exc:
