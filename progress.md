@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-20. Commit `a7e01fa` on `main`.
+Written 2026-08-21. Commit `a70b14d` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -52,7 +52,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 328 tests / 35956 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
-python -m unittest discover -s server/tests -t server  # 382 tests   (from the repo root)
+python -m unittest discover -s server/tests -t server  # 392 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
@@ -146,54 +146,63 @@ live preview at all.
 
 ---
 
-## 3b. The far end is linear, not cliffed — an earlier measurement here was wrong
+## 3b. The far end: linear and fast, and it now answers VAD questions
 
-**Retraction.** This section previously reported a latency cliff between 8 s and 12 s of audio
-(12× the time for 1.5× the audio) and concluded that `window_ms` could never be raised. **That was
-an artifact of the harness, not a property of the server**, and every conclusion drawn from it was
-wrong. It was measured with synthetic harmonic noise, which drives the model into a repetition
-loop until it hits its token cap: ~7 s to return the 9 characters `'Whoa! Who'`. The giveaway was
-in the data and went unread — the *slow* responses returned the *least* text, and 10.0 s was fast
-while 9.5 s and 11 s were slow, which no duration limit explains.
+**Retraction, kept because it cost a day's conclusions.** This section once reported a latency
+cliff between 8 s and 12 s of audio and concluded `window_ms` could never be raised. That was an
+artifact of the harness: the sweep used synthetic harmonic noise, which drives the model into a
+repetition loop until it hits its token cap (~7 s to return the 9 characters `'Whoa! Who'`). The
+data said so and went unread — the *slow* responses returned the *least* text. **Measure this
+endpoint with real speech or not at all.**
 
-**Re-measured 2026-08-21 on real speech** (Windows SAPI, 16 kHz mono, sliced from one 57 s
-utterance), two requests per size:
+**Measured 2026-08-21, real speech** (SAPI, sliced from one 57 s utterance), after the server moved
+to vLLM:
 
-| audio | median | ×realtime | | audio | median | ×realtime |
-|---|---|---|---|---|---|---|
-| 2 s | 457 ms | 4.4× | | 16 s | 1501 ms | 10.7× |
-| 4 s | 529 ms | 7.6× | | 20 s | 1789 ms | 11.2× |
-| 8 s | 825 ms | 9.7× | | 30 s | 2587 ms | 11.6× |
-| 12 s | 1157 ms | 10.4× | | 57 s | 5003 ms | 11.4× |
-
-Linear at **~11× realtime**, no discontinuity anywhere. Still not the operator's voice or
-microphone, so it is representative rather than definitive — but it is faithful in the one way
-that matters, which the previous attempt was not.
-
-### What actually bounds the window
-
-Throughput, not a ceiling. Every hop re-uploads and re-decodes the **whole** window, so a
-configuration is sustainable only while `window_ms / 11 < chunk_ms`. Fall behind and the sidecar's
-bounded audio queue (3000 ms) overflows into a **fatal `overload_audio`** — so this wants margin,
-not just an inequality.
-
-| window | hop | decode | duty |
+| audio | 2026-08-21 (vLLM) | before | ×realtime |
 |---|---|---|---|
-| 8 s | 1 s | 727 ms | 73% ← the old pairing |
-| 12 s | 2 s | 1091 ms | 55% |
-| **16 s** | **2 s** | **1455 ms** | **73%** ← now |
-| 20 s | 2 s | 1818 ms | 91% — too tight |
-| 30 s | 4 s | 2727 ms | 68% |
+| 8 s | **237 ms** | 825 ms | 34× |
+| 16 s | **344 ms** | 1501 ms | 47× |
+| 30 s | **541 ms** | 2587 ms | 55× |
 
-Now **`window=16000`, `hop=2000`**: twice the window at the duty cycle the old pairing was already
-sustaining, and half the request rate on the far end. The cost is that the live preview updates
-every 2 s instead of every 1 s, which matters less than it used to now that nothing is typed until
-the session ends (§3c).
+Linear, no discontinuity. `/health` reports `{"backend": "vllm", "vad": true}`.
 
-**`window_slide` should now be rare.** It fired three times in two short sessions under the 8 s
-window (2026-08-21 00:06–00:11); it takes 16 s of *continuous* speech with no 1.5 s pause to
-provoke it now. If it still appears in the log, raise `window_ms` **and `chunk_ms` together** —
-raising the window alone is exactly how to overflow the queue.
+### What bounds the window
+
+Throughput, not a ceiling. Each hop re-uploads and re-decodes the **whole** window, so
+`window_ms/50 + vad` must stay well under `chunk_ms`. Falling behind overflows the sidecar's
+bounded audio queue (3000 ms) into a **fatal `overload_audio`**, so this wants margin.
+
+Now **`window=30000`, `hop=2000`** — **~36% duty** including the VAD call, against ~73% before,
+with nearly **four times** the window. A 30 s window makes the frozen-prefix stitch effectively
+unreachable in normal speech; `window_slide` fired three times in two sessions at 8 s. If it ever
+returns, raise `window_ms` **and `chunk_ms` together**.
+
+### The VAD route, and why it is a correctness fix
+
+`POST /v1/audio/vad` (Silero via pysilero-vad) answers whether a clip contains speech, in 50–176 ms
+for 0.5–30 s. `vad_gate=true` asks it **before** transcribing.
+
+This is not tidiness. Handed non-speech, the model **invents** — re-confirmed live 2026-08-21:
+
+| input | model returns |
+|---|---|
+| 500 ms digital silence | `"Yeah."` |
+| 2000 ms digital silence | `"Okay."` |
+| key-click transients | `"Hi."` |
+
+Under end-of-session cadence (§3c) those are typed into the document along with everything real,
+and the log holds two 5-byte commits — the exact length of `"Yeah."` — both of which were Esc'd.
+The VAD route rejects all three cleanly (`speech: false`) and passes real speech.
+
+* **In the backend, not `kvit_asr.vad`.** That module is a frame-wise *streaming endpointer*
+  deciding when an utterance ends, 32 ms at a time; this is a *batch* question about a finished
+  buffer. Different shapes — so the gate does not replace the local VAD, it adds a
+  better-informed opinion at the one moment that matters.
+* **Fails open**: missing route, timeout, bad body → transcribe anyway. Losing real speech is
+  worse than an occasional invented word, and a VAD outage must not silence dictation. It latches
+  after the first refusal so a 2 s hop cannot log a warning every 2 s.
+* **This is the silero question, answered without a local install.** §4's open item was whether to
+  put `onnxruntime` on this machine; the server now does it, with the operator's own tuning.
 
 ---
 
@@ -231,27 +240,21 @@ contents, so it stops jittering on every revision.
 
 ## 4. Also true, and smaller
 
-* **The VAD is the fallback, and how weak is an open question.** Silero is not configured, so the
-  stdlib energy/ZCR endpointer is in use — its own docstring says it "detects sound rather than
-  speech and is measurably worse".
-  * This file used to assert "it triggers on keyboard noise" as fact. **Unverified**, and one
-    attempt to reproduce it (2026-08-21) failed: digital silence and synthetic key-click
-    transients were all rejected, `gate_open=False`, nothing reaching the decoder. That test was
-    synthetic and effectively a quiet room, so it does not clear the detector either — it only
-    means nobody has actually caught it misbehaving.
-  * The reason to care is downstream and **is** measured (below): the model invents words from
-    non-speech, so the VAD is the only thing between that and the document.
-  * The real difference is what they measure — energy/ZCR measures *loudness*, silero measures
-    *speechiness*. Loudness is a fair proxy in a quiet room and degrades with a fan, music or a
-    nearby conversation.
-  * The model file already exists on this machine at
-    `%LOCALAPPDATA%\screenpipead\silero_vad.onnx` (643 KB), so plan.md §1.9's refusal to
-    download is satisfied — but `onnxruntime` is **not** installed in `C:\Python312`, which is
-    the actual cost. Copy the model into kvit-dictate's own directory rather than pointing at
-    another application's data folder.
-  * **The cheap way to settle it**: `privacy.transcript.enabled` for one real session and read
-    what the short commits actually were. Debug builds only, off by default, and it writes
-    recognised text to disk — so it is the operator's call.
+* **The local VAD is still the energy/ZCR fallback, and it matters less than it did.** Silero is
+  not configured locally, so the stdlib endpointer does the *endpointing* — deciding when an
+  utterance ends. What it no longer does is decide what reaches the model: the server's VAD route
+  now gates that (§3b), which was the half that could put invented words in the document.
+  * This file used to assert "it triggers on keyboard noise" as fact. **Unverified**, and an
+    attempt to reproduce it (2026-08-21) failed — digital silence and synthetic key-click
+    transients were all rejected, `gate_open=False`. That test was synthetic and effectively a
+    quiet room, so it does not clear the detector either; it means nobody has caught it
+    misbehaving.
+  * A local silero would still be better at *endpointing* (energy/ZCR measures loudness, silero
+    measures speechiness, and loudness degrades with a fan, music or a nearby conversation). But
+    the argument for it is now latency and boundary precision, not correctness. `onnxruntime` is
+    not installed in `C:\Python312`; `%LOCALAPPDATA%\screenpipead\silero_vad.onnx` exists if
+    it is ever wanted.
+
 * **The model hallucinates over silence**, measured: 500 ms of digital silence returns `"Yeah."`,
   2000 ms returns `"Okay."` No guard is implemented on purpose — the endpoint returns a bare
   string with no timestamps to filter on, and a phrase blocklist would silently delete words a
