@@ -191,6 +191,30 @@ class TestSilenceGate(unittest.TestCase):
             self.assertEqual(b.finalize().text, "1000 ms")
 
 
+class TestWarmUp(unittest.TestCase):
+    """The inherited warm-up feeds silence, which this backend's own gate refuses."""
+
+    def test_warm_up_actually_decodes_something(self):
+        with _Loaded(_backend("--echo-length")) as b:
+            ms = b.warm_up(audio_ms=300)
+            self.assertGreaterEqual(b.describe()["requests"], 1,
+                                    "warm-up did not reach the model")
+            self.assertEqual(b.describe()["silence_skipped"], 0,
+                             "warm-up audio was mistaken for silence")
+            self.assertGreaterEqual(ms, 0)
+
+    def test_warm_up_clears_a_high_gate_too(self):
+        with _Loaded(_backend("--echo-length", silence_peak_threshold=20000)) as b:
+            b.warm_up(audio_ms=200)
+            self.assertGreaterEqual(b.describe()["requests"], 1)
+
+    def test_warm_up_leaves_no_text_behind(self):
+        with _Loaded(_backend("--text", "warmup noise")) as b:
+            b.warm_up(audio_ms=200)
+            b.reset(ResetReason.SESSION_START)
+            self.assertIsNone(b.finalize(), "warm-up audio leaked into the next utterance")
+
+
 class TestFailureDuringDictation(unittest.TestCase):
     def test_a_decode_error_names_the_reason_and_does_not_kill_the_backend(self):
         with _Loaded(_backend("--error-on-audio", "the model said no")) as b:

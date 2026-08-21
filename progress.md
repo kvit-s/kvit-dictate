@@ -65,7 +65,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 331 tests / 36005 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
-python -m unittest discover -s server/tests -t server  # 416 tests   (from the repo root)
+python -m unittest discover -s server/tests -t server  # 419 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
