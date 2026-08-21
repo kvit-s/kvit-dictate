@@ -198,6 +198,9 @@ private:
     // Empties `deferred_` into the document, or onto the clipboard when the target is gone.
     // Safe to call with nothing deferred: it returns having done nothing.
     void flush_deferred_commits(const char* why);
+    // What the overlay should be showing right now, given the cadence. `tail` is the engine's
+    // unstable text for the utterance in progress.
+    void render_preview(std::string_view tail);
 
     bool spawn_sidecar();
     void on_conn_state(kd::proto::ConnState s);
@@ -1000,9 +1003,7 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         return;
     }
 
-    if (overlay_ != nullptr) {
-        overlay_->set_text(r.pending_text, {});
-    }
+    render_preview(r.pending_text);
 
     if (!r.op.has_value() || r.op->text.empty()) return;
     if (!target_.has_value()) return;
@@ -1037,6 +1038,12 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         deferred_ += text;
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
                      text.size(), deferred_.size());
+        // Again, because the buffer just grew. Without this the preview empties at every
+        // utterance boundary: the call above renders the engine's `pending_text`, which is scoped
+        // to the utterance in progress and is empty on a `final` — so everything said so far
+        // vanished from the pill the moment the speaker paused, while the buffer behind it was
+        // perfectly intact and typed in full at the end. Reported exactly that way.
+        render_preview({});
         return;
     }
 
@@ -1070,6 +1077,14 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
 
 void App::begin_dictation() {
     if (session_ == nullptr) return;
+
+    // Defensive. A buffer that survived into a new session belongs to the *previous* session's
+    // target and must never be typed into this one's window. `finish_dictation` is the one path a
+    // session ends through and it flushes, so this should never fire — but if it ever does, the
+    // text is rescued (document if that target still has focus, clipboard otherwise) rather than
+    // silently carried into a stranger's window. Runs before target_ is replaced, deliberately.
+    flush_deferred_commits("a new session started while text was still buffered");
+
     if (finalizing_) {
         // §7.2: one session per connection. The previous one has been asked to stop and its
         // `final` may still be in flight, so starting another now would be a fatal
@@ -1193,6 +1208,34 @@ void App::end_dictation(kd::LocalEvent why) {
     finalize_deadline_ms_ = clock_.now_ms() + kFinalizeGraceMs;
     set_tray_state(kd::OverlayState::Finalizing);
     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Finalizing);
+}
+
+void App::render_preview(std::string_view tail) {
+    if (overlay_ == nullptr) return;
+
+    // The overlay's two colours mean "settled" (opaque) and "still moving" (60% alpha), and under
+    // a deferred cadence that maps onto something real for the first time: everything already
+    // accumulated is settled and merely waiting for a keystroke, while the tail of the current
+    // utterance is still being revised. With Cadence::Immediate the settled half is in the
+    // document rather than in the overlay, so there is nothing to put in it.
+    if (settings_.stability.cadence == kd::Cadence::EndOfSession) {
+        if (deferred_.empty() || tail.empty()) {
+            overlay_->set_text(deferred_, tail);
+            return;
+        }
+        // The overlay concatenates its two halves with no separator, and committed text never
+        // ends in whitespace (plan.md §1.4 holds it back so `CommitOp::leading_space` can add it
+        // exactly once). Without this the preview reads "…the configand restart". Display only:
+        // the space that actually reaches the document still comes from `leading_space`, so this
+        // cannot double it.
+        std::string settled;
+        settled.reserve(deferred_.size() + 1);
+        settled += deferred_;
+        settled.push_back(' ');
+        overlay_->set_text(settled, tail);
+        return;
+    }
+    overlay_->set_text(tail, {});
 }
 
 void App::flush_deferred_commits(const char* why) {

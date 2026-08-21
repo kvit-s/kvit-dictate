@@ -174,6 +174,25 @@ KD_TEST(commit_engine, end_of_session_suppresses_partial_flushes_but_not_the_fin
     KD_CHECK_EQ(r.op->text, "the quick brown fox jumps");
 }
 
+// `pending_text` is scoped to the utterance in progress, and a `final` empties it.
+//
+// Obvious once stated, and the source of a real defect: App used `pending_text` alone as the
+// overlay preview, which is right when every utterance is typed into the document as it closes —
+// the preview empties exactly because the words moved into the document. Under
+// Cadence::EndOfSession nothing moves anywhere, so the same code emptied the pill at every pause
+// while the accumulated buffer sat behind it, and the user watched a sentence of their dictation
+// apparently vanish. A deferred cadence has to render the buffer, not just this.
+KD_TEST(commit_engine, pending_text_is_utterance_scoped_and_a_final_empties_it) {
+    Driver d(local_params(/*m=*/3, /*t=*/0));
+
+    const auto mid = d.partial("the quick brown fox jumps", 0);
+    KD_CHECK(!mid.pending_text.empty());   // mid-utterance there is something to preview
+
+    const auto end = d.final_msg("the quick brown fox jumps");
+    KD_CHECK(end.ok());
+    KD_CHECK_EQ(end.pending_text, "");     // nothing unstable is left to show
+}
+
 // ─── Spellings ──────────────────────────────────────────────────────────────────────────────
 
 KD_TEST(commit_engine, to_string_spellings) {
