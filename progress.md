@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-19. Commit `c5a65bb` on `main`.
+Written 2026-08-20. Commit `a7e01fa` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -49,7 +49,7 @@ has the mechanism.
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 327 tests / 35940 checks
+build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 328 tests / 35956 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
 python -m unittest discover -s server/tests -t server  # 382 tests   (from the repo root)
@@ -68,12 +68,17 @@ immediately, which is two symptoms of one cause.
 as `settings.json.before-real-model`. The log at
 `%LOCALAPPDATA%\kvit-dictate\logs\kvit-dictate.log` is the first thing to read after any session.
 
-**Commit frequency does not live in `settings.json`.** Its `session.endpoint_silence_ms` is a
-*hint* — `session.cpp:752` says so, and `close_utterance()` only flips a bool; audio keeps
-flowing. The authoritative utterance boundary is the sidecar's, so the knob is
-`--endpoint-silence-ms` in **`models.json`**, currently **1500 ms** for both qwen entries (was the
-800 ms default, which split sentences at every breath). The client-side value is kept at 1500 to
-match, purely so the two do not read as disagreeing.
+**Two different things control "how often does text appear", and they live in different files.**
+
+1. **How often audio is transcribed** — the utterance boundary. `settings.json`'s
+   `session.endpoint_silence_ms` is only a *hint* (`session.cpp:752` says so; `close_utterance()`
+   flips a bool and audio keeps flowing). The authoritative boundary is the sidecar's, so the knob
+   is `--endpoint-silence-ms` in **`models.json`**, now **1500 ms** for both qwen entries (was 800,
+   which split a sentence at every breath). The client-side value is kept at 1500 only so the two
+   do not read as disagreeing.
+2. **How often text is typed** — `settings.json`'s `cadence.mode`, now **`end-of-session`**. See
+   §3c. The two are independent: the sidecar still decodes about a sentence at a time and still
+   uploads at most an 8 s window, whatever the client does with the results.
 
 Model entries that matter:
 
@@ -177,6 +182,38 @@ transcript"*, and that the result is *"not stable in the §1.4 sense … merely 
 stability machinery cannot protect the document from it. It is now a `window_slide` WARN, once per
 utterance (`connection.py::_note_window_slide`, 5 tests) — **if that line appears in a log, the
 text around it is suspect and the sentence was too long, not mis-heard.**
+
+---
+
+## 3c. Deferred commit (`cadence.mode: "end-of-session"`)
+
+Text accumulates for the whole session and is typed once, at the end, in a single injection.
+Currently **on**. `Cadence::Immediate` is the old behaviour and is still the default in code.
+
+* **It costs nothing in audio.** Utterance boundaries and injection cadence were already fully
+  decoupled — the sidecar decodes a sentence at a time into an 8 s window regardless (§3b).
+* **Implemented across two files on purpose**, and the header says so: the engine's cadence gate
+  covers only the partial path (`cadence_allows`, one call site — `on_final` never asks), so the
+  engine suppresses early flushes and `App::flush_deferred_commits` does the accumulating. The
+  engine still emits its op at each `final`, because a caller that buffers needs something to
+  buffer.
+* **The old `cadence` knob was dead** for this backend before this: every op comes from
+  `on_final`, which does not consult it. Worth knowing before trusting any other §1.4 knob.
+
+What happens to the buffer when the session ends:
+
+| ending | what happens |
+|---|---|
+| hotkey again, click, keystroke, silence | **typed into the document** — all go through `finalise_session` |
+| **focus moved to another window** | **clipboard**, plus a tray warning. It cannot be typed: `validate_target` requires the target to still be the foreground window, and the injector never restores focus because `SendInput` types into whatever *is* focused. |
+| Esc | **discarded**, deliberately |
+| crash / fatal error | lost, logged |
+
+**The visible tail is 8 lines** (`kMaxLines`, raised from 3) and there is **no scrollback** — a
+session-long buffer sits behind that window unseen. Front-elision means it always shows the newest
+lines, so it reads as scrolled to the bottom. The overlay is on the floating pill because 8 lines
+at the caret would cover the document being dictated into; the pill also no longer resizes to its
+contents, so it stops jittering on every revision.
 
 ---
 
