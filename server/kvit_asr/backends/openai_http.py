@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import socket
 import urllib.error
 import urllib.request
@@ -97,7 +98,13 @@ DEFAULT_MODEL = "Qwen/Qwen3-ASR-1.7B"
 # The endpoint accepts anything ffmpeg can decode. WAV is chosen because the standard library can
 # write it and because it is lossless: re-encoding to a compressed format on the way out would put
 # a codec between the measured audio and the model for no benefit.
+logger = logging.getLogger(__name__)
+
 _PATH = "/v1/audio/transcriptions"
+
+# The same host's Silero endpoint (pysilero-vad). Optional: a server without it answers 503 naming
+# the package, and `_vad_says_speech` treats that — and every other failure — as "go ahead".
+_VAD_PATH = "/v1/audio/vad"
 
 
 def _wav_bytes(pcm: bytes) -> bytes:
@@ -157,6 +164,9 @@ class OpenAiHttpBackend(PseudoStreamingBackend):
         window_ms: int = 8000,
         hop_ms: int = 1000,
         finalize_only: bool = False,
+        vad_gate: bool = False,
+        vad_threshold: Optional[float] = None,
+        vad_gain: Optional[float] = None,
     ) -> None:
         # finalize_only turns the hop off entirely by making it longer than any window can be, so
         # the only transcription is the one finalize() forces. One request per utterance, no live
@@ -171,11 +181,16 @@ class OpenAiHttpBackend(PseudoStreamingBackend):
         self._timeout_s = float(timeout_s)
         self._api_key = api_key or None
         self._finalize_only = bool(finalize_only)
+        self._vad_gate = bool(vad_gate)
+        self._vad_threshold = vad_threshold
+        self._vad_gain = vad_gain
+        self._vad_unavailable = False   # latched after the first refusal, so it is logged once
         # Counters a result file can carry, so a slow or flaky run is attributable afterwards
         # rather than remembered.
         self.request_count = 0
         self.request_ms_total = 0
         self.empty_response_count = 0
+        self.vad_skipped_count = 0      # windows the detector said were not speech
 
     # -- declaration --------------------------------------------------------------------------
 
@@ -217,14 +232,15 @@ class OpenAiHttpBackend(PseudoStreamingBackend):
         for key, value in (getattr(cfg, "options", None) or {}).items():
             options[key] = value
         # The flat options arrive as strings from the command line.
-        for flag in ("finalize_only",):
+        for flag in ("finalize_only", "vad_gate"):
             if flag in options and isinstance(options[flag], str):
                 options[flag] = options[flag].strip().lower() in ("1", "true", "yes", "on")
         for num in ("hop_ms", "window_ms"):
             if num in options and isinstance(options[num], str):
                 options[num] = int(options[num])
-        if "timeout_s" in options and isinstance(options["timeout_s"], str):
-            options["timeout_s"] = float(options["timeout_s"])
+        for real in ("timeout_s", "vad_threshold", "vad_gain"):
+            if real in options and isinstance(options[real], str):
+                options[real] = float(options[real])
         return cls(**options)
 
     # -- lifecycle ----------------------------------------------------------------------------
@@ -253,8 +269,65 @@ class OpenAiHttpBackend(PseudoStreamingBackend):
 
     # -- the one thing PseudoStreamingBackend asks for -----------------------------------------
 
+    def _vad_says_speech(self, pcm: bytes) -> bool:
+        """Ask the server's Silero route whether this window contains speech at all.
+
+        **Why this exists.** Handed non-speech, the model does not return nothing — it invents.
+        Measured against this endpoint on 2026-08-21: 500 ms of digital silence returns "Yeah.",
+        2000 ms returns "Okay.", and click transients return "Hi.". Those are not transcription
+        errors that a better model would fix; there is nothing there to transcribe. The only place
+        to stop them is before the request, and until this route existed there was nowhere on this
+        side to ask.
+
+        **Why here rather than in `kvit_asr.vad`.** That module is a frame-wise streaming
+        endpointer: it decides *when an utterance ends*, incrementally, 32 ms at a time. This route
+        is a batch question about a finished buffer, which is a different shape and cannot drive
+        endpointing. So the two are not alternatives and this does not replace the local VAD — it
+        adds a second, better-informed opinion at the one moment that matters, when a window is
+        about to be turned into words that go in the user's document.
+
+        **Fails open, deliberately.** Any failure — the route missing (503), a timeout, a
+        malformed answer — returns True and the transcription proceeds. Losing something the user
+        actually said is a worse outcome than an occasional invented "Okay.", and a VAD outage
+        must not be able to silence dictation.
+
+        Costs a round trip: measured at 50-176 ms for 0.5-30 s of audio, against a transcription
+        that is now 237-541 ms. It also *saves* the transcription whenever it says no.
+        """
+        fields: dict = {}
+        if self._vad_threshold is not None:
+            fields["threshold"] = str(self._vad_threshold)
+        if self._vad_gain is not None:
+            fields["gain"] = str(self._vad_gain)
+        body, content_type = _multipart(fields, "clip.wav", _wav_bytes(pcm))
+        req = urllib.request.Request(self._base_url + _VAD_PATH, data=body, method="POST")
+        req.add_header("Content-Type", content_type)
+        req.add_header("Content-Length", str(len(body)))
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            return bool(payload.get("speech", True))
+        except Exception as exc:  # noqa: BLE001 - see "fails open" above; every failure is one case
+            if not self._vad_unavailable:
+                self._vad_unavailable = True
+                logger.warning(
+                    "VAD gate unavailable (%s: %s); transcribing without it. Non-speech may be "
+                    "returned as invented words -- this endpoint answers 500 ms of silence with "
+                    "\"Yeah.\". Logged once per session.",
+                    type(exc).__name__, str(exc)[:160],
+                )
+            return True
+
     def _transcribe_batch(self, pcm: bytes) -> str:
         if not pcm:
+            return ""
+
+        if self._vad_gate and not self._vad_unavailable and not self._vad_says_speech(pcm):
+            # Nothing was said. Returning "" is not a failure and must not look like one: the
+            # wrapper treats it as "this window produced no hypothesis", which is exactly right.
+            self.vad_skipped_count += 1
             return ""
         body, content_type = _multipart(
             {
