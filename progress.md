@@ -146,42 +146,54 @@ live preview at all.
 
 ---
 
-## 3b. The far end has a cliff, and it sets a hard product limit
+## 3b. The far end is linear, not cliffed — an earlier measurement here was wrong
 
-**Measured** 2026-08-19 against `strixhalo.lan:10301`, three requests per size, median:
+**Retraction.** This section previously reported a latency cliff between 8 s and 12 s of audio
+(12× the time for 1.5× the audio) and concluded that `window_ms` could never be raised. **That was
+an artifact of the harness, not a property of the server**, and every conclusion drawn from it was
+wrong. It was measured with synthetic harmonic noise, which drives the model into a repetition
+loop until it hits its token cap: ~7 s to return the 9 characters `'Whoa! Who'`. The giveaway was
+in the data and went unread — the *slow* responses returned the *least* text, and 10.0 s was fast
+while 9.5 s and 11 s were slow, which no duration limit explains.
 
-| audio | median | vs realtime |
-|---|---|---|
-| 4 s | 332 ms | 12.1× |
-| 8 s | 547 ms | 14.6× |
-| **12 s** | **6796 ms** | 1.8× |
-| 20 s | 6763 ms | 3.0× |
-| 30 s | 13661 ms | 2.2× |
+**Re-measured 2026-08-21 on real speech** (Windows SAPI, 16 kHz mono, sliced from one 57 s
+utterance), two requests per size:
 
-Not a scaling curve — a **discontinuity between 8 s and 12 s**, 12× the time for 1.5× the audio.
-Synthetic audio (a modulated harmonic stack), so these are a **lower bound**: real speech
-generates more output tokens and will be slower. Whatever the far end is doing differently past
-~8 s was not investigated; the operational fact is enough.
+| audio | median | ×realtime | | audio | median | ×realtime |
+|---|---|---|---|---|---|---|
+| 2 s | 457 ms | 4.4× | | 16 s | 1501 ms | 10.7× |
+| 4 s | 529 ms | 7.6× | | 20 s | 1789 ms | 11.2× |
+| 8 s | 825 ms | 9.7× | | 30 s | 2587 ms | 11.6× |
+| 12 s | 1157 ms | 10.4× | | 57 s | 5003 ms | 11.4× |
 
-The consequences are not small:
+Linear at **~11× realtime**, no discontinuity anywhere. Still not the operator's voice or
+microphone, so it is representative rather than definitive — but it is faithful in the one way
+that matters, which the previous attempt was not.
 
-* **`window_ms` cannot be raised.** The hop re-uploads and re-decodes the *whole* window every
-  second. Its 8000 default is not conservative — it is the edge of the only fast regime. At 12 s
-  the far end takes ~7× the hop, so requests pile up and the preview falls permanently behind.
-* **The product's real limit is ~8 s of continuous speech**, roughly 20 words at 150 wpm — about
-  one sentence. **Sentence-level accumulation is the maximum this backend can do at any setting.**
-  Paragraph-level is not available.
-* Longer *pauses* are free, though, and that is what made 1500 ms cheap: silence is gated out
-  before the decoder (`session.py::_route`, plan.md §1.6), so the window bounds continuous speech
-  and not wall-clock.
+### What actually bounds the window
 
-Past the ceiling the wrapper freezes the scrolled-out text and stitches by word overlap.
-`base.py` is blunt that the stitch finds *"no exact overlap at all"* for a model that recases or
-repunctuates across the boundary — Qwen, per §3 — then *"freezes the entire pre-slide
-transcript"*, and that the result is *"not stable in the §1.4 sense … merely unrecoverable"*. The
-stability machinery cannot protect the document from it. It is now a `window_slide` WARN, once per
-utterance (`connection.py::_note_window_slide`, 5 tests) — **if that line appears in a log, the
-text around it is suspect and the sentence was too long, not mis-heard.**
+Throughput, not a ceiling. Every hop re-uploads and re-decodes the **whole** window, so a
+configuration is sustainable only while `window_ms / 11 < chunk_ms`. Fall behind and the sidecar's
+bounded audio queue (3000 ms) overflows into a **fatal `overload_audio`** — so this wants margin,
+not just an inequality.
+
+| window | hop | decode | duty |
+|---|---|---|---|
+| 8 s | 1 s | 727 ms | 73% ← the old pairing |
+| 12 s | 2 s | 1091 ms | 55% |
+| **16 s** | **2 s** | **1455 ms** | **73%** ← now |
+| 20 s | 2 s | 1818 ms | 91% — too tight |
+| 30 s | 4 s | 2727 ms | 68% |
+
+Now **`window=16000`, `hop=2000`**: twice the window at the duty cycle the old pairing was already
+sustaining, and half the request rate on the far end. The cost is that the live preview updates
+every 2 s instead of every 1 s, which matters less than it used to now that nothing is typed until
+the session ends (§3c).
+
+**`window_slide` should now be rare.** It fired three times in two short sessions under the 8 s
+window (2026-08-21 00:06–00:11); it takes 16 s of *continuous* speech with no 1.5 s pause to
+provoke it now. If it still appears in the log, raise `window_ms` **and `chunk_ms` together** —
+raising the window alone is exactly how to overflow the queue.
 
 ---
 
