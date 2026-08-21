@@ -1,6 +1,6 @@
 # progress — kvit-dictate
 
-Written 2026-08-21. Commit `a70b14d` on `main`.
+Written 2026-08-21. Commit `a442a5b` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
 `docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
@@ -28,6 +28,10 @@ to abort partway and lose its tail. Diagnosed from the log and the two sources a
 repro, then verified in a real dictation on 2026-08-18 at 22:09 — 47 seconds into Notepad3, seven
 utterances committed, no violation. The two sessions it used to fail in died after about five. §3
 has the mechanism.
+
+**Since then the far end has moved under it, twice over** (2026-08-21): strixhalo switched to
+vLLM and got 4–5× faster, and grew a Silero VAD route. Both are now used — see §3b. Together they
+retired the two standing quality questions, and **Silero will not be run locally** (§6).
 
 ---
 
@@ -201,8 +205,8 @@ The VAD route rejects all three cleanly (`speech: false`) and passes real speech
 * **Fails open**: missing route, timeout, bad body → transcribe anyway. Losing real speech is
   worse than an occasional invented word, and a VAD outage must not silence dictation. It latches
   after the first refusal so a 2 s hop cannot log a warning every 2 s.
-* **This is the silero question, answered without a local install.** §4's open item was whether to
-  put `onnxruntime` on this machine; the server now does it, with the operator's own tuning.
+* **This is the silero question, answered without a local install**, and §6 records the decision
+  not to install one. The server runs the same model with the operator's own tuning.
 
 ---
 
@@ -241,8 +245,8 @@ contents, so it stops jittering on every revision.
 ## 4. Also true, and smaller
 
 * **The local endpointer stays as it is, and that is now a decision rather than a default.**
-  Silero locally was the standing open item; §7b measures it and closes it — the energy scorer is
-  over-inclusive, not lossy, so a local Silero would buy boundary precision and nothing else. The
+  Silero locally was the standing open item; §4b measures it and §6 closes it for good — the
+  energy scorer is over-inclusive, not lossy, so a local Silero buys boundary precision only. The
   unverified "triggers on keyboard noise" claim also stays retired: over-inclusive is exactly what
   that claim predicted, and §3b's gate is the answer to it either way.
 
@@ -262,6 +266,57 @@ contents, so it stops jittering on every revision.
   recorded in that file. It matters more than a note: if the quality winner is a *batch* model,
   then reconciling revisions is the permanent architecture, not a bring-up compromise waiting for
   a streaming model to make it moot.
+
+---
+
+## 4b. Which VAD does what
+
+Three things could be called "the VAD". Only two of them run.
+
+| | where | what it decides | status |
+|---|---|---|---|
+| **energy/ZCR endpointer** | sidecar, `vad.py`, frame-wise on 32 ms frames | **when an utterance ends** (`--endpoint-silence-ms`, 1500 ms) and what reaches the decoder | **running** — this is "the local VAD" |
+| **`/v1/audio/vad`** (Silero) | strixhalo, batch, per window | **whether a window is speech at all**, before it is transcribed (§3b) | **running** — added 2026-08-21 |
+| Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not happening** — decided, see below |
+
+They are not alternatives. The first is a *streaming endpointer* answering "has the speaker
+stopped?" incrementally; the second is a *batch classifier* answering "is there speech in this
+buffer?" about a finished window. Only the first can drive utterance boundaries; only the second is
+good enough to be trusted about content.
+
+### Do we need Silero locally too? No, and that is now a decision — measured 2026-08-21
+
+It is the same model the server runs, so a local copy could only add one thing: *streaming*
+endpointing, the remote route being batch. The question is therefore narrow — **is the energy
+scorer losing speech?** Its false *positives* no longer reach the document (§3b's gate catches
+them), but audio it refuses to pass never reaches the backend at all and nothing can recover it.
+
+57.4 s of real speech through both:
+
+| | result |
+|---|---|
+| server Silero | 48.93 s of speech, 12 segments |
+| local energy scorer | **58.70 s passed to the decoder**, 8 utterances — **120%** |
+
+**It is over-inclusive, not under-inclusive.** It passes more than the whole file (pre-roll padding
+re-emits lead-in) and loses nothing. Identical with and without lead-in silence, so the
+calibration-window worry in its docstring did not materialise on a hotkey-style opening either.
+
+Two consequences:
+
+* **A local Silero would buy nothing that matters, so it is not being installed** (§6). What it
+  would improve is boundary *precision* — 8 utterances against Silero's 12 segments — which is
+  punctuation granularity, and invisible under end-of-session cadence. Not worth putting
+  `onnxruntime` on this machine.
+* **It also explains the `"Yeah."` commits.** Passing ~everything means digital silence was
+  reaching the decoder unimpeded, and the model invents on silence (§4). The local scorer was
+  never filtering content; §3b's gate is what does it now.
+
+Caveat, since this file has been burned once today: clean synthesised speech in a silent file. A
+real microphone with a fan or a conversation in the room is the case not covered, and it is the
+one the docstring's "detects sound, not speech" is really about.
+
+**The client (C++) has no VAD at all**, which was not the design — see §8.
 
 ---
 
@@ -295,28 +350,39 @@ problem.
 
 ## 6. What to do next
 
-1. ~~Dictate the sentence that used to abort.~~ **Done, 2026-08-18 22:09.** Clean: no violation,
-   no `session error:` line, seven utterances committed over 47 seconds. §3 is confirmed.
-2. ~~Tune the sidecar's stability for a revising backend.~~ **Ruled out** — §3 says why the three
-   knobs cannot fix a revision at byte 0. Done instead by pinning the mark to 0 for the whole
-   class of backend.
-3. **Point the VAD at a local `silero_vad.onnx`.** Cheap, and it improves both endpointing and the
-   silence-hallucination exposure. **Now the largest known defect** — and §3's fix made it *more*
-   load-bearing, not less: with nothing committed until the endpoint, the endpointer is what
-   decides when the user's words reach the document. A false endpoint on keyboard noise now splits
-   a sentence into two commits; a missed one holds the whole sentence back.
-4. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4**, with whatever
-   numbers exist. The picks table currently recommends models the operator has rejected. §3 raises
-   the stakes on this: if the quality winner really is a *batch* model, then
-   `publish_stable_partials=False` — commit at the endpoint, never mid-sentence — is the product's
-   permanent latency profile rather than a workaround, and that belongs in the picks table where
-   the decision gets made.
-5. **Decide what the product does when the far end is unreachable.** This backend has no local
-   fallback, and plan.md §2's "no network access during dictation" is broken in the letter by it —
-   see the module docstring for the full argument. If the LAN endpoint is the long-term plan rather
-   than a bring-up step, that guarantee should be rewritten rather than quietly violated.
-6. **The clipboard injection path has still never executed.** Selected by policy for `notepad.exe`,
-   and the question is whether the clipboard is restored afterwards.
+**Decided, not open — Silero will not run locally.** The sidecar keeps the stdlib energy/ZCR
+endpointer. `onnxruntime` is not going on this machine and `SileroOnnxScorer` stays unconfigured.
+The reasoning is measured in §4b: the energy scorer is *over*-inclusive (it passed 120% of the
+speech the server's Silero found, losing nothing), so the only thing a local copy would buy is
+utterance-boundary precision — punctuation granularity, invisible under end-of-session cadence.
+The job that actually mattered, keeping invented words out of the document, is done by
+`/v1/audio/vad` on strixhalo, which is the same Silero with the operator's own tuning (§3b).
+`%LOCALAPPDATA%\screenpipe\vad\silero_vad.onnx` exists if this is ever revisited; it would need
+a reason connected to a user-visible problem, and a noisy room is the one case §4b does not cover.
+
+Actually next:
+
+1. **Use it for a while and watch three lines.** Everything below §3 changed today and none of it
+   has had a real day's dictation: `window_slide` should have stopped (30 s window), 5-byte
+   `"Yeah."` commits should have stopped (the VAD gate), and a session should now survive past two
+   minutes of continuous talking (§8's timer fix).
+2. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4.** The picks table
+   still recommends models the operator has measured as worse than Qwen. Now overdue on two
+   counts: `publish_stable_partials=False` means commit-at-the-endpoint is the permanent latency
+   profile if the quality winner is a batch model, and §3b's numbers (34–55× realtime) invalidate
+   the latency arithmetic the table's argument rests on.
+3. **Decide what the product does when the far end is unreachable.** Deeper than it was: strixhalo
+   now serves *both* transcription and VAD, so a LAN outage takes the whole product down rather
+   than degrading it. plan.md §2's "no network access during dictation" is broken in the letter,
+   and this is now a design commitment rather than a bring-up shortcut — it should be rewritten
+   deliberately or the dependency reduced, not left contradicting the plan.
+4. **Two clipboard paths have still never executed.** The injection policy for `notepad.exe`, where
+   the open question is whether the clipboard is restored afterwards; and the new
+   `set_clipboard_text` rescue for a deferred buffer whose target has gone (§3c), which is
+   deliberately the one that does *not* restore.
+5. **`settings.cpp` has no tests at all.** Noticed while adding `Cadence::EndOfSession`: the
+   round-trip was verified by starting the app and watching it not complain. That is a real gap in
+   a 1900-line file that parses and writes the user's configuration.
 
 ---
 
@@ -337,57 +403,7 @@ problem.
 
 ---
 
-## 7b. Which VAD does what
-
-Three things could be called "the VAD". Only two of them run.
-
-| | where | what it decides | status |
-|---|---|---|---|
-| **energy/ZCR endpointer** | sidecar, `vad.py`, frame-wise on 32 ms frames | **when an utterance ends** (`--endpoint-silence-ms`, 1500 ms) and what reaches the decoder | **running** — this is "the local VAD" |
-| **`/v1/audio/vad`** (Silero) | strixhalo, batch, per window | **whether a window is speech at all**, before it is transcribed (§3b) | **running** — added 2026-08-21 |
-| Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not needed** — see below |
-
-They are not alternatives. The first is a *streaming endpointer* answering "has the speaker
-stopped?" incrementally; the second is a *batch classifier* answering "is there speech in this
-buffer?" about a finished window. Only the first can drive utterance boundaries; only the second is
-good enough to be trusted about content.
-
-### Do we need Silero locally too? No — measured 2026-08-21
-
-It is the same model the server runs, so a local copy could only add one thing: *streaming*
-endpointing, the remote route being batch. The question is therefore narrow — **is the energy
-scorer losing speech?** Its false *positives* no longer reach the document (§3b's gate catches
-them), but audio it refuses to pass never reaches the backend at all and nothing can recover it.
-
-57.4 s of real speech through both:
-
-| | result |
-|---|---|
-| server Silero | 48.93 s of speech, 12 segments |
-| local energy scorer | **58.70 s passed to the decoder**, 8 utterances — **120%** |
-
-**It is over-inclusive, not under-inclusive.** It passes more than the whole file (pre-roll padding
-re-emits lead-in) and loses nothing. Identical with and without lead-in silence, so the
-calibration-window worry in its docstring did not materialise on a hotkey-style opening either.
-
-Two consequences:
-
-* **A local Silero would buy nothing that matters.** What it would improve is boundary
-  *precision* — 8 utterances against Silero's 12 segments — which is punctuation granularity, and
-  invisible under end-of-session cadence. Not worth an `onnxruntime` install.
-* **It also explains the `"Yeah."` commits.** Passing ~everything means digital silence was
-  reaching the decoder unimpeded, and the model invents on silence (§4). The local scorer was
-  never filtering content; §3b's gate is what does it now.
-
-Caveat, since this file has been burned once today: clean synthesised speech in a silent file. A
-real microphone with a fan or a conversation in the room is the case not covered, and it is the
-one the docstring's "detects sound, not speech" is really about.
-
-**The client (C++) has no VAD at all**, which was not the design — see §8.
-
----
-
-## 8. The recurring failure mode, five sessions running
+## 8. The recurring failure mode, six sessions running
 
 **A contract implemented on one side and never called from the other.** The clearest instance yet
 is §3's, because the failure mode struck *twice over* on the same incident and the second strike
