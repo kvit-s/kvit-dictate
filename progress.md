@@ -231,15 +231,36 @@ contents, so it stops jittering on every revision.
 
 ## 4. Also true, and smaller
 
-* **The VAD is the weak fallback.** Silero is not configured, so the stdlib energy/ZCR endpointer
-  is in use — its own docstring says it "detects sound rather than speech and is measurably
-  worse". It triggers on keyboard noise. Fix: point `VadConfig.silero_model_path` at a local
-  `silero_vad.onnx`; plan.md §1.9 deliberately refuses to download it.
+* **The VAD is the fallback, and how weak is an open question.** Silero is not configured, so the
+  stdlib energy/ZCR endpointer is in use — its own docstring says it "detects sound rather than
+  speech and is measurably worse".
+  * This file used to assert "it triggers on keyboard noise" as fact. **Unverified**, and one
+    attempt to reproduce it (2026-08-21) failed: digital silence and synthetic key-click
+    transients were all rejected, `gate_open=False`, nothing reaching the decoder. That test was
+    synthetic and effectively a quiet room, so it does not clear the detector either — it only
+    means nobody has actually caught it misbehaving.
+  * The reason to care is downstream and **is** measured (below): the model invents words from
+    non-speech, so the VAD is the only thing between that and the document.
+  * The real difference is what they measure — energy/ZCR measures *loudness*, silero measures
+    *speechiness*. Loudness is a fair proxy in a quiet room and degrades with a fan, music or a
+    nearby conversation.
+  * The model file already exists on this machine at
+    `%LOCALAPPDATA%\screenpipead\silero_vad.onnx` (643 KB), so plan.md §1.9's refusal to
+    download is satisfied — but `onnxruntime` is **not** installed in `C:\Python312`, which is
+    the actual cost. Copy the model into kvit-dictate's own directory rather than pointing at
+    another application's data folder.
+  * **The cheap way to settle it**: `privacy.transcript.enabled` for one real session and read
+    what the short commits actually were. Debug builds only, off by default, and it writes
+    recognised text to disk — so it is the operator's call.
 * **The model hallucinates over silence**, measured: 500 ms of digital silence returns `"Yeah."`,
   2000 ms returns `"Okay."` No guard is implemented on purpose — the endpoint returns a bare
   string with no timestamps to filter on, and a phrase blocklist would silently delete words a
-  user really said. VAD gating upstream is the real fix, which makes the weak VAD above matter
-  more than it looks.
+  user really said. VAD gating upstream is the real fix, which is what makes the VAD above matter.
+  **Re-confirmed 2026-08-21** against the live endpoint, and it is worse than "silence": 500 ms of
+  silence returns `"Yeah."`, 2000 ms returns `"Okay."`, and synthetic key-click transients return
+  `"Hi."` — both 5-byte strings, and the log contains two 5-byte commits (2026-08-21 00:12–00:13),
+  both of which the operator pressed Esc on. Consistent with hallucination; not proof, since a real
+  5-byte word is equally possible. The transcript-log test above is what would settle it.
 * **Clicking or typing ends a session.** By design (plan.md §1.8). The sequence is: focus the
   target, *then* `Win+Y`, then do not touch the mouse. The log now names the gesture.
 * **`bench/CANDIDATES.md` §4 is contradicted by testing.** It names Nemotron and zipformer as the
