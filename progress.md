@@ -240,20 +240,11 @@ contents, so it stops jittering on every revision.
 
 ## 4. Also true, and smaller
 
-* **The local VAD is still the energy/ZCR fallback, and it matters less than it did.** Silero is
-  not configured locally, so the stdlib endpointer does the *endpointing* — deciding when an
-  utterance ends. What it no longer does is decide what reaches the model: the server's VAD route
-  now gates that (§3b), which was the half that could put invented words in the document.
-  * This file used to assert "it triggers on keyboard noise" as fact. **Unverified**, and an
-    attempt to reproduce it (2026-08-21) failed — digital silence and synthetic key-click
-    transients were all rejected, `gate_open=False`. That test was synthetic and effectively a
-    quiet room, so it does not clear the detector either; it means nobody has caught it
-    misbehaving.
-  * A local silero would still be better at *endpointing* (energy/ZCR measures loudness, silero
-    measures speechiness, and loudness degrades with a fan, music or a nearby conversation). But
-    the argument for it is now latency and boundary precision, not correctness. `onnxruntime` is
-    not installed in `C:\Python312`; `%LOCALAPPDATA%\screenpipead\silero_vad.onnx` exists if
-    it is ever wanted.
+* **The local endpointer stays as it is, and that is now a decision rather than a default.**
+  Silero locally was the standing open item; §7b measures it and closes it — the energy scorer is
+  over-inclusive, not lossy, so a local Silero would buy boundary precision and nothing else. The
+  unverified "triggers on keyboard noise" claim also stays retired: over-inclusive is exactly what
+  that claim predicted, and §3b's gate is the answer to it either way.
 
 * **The model hallucinates over silence**, measured: 500 ms of digital silence returns `"Yeah."`,
   2000 ms returns `"Okay."` No guard is implemented on purpose — the endpoint returns a bare
@@ -354,18 +345,43 @@ Three things could be called "the VAD". Only two of them run.
 |---|---|---|---|
 | **energy/ZCR endpointer** | sidecar, `vad.py`, frame-wise on 32 ms frames | **when an utterance ends** (`--endpoint-silence-ms`, 1500 ms) and what reaches the decoder | **running** — this is "the local VAD" |
 | **`/v1/audio/vad`** (Silero) | strixhalo, batch, per window | **whether a window is speech at all**, before it is transcribed (§3b) | **running** — added 2026-08-21 |
-| Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not configured** — no `onnxruntime` locally |
+| Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not needed** — see below |
 
 They are not alternatives. The first is a *streaming endpointer* answering "has the speaker
 stopped?" incrementally; the second is a *batch classifier* answering "is there speech in this
 buffer?" about a finished window. Only the first can drive utterance boundaries; only the second is
 good enough to be trusted about content.
 
-`EnergyZcrScorer`'s own docstring is the honest account of the first one: *"It detects sound, not
-speech. A door, a keyboard, a cough and a loud fan step are all speech if they clear the SNR
-gate."* It also needs a calibration window, so a stream that opens mid-word loses that word's
-onset. It is the endpointer for now, and §3b's gate is what keeps its mistakes out of the
-document.
+### Do we need Silero locally too? No — measured 2026-08-21
+
+It is the same model the server runs, so a local copy could only add one thing: *streaming*
+endpointing, the remote route being batch. The question is therefore narrow — **is the energy
+scorer losing speech?** Its false *positives* no longer reach the document (§3b's gate catches
+them), but audio it refuses to pass never reaches the backend at all and nothing can recover it.
+
+57.4 s of real speech through both:
+
+| | result |
+|---|---|
+| server Silero | 48.93 s of speech, 12 segments |
+| local energy scorer | **58.70 s passed to the decoder**, 8 utterances — **120%** |
+
+**It is over-inclusive, not under-inclusive.** It passes more than the whole file (pre-roll padding
+re-emits lead-in) and loses nothing. Identical with and without lead-in silence, so the
+calibration-window worry in its docstring did not materialise on a hotkey-style opening either.
+
+Two consequences:
+
+* **A local Silero would buy nothing that matters.** What it would improve is boundary
+  *precision* — 8 utterances against Silero's 12 segments — which is punctuation granularity, and
+  invisible under end-of-session cadence. Not worth an `onnxruntime` install.
+* **It also explains the `"Yeah."` commits.** Passing ~everything means digital silence was
+  reaching the decoder unimpeded, and the model invents on silence (§4). The local scorer was
+  never filtering content; §3b's gate is what does it now.
+
+Caveat, since this file has been burned once today: clean synthesised speech in a silent file. A
+real microphone with a fan or a conversation in the room is the case not covered, and it is the
+one the docstring's "detects sound, not speech" is really about.
 
 **The client (C++) has no VAD at all**, which was not the design — see §8.
 
