@@ -587,6 +587,28 @@ Earlier instances:
   abort left the hotkey permanently dead.
 * `o.error` — the session machine's full diagnosis — was built on every error and read by nothing.
 
+**2026-08-21, and the `31 byte reason` line finally paid for itself.** The first real dictation
+with `windows-speech` put *"committed text contradicted"* on the pill before a word was spoken. It
+was neither. The press landed 1 s into a 4.2 s model load, `session.cpp:652` correctly refused it —
+and then two things that had been wrong all along became visible:
+
+* **The message was a fixed string.** All seven raisers of `Effect::SurfaceWarning` reached the
+  overlay as `"committed text was contradicted"` (31 bytes — *that* is what the count means), so a
+  refusal during a model load was reported as a stability violation. Only two of the three
+  occurrences in the entire log are the thing the message names. `refusal()`'s own comment in
+  session.h says it exists so the user is not left guessing; nothing had ever read it.
+* **`begin_dictation` opened the microphone before asking, and ignored the answer.** `apply()`
+  returns void, so `Verdict::Refused` fell through to `set_tray_state(Listening)` and
+  `KD_LOG_INFO("dictation started")` for a session with no `start` on the wire. Hence the
+  `no 'stopped' within 5000 ms` that followed: nothing was ever started to be stopped.
+
+**Neither bug was new. What was new was a model slow enough to reach them.** Every other backend
+reports ready in 0–77 ms; `windows-speech` takes 3140–4155 ms, so the window went from
+unhittable to the default experience. A latency change turned two latent defects into the first
+thing the operator saw. Fixed: the press is now *held* with the loading state showing and started
+when the machine itself reports IDLE, the microphone is not opened until the activation is
+accepted, and the overlay is given the real reason.
+
 **2026-08-21, §3d, and it is the `31 byte reason` habit exactly.** The streaming API was written up
 as disqualified because a segment "repeated across the seam". The segment's own `off=7960
 dur=1120` was printed on the same line as the text, the speech in that clip ended at 7555 ms, and

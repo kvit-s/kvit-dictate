@@ -69,6 +69,33 @@ constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the c
 // strand the session forever.
 constexpr uint64_t kFinalizeGraceMs = 5000;
 
+// How long a hotkey press waits for a model that is still loading before it is given up on. The
+// protocol allows the sidecar 180 s to reach ready (docs/protocol.md §1.1 READY_TIMEOUT_MS), which
+// is far too long to hold a microphone-shaped promise on screen; a model that has not loaded in
+// this long is a problem to report, not to wait out. The slowest real load measured is 4155 ms
+// (windows-speech, cold).
+constexpr uint64_t kActivationWaitMs = 30000;
+
+// Is this connection state one that still reaches IDLE on its own? The four states of a child
+// coming up are; the three that mean a session is already in flight are handled before this is
+// asked; DEAD is not, and waiting in it would be waiting for nothing.
+bool connection_can_become_idle(kd::proto::ConnState s) noexcept {
+    switch (s) {
+        case kd::proto::ConnState::Spawning:
+        case kd::proto::ConnState::Validating:
+        case kd::proto::ConnState::Handshake:
+        case kd::proto::ConnState::Loading:
+            return true;
+        case kd::proto::ConnState::Idle:
+        case kd::proto::ConnState::Running:
+        case kd::proto::ConnState::Finalizing:
+        case kd::proto::ConnState::Cancelling:
+        case kd::proto::ConnState::Dead:
+            return false;
+    }
+    return false;  // unreachable; enumerated so a new value is a compiler warning
+}
+
 constexpr UINT kTrayId = 1;
 constexpr UINT kMenuToggle = 100;
 constexpr UINT kMenuSettings = 101;
@@ -254,6 +281,14 @@ private:
     bool settings_open_ = false;
     bool finalizing_ = false;       // `stop` is out; the target is held until `stopped`
     uint64_t finalize_deadline_ms_ = 0;
+
+    // A hotkey press that arrived before the model was ready, held until it is (§10.2 allows
+    // `start` only from IDLE). Nothing before `windows-speech` made this reachable: every other
+    // backend reports ready in 0–77 ms, so the window did not exist in practice. That model takes
+    // ~4.2 s, which is long enough that pressing the hotkey inside it is the normal case rather
+    // than a race.
+    bool activation_pending_ = false;
+    uint64_t activation_deadline_ms_ = 0;
 
     std::mutex ipc_mutex_;
     std::deque<kd::proto::Message> ipc_queue_;
@@ -590,6 +625,32 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                                 static_cast<unsigned long long>(kFinalizeGraceMs));
                     finish_dictation("finalize grace expired");
                 }
+                // The held press, honoured the moment the machine itself says it can accept a
+                // `start`. begin_dictation() is re-entered from the top rather than resumed
+                // part-way, so the target is captured *now* and every refusal — password field,
+                // elevated target, secure desktop, app policy — is decided against the window
+                // that has focus at this moment. Seconds passed while the model loaded, and
+                // plan.md §1.7 is emphatic that a target is not allowed to drift under a session.
+                if (activation_pending_ && session_ != nullptr &&
+                    session_->state() == kd::proto::ConnState::Idle) {
+                    activation_pending_ = false;
+                    activation_deadline_ms_ = 0;
+                    KD_LOG_INFO("model ready; starting the activation that was waiting for it");
+                    begin_dictation();
+                }
+                if (activation_pending_ && clock_.now_ms() >= activation_deadline_ms_) {
+                    // Held long enough. Said out loud with the state it is stuck in, because "I
+                    // pressed the hotkey and nothing happened" has to be answerable from the log.
+                    activation_pending_ = false;
+                    activation_deadline_ms_ = 0;
+                    KD_LOG_WARN("the model did not become ready within %llu ms of the hotkey "
+                                "press (connection is %s); the activation was dropped",
+                                static_cast<unsigned long long>(kActivationWaitMs),
+                                session_ != nullptr ? kd::proto::to_string(session_->state())
+                                                    : "(no session machine)");
+                    set_tray_state(kd::OverlayState::Error);
+                    if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Error);
+                }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
                 if (overlay_ != nullptr) {
@@ -861,8 +922,28 @@ void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* 
                 break;
 
             case kd::Effect::SurfaceWarning:
+                // One fixed string used to serve all seven raisers of this effect, and it named
+                // the rarest of them: a press refused during a model load put "committed text was
+                // contradicted" on screen with nothing committed and nothing contradicted. Three
+                // incidents in the whole log carry that message and only two of them are the
+                // thing it describes — which is the ambiguity main.cpp's `o.error` reader was
+                // added to end, one effect too late.
+                //
+                // `o.error` is the machine's own diagnosis where it built one; `refusal()` is what
+                // it set where it did not, and its own comment in session.h says it exists so the
+                // user is not left guessing. Neither is a transcript, so both may be logged
+                // (util/log.h).
                 set_tray_state(kd::OverlayState::Warning);
-                if (overlay_ != nullptr) overlay_->flag_violation("committed text was contradicted");
+                if (overlay_ != nullptr) {
+                    if (o.error.has_value()) {
+                        overlay_->flag_violation(o.error->msg);
+                    } else if (session_ != nullptr &&
+                               session_->refusal() != kd::InjectStatus::Ok) {
+                        overlay_->flag_violation(kd::to_string(session_->refusal()));
+                    } else {
+                        overlay_->flag_violation("the session was refused");
+                    }
+                }
                 break;
 
             case kd::Effect::SurfaceFatal:
@@ -1117,6 +1198,46 @@ void App::begin_dictation() {
         return;
     }
 
+    // A second press while one is already waiting means "never mind" — the same toggle the hotkey
+    // has everywhere else. The filter never learned a session started, so this press arrives as
+    // another Activate rather than as a Finalize, and without this it would silently re-arm.
+    if (activation_pending_) {
+        activation_pending_ = false;
+        activation_deadline_ms_ = 0;
+        KD_LOG_INFO("queued activation cancelled by a second press");
+        set_tray_state(kd::OverlayState::Idle);
+        if (overlay_ != nullptr) {
+            overlay_->set_state(kd::OverlayState::Idle);
+            overlay_->hide();
+        }
+        return;
+    }
+
+    // §10.2: `start` may only be sent from IDLE. The press is held rather than refused, and the
+    // microphone is NOT opened — the old code opened it first and asked afterwards, so a press
+    // during a model load left the mic running, the overlay saying "Listening" and the log saying
+    // "dictation started" for a session that was never started at all.
+    if (session_->state() != kd::proto::ConnState::Idle) {
+        if (!connection_can_become_idle(session_->state())) {
+            KD_LOG_WARN("hotkey pressed while the connection is %s; nothing to wait for",
+                        kd::proto::to_string(session_->state()));
+            set_tray_state(kd::OverlayState::Error);
+            return;
+        }
+        activation_pending_ = true;
+        activation_deadline_ms_ = clock_.now_ms() + kActivationWaitMs;
+        KD_LOG_INFO("hotkey pressed while the model is still loading (%s); holding the "
+                    "activation for up to %llu ms",
+                    kd::proto::to_string(session_->state()),
+                    static_cast<unsigned long long>(kActivationWaitMs));
+        set_tray_state(kd::OverlayState::ModelLoading);
+        if (overlay_ != nullptr) {
+            overlay_->set_state(kd::OverlayState::ModelLoading);
+            overlay_->show();
+        }
+        return;
+    }
+
     auto captured = kd::capture_foreground_target();
     if (!captured) {
         KD_LOG_WARN("no usable foreground target: %s", captured.status().message().c_str());
@@ -1184,7 +1305,25 @@ void App::begin_dictation() {
     // activation", and the switch that turns typing into stop-on-input for the duration.
     hotkey_->note_session_started();
 
-    apply(session_->on_local(kd::LocalEvent::HotkeyPressed));
+    // The verdict was being computed and dropped — `apply()` returns void, so a `Refused` press
+    // fell straight through to "Listening" and "dictation started" with no `start` on the wire.
+    // The session machine's refusals (password field, elevated target, secure desktop) all take
+    // that path, and so did the model-load press until the check above. §8's shape exactly: one
+    // side decides, the other never asks.
+    const kd::SessionMachine::Outcome o = session_->on_local(kd::LocalEvent::HotkeyPressed);
+    apply(o);
+    if (o.verdict == kd::Verdict::Refused) {
+        KD_LOG_WARN("the session machine refused the activation (%s); closing the microphone",
+                    kd::to_string(session_->refusal()));
+        capture_->stop();
+        audio_running_ = false;
+        hotkey_->note_session_ended();
+        target_.reset();
+        // The tray and the overlay were already set by SurfaceWarning in apply(); leaving them is
+        // the point — the refusal is what the user needs to see.
+        return;
+    }
+
     set_tray_state(kd::OverlayState::Listening);
     if (overlay_ != nullptr) {
         overlay_->set_state(kd::OverlayState::Listening);
@@ -1205,6 +1344,22 @@ void App::begin_dictation() {
 // found no target and returned, and the text went nowhere. The microphone closes now (nothing more
 // will be transcribed), the target closes at `stopped`.
 void App::end_dictation(kd::LocalEvent why) {
+    // Esc while an activation is still waiting for the model cancels the wait. It has to be
+    // handled before the guard below, which returns early precisely because none of the things it
+    // checks for exist yet: no target was captured and no microphone was opened. Without this the
+    // flag would survive Esc and the session would start on its own once the model loaded.
+    if (activation_pending_) {
+        activation_pending_ = false;
+        activation_deadline_ms_ = 0;
+        KD_LOG_INFO("queued activation cancelled: %s", kd::to_string(why));
+        set_tray_state(kd::OverlayState::Idle);
+        if (overlay_ != nullptr) {
+            overlay_->set_state(kd::OverlayState::Idle);
+            overlay_->hide();
+        }
+        return;
+    }
+
     if (session_ == nullptr || !target_.has_value() || finalizing_) return;
 
     KD_LOG_INFO("dictation ending: %s", kd::to_string(why));
@@ -1369,6 +1524,13 @@ void App::on_conn_state(kd::proto::ConnState s) {
 
         case kd::proto::ConnState::Idle:
             if (tray_state_ == kd::OverlayState::ModelLoading) set_tray_state(kd::OverlayState::Idle);
+            // A held activation is deliberately NOT started from here. This is IpcClient's view
+            // of the transport, and SessionMachine reaches IDLE only when it drains the `ready`
+            // *frame*, which arrives on a different queue (kMsgIpcQueue) than this notification
+            // (kMsgIpcState). Starting here would race that: on the losing order the machine is
+            // still LOADING, begin_dictation() re-queues the press, and nothing ever posts this
+            // state again — a hotkey that silently does nothing, permanently. The tick polls the
+            // machine's own state instead, which cannot disagree with itself. Costs one 50 ms tick.
             break;
 
         default:
@@ -1379,6 +1541,14 @@ void App::on_conn_state(kd::proto::ConnState s) {
 void App::on_sidecar_lost() {
     if (quitting_) return;
     KD_LOG_WARN("sidecar connection ended");
+    if (activation_pending_) {
+        // A respawn reaches IDLE again and would honour the held press seconds after a crash the
+        // user was never told about. A lost sidecar is something to report, not to quietly wait
+        // out; pressing the hotkey again once the tray recovers is one keystroke.
+        activation_pending_ = false;
+        activation_deadline_ms_ = 0;
+        KD_LOG_WARN("queued activation dropped: the sidecar was lost before the model was ready");
+    }
     if (target_.has_value() && !finalizing_ && hotkey_ != nullptr) hotkey_->note_session_ended();
     // Committed text stays in the document — it was correct when it was written and the
     // invariant forbids taking it back. Only the uncommitted tail is lost.
