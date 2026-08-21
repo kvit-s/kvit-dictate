@@ -1,10 +1,11 @@
 # progress — kvit-dictate
 
-Written 2026-08-21. Commit `a442a5b` on `main`.
+Written 2026-08-21. Commit `e800028` on `main`.
 
-Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks) and
-`docs/supported-targets.md` (measurements + open questions §9). This file is only: what works,
-what does not, and what to do next.
+Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks),
+`docs/supported-targets.md` (measurements + open questions §9) and
+`tools/kvit-speech/README.md` (the local model's measurement record). This file is only: what
+works, what does not, and what to do next.
 
 ---
 
@@ -33,6 +34,14 @@ has the mechanism.
 vLLM and got 4–5× faster, and grew a Silero VAD route. Both are now used — see §3b. Together they
 retired the two standing quality questions, and **Silero will not be run locally** (§6).
 
+**And there is now a second real model that needs no far end at all** (2026-08-21, later):
+`windows-speech` runs Microsoft's on-device speech model — quantized Whisper Small, an optional
+Windows component — entirely on this machine. It is the first configuration that keeps plan.md
+§2's "no network access during dictation" in the letter and not only the spirit, so §6's standing
+question *"what does the product do when the far end is unreachable?"* now has an answer to choose
+rather than only a problem to state. It is slower than the LAN (≈3.0 s for a 5 s utterance against
+strixhalo's ≈550 ms) and its API is experimental. §3d has the whole thing.
+
 ---
 
 ## 2. What works, verified by a human
@@ -56,7 +65,7 @@ cmake --build build-windows-msvc-debug --config Debug
 build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 331 tests / 36005 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
-python -m unittest discover -s server/tests -t server  # 392 tests   (from the repo root)
+python -m unittest discover -s server/tests -t server  # 416 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
@@ -77,9 +86,9 @@ as `settings.json.before-real-model`. The log at
 1. **How often audio is transcribed** — the utterance boundary. `settings.json`'s
    `session.endpoint_silence_ms` is only a *hint* (`session.cpp:752` says so; `close_utterance()`
    flips a bool and audio keeps flowing). The authoritative boundary is the sidecar's, so the knob
-   is `--endpoint-silence-ms` in **`models.json`**, now **1500 ms** for both qwen entries (was 800,
-   which split a sentence at every breath). The client-side value is kept at 1500 only so the two
-   do not read as disagreeing.
+   is `--endpoint-silence-ms` in **`models.json`**, now **1500 ms** for both qwen entries and both
+   windows-speech entries (was 800, which split a sentence at every breath). The client-side value
+   is kept at 1500 only so the two do not read as disagreeing.
 2. **How often text is typed** — `settings.json`'s `cadence.mode`, now **`end-of-session`**. See
    §3c. The two are independent: the sidecar still decodes about a sentence at a time and still
    uploads at most an 8 s window, whatever the client does with the results.
@@ -91,6 +100,8 @@ Model entries that matter:
 | `qwen-asr-http` | LAN Qwen3-ASR, re-transcribes once a second → live preview that revises. Used to trip the stability abort; fixed in `89d012e` and confirmed working (§3). Commits once per utterance, at the endpoint. |
 | `qwen-asr-http-finalize` | one request per utterance, no live preview. Cannot trip it. The reliable one. |
 | `mock` | scripted; the only entry that needs nothing at all. Still the way to test the C++ side in isolation. |
+| `windows-speech` | **local, no network.** Microsoft's on-device model (Whisper Small int8) via `tools/kvit-speech`. Finalize-only — one decode per utterance. Slower than the LAN; see §3d. |
+| `windows-speech-preview` | the same, with the hop on so the overlay revises. Lags on purpose; it exists so the lag can be seen rather than argued about. |
 | `whisper-large-v3-turbo` | zero-install baseline: the weights (1.6 GB) and the venv both already exist on this machine. Never run. |
 
 ---
@@ -242,6 +253,95 @@ contents, so it stops jittering on every revision.
 
 ---
 
+## 3d. The local model — `windows-speech`, added 2026-08-21
+
+**Dictation no longer requires another machine.** `windows-speech` runs Microsoft's on-device
+speech model through `Microsoft.Windows.AI.Speech`. Switching between it and the LAN is what it is
+for every other model: `model_id` in `settings.json`. No C++ changed — `models.json`'s
+`interpreter` + `module` + `args` already carried everything this needed.
+
+Verified through the real `Backend` interface against a 7.5 s synthesized utterance: load 2802 ms,
+one decode at the endpoint in 3486 ms, transcript exact. **Not yet verified by a human dictating
+into a document** — that is item 1 of §6.
+
+`tools/kvit-speech/README.md` carries the full measurement record. The five things that decide how
+it is used:
+
+**1. It is Whisper Small, int8.** The component package contains
+`whisper_small_encoder.quant.onnxe` (107 MB) and `whisper_small_decoder.quant.onnxe` (181 MB). So
+"uses components from OpenAI Whisper" means it *is* Whisper, and every Whisper caveat in this file
+applies to it — including §4's invented commits over silence. Measured here: two seconds of
+**digital silence** returned `Rwy'n cael ei wneud i'r unrhyw ychydig.`, a fluent Welsh sentence
+from an all-zero buffer. The backend carries its own `silence_peak_threshold` gate behind the
+server's VAD, and `test_windows_speech.py` asserts on the *request counter* rather than the text,
+because that assertion has to fail even when the invention is plausible.
+
+**2. It is slower than the LAN, and the shape of the cost is what matters.** Decode is
+≈ **1350 ms fixed + 0.30× real time** on this i7-14700K.
+
+| audio | 1 s | 3 s | 5 s | 8 s | 30 s |
+|---|---|---|---|---|---|
+| decode | 1668 ms | 2203 ms | 2984 ms | 3686 ms | 10197 ms |
+
+strixhalo does 5 s in ≈550 ms (§3b), so this is ~5× slower. The **fixed floor** is the part with
+consequences: a one-second hop needs a 1.7 s decode every second, so a live preview cannot keep up
+and falls further behind within a sentence. `finalize_only` is therefore the default, which is the
+same shape as `qwen-asr-http-finalize` and invisible under end-of-session cadence (§3c).
+
+**3. The API is experimental, and the documentation is wrong about that.** Microsoft's page gives
+the prerequisite as "WinAppSDK 1.7.1 or later". In fact `Microsoft.Windows.AI.Speech` exists in no
+stable Windows App SDK — 2.4.0 ships the Text, Imaging, Video, ContentSafety and MachineLearning
+projections and no Speech projection at all. `tools/kvit-speech` pins `2.3.2-experimentala` and
+carries the runtime beside the exe, so this does **not** require a preview runtime system-wide.
+`CS8305` warnings on every build are the API saying so; they are left visible.
+
+**4. Package identity is not required, despite the documentation saying it is.** The docs demand
+an MSIX with the `systemAIModels` capability, which would have forced identity on the whole
+process tree. Measured: `GetReadyState()` and `EnsureReadyAsync()` both work unpackaged, and only
+`TryCreateAsync()` fails — with `0x8007007E`, `ERROR_MOD_NOT_FOUND`. The implementation DLLs ship
+*inside* the component package's `winml\` folder and an unpackaged process has no package graph to
+resolve them through. Adding that folder to the DLL search path is the entire fix. **This is the
+most likely thing here to break on a future Windows update**; the symptom is exactly that HRESULT
+and the fallback is a sparse package identity for the helper alone.
+
+**5. The WinRT is in a separate process, and that is not incidental.** `tools/kvit-speech` is a C#
+helper the sidecar spawns and talks to over a small framed protocol. It is there so the sidecar
+package stays stdlib-only — a WinRT projection and a Windows App SDK bootstrapper inside
+`C:\Python312` would end that rule for *every* backend, not just this one. It also means the
+blast radius of an experimental API is one directory.
+
+It hijacks stdout before loading any speech DLL, because **those DLLs print to stdout**
+(`[loader] INT8 zp size mismatch: …` on every startup). That is precisely the hazard
+docs/protocol.md §2.1 cites when it refuses stdio for the main protocol, except here it is
+observed rather than hypothetical.
+
+### The streaming API was measured and rejected for this seam
+
+`StreamingRecognition` + `SpeechAudioProvider` does let the caller push its own PCM rather than
+letting the API open the microphone — which is the property kvit-dictate needs, since capture,
+VAD and gating already live here. It was not used anyway, because its output shape fights
+docs/protocol.md §8.1:
+
+```
+off=0     dur=4000   "The quick brown fox jumps over the lazy dog. This"
+off=3960  dur=4000   " is a test of the Windows on-device speech recognition model."
+off=7960  dur=1120   " of the Windows on Device Speech Recognition Model."
+```
+
+`Recognized` emits **overlapping four-second windows whose text repeats across the seam, recased**.
+`Recognizing` never fired at all and `IsFinal` was never true. §8.1 requires cumulative text, so
+using this means a de-overlap heuristic whose failure mode looks exactly like the stability
+violations §8.3 exists to reject — and §3 is the record of what one of those costs to diagnose.
+Batch returns one clean, correctly-cased, correctly-punctuated string per window, which is what
+`PseudoStreamingBackend` is built around.
+
+Two facts about it recorded so nobody rediscovers them: `StartContinuousRecognitionAsync()` must
+**not** be awaited before pushing audio (it runs for the life of the stream; awaiting it first
+deadlocks), and `provider.Dispose()` — not `StopContinuousRecognition()` — is the end-of-stream
+signal.
+
+---
+
 ## 4. Also true, and smaller
 
 * **The local endpointer stays as it is, and that is now a decision rather than a default.**
@@ -271,13 +371,25 @@ contents, so it stops jittering on every revision.
 
 ## 4b. Which VAD does what
 
-Three things could be called "the VAD". Only two of them run.
+Six things could be called "the VAD". Three of them run.
 
 | | where | what it decides | status |
 |---|---|---|---|
 | **energy/ZCR endpointer** | sidecar, `vad.py`, frame-wise on 32 ms frames | **when an utterance ends** (`--endpoint-silence-ms`, 1500 ms) and what reaches the decoder | **running** — this is "the local VAD" |
 | **`/v1/audio/vad`** (Silero) | strixhalo, batch, per window | **whether a window is speech at all**, before it is transcribed (§3b) | **running** — added 2026-08-21 |
+| **`silence_peak_threshold`** | `windows_speech.py`, per window | whether to spend a local decode at all | **running** — added 2026-08-21, and it is a *correctness* gate, not a saving (§3d) |
 | Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not happening** — decided, see below |
+| the Windows model's own VAD | inside the speech component (`vad.all.onnxe`, `vadapi.dll`) | its internal segmentation | **runs, and is not ours** — no API exposes it, no setting reaches it, and it did not stop the Welsh sentence over silence (§3d) |
+| Media Foundation Voice Capture DSP | `MFPKEY_WMAAECMA_FEATR_VAD`, `AEC_VAD_*` | would be a frame-wise speech/non-speech flag in the C++ client | **not needed** — see below |
+
+**On the Voice Capture DSP VAD.** It is real, it is public, and it is the wrong tool here. Three
+reasons, in order of weight. It is a *frame classifier*, so it answers "is this frame speech?" and
+not "has the speaker stopped?" — the endpointing state machine in `vad.py` would still have to
+exist, and would still be the thing with the bugs. It is a property of the Voice Capture DMO,
+which means adopting it means routing capture through that DMO and inheriting its AEC and its
+resampling, a change to `audio_capture.cpp` far larger than the thing it buys. And the measurement
+in §4b already says the local scorer is *over*-inclusive rather than lossy, so a better frame
+classifier is not what is missing. Recorded as considered and declined, not as unexamined.
 
 They are not alternatives. The first is a *streaming endpointer* answering "has the speaker
 stopped?" incrementally; the second is a *batch classifier* answering "is there speech in this
@@ -366,16 +478,26 @@ Actually next:
    has had a real day's dictation: `window_slide` should have stopped (30 s window), 5-byte
    `"Yeah."` commits should have stopped (the VAD gate), and a session should now survive past two
    minutes of continuous talking (§8's timer fix).
+1b. **Dictate into a document with `model_id: "windows-speech"`.** §3d is verified through the
+   `Backend` interface against synthesized speech, which is not the same claim: a real microphone
+   in a real room is exactly the case §4b says is not covered, and this model invents over
+   non-speech more readily than Qwen does. Two specific things to watch — whether the ~3 s wait
+   after the endpoint is tolerable in practice under end-of-session cadence, and whether anything
+   Welsh, or otherwise unrelated to what was said, reaches the document.
 2. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4.** The picks table
    still recommends models the operator has measured as worse than Qwen. Now overdue on two
    counts: `publish_stable_partials=False` means commit-at-the-endpoint is the permanent latency
    profile if the quality winner is a batch model, and §3b's numbers (34–55× realtime) invalidate
    the latency arithmetic the table's argument rests on.
-3. **Decide what the product does when the far end is unreachable.** Deeper than it was: strixhalo
-   now serves *both* transcription and VAD, so a LAN outage takes the whole product down rather
-   than degrading it. plan.md §2's "no network access during dictation" is broken in the letter,
-   and this is now a design commitment rather than a bring-up shortcut — it should be rewritten
-   deliberately or the dependency reduced, not left contradicting the plan.
+3. **Decide what the product does when the far end is unreachable** — half-answered, and the
+   remaining half is now a product decision rather than an engineering one. `windows-speech` (§3d)
+   is a complete local path, so the dependency is no longer forced: plan.md §2 can be honoured by
+   choosing that entry. What does *not* exist is any automatic behaviour. Selecting a model is a
+   `settings.json` edit and a restart, so a LAN outage mid-session still ends that session; nothing
+   detects strixhalo being down and nothing falls back. Whether it should is the open question, and
+   it is a real one — a silent fallback would swap a 550 ms model for a 3 s one without saying so,
+   which is its own kind of wrong. Also still true: strixhalo serves *both* transcription and VAD,
+   so the qwen entries have two dependencies on it, not one.
 4. **Two clipboard paths have still never executed.** The injection policy for `notepad.exe`, where
    the open question is whether the clipboard is restored afterwards; and the new
    `set_clipboard_text` rescue for a deferred buffer whose target has gone (§3c), which is

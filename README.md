@@ -79,6 +79,7 @@ src/
   settings.{h,cpp}    settings + the models.json manifest
   util/               utf8, json, log, result, clock         ← all pure
 tools/probe/          Phase 0B spike: fixed-text injector + anchor probe
+tools/kvit-speech/    C# helper for the on-device Windows AI speech model (WinRT)
 tools/testtarget/     controlled target: edit, richedit, multiline, password, RTL
 tests/                kd_test harness + suites + shared protocol fixtures
 server/kvit_asr/      Python sidecar: transport, session, stability, vad, backends/
@@ -188,7 +189,7 @@ its job.
 | **0A** Source and environment verification | ✅ done — `bench/CANDIDATES.md`; all three PRD citations resolve; four Phase-1 picks selected; NeMo need not be installed |
 | **Protocol spec** | ✅ done — `docs/protocol.md` (proto 1 draft) + 20 fixtures, run by BOTH endpoints. Freezes in Phase 2. |
 | **C++ client** | ✅ implemented — every module under `src/`, wired together in `main.cpp`. 303 tests. The whole path has now been executed against a real target: hotkey, microphone, session, commit, injection, finalisation. |
-| **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper), joined by `kvit_asr/connection.py`. 372 tests. All five backends are registered and reachable by name; only `mock` has ever run, because the other four need a model on disk and an environment that does not exist yet. |
+| **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper, openai-http, windows-speech), joined by `kvit_asr/connection.py`. 416 tests. Two have run against real audio: `openai-http` (Qwen3-ASR on the LAN) and `windows-speech` (Microsoft's on-device model, via `tools/kvit-speech`). The four that need a model on disk and an environment that does not exist yet still have not. |
 | **Bench harness** | ✅ implemented — recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
 | **Phase 0B** | ⚠️ started — 11 of 162 cells measured, all on `A09` (`tools/testtarget`), automated by `tools/phase0b/`. Read `docs/supported-targets.md` §5.9.1 and §5.9.2 before adding cells: they record why REF-1 cannot measure anchor error, and what the first eleven cells do and do not say. |
 | **0B** Windows feasibility spike | ⚠️ **instrument ready, not run — this is the critical gate.** `tools/probe` builds and walks a resumable 162-cell matrix; 0 cells are measured. Until an operator runs it, the inline-overlay UX is unproven and `docs/supported-targets.md` contains no measurements. |
