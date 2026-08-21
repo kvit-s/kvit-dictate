@@ -760,6 +760,30 @@ void App::drain_ipc_queue() {
         // §6.2: `stopped` is terminal for the session, and only now is the target free. The
         // verdict is what distinguishes it from a `stopped` for a session we have already moved
         // on from, which §7.1 says to record and apply to nothing.
+        // Tell the machine somebody is talking.
+        //
+        // Both silence timers hang off `last_voice_ms`, and `LocalEvent::SpeechDetected` is its
+        // only writer — which nothing in src/ was raising, so it kept the value it was seeded with
+        // at `start`. The endpoint timer is additionally guarded by `utterance_open`, set in that
+        // same unreachable handler, so it never fired at all; the session timer has no such guard
+        // and so counted wall-clock from activation instead of silence. The shipped 120 s became a
+        // hard two-minute cap on any dictation, however much the user was saying — which
+        // end-of-session cadence makes far easier to hit, since it exists to encourage long
+        // sessions.
+        //
+        // The signal is the sidecar's, not a second detector: it owns the VAD, and a `partial` or
+        // `final` carrying text is it reporting speech. Deriving it here costs nothing, cannot
+        // disagree with the endpointer that produced the words, and needs no audio analysis on
+        // this side. Empty text does not count — that is the backend saying it heard nothing.
+        if (outcome.verdict == kd::Verdict::Accept ||
+            outcome.verdict == kd::Verdict::AcceptAfterGap) {
+            const auto* p = m.get_if<kd::proto::PartialMsg>();
+            const auto* f = m.get_if<kd::proto::FinalMsg>();
+            if ((p != nullptr && !p->text.empty()) || (f != nullptr && !f->text.empty())) {
+                apply(session_->on_local(kd::LocalEvent::SpeechDetected));
+            }
+        }
+
         if (m.get_if<kd::proto::StoppedMsg>() != nullptr &&
             outcome.verdict == kd::Verdict::Accept) {
             finish_dictation("stopped");

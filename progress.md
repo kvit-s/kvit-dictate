@@ -49,7 +49,7 @@ has the mechanism.
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 328 tests / 35956 checks
+build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 331 tests / 36005 checks
 cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
 
 python -m unittest discover -s server/tests -t server  # 392 tests   (from the repo root)
@@ -346,6 +346,31 @@ problem.
 
 ---
 
+## 7b. Which VAD does what
+
+Three things could be called "the VAD". Only two of them run.
+
+| | where | what it decides | status |
+|---|---|---|---|
+| **energy/ZCR endpointer** | sidecar, `vad.py`, frame-wise on 32 ms frames | **when an utterance ends** (`--endpoint-silence-ms`, 1500 ms) and what reaches the decoder | **running** — this is "the local VAD" |
+| **`/v1/audio/vad`** (Silero) | strixhalo, batch, per window | **whether a window is speech at all**, before it is transcribed (§3b) | **running** — added 2026-08-21 |
+| Silero ONNX in-process | sidecar, `SileroOnnxScorer` | would replace the energy scorer above | **not configured** — no `onnxruntime` locally |
+
+They are not alternatives. The first is a *streaming endpointer* answering "has the speaker
+stopped?" incrementally; the second is a *batch classifier* answering "is there speech in this
+buffer?" about a finished window. Only the first can drive utterance boundaries; only the second is
+good enough to be trusted about content.
+
+`EnergyZcrScorer`'s own docstring is the honest account of the first one: *"It detects sound, not
+speech. A door, a keyboard, a cough and a loud fan step are all speech if they clear the SNR
+gate."* It also needs a calibration window, so a stream that opens mid-word loses that word's
+onset. It is the endpointer for now, and §3b's gate is what keeps its mistakes out of the
+document.
+
+**The client (C++) has no VAD at all**, which was not the design — see §8.
+
+---
+
 ## 8. The recurring failure mode, five sessions running
 
 **A contract implemented on one side and never called from the other.** The clearest instance yet
@@ -361,6 +386,20 @@ was the fix for the first:
 The habit that would have caught it: the log said `31 byte reason`, and 31 is the length of the
 fixed string on one specific branch. The evidence identifying the true path was already in the
 file that was being read for evidence.
+
+**2026-08-21, and the costliest yet because it was user-visible.** `LocalEvent::SpeechDetected` is
+the only writer of `last_voice_ms`, and it was raised from **nowhere** in `src/` — all four call
+sites were in `tests/`. Both of plan.md §1.6's silence timers hang off that value, so:
+
+* the endpoint timer, also guarded by `utterance_open` (set only in that same unreachable handler),
+  **never fired at all**;
+* the session timer has no such guard, so it measured **wall-clock since activation** rather than
+  silence — a hard **two-minute cap on every dictation**, however much the user was saying.
+
+A green suite said otherwise the whole time, because the tests raised the event themselves. That is
+the shape to watch for: a test that supplies the input the product never supplies is testing a
+function the product does not compute. Fixed by deriving the event from the sidecar's own
+`partial`/`final` text — the component that owns the VAD — rather than adding a second detector.
 
 Earlier instances:
 

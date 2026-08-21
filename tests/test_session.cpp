@@ -139,6 +139,53 @@ bool sends(const kd::SessionMachine::Outcome& o, proto::MessageType t) {
 //  plan.md §1.6 — the two timers a naive implementation merges
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
+// Both silence timers hang off `last_voice_ms`, whose only writer is `LocalEvent::SpeechDetected`.
+//
+// That event was raised from nowhere in src/ — every call site was in this file — so the value
+// stayed as seeded at `start` and the timers measured wall-clock since activation instead of
+// silence. The endpoint timer, additionally guarded by `utterance_open` (set in the same
+// unreachable handler), never fired at all; the session timer has no such guard and so imposed a
+// hard 120 s cap on every dictation however much the user was saying. `App` now derives the event
+// from the sidecar's own `partial`/`final` text, which is the component that owns the VAD.
+//
+// These two pin both halves: silence still ends the session, and speech still prevents it.
+KD_TEST(session, speech_keeps_the_session_alive_past_the_silence_timer) {
+    kd::ManualClock clock(1000);
+    kd::SessionConfig cfg;  // 120 s session timer
+    kd::SessionMachine m(clock, cfg);
+    bring_to_idle(m);
+    start_session(m);
+
+    // Three minutes of steady talking, reported the way App reports it.
+    for (int i = 0; i < 6; ++i) {
+        clock.advance(30000);
+        m.on_local(LocalEvent::SpeechDetected);
+        KD_CHECK_EQ(m.on_tick().verdict, Verdict::Accept);
+        KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+    }
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);   // still dictating at 3 minutes
+}
+
+KD_TEST(session, silence_past_the_session_timer_still_ends_it) {
+    kd::ManualClock clock(1000);
+    kd::SessionConfig cfg;
+    kd::SessionMachine m(clock, cfg);
+    bring_to_idle(m);
+    start_session(m);
+
+    // One burst of speech, then nothing for over two minutes.
+    m.on_local(LocalEvent::SpeechDetected);
+    clock.advance(60000);
+    KD_CHECK_EQ(m.on_tick().verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);   // a one-minute pause is not the end
+
+    clock.advance(61000);                                 // now past 120 s since the last word
+    const auto t = m.on_tick();
+    KD_CHECK_EQ(t.verdict, Verdict::Sent);
+    KD_CHECK(sends(t, proto::MessageType::Stop));
+    KD_CHECK_EQ(m.state(), proto::ConnState::Finalizing);
+}
+
 KD_TEST(session, thinking_pause_ends_the_utterance_and_not_the_session) {
     kd::ManualClock clock(1000);
     kd::SessionConfig cfg;  // 800 ms endpoint, 120 s session — the shipped defaults
