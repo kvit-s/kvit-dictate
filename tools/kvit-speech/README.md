@@ -153,25 +153,60 @@ Verified byte-identical transcripts for the same audio as a file path, as WAV by
 16 kHz mono s16le PCM. That is already the format docs/protocol.md §6.3 fixes, so nothing is
 converted anywhere on this path.
 
-### Streaming was measured and rejected for this seam
+### Streaming — measured three times, and the first reading was wrong
 
-`StreamingRecognition` + `SpeechAudioProvider` works — the caller can push its own PCM rather than
-letting the API open the microphone, which is what kvit-dictate needs. But its output shape does
-not fit:
+**Correction.** This section used to say streaming emitted "overlapping four-second windows whose
+text repeats across the seam, recased", and that this ruled it out. That was wrong. It was written
+from a 7.5 s run in which the last segment covered 7960–9080 ms while the speech ended at 7555 ms
+— so the apparent duplicate was a *silence hallucination*, the same failure as the Welsh sentence
+above, and not a seam artifact at all. The offsets were in the output and were not checked against
+where the speech ended.
+
+What actually happens, from 25.4 s of speech pushed at real time with no padding, run twice with
+byte-identical results:
 
 ```
-off=0     dur=4000   "The quick brown fox jumps over the lazy dog. This"
-off=3960  dur=4000   " is a test of the Windows on-device speech recognition model."
-off=7960  dur=1120   " of the Windows on Device Speech Recognition Model."
+off=    0  dur=4000  "The quick brown fox jumps over the lazy dog. D"
+off= 3960  dur=4000  " Dictation should not depend on another machine being switched on."
+off= 7960  dur=4000  " This sentence exists to push the audio well past the 4 second window"
+off=11960  dur=4000  " boundary so that several segments are produced. The third window"
+off=15960  dur=4000  " begins somewhere inside the sentence, which is exactly where a scene"
+off=19960  dur=4000  " duplicate would show up if there were one. Finally, a short"
+off=23955  dur=1405  " closing clause."
 ```
 
-`Recognized` emits **overlapping four-second windows** whose text repeats across the seam, recased.
-`Recognizing` never fired at all and `IsFinal` was never true. docs/protocol.md §8.1 requires
-cumulative text, so using this would mean a de-overlap heuristic whose failures look exactly like
-the stability violations §8.3 exists to reject.
+Segments are deterministic and essentially contiguous. **No phrase repeats across a seam.** There
+is one artifact, and it is the opposite of a repeat: a **truncated word fragment** at the first
+seam — `"… lazy dog. D"`, with `"Dictation"` arriving whole in the next segment — so naive
+concatenation gives `"dog. D Dictation"`. Real, and it would corrupt the cumulative text
+docs/protocol.md §8.1 requires, but narrow and characterised rather than structural.
 
-Two more facts about it, recorded so nobody has to rediscover them:
+One more difference from batch: inverse text normalisation varies with context. Streaming produced
+`"the 4 second window"` where batch, seeing the whole utterance, produced `"the four-second
+window"`. Neither is wrong; they are not identical.
 
+**The reason to build it is latency**, and the gap is large on a long utterance:
+
+| | 25.4 s of audio |
+|---|---|
+| batch, whole utterance | 8740 ms / 9486 ms |
+| streaming, tail after last audio | **1703 ms / 1575 ms** |
+
+Five to six times better, because streaming overlaps decode with speech and only the tail is left
+when the speaker stops. It also has no window cap — batch decode grows with the window, so
+`window_ms` truncates a long utterance and `PseudoStreamingBackend` reassembles it from a frozen
+prefix; streaming needs none of that. For a *short* utterance the two are close, since batch's
+~1350 ms floor and streaming's ~1.6 s tail are comparable.
+
+So the honest status is **promising and not built**, not rejected. Building it means a `Backend`
+that declares `stateful-chunked`, holds the stream open across an utterance, accumulates segments,
+and repairs the seam fragment.
+
+Three mechanical facts, recorded so nobody has to rediscover them:
+
+* `Recognizing` **never fires** — three runs, both audio lengths, real-time and faster-than-real-time
+  pushes. And `IsFinal` is **never true**, even at the real end of the stream. Neither event can be
+  used to detect finality.
 * `StartContinuousRecognitionAsync()` must **not** be awaited before pushing audio. It does not
   complete on start; it runs for the life of the stream. Awaiting it first deadlocks.
 * `provider.Dispose()` is the end-of-stream signal, and the thing that completes that task.

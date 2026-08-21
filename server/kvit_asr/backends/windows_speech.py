@@ -18,20 +18,49 @@ it every time (measured 2851 ms cold / 919 ms warm).
 
 ─── Why this is a PseudoStreamingBackend, and why finalize-only is the default ─────────────────
 
-The API's streaming mode was measured and rejected for this seam, not overlooked.
-``StreamingRecognition`` emits ``Recognized`` events carrying **overlapping four-second windows**
-whose text repeats across the seam, recased:
+Batch is what is implemented. It is **not** established that batch is the better choice, and the
+first version of this comment claimed it was on a reading of the data that turned out to be wrong.
+What is measured, three runs, is below; the honest status of streaming is *promising and not
+built*, not *rejected*.
 
-    off=0     dur=4000   "The quick brown fox jumps over the lazy dog. This"
-    off=3960  dur=4000   " is a test of the Windows on-device speech recognition model."
-    off=7960  dur=1120   " of the Windows on Device Speech Recognition Model."
+``StreamingRecognition`` + ``SpeechAudioProvider`` lets the caller push its own PCM rather than
+letting the API open the microphone, which is the property this product needs — capture, VAD and
+gating already live on this side. Its ``Recognized`` events carry deterministic, essentially
+contiguous ~4 s segments. On 25.4 s of speech, twice, byte-identical both times:
 
-docs/protocol.md §8.1 requires a backend's text to be **cumulative**, and reconciling those
-windows into a cumulative string means a de-overlap heuristic whose failures would look exactly
-like the stability violations §8.3 exists to reject. ``Recognizing`` never fired at all, and
-``IsFinal`` was never true. Batch recognition returns one clean, correctly-cased, correctly-
-punctuated string for the window it is given, which is what ``PseudoStreamingBackend`` is built
-around. If the streaming API's semantics change, revisit — but re-measure first.
+    off=    0  dur=4000  "The quick brown fox jumps over the lazy dog. D"
+    off= 3960  dur=4000  " Dictation should not depend on another machine being switched on."
+    off= 7960  dur=4000  " This sentence exists to push the audio well past the 4 second window"
+    ...
+
+**Text does not repeat across the seams.** The one artifact is at the first seam and is the
+opposite of a repeat: a *truncated* word fragment, ``"… lazy dog. D"``, with the whole word
+arriving in the next segment. Naive concatenation therefore yields ``"dog. D Dictation"``. That is
+real and would corrupt the cumulative text docs/protocol.md §8.1 requires, but it is a narrow,
+characterised defect rather than the de-overlap problem this comment used to describe. (The
+apparent duplicate in the earlier 7.5 s run was a *silence hallucination*: that segment covered
+7960–9080 ms and the speech ended at 7555 ms.)
+
+The reason to revisit is latency, and it is not small. Streaming overlaps decode with speech, so
+what is left when the speaker stops is only the tail:
+
+    25.4 s of audio    batch 8740 / 9486 ms      streaming tail 1703 / 1575 ms after last audio
+
+Five to six times better on a long utterance, and it also has no window cap — ``window_ms`` below
+exists because batch decode grows with the window, and a long utterance is truncated to the last
+``window_ms`` and reassembled by ``PseudoStreamingBackend``'s frozen-prefix machinery. Streaming
+needs none of that. For a *short* utterance the gap is much smaller, because batch's fixed ~1350 ms
+floor and streaming's ~1.6 s tail are comparable.
+
+Two more facts, so nobody rediscovers them: ``Recognizing`` never fires (three runs), and
+``IsFinal`` is never true even at the real end of the stream — so neither can be used to detect
+finality. ``provider.Dispose()``, not ``StopContinuousRecognition()``, is the end-of-stream signal,
+and it is what completes ``StartContinuousRecognitionAsync``'s task. That task must not be awaited
+before pushing audio; it runs for the life of the stream, and awaiting it first deadlocks.
+
+Building it means a different shape from this class: a ``Backend`` that declares
+``STATEFUL_CHUNKED``, holds the stream open across an utterance, accumulates segments into
+cumulative text, and repairs the seam fragment. That is a real piece of work and it is not done.
 
 Decode cost, measured on an i7-14700K with the CPU execution provider:
 

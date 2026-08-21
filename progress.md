@@ -315,30 +315,46 @@ It hijacks stdout before loading any speech DLL, because **those DLLs print to s
 docs/protocol.md §2.1 cites when it refuses stdio for the main protocol, except here it is
 observed rather than hypothetical.
 
-### The streaming API was measured and rejected for this seam
+### The streaming API — promising, not built, and this section used to be wrong
 
-`StreamingRecognition` + `SpeechAudioProvider` does let the caller push its own PCM rather than
-letting the API open the microphone — which is the property kvit-dictate needs, since capture,
-VAD and gating already live here. It was not used anyway, because its output shape fights
-docs/protocol.md §8.1:
+**Retracted.** This section previously said streaming emitted *"overlapping four-second windows
+whose text repeats across the seam, recased"* and treated that as disqualifying. It was written
+from a 7.5 s run whose last segment covered 7960–9080 ms while the speech ended at 7555 ms — so
+the apparent duplicate was a **silence hallucination**, the same failure as the Welsh sentence,
+not a seam artifact. The offsets were in the output and were not checked against where the speech
+ended. Batch is still what is implemented; what is not true is that it was the *measured better*
+choice. §8 has the habit that would have caught it.
 
-```
-off=0     dur=4000   "The quick brown fox jumps over the lazy dog. This"
-off=3960  dur=4000   " is a test of the Windows on-device speech recognition model."
-off=7960  dur=1120   " of the Windows on Device Speech Recognition Model."
-```
+Re-measured on 25.4 s of speech, pushed at real time with no padding, run twice with
+byte-identical results. Segments are deterministic and essentially contiguous, and **no phrase
+repeats across a seam**. The one real artifact is the opposite of a repeat — a **truncated word
+fragment**: segment 1 ends `"… lazy dog. D"` and segment 2 begins `" Dictation …"`, so naive
+concatenation gives `"dog. D Dictation"`. That would corrupt cumulative text under §8.1, but it is
+a narrow characterised defect, not a structural mismatch.
 
-`Recognized` emits **overlapping four-second windows whose text repeats across the seam, recased**.
-`Recognizing` never fired at all and `IsFinal` was never true. §8.1 requires cumulative text, so
-using this means a de-overlap heuristic whose failure mode looks exactly like the stability
-violations §8.3 exists to reject — and §3 is the record of what one of those costs to diagnose.
-Batch returns one clean, correctly-cased, correctly-punctuated string per window, which is what
-`PseudoStreamingBackend` is built around.
+**The reason to build it is latency, and the gap is not small:**
 
-Two facts about it recorded so nobody rediscovers them: `StartContinuousRecognitionAsync()` must
-**not** be awaited before pushing audio (it runs for the life of the stream; awaiting it first
-deadlocks), and `provider.Dispose()` — not `StopContinuousRecognition()` — is the end-of-stream
-signal.
+| | 25.4 s of audio |
+|---|---|
+| batch, whole utterance | 8740 / 9486 ms |
+| streaming, tail after the last audio | **1703 / 1575 ms** |
+
+Streaming overlaps decode with speech, so only the tail is left when the speaker stops. It also
+needs no window cap: batch decode grows with the window, so `window_ms` truncates a long utterance
+and `PseudoStreamingBackend` reassembles it from a frozen prefix. For a *short* utterance the two
+are close — batch's ~1350 ms floor against streaming's ~1.6 s tail — so the win is concentrated
+exactly where batch is worst.
+
+Building it means a `Backend` declaring `stateful-chunked` that holds the stream open across an
+utterance, accumulates segments, and repairs the seam fragment. **No C++ would change for it
+either**: `native-streaming` and `stateful-chunked` are already declared modes the client speaks,
+and `feed() -> list[Hypothesis]` is already the streaming shape. See §6.
+
+Three mechanical facts, recorded so nobody rediscovers them: `Recognizing` **never fires** (three
+runs, both audio lengths) and `IsFinal` is **never true** even at the real end, so neither can
+detect finality; `StartContinuousRecognitionAsync()` must **not** be awaited before pushing audio
+(it runs for the life of the stream, and awaiting it first deadlocks); and `provider.Dispose()` —
+not `StopContinuousRecognition()` — is the end-of-stream signal and what completes that task.
 
 ---
 
@@ -484,6 +500,14 @@ Actually next:
    non-speech more readily than Qwen does. Two specific things to watch — whether the ~3 s wait
    after the endpoint is tolerable in practice under end-of-session cadence, and whether anything
    Welsh, or otherwise unrelated to what was said, reaches the document.
+1c. **Decide whether to build the streaming arm of `windows-speech`** (§3d). Measured: on 25.4 s of
+   speech, batch takes 8.7–9.5 s from the endpoint while streaming leaves a 1.6–1.7 s tail, and
+   streaming needs no `window_ms` cap at all. The win is concentrated on long utterances, which is
+   exactly where batch is worst and where the frozen-prefix reassembly is doing the most guessing.
+   The cost is one characterised defect to repair — a truncated word fragment at the first seam —
+   plus a `Backend` that holds the stream open and declares `stateful-chunked`. **No C++ changes**;
+   the client already speaks that mode. Do §6.1b first: if ~3 s after the endpoint turns out to be
+   fine in real use, this is optimisation and can wait behind items 2–5.
 2. **Record the Nemotron/zipformer quality finding in `bench/CANDIDATES.md` §4.** The picks table
    still recommends models the operator has measured as worse than Qwen. Now overdue on two
    counts: `publish_stable_partials=False` means commit-at-the-endpoint is the permanent latency
@@ -562,6 +586,20 @@ Earlier instances:
 * `note_session_ended()` was called from one of the two paths a session can end through, so an
   abort left the hotkey permanently dead.
 * `o.error` — the session machine's full diagnosis — was built on every error and read by nothing.
+
+**2026-08-21, §3d, and it is the `31 byte reason` habit exactly.** The streaming API was written up
+as disqualified because a segment "repeated across the seam". The segment's own `off=7960
+dur=1120` was printed on the same line as the text, the speech in that clip ended at 7555 ms, and
+comparing the two numbers is the whole refutation: it was not a repeat, it was the silence
+hallucination this same section documents three paragraphs earlier. **The evidence was in the
+output being read for evidence**, one field to the left of the text that was read instead — and it
+was then written into three files as a settled finding, which is what made it expensive rather than
+merely wrong. Caught only because the operator asked whether the design should have changed.
+
+Its own twin: **one run is not a measurement.** The retracted claim came from a single clip, of a
+single length, with padding the real product would never send. The correction came from a longer
+clip run twice, byte-identical — which is what made the truncated-fragment artifact trustworthy
+enough to write down.
 
 And its measurement-side twin: **a harness that is not faithful to the product measures a different
 function.** The Phase 0B row was measured three times before its numbers meant anything: first with
