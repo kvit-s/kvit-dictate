@@ -122,6 +122,12 @@ REGISTRY: dict[str, str] = {
     # no environment to build and nothing to download. Its module is stdlib-only, so unlike every
     # other row here it cannot raise BackendUnavailable for a missing runtime.
     "openai-http": ".openai_http:OpenAiHttpBackend",
+    # Not a CANDIDATES.md row either. The on-device Windows AI speech model (Whisper Small int8),
+    # reached through a C# helper process because the API is WinRT. Like `openai-http` its module
+    # is stdlib-only and so can never raise BackendUnavailable — what it *can* be missing is the
+    # helper executable and the optional Windows component, and both of those are reported by
+    # `load()` with the command to fix them, not by an import failure.
+    "windows-speech": ".windows_speech:WindowsSpeechBackend",
 }
 
 

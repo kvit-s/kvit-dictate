@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>kvit-speech</AssemblyName>
+    <RootNamespace>KvitSpeech</RootNamespace>
+    <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>x64</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- No package identity. The whole point of this helper is that it runs as an ordinary child
+         process of the Python sidecar, which is itself an ordinary child of kvit-dictate.exe.
+         See SpeechRuntime.cs for what that costs and how it is paid for. -->
+    <WindowsPackageType>None</WindowsPackageType>
+
+    <!-- Self-contained *Windows App SDK*, not self-contained .NET. The Speech API ships only in
+         the WinAppSDK experimental channel, whose framework package is NOT installed on a normal
+         machine; carrying it in this folder means using this backend never requires installing a
+         preview runtime system-wide. The .NET runtime is still a machine dependency, declared in
+         the models.json entry's "requires". -->
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- EXPERIMENTAL ON PURPOSE, and pinned. Microsoft.Windows.AI.Speech does not exist in any
+         stable Windows App SDK: 2.4.0 ships AI.Text / AI.Imaging / AI.Video / AI.ContentSafety /
+         AI.MachineLearning and no Speech projection at all. Verified by inspecting the restored
+         package, not by reading the docs, which claim "WinAppSDK 1.7.1 or later". Moving this to a
+         stable version will remove the API; moving it forward within the experimental channel is
+         a change that must be re-measured, because nothing here is covered by a stability
+         guarantee. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.2-experimentala" />
+  </ItemGroup>
+
+</Project>
