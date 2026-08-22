@@ -1009,11 +1009,21 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             // wasted GDI round trip on the message-loop thread.
             return 1;
 
-        case WM_PAINT:
-            // Layered windows painted with UpdateLayeredWindow do not paint through WM_PAINT.
-            // Validate so the message is not re-posted forever if one ever arrives.
-            ValidateRect(hwnd, nullptr);
+        case WM_PAINT: {
+            // Layered windows painted with UpdateLayeredWindow do not paint through WM_PAINT,
+            // but the message still has to be *answered properly*, and ValidateRect is not a
+            // proper answer. ValidateRect clears the client update region only; it leaves the
+            // window's internal paint state — the non-client half of it — set. Windows then
+            // regenerates WM_PAINT the moment the queue drains, and GetMessage hands it back
+            // forever: measured at ~190,000 WM_PAINT per second on an idle, *hidden* overlay,
+            // which is one core of kernel time spent dispatching a message we already answered.
+            // BeginPaint/EndPaint is the only pair that clears both halves. The empty body is
+            // deliberate — the pixels come from UpdateLayeredWindow.
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
             return 0;
+        }
 
         case WM_DPICHANGED:
             // The suggested rectangle in lParam is deliberately ignored. It is a proportional
