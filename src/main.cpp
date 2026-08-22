@@ -107,7 +107,10 @@ const wchar_t kSingleInstanceMutex[] = L"Local\\kvit-dictate-single-instance";
 
 // A queued hotkey/mouse notification from the hook thread.
 struct HookNote {
-    enum class Kind : uint8_t { Activate, Finalize, Cancel, StopInput, LeftClick, Wheel, HookLost };
+    enum class Kind : uint8_t {
+        Activate, Finalize, Cancel, StopInput, LeftClick, Wheel, HookLost,
+        Commit,   // Enter — docs/editing.md §4.3
+    };
     Kind kind = Kind::Activate;
     kd::StopInputReason reason = kd::StopInputReason::Keystroke;
     int32_t x = 0;
@@ -175,6 +178,7 @@ public:
     void on_activate() override { post_hook(HookNote{HookNote::Kind::Activate}); }
     void on_finalize() override { post_hook(HookNote{HookNote::Kind::Finalize}); }
     void on_cancel() override { post_hook(HookNote{HookNote::Kind::Cancel}); }
+    void on_commit() override { post_hook(HookNote{HookNote::Kind::Commit}); }
     void on_stop_input(kd::StopInputReason reason) override {
         HookNote n;
         n.kind = HookNote::Kind::StopInput;
@@ -454,6 +458,12 @@ bool App::startup() {
     // must not depend on the thing it is filtering out. Without this, the first injected
     // character stops the session that produced it.
     hotkey_->set_injection_mark(kd::injection_mark().extra_info);
+
+    // docs/editing.md §12/§16. Before start(), so the very first chord is classified against the
+    // user's configuration rather than against EditingConfig's defaults — and unconditionally,
+    // because Settings::normalise() has already forced `enabled` off for any cadence but
+    // end-of-session and this is the one place that answer is consumed.
+    hotkey_->set_editing(settings_.editing);
 
     if (const kd::Status st = hotkey_->start(settings_.hotkey,
                                              reinterpret_cast<uintptr_t>(hwnd_), this);
@@ -767,6 +777,15 @@ void App::drain_hook_queue() {
             case HookNote::Kind::Cancel:
                 end_dictation(kd::LocalEvent::EscPressed);
                 break;
+            case HookNote::Kind::Commit:
+                // docs/editing.md §4.3. The same finalise the hotkey's second press produces —
+                // `stop`, a last decode, then finish_dictation() flushing the buffer — reached
+                // by the gesture that now means it. What is different is upstream: the filter
+                // swallowed the Enter, so the target never receives it and the session's text can
+                // no longer land after a line break the user meant to come *after* it (§2).
+                KD_LOG_INFO("commit: Enter");
+                end_dictation(kd::LocalEvent::HotkeyPressed);
+                break;
             case HookNote::Kind::StopInput:
                 // The reason is known here and was being dropped one line later: end_dictation
                 // takes a LocalEvent, so the log read "dictation ending: stop_on_input" and left
@@ -790,6 +809,7 @@ void App::drain_hook_queue() {
                 KD_LOG_ERROR("keyboard hook was removed by the system; reinstalling");
                 if (hotkey_ != nullptr) {
                     hotkey_->stop();
+                    hotkey_->set_editing(settings_.editing);
                     hotkey_->start(settings_.hotkey, reinterpret_cast<uintptr_t>(hwnd_), this);
                 }
                 break;
@@ -1629,6 +1649,7 @@ void App::apply_settings(kd::Settings next) {
 
     if (hotkey_ != nullptr) {
         hotkey_->stop();
+        hotkey_->set_editing(settings_.editing);
         if (const kd::Status st = hotkey_->start(settings_.hotkey,
                                                  reinterpret_cast<uintptr_t>(hwnd_), this);
             !st.ok()) {

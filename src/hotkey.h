@@ -141,6 +141,36 @@ struct HotkeySpec {
 // The presets settings offers, as data rather than as a switch statement in the dialog.
 std::vector<std::pair<std::string, HotkeySpec>> hotkey_presets();
 
+// ─── The compose buffer's configuration (docs/editing.md §12) ───────────────────────────────
+
+// What happens to a key the pill claims but has no meaning for — Ctrl+S, F5, Win+E.
+//
+// Deliberately an enum and not a boolean, because the two values name two different things that
+// happen and `capture_all_keys: true` would have left the reader to guess which
+// (docs/editing.md §12).
+enum class ForeignKeyAction : uint8_t {
+    Ignore,      // swallowed, nothing happens, the pill shows a one-line hint (§4.4, the default)
+    EndSession,  // today's behaviour: the key passes through and stop-on-input ends the session
+};
+
+const char* to_string(ForeignKeyAction a) noexcept;
+bool parse_foreign_key_action(std::string_view s, ForeignKeyAction& out) noexcept;
+
+struct EditingConfig {
+    // Forced off unless `stability.cadence` is `end-of-session` — docs/editing.md §6.1: under
+    // Cadence::Immediate the text is already in the document as it is spoken and there is
+    // nothing in the pill to edit. Settings::normalise() is where that is applied, so nothing
+    // downstream has to re-derive it.
+    bool enabled = true;
+    bool mouse = true;
+    ForeignKeyAction on_foreign_key = ForeignKeyAction::Ignore;
+
+    // Only Enter is offered, but it is a value rather than a constant so that the settings block
+    // has somewhere to land and so the tests can prove the classification is driven by
+    // configuration rather than by a VK buried in a switch.
+    uint32_t commit_vk = vk::kReturn;
+};
+
 // ─── Reasons a session ends from input ──────────────────────────────────────────────────────
 
 enum class StopInputReason : uint8_t {
@@ -149,6 +179,7 @@ enum class StopInputReason : uint8_t {
     HotkeyToggle,  // the second press: finalise (commit the stable prefix, discard the tail
                    // after a final decode)
     Escape,        // cancel: discard everything uncommitted
+    Commit,        // Enter: docs/editing.md §4.3. Swallowed, never replayed to the target.
 };
 
 const char* to_string(StopInputReason r) noexcept;
@@ -179,6 +210,16 @@ struct FilterOutcome {
     bool toggle_finalize = false; // second hotkey press
     bool cancel = false;          // Esc
 
+    // docs/editing.md §4.3's Commit class: Enter, unmodified, while a session is running.
+    //
+    // This is **not** stop-on-input wearing a different name, and the difference is the whole
+    // point of the feature's first stage. Stop-on-input observes a key and lets it through, so
+    // the target received the Enter *before* the session's text was injected and the dictated
+    // words landed on the line below where they belonged. Commit swallows the key: it means
+    // "finish and type what you have", nothing else, and the target never sees it. Press Enter
+    // again once the session is over and it reaches the application normally.
+    bool commit = false;
+
     bool stop_on_input = false;
     StopInputReason stop_reason = StopInputReason::Keystroke;
 
@@ -204,6 +245,12 @@ public:
 
     // Pure decision. No allocation, no syscall, bounded work — safe to call from the hook.
     FilterOutcome on_event(const InputEvent& e);
+
+    // docs/editing.md §12. With `enabled` false the filter behaves exactly as it did before the
+    // compose buffer existed: Enter is stop-on-input and reaches the target, and the hotkey
+    // keeps plan.md §1.8's toggle.
+    void set_editing(const EditingConfig& cfg) noexcept;
+    [[nodiscard]] const EditingConfig& editing() const noexcept;
 
     // Test/inspection accessors.
     [[nodiscard]] bool session_active() const noexcept;
@@ -237,7 +284,12 @@ private:
     static constexpr size_t kVkWords = vk::kCount / 64;
     uint64_t down_[kVkWords]{};
     uint64_t down_at_activation_[kVkWords]{};
+    // Key-downs this filter swallowed on the pill's behalf. Their key-ups must be swallowed too:
+    // a target that never saw the press but does see the release can get its own key-state
+    // tracking stuck — the same failure the binding key's release is already swallowed to avoid.
+    uint64_t swallowed_down_[kVkWords]{};
     HotkeySpec spec_{};
+    EditingConfig editing_{};
     uintptr_t injection_mark_ = 0;
     bool session_active_ = false;
     uint64_t session_started_ms_ = 0;
@@ -254,6 +306,12 @@ public:
     virtual void on_activate() = 0;
     virtual void on_finalize() = 0;
     virtual void on_cancel() = 0;
+
+    // Enter, swallowed: type the composed buffer into the document and end the session
+    // (docs/editing.md §4.3). Distinct from on_finalize() so the log — and anyone reading this
+    // interface — can tell the two gestures apart.
+    virtual void on_commit() = 0;
+
     virtual void on_stop_input(StopInputReason reason) = 0;
 
     // Anchor source B (plan.md §1.5). `window` is the HWND under the click, as an opaque value.
@@ -289,6 +347,9 @@ enum class HotkeyPost : uint32_t {
     LeftClick,
     Wheel,
     HookLost,
+    Commit,     // Enter — docs/editing.md §4.3. Appended, not inserted: the values are compared
+                // as integers across a PostMessage boundary and renumbering them would make an
+                // in-flight message mean something else.
 };
 
 // Call from the owner window's WndProc. Returns true if the message belonged to this module,
@@ -309,6 +370,10 @@ public:
 
     // Change the binding without tearing the hooks down.
     void set_hotkey(const HotkeySpec& spec);
+
+    // Same route, same reason: the filter is hook-thread-only state, so a settings change
+    // reaches it as a posted message rather than as a write from the UI thread.
+    void set_editing(const EditingConfig& cfg);
 
     // The dwExtraInfo value that marks this process's own synthetic input, so the filter can
     // ignore it (plan.md §1.8: "Our own SendInput traffic must never stop the session producing

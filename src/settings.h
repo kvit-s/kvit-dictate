@@ -181,6 +181,14 @@ struct Settings {
     // per-app policies. Wiring it fully needs one bool on InjectConfig.
     bool paste_ctrl_shift_v_default = false;
 
+    // docs/editing.md §12 — the pill as a compose buffer. `editing.enabled` is forced off by
+    // normalise() unless the cadence is `end-of-session`, because under Cadence::Immediate the
+    // text is already in the document as it is spoken and there is nothing in the pill to edit
+    // (docs/editing.md §6.1). That is a live trap rather than a hypothetical one: Immediate is
+    // still the default in commit_engine.h, so a user who has changed nothing would otherwise
+    // get a feature that parses, validates, round-trips and does nothing.
+    EditingConfig editing;
+
     // plan.md §1.5 / §1.3.
     anchor::AnchorConfig anchor;
     OverlayStyle overlay_style;

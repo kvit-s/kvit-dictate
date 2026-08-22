@@ -72,12 +72,33 @@ static_assert(kMsgHotkey == WM_APP + 0x11u, "kMsgHotkey must be inside the WM_AP
 //  StopInputReason
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
+const char* to_string(ForeignKeyAction a) noexcept {
+    switch (a) {
+        case ForeignKeyAction::Ignore: return "ignore";
+        case ForeignKeyAction::EndSession: return "end-session";
+    }
+    return "ignore";
+}
+
+bool parse_foreign_key_action(std::string_view s, ForeignKeyAction& out) noexcept {
+    if (s == "ignore") {
+        out = ForeignKeyAction::Ignore;
+        return true;
+    }
+    if (s == "end-session") {
+        out = ForeignKeyAction::EndSession;
+        return true;
+    }
+    return false;
+}
+
 const char* to_string(StopInputReason r) noexcept {
     switch (r) {
         case StopInputReason::Keystroke: return "keystroke";
         case StopInputReason::MouseClick: return "mouse_click";
         case StopInputReason::HotkeyToggle: return "hotkey_toggle";
         case StopInputReason::Escape: return "escape";
+        case StopInputReason::Commit: return "commit";
     }
     return "unknown";
 }
@@ -313,6 +334,10 @@ void InputFilter::set_hotkey(const HotkeySpec& spec) {
 
 const HotkeySpec& InputFilter::hotkey() const noexcept { return spec_; }
 
+void InputFilter::set_editing(const EditingConfig& cfg) noexcept { editing_ = cfg; }
+
+const EditingConfig& InputFilter::editing() const noexcept { return editing_; }
+
 void InputFilter::set_injection_mark(uintptr_t extra_info) noexcept { injection_mark_ = extra_info; }
 
 void InputFilter::begin_session_state(uint64_t now_ms) noexcept {
@@ -343,7 +368,10 @@ void InputFilter::note_session_ended() {
     session_started_ms_ = 0;
     for (size_t i = 0; i < kVkWords; ++i) down_at_activation_[i] = 0;
     // hotkey_chord_consumed_ is deliberately NOT cleared: the binding key may still be held, and
-    // its key-up must still be swallowed to match the key-down we swallowed.
+    // its key-up must still be swallowed to match the key-down we swallowed. `swallowed_down_`
+    // is left alone for exactly the same reason — Enter is very often still down at the instant
+    // the commit it triggered ends the session, and its release has to go the same way its press
+    // did or the target sees half a keystroke.
 }
 
 uint32_t InputFilter::current_mods(uint32_t ignore_vk) const noexcept {
@@ -436,6 +464,15 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
             return out;
         }
 
+        // The same rule, generalised to every key the pill swallowed on its own behalf — Enter,
+        // today. The set is written by the key-down path below and drained here, so a key can
+        // only ever have its release swallowed once, and only if its press actually was.
+        if (bit_test(swallowed_down_, e.vk)) {
+            bit_clear(swallowed_down_, e.vk);
+            out.swallow = true;
+            return out;
+        }
+
         // plan.md §1.8's rule, stated there as "ignore all key-up events for keys already down
         // at activation". This implementation is deliberately stronger: **no key-up ever stops
         // the session**, whether or not the key was held at activation. A key-up cannot express
@@ -487,6 +524,25 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
     // target also sees the Esc; the alternative cost is worse and less explicable.
     if (e.vk == vk::kEscape) {
         out.cancel = true;
+        return out;
+    }
+
+    // ── Enter commits, and is consumed ───────────────────────────────────────────────────────
+    //
+    // docs/editing.md §4.3. **Unmodified only**: Ctrl+Enter, Shift+Enter and Alt+Enter mean
+    // something in the target (send-and-keep-open, soft line break, properties) and are not this
+    // gesture. Auto-repeat is excluded too — one press, one commit — but the repeats are still
+    // swallowed, because a target that received only the *second* Enter of a held key is worse
+    // than one that received none.
+    //
+    // Swallowed rather than passed through, which is the entire fix for the ordering bug in
+    // docs/editing.md §2: stop-on-input let the Enter reach the application first and the
+    // session's text was injected after it, one line below where the user was typing.
+    if (editing_.enabled && e.vk == editing_.commit_vk &&
+        current_mods(editing_.commit_vk) == kModNone) {
+        out.swallow = true;
+        bit_set(swallowed_down_, e.vk);
+        if (!was_down) out.commit = true;
         return out;
     }
 
@@ -628,6 +684,7 @@ constexpr UINT kHookMsgSessionStarted = WM_USER + 2;
 constexpr UINT kHookMsgSessionEnded = WM_USER + 3;
 constexpr UINT kHookMsgSuppressStart = WM_USER + 4;
 constexpr UINT kHookMsgSetMark = WM_USER + 5;        // wParam: dwExtraInfo mark
+constexpr UINT kHookMsgSetEditing = WM_USER + 6;     // lParam: new EditingConfig*, owned by the loop
 
 // How often the watchdog checks whether we are still in the hook chain, and how far behind the
 // system's last-input time we tolerate being before concluding we are not.
@@ -771,6 +828,7 @@ void deliver(HookRuntime* rt, const FilterOutcome& o, const InputEvent& e) noexc
     if (o.activate) post_to_owner(rt, HotkeyPost::Activate, 0);
     if (o.toggle_finalize) post_to_owner(rt, HotkeyPost::Finalize, 0);
     if (o.cancel) post_to_owner(rt, HotkeyPost::Cancel, 0);
+    if (o.commit) post_to_owner(rt, HotkeyPost::Commit, 0);
     if (o.stop_on_input) post_to_owner(rt, HotkeyPost::StopInput, static_cast<intptr_t>(o.stop_reason));
     if (o.click_invalidated) post_to_owner(rt, HotkeyPost::Wheel, 0);
     if (o.click_captured) {
@@ -943,6 +1001,14 @@ void hook_thread_main(HookRuntime* rt, std::promise<Status> ready) {
                 }
                 break;
             }
+            case kHookMsgSetEditing: {
+                EditingConfig* cfg = reinterpret_cast<EditingConfig*>(msg.lParam);
+                if (cfg != nullptr) {
+                    rt->filter.set_editing(*cfg);
+                    delete cfg;
+                }
+                break;
+            }
             case kHookMsgSetMark:
                 rt->injection_mark = static_cast<uintptr_t>(msg.wParam);
                 rt->filter.set_injection_mark(rt->injection_mark);
@@ -1051,6 +1117,20 @@ void HotkeyManager::set_hotkey(const HotkeySpec& spec) {
     }
 }
 
+void HotkeyManager::set_editing(const EditingConfig& cfg) {
+    HookRuntime* rt = &impl_->rt;
+    if (!rt->running.load(std::memory_order_acquire)) {
+        rt->filter.set_editing(cfg);
+        return;
+    }
+    EditingConfig* copy = new EditingConfig(cfg);
+    if (!PostThreadMessageW(rt->thread_id.load(std::memory_order_acquire), kHookMsgSetEditing, 0,
+                            reinterpret_cast<LPARAM>(copy))) {
+        delete copy;
+        KD_LOG_ERROR("set_editing: PostThreadMessage failed (err %lu)", GetLastError());
+    }
+}
+
 void HotkeyManager::set_injection_mark(uintptr_t extra_info) {
     HookRuntime* rt = &impl_->rt;
     if (!rt->running.load(std::memory_order_acquire)) {
@@ -1108,6 +1188,7 @@ bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
         case HotkeyPost::Activate: rt->listener->on_activate(); break;
         case HotkeyPost::Finalize: rt->listener->on_finalize(); break;
         case HotkeyPost::Cancel: rt->listener->on_cancel(); break;
+        case HotkeyPost::Commit: rt->listener->on_commit(); break;
         case HotkeyPost::StopInput:
             rt->listener->on_stop_input(static_cast<StopInputReason>(lparam));
             break;

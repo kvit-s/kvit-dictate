@@ -642,6 +642,130 @@ KD_TEST(hotkey, escape_cancels_only_while_a_session_is_running) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The Commit class — docs/editing.md §4.3, stage 1
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// The bug this fixes is an *ordering* bug (docs/editing.md §2): Enter used to be stop-on-input,
+// which observes a key and lets it through, so the application received the line break before
+// the session's text was injected and the dictated words landed one line too low. Every check
+// below is on the two properties that fix it — the commit is reported, and the key is eaten.
+
+// A composing session: editing enabled (which Settings::normalise() only permits under
+// Cadence::EndOfSession) and the Win+Y chord pressed and released.
+namespace {
+
+void activate_composing(kd::InputFilter& f, uint64_t t = 100) {
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    f.set_editing(cfg);
+    activate_win_y(f, t);
+    release_win_y(f, t + 20);
+}
+
+}  // namespace
+
+KD_TEST(hotkey, enter_commits_and_is_swallowed) {
+    kd::InputFilter f;
+    activate_composing(f);
+
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 400));
+    KD_CHECK(o.commit);
+    KD_CHECK(o.swallow);        // the whole point: the target never sees it
+    KD_CHECK(!o.stop_on_input);  // "commit" is the specific signal; a generic stop loses why
+    KD_CHECK(!o.cancel);
+
+    // And the release goes the same way the press did, so the target is never handed half a
+    // keystroke.
+    const kd::FilterOutcome up = f.on_event(kup(kd::vk::kReturn, 420));
+    KD_CHECK(up.swallow);
+    KD_CHECK(!up.commit);
+}
+
+KD_TEST(hotkey, a_held_enter_commits_once_and_swallows_every_repeat) {
+    kd::InputFilter f;
+    activate_composing(f);
+
+    KD_CHECK(f.on_event(kdown(kd::vk::kReturn, 400)).commit);
+    for (uint64_t t = 430; t < 600; t += 30) {
+        const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, t));
+        // One press, one commit — but the repeats are still eaten, because a target that
+        // received only the *second* Enter of a held key is worse off than one that got none.
+        KD_CHECK(!o.commit);
+        KD_CHECK(o.swallow);
+    }
+}
+
+KD_TEST(hotkey, only_an_unmodified_enter_commits) {
+    // Ctrl+Enter, Shift+Enter and Alt+Enter mean something in the target — send-and-keep-open,
+    // soft line break, properties — and are not this gesture.
+    for (uint32_t mod : {kd::vk::kLControl, kd::vk::kLShift, kd::vk::kLMenu}) {
+        kd::InputFilter f;
+        activate_composing(f);
+        f.on_event(kdown(mod, 400));
+        const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 410));
+        KD_CHECK(!o.commit);
+        KD_CHECK(!o.swallow);
+        KD_CHECK(o.stop_on_input);  // it is the user doing something else, exactly as before
+    }
+}
+
+KD_TEST(hotkey, enter_is_inert_while_no_session_is_running) {
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    f.set_editing(cfg);
+
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 50));
+    KD_CHECK(!o.commit);
+    KD_CHECK(!o.swallow);  // idle: Enter is entirely the target's business
+}
+
+KD_TEST(hotkey, with_editing_disabled_enter_keeps_todays_behaviour) {
+    // docs/editing.md §6.1 and §16: `editing.enabled` is forced off unless the cadence is
+    // end-of-session, and a user who has changed nothing is still on Cadence::Immediate. With the
+    // buffer already in the document there is nothing for Enter to commit, so it must go on
+    // meaning what it meant — a keystroke that ends the session and reaches the application.
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = false;
+    f.set_editing(cfg);
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 400));
+    KD_CHECK(!o.commit);
+    KD_CHECK(!o.swallow);
+    KD_CHECK(o.stop_on_input);
+}
+
+KD_TEST(hotkey, the_commit_key_comes_from_configuration) {
+    // Not a VK buried in a switch: docs/editing.md §12 makes it `editing.commit_key`, and a test
+    // that only ever exercises the default cannot tell the two apart.
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    cfg.commit_vk = kd::vk::kF13;
+    f.set_editing(cfg);
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    KD_CHECK(f.on_event(kdown(kd::vk::kF13, 400)).commit);
+    KD_CHECK(!f.on_event(kdown(kd::vk::kReturn, 500)).commit);
+}
+
+KD_TEST(hotkey, foreign_key_action_round_trips_through_its_spelling) {
+    kd::ForeignKeyAction a = kd::ForeignKeyAction::EndSession;
+    KD_CHECK(kd::parse_foreign_key_action("ignore", a));
+    KD_CHECK_EQ(static_cast<int>(a), static_cast<int>(kd::ForeignKeyAction::Ignore));
+    KD_CHECK(kd::parse_foreign_key_action("end-session", a));
+    KD_CHECK_EQ(static_cast<int>(a), static_cast<int>(kd::ForeignKeyAction::EndSession));
+    KD_CHECK(!kd::parse_foreign_key_action("", a));
+    KD_CHECK(!kd::parse_foreign_key_action("Ignore", a));  // the file's spelling is exact
+    KD_CHECK_EQ(kd::to_string(kd::ForeignKeyAction::Ignore), "ignore");
+    KD_CHECK_EQ(kd::to_string(kd::ForeignKeyAction::EndSession), "end-session");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
 //  Anchor source B (plan.md §1.5)
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 

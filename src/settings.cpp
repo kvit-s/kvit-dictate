@@ -348,6 +348,21 @@ constexpr EnumName kFallbacks[] = {
     {"no-preview", static_cast<int>(anchor::Fallback::NoPreview)},
 };
 
+// The settings-file spelling of a bare (unmodified) virtual key. Routed through HotkeySpec so
+// that "enter" means exactly what it means in the `hotkey` string — the two are parsed by the
+// same table and cannot drift apart — and lowercased because that is the spelling docs/editing.md
+// §12 writes and JSON keys elsewhere in this file are lower case too.
+std::string vk_setting_name(uint32_t v) {
+    HotkeySpec spec;
+    spec.vk = v;
+    spec.mods = kModNone;
+    std::string s = spec.to_display_string();
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
 template <size_t N>
 const char* enum_to_text(const EnumName (&table)[N], int value, const char* fallback) {
     for (const EnumName& e : table) {
@@ -766,6 +781,8 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "app_policies": [ { "process_name": "windowsterminal.exe", "method": "Clipboard",
 //                         "use_ctrl_shift_v": true, "supported": true, "note": "" } ],
 //     "anchor":    { "min_confidence": 0.5, "below_threshold": "floating-pill", ... },
+//     "editing":   { "enabled": true, "mouse": true,      // docs/editing.md §12
+//                    "on_foreign_key": "ignore", "commit_key": "enter" },
 //     "overlay":   { "mode": "inline", "font_family": "Segoe UI", "font_size_dip": 14.0,
 //                    "color_pending": "#FF3C3C3C", ... },
 //     "audio_device_id": "",
@@ -817,6 +834,18 @@ void Settings::normalise() {
     }
 
     if (overlay_style.font_family.empty()) overlay_style.font_family = "Segoe UI";
+
+    // docs/editing.md §6.1 and §16's second bullet. The compose buffer only exists under
+    // `end-of-session`: with any other cadence the committed text has already been typed into
+    // the document, so there is nothing left in the pill for Enter to commit or for Backspace to
+    // remove. Forced here rather than checked at each use, so that every reader of
+    // `editing.enabled` — the input filter, the overlay, the settings dialog — sees one answer.
+    if (stability.cadence != Cadence::EndOfSession) editing.enabled = false;
+
+    // The commit key is offered as "enter" and nothing else. A file that names some other key
+    // still round-trips, but a file that names *no* key would silently disable the one gesture
+    // that ends a composing session.
+    if (editing.commit_vk == 0) editing.commit_vk = vk::kReturn;
 }
 
 Status Settings::validate() const {
@@ -1026,6 +1055,14 @@ std::string serialize_settings(const Settings& s) {
     }
     {
         json::Value o = json::Value::object();
+        put_bool(o, "enabled", s.editing.enabled);
+        put_bool(o, "mouse", s.editing.mouse);
+        put_str(o, "on_foreign_key", to_string(s.editing.on_foreign_key));
+        put_str(o, "commit_key", vk_setting_name(s.editing.commit_vk));
+        root.set("editing", std::move(o));
+    }
+    {
+        json::Value o = json::Value::object();
         put_str(o, "mode", enum_to_text(kOverlayModes, static_cast<int>(s.overlay_mode), "inline"));
         put_str(o, "font_family", s.overlay_style.font_family);
         put_f32(o, "font_size_dip", s.overlay_style.font_size_dip);
@@ -1231,6 +1268,31 @@ Result<Settings> parse_settings(std::string_view json_text) {
                           "\"no-preview\", got \"" + fb + "\""};
         }
         s.anchor.below_threshold = static_cast<anchor::Fallback>(value);
+    }
+
+    if (const json::Value* v = root.find("editing")) {
+        Obj o(*v, "settings.editing");
+        o.bool_opt("enabled", s.editing.enabled);
+        o.bool_opt("mouse", s.editing.mouse);
+        std::string action = to_string(s.editing.on_foreign_key);
+        o.str_opt("on_foreign_key", action);
+        std::string key = vk_setting_name(s.editing.commit_vk);
+        o.str_opt("commit_key", key);
+        if (o.failed()) return Status{StatusCode::Malformed, o.error()};
+        if (!parse_foreign_key_action(action, s.editing.on_foreign_key)) {
+            return Status{StatusCode::Malformed,
+                          "settings.editing.on_foreign_key: expected \"ignore\" or "
+                          "\"end-session\", got \"" + action + "\""};
+        }
+        // Parsed through the hotkey module's own key-name table, so "enter" means the same thing
+        // here as it does in the `hotkey` string and the two cannot drift apart.
+        HotkeySpec parsed_key;
+        if (!HotkeySpec::parse(key, parsed_key) || parsed_key.mods != kModNone) {
+            return Status{StatusCode::Malformed,
+                          "settings.editing.commit_key: \"" + key +
+                              "\" is not an unmodified key name (only \"enter\" is offered)"};
+        }
+        s.editing.commit_vk = parsed_key.vk;
     }
 
     if (const json::Value* v = root.find("overlay")) {
