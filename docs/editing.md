@@ -490,6 +490,44 @@ this feature gives that requirement three more jobs.
 A microphone glyph — live, and struck through — plus the state word. The glyph is what the user
 checks against the hardware light on their machine, so the two must never disagree.
 
+### 7.5 The pill names the keys, because nothing else can
+
+§4.1 is what forces this: the pill can never take focus, so it has no menu, no tooltip and no
+window a user can right-click. Every gesture in §4.3 has to be learned from somewhere, and the
+only surface that is on screen at the moment it matters is the pill itself.
+
+So the bottom line of the pill is a standing legend of key names, in the dimmest colour the style
+defines, composed from the state being painted:
+
+| state | line |
+|---|---|
+| Listening / Speaking, composing | `Enter to finish · Esc to cancel · type or click to edit` |
+| Editing | `Enter to finish · Esc to cancel · Win+Y to resume` |
+| Listening / Speaking, not composing | `Win+Y to finish · Esc to cancel · any key ends it` |
+| anything else | nothing |
+
+Three rules make it honest rather than decorative, and `key_legend` in `overlay.h` is a pure
+function with tests for exactly that reason:
+
+* **It never names a key that does nothing in the state it names it in.** The hotkey appears only
+  while editing, because §4.5 makes it a deliberate no-op while the microphone is already open.
+* **It never names Enter as a commit outside a composing session.** With `editing.enabled` false —
+  or any cadence but end-of-session (§6.1) — Enter is an ordinary keystroke that passes through to
+  the target and ends the session, so the line says what `plan.md` §1.8 actually does instead. This
+  is the one that would be actively harmful to get wrong: it would teach the user that a
+  destructive key is a safe one.
+* **It is gone in every state where the session is not the user's to steer**, `Finalizing`
+  included: by then `stop` has gone out and none of the three keys still means what it meant.
+
+It is drawn in the floating pill only. `StatusOnly` has nothing to steer, and the inline overlay is
+a label attached to a caret whose whole job is to stay out of the way — a standing legend there
+would make it the largest thing on the line it annotates. The pill is the mode with the room, and
+it is where the compose buffer, the mouse (§5) and the microphone button already live.
+
+There is no setting to hide it. If a day of use says an expert wants it gone, the honest form is a
+setting and not a fade-after-N-sessions timer: something that disappears on a schedule is exactly
+the thing a user cannot find again when they need it.
+
 ## 8. Where the code changes
 
 | file | change | size |

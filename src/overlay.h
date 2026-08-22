@@ -219,6 +219,19 @@ public:
     void set_hint(std::string_view hint);
     void clear_hint();
 
+    // The key legend across the bottom of the pill (docs/editing.md §7.5). The overlay composes
+    // the line itself from the state it is already painting; the two things it cannot know are
+    // pushed here, once, rather than re-pushed per state change:
+    //
+    //   * `hotkey` — how the binding chord is spelled for a human ("Win+Y"), from
+    //     `HotkeySpec::to_display_string()`. Empty drops the item that names it rather than
+    //     printing a blank chord.
+    //   * `composing` — whether the pill is a compose buffer at all (`editing.enabled`, which
+    //     `Settings::normalise` has already forced false for any cadence but end-of-session).
+    //     Enter only finishes, and typing only edits, when it is true; with it false the legend
+    //     says what plan.md §1.8 actually does instead.
+    void set_key_legend(std::string_view hotkey, bool composing);
+
     // §7.3. Scrollback is a prerequisite, not a nicety: the pill shows the newest `kMaxLines`
     // with front-elision, so a session-long buffer sits behind that window unseen, and
     // editable-but-unreachable text is not a feature but a trap.
@@ -283,6 +296,17 @@ private:
     struct Impl;
     Impl* impl_;
 };
+
+// ─── The key legend, pure ───────────────────────────────────────────────────────────────────
+//
+// docs/editing.md §7.5. The line of key names along the bottom of the pill, as UTF-8, for the
+// state being painted: empty for every state where the session is not the user's to steer.
+//
+// Pure and declared here because it is the one thing a legend must never get wrong — naming a key
+// that does nothing in the state it is shown in. `composing` false is plan.md §1.8's session,
+// where Enter is not a commit and any key ends the session; true is docs/editing.md's, where it
+// is and they do not.
+[[nodiscard]] std::string key_legend(OverlayState state, bool composing, std::string_view hotkey);
 
 // ─── Pure layout helper ─────────────────────────────────────────────────────────────────────
 //

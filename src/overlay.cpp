@@ -478,6 +478,55 @@ OverlayMode overlay_mode_for(OverlayMode configured, const std::optional<anchor:
     return OverlayMode::FloatingPill;
 }
 
+std::string key_legend(OverlayState state, bool composing, std::string_view hotkey) {
+    // Only the three states where the session is the user's to steer. Finalizing is deliberately
+    // not one of them: by then `stop` has gone out and none of these keys would do what the line
+    // promised. Idle, ModelLoading, Warning, Unsupported and Error have no session to steer at
+    // all, and the pill in those states is already saying the one thing that matters.
+    if (state != OverlayState::Listening && state != OverlayState::Speaking &&
+        state != OverlayState::Editing) {
+        return std::string();
+    }
+
+    std::string out;
+    const auto item = [&out](std::string_view text) {
+        if (!out.empty()) out.append(" Â· ");  // U+00B7 MIDDLE DOT
+        out.append(text);
+    };
+
+    if (composing) {
+        // docs/editing.md §4.3's classes, in the order a user needs them: the way out that keeps
+        // the text, the way out that discards it, then what this state offers that the other does
+        // not. The hotkey is named only while editing, because §4.5 gives it exactly one meaning
+        // and while the microphone is already open that meaning is a no-op — a legend that named
+        // it there would be advertising a key that does nothing.
+        item("Enter to finish");
+        item("Esc to cancel");
+        if (state == OverlayState::Editing) {
+            if (!hotkey.empty()) {
+                std::string resume(hotkey);
+                resume.append(" to resume");
+                item(resume);
+            }
+        } else {
+            item("type or click to edit");
+        }
+        return out;
+    }
+
+    // plan.md §1.8's session, which is what runs whenever the compose buffer does not exist.
+    // Enter is not a commit here and must not be named as one; the hotkey finishes, and every
+    // other key ends the session by passing through to the target.
+    if (!hotkey.empty()) {
+        std::string finish(hotkey);
+        finish.append(" to finish");
+        item(finish);
+    }
+    item("Esc to cancel");
+    item("any key ends it");
+    return out;
+}
+
 const char* to_string(OverlayState s) noexcept {
     switch (s) {
         case OverlayState::Idle: return "Idle";
@@ -530,6 +579,11 @@ struct OverlayCore {
 
     // §4.4's one-line hint, expired by the caller on the tick it already runs.
     std::string hint;
+
+    // §7.5's key legend. Pushed once by the caller (the binding's spelling, and whether the pill
+    // is a compose buffer this session); the line itself is composed per paint from `state`.
+    std::string legend_hotkey;
+    bool legend_composing = false;
 
     // §7.3. `scroll_pinned` is the default and is what makes a session with no editing look and
     // behave exactly as it does today: the view follows the bottom of a transcript that only ever
@@ -1077,12 +1131,34 @@ HRESULT OverlayCore::paint_once() {
                                    : 0.0f;
     const float mic_h = mic_layout ? mic_metrics.height + kMicButtonPadDip : 0.0f;
 
-    const float measured_w = std::max(std::max(body_w, note_w), mic_w);
+    // The key legend (docs/editing.md §7.5), on the bottom line — **the pill only**. StatusOnly
+    // has nothing to steer with the keys; Inline is a label attached to a caret, sized to get out
+    // of the way, and a standing two-line legend there would make it the largest thing on the
+    // line it is annotating. The pill is the mode with room, and it is where the compose buffer,
+    // the mouse and the microphone button already live.
+    ComRef<IDWriteTextLayout> legend_layout;
+    DWRITE_TEXT_METRICS legend_metrics{};
+    if (em == OverlayMode::FloatingPill) {
+        const std::wstring line = utf8::to_utf16_or_empty(
+            key_legend(state, legend_composing, legend_hotkey));
+        if (!line.empty() &&
+            SUCCEEDED(dwrite->CreateTextLayout(line.c_str(), static_cast<UINT32>(line.size()),
+                                               format_note.get(), max_text_w, 4096.0f,
+                                               legend_layout.put()))) {
+            if (FAILED(legend_layout->GetMetrics(&legend_metrics))) legend_layout.reset();
+        }
+    }
+    const float legend_w =
+        legend_layout ? legend_metrics.widthIncludingTrailingWhitespace : 0.0f;
+    const float legend_h = legend_layout ? legend_metrics.height : 0.0f;
+
+    const float measured_w = std::max(std::max(std::max(body_w, note_w), mic_w), legend_w);
     const float content_w = (mode == OverlayMode::FloatingPill && measured_w > 0.0f)
                                 ? max_text_w
                                 : measured_w;
     const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f) +
-                            (mic_layout ? gap + mic_h : 0.0f);
+                            (mic_layout ? gap + mic_h : 0.0f) +
+                            (legend_layout ? gap + legend_h : 0.0f);
 
     // A minimum height so a bare status dot still reads as a control and not as a speck.
     const float box_w_dip = text_x + std::max(content_w, dot_r * 2.0f) + pad;
@@ -1219,13 +1295,13 @@ HRESULT OverlayCore::paint_once() {
                            D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
+    const float mic_y = note_y + (note_layout ? note_h + gap : 0.0f);
     mic_left = mic_top = mic_right = mic_bottom = 0.0f;
     if (mic_layout && brush_border && brush_pending) {
-        const float y = note_y + (note_layout ? note_h + gap : 0.0f);
         mic_left = text_x;
-        mic_top = y;
+        mic_top = mic_y;
         mic_right = text_x + mic_w;
-        mic_bottom = y + mic_h;
+        mic_bottom = mic_y + mic_h;
 
         const D2D1_ROUNDED_RECT button = D2D1::RoundedRect(
             D2D1::RectF(mic_left, mic_top, mic_right, mic_bottom), 4.0f, 4.0f);
@@ -1241,6 +1317,16 @@ HRESULT OverlayCore::paint_once() {
         rt->DrawTextLayout(D2D1::Point2F(mic_left + kMicButtonPadDip,
                                          mic_top + kMicButtonPadDip * 0.5f),
                            mic_layout.get(), brush_pending.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+
+    if (legend_layout && brush_unstable) {
+        // Last line, below everything including the button, and in the unstable brush — the
+        // dimmest thing the style defines. It is standing information rather than a message: it
+        // must be readable when looked for and must not compete with the words the user is
+        // dictating, which is the one way a permanent legend can go wrong.
+        const float legend_y = mic_y + (mic_layout ? mic_h + gap : 0.0f);
+        rt->DrawTextLayout(D2D1::Point2F(text_x, legend_y), legend_layout.get(),
+                           brush_unstable.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
     hr = rt->EndDraw();
@@ -1637,6 +1723,15 @@ void Overlay::set_hint(std::string_view h) {
         return;
     }
     impl_->hint.assign(h);
+    impl_->dirty = true;
+}
+
+void Overlay::set_key_legend(std::string_view hotkey, bool composing) {
+    if (impl_->legend_hotkey == hotkey && impl_->legend_composing == composing) {
+        return;
+    }
+    impl_->legend_hotkey.assign(hotkey);
+    impl_->legend_composing = composing;
     impl_->dirty = true;
 }
 

@@ -41,6 +41,7 @@
 #include "overlay.h"
 
 #include <optional>
+#include <string>
 
 namespace {
 
@@ -276,4 +277,83 @@ KD_TEST(overlay, the_caret_on_the_last_line_pins_the_view_to_the_bottom) {
     KD_CHECK_EQ(kd::clamp_scroll_line(0, 39, true, 40, 8), uint32_t{32});
     // ...and never past it, however far the caret is claimed to be.
     KD_CHECK_EQ(kd::clamp_scroll_line(0, 500, true, 40, 8), uint32_t{32});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  key_legend — docs/editing.md §7.5
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// The pill's standing line of key names. It is tested for one property above all: **it may not
+// name a key that does nothing in the state it is shown in.** A legend that is merely decorative
+// is harmless; a legend that promises Enter will finish, in a session where Enter is an ordinary
+// keystroke that ends the session and lands in the document, teaches the user something false
+// about a destructive key. The two session shapes — docs/editing.md's compose buffer and
+// plan.md §1.8's stop-on-input — disagree about exactly that, which is why `composing` is a
+// parameter rather than an assumption.
+
+namespace {
+
+using kd::OverlayState;
+using kd::key_legend;
+
+bool mentions(const std::string& haystack, const char* needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+}  // namespace
+
+KD_TEST(overlay, the_legend_is_silent_where_there_is_no_session_to_steer) {
+    // Finalizing is the one worth stating: `stop` has gone out, and Enter, Esc and the hotkey no
+    // longer do what a legend drawn there would have just promised.
+    KD_CHECK(key_legend(OverlayState::Finalizing, true, "Win+Y").empty());
+    KD_CHECK(key_legend(OverlayState::Idle, true, "Win+Y").empty());
+    KD_CHECK(key_legend(OverlayState::ModelLoading, true, "Win+Y").empty());
+    KD_CHECK(key_legend(OverlayState::Warning, true, "Win+Y").empty());
+    KD_CHECK(key_legend(OverlayState::Unsupported, true, "Win+Y").empty());
+    KD_CHECK(key_legend(OverlayState::Error, true, "Win+Y").empty());
+}
+
+KD_TEST(overlay, a_composing_session_names_enter_and_esc_in_every_state_it_shows) {
+    for (OverlayState s : {OverlayState::Listening, OverlayState::Speaking,
+                           OverlayState::Editing}) {
+        const std::string line = key_legend(s, true, "Win+Y");
+        KD_CHECK(mentions(line, "Enter to finish"));
+        KD_CHECK(mentions(line, "Esc to cancel"));
+    }
+}
+
+KD_TEST(overlay, the_hotkey_is_named_only_where_it_does_something) {
+    // docs/editing.md §4.5: the hotkey means "dictate" and nothing else, so while the microphone
+    // is already open it is deliberately a no-op. Naming it there would advertise a dead key.
+    KD_CHECK(!mentions(key_legend(OverlayState::Listening, true, "Win+Y"), "Win+Y"));
+    KD_CHECK(!mentions(key_legend(OverlayState::Speaking, true, "Win+Y"), "Win+Y"));
+    KD_CHECK(mentions(key_legend(OverlayState::Editing, true, "Win+Y"), "Win+Y to resume"));
+    // §3.2: the microphone is closed while editing and open otherwise, so the invitation to edit
+    // belongs to the states that are not editing yet.
+    KD_CHECK(mentions(key_legend(OverlayState::Listening, true, "Win+Y"), "type or click to edit"));
+    KD_CHECK(!mentions(key_legend(OverlayState::Editing, true, "Win+Y"), "type or click to edit"));
+}
+
+KD_TEST(overlay, without_the_compose_buffer_enter_is_not_a_commit_and_is_not_named) {
+    // plan.md §1.8's session, which is what runs with `editing.enabled` false or any cadence but
+    // end-of-session. Enter is an ordinary key there: it passes through to the target and ends
+    // the session. The legend must not say it finishes.
+    const std::string line = key_legend(OverlayState::Listening, false, "Win+Y");
+    KD_CHECK(!mentions(line, "Enter"));
+    KD_CHECK(mentions(line, "Win+Y to finish"));
+    KD_CHECK(mentions(line, "Esc to cancel"));
+    KD_CHECK(mentions(line, "any key ends it"));
+}
+
+KD_TEST(overlay, an_unspellable_binding_drops_its_item_rather_than_printing_a_blank) {
+    // HotkeySpec::to_display_string() has no failure mode today, but a legend reading
+    // " to resume" would be worse than one item shorter, and the caller may push an empty string
+    // before a binding is installed at all.
+    const std::string editing = key_legend(OverlayState::Editing, true, "");
+    KD_CHECK(mentions(editing, "Enter to finish"));
+    KD_CHECK(!mentions(editing, "to resume"));
+
+    const std::string plain = key_legend(OverlayState::Listening, false, "");
+    KD_CHECK(!mentions(plain, "to finish"));
+    KD_CHECK(mentions(plain, "Esc to cancel"));
 }
