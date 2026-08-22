@@ -1099,6 +1099,191 @@ KD_TEST(hotkey, the_stale_check_survives_a_tick_count_wrap) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The mouse over the pill — docs/editing.md §5.2
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A composing session with a pill at [100,200 .. 400,300] in physical screen pixels.
+void activate_with_pill(kd::InputFilter& f) {
+    activate_composing(f);
+    f.set_pill_rect(100, 200, 400, 300);
+}
+
+kd::InputEvent wheel_at(int32_t x, int32_t y, int32_t delta, uint64_t t = 400) {
+    kd::InputEvent e = mouse_event(kd::InputEvent::Kind::MouseWheel, false, x, y, t);
+    e.wheel_delta = delta;
+    return e;
+}
+
+}  // namespace
+
+KD_TEST(hotkey, a_click_inside_the_pill_places_a_caret_rather_than_ending_the_session) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+
+    const kd::FilterOutcome o = f.on_event(mdown(true, 150, 250, 400));
+    KD_CHECK(o.pill_pointer);
+    KD_CHECK_EQ(static_cast<int>(o.pill_kind),
+                static_cast<int>(kd::FilterOutcome::PillPointerKind::Down));
+    KD_CHECK(!o.stop_on_input);
+    // Relative to the pill's top-left, because that is what the UI thread hit-tests against.
+    KD_CHECK_EQ(o.pill_x, 50);
+    KD_CHECK_EQ(o.pill_y, 50);
+    // Not cached as an anchor either: the user clicked our window, not the document, so the
+    // insertion point in the target has not moved.
+    KD_CHECK(!o.click_captured);
+}
+
+KD_TEST(hotkey, a_click_outside_the_pill_still_ends_the_session) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+
+    const kd::FilterOutcome o = f.on_event(mdown(true, 500, 250, 400));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.stop_on_input);
+    KD_CHECK_EQ(kd::to_string(o.stop_reason), "mouse_click");
+    KD_CHECK(o.click_captured);
+}
+
+KD_TEST(hotkey, an_unpublished_rectangle_contains_nothing) {
+    // docs/editing.md §16 names this as the `last_voice_ms` shape: a value the tests supply and
+    // the product may not. If the UI thread never publishes the rectangle the slot reads zero,
+    // every click is outside the pill, and the mouse reverts to today's behaviour — which is the
+    // safe direction, and is pinned here so it stays deliberate rather than accidental.
+    kd::InputFilter f;
+    activate_composing(f);   // no set_pill_rect
+    const kd::FilterOutcome o = f.on_event(mdown(true, 150, 250, 400));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.stop_on_input);
+}
+
+KD_TEST(hotkey, the_pill_rectangle_is_half_open_at_its_far_edges) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+    KD_CHECK(f.point_in_pill(100, 200));
+    KD_CHECK(f.point_in_pill(399, 299));
+    KD_CHECK(!f.point_in_pill(400, 250));
+    KD_CHECK(!f.point_in_pill(250, 300));
+    KD_CHECK(!f.point_in_pill(99, 250));
+}
+
+KD_TEST(hotkey, only_the_left_button_places_a_caret) {
+    // A right-click opens a context menu and a middle-click pastes. Neither is a caret placement,
+    // and both meant "the user has gone elsewhere" before the pill was clickable.
+    kd::InputFilter f;
+    activate_with_pill(f);
+    const kd::FilterOutcome o = f.on_event(mdown(false, 150, 250, 400));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.stop_on_input);
+}
+
+KD_TEST(hotkey, a_drag_that_starts_in_the_pill_is_followed_out_of_it) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+
+    KD_REQUIRE(f.on_event(mdown(true, 150, 250, 400)).pill_pointer);
+
+    kd::FilterOutcome o = f.on_event(mmove(300, 260, 410));
+    KD_CHECK(o.pill_pointer);
+    KD_CHECK_EQ(static_cast<int>(o.pill_kind),
+                static_cast<int>(kd::FilterOutcome::PillPointerKind::Move));
+
+    // Out of the rectangle, still dragging: a selection that started inside the pill is the
+    // user's, and letting go anywhere ends it.
+    o = f.on_event(mmove(900, 900, 420));
+    KD_CHECK(o.pill_pointer);
+    KD_CHECK(!o.stop_on_input);
+
+    o = f.on_event(mup(true, 430));
+    KD_CHECK(o.pill_pointer);
+    KD_CHECK_EQ(static_cast<int>(o.pill_kind),
+                static_cast<int>(kd::FilterOutcome::PillPointerKind::Up));
+
+    // And once it is over, an ordinary move is an ordinary move again.
+    KD_CHECK(!f.on_event(mmove(900, 900, 440)).pill_pointer);
+}
+
+KD_TEST(hotkey, a_move_with_no_drag_is_still_not_an_intention) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+    const kd::FilterOutcome o = f.on_event(mmove(150, 250, 400));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(!o.stop_on_input);   // dictating with a hand resting on the mouse must work
+}
+
+KD_TEST(hotkey, the_wheel_over_the_pill_scrolls_it_and_spares_the_anchor) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+
+    const kd::FilterOutcome o = f.on_event(wheel_at(150, 250, 120));
+    KD_CHECK(o.pill_pointer);
+    KD_CHECK_EQ(static_cast<int>(o.pill_kind),
+                static_cast<int>(kd::FilterOutcome::PillPointerKind::Scroll));
+    KD_CHECK_EQ(o.pill_wheel, 120);
+    // The user scrolled *our* window, so the target's caret has not moved and the cached click
+    // is still where the insertion point is.
+    KD_CHECK(!o.click_invalidated);
+    KD_CHECK(!o.stop_on_input);
+}
+
+KD_TEST(hotkey, the_wheel_elsewhere_still_invalidates_the_cached_click) {
+    kd::InputFilter f;
+    activate_with_pill(f);
+    const kd::FilterOutcome o = f.on_event(wheel_at(900, 900, 120));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.click_invalidated);
+    KD_CHECK(!o.stop_on_input);
+}
+
+KD_TEST(hotkey, the_mouse_setting_turns_the_clickable_pill_off) {
+    // docs/editing.md §12's `editing.mouse`. With it off the keyboard half is unaffected and the
+    // mouse behaves exactly as it did before the pill was clickable — which is also what the
+    // overlay does, because main.cpp leaves WS_EX_TRANSPARENT set in that case.
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    cfg.mouse = false;
+    f.set_editing(cfg);
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+    f.set_pill_rect(100, 200, 400, 300);
+
+    const kd::FilterOutcome o = f.on_event(mdown(true, 150, 250, 400));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.stop_on_input);
+    KD_CHECK(f.on_event(kdown(kd::vk::kBack, 500)).swallow);  // the keyboard still works
+}
+
+KD_TEST(hotkey, failing_open_gives_the_mouse_back_too) {
+    // §10.1's latch is about the pill's claim on input, not specifically about keys. A UI thread
+    // that will never process a caret placement must not be the reason a click stops meaning
+    // "the user has gone elsewhere".
+    kd::InputFilter f;
+    activate_with_pill(f);
+    f.note_ui_heartbeat(500);
+    f.on_event(kdown(kd::vk::kBack, 500 + 3000));
+    KD_REQUIRE(f.failed_open());
+
+    const kd::FilterOutcome o = f.on_event(mdown(true, 150, 250, 500 + 3100));
+    KD_CHECK(!o.pill_pointer);
+    KD_CHECK(o.stop_on_input);
+}
+
+KD_TEST(hotkey, a_pill_post_survives_the_round_trip_through_one_lparam) {
+    kd::PillPost p;
+    p.kind = kd::FilterOutcome::PillPointerKind::Move;
+    p.x = -1234;
+    p.y = 4321;
+    p.wheel = -240;
+    const kd::PillPost q = kd::unpack_pill_post(kd::pack_pill_post(p));
+    KD_CHECK_EQ(static_cast<int>(q.kind), static_cast<int>(p.kind));
+    KD_CHECK_EQ(q.x, p.x);
+    KD_CHECK_EQ(q.y, p.y);
+    KD_CHECK_EQ(q.wheel, p.wheel);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
 //  Anchor source B (plan.md §1.5)
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 

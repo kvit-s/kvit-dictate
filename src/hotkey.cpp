@@ -111,6 +111,31 @@ EditPost unpack_edit_post(uint64_t packed) noexcept {
     return p;
 }
 
+uint64_t pack_pill_post(const PillPost& p) noexcept {
+    const auto clamp16 = [](int32_t v) noexcept -> uint64_t {
+        if (v < -32768) v = -32768;
+        if (v > 32767) v = 32767;
+        return static_cast<uint64_t>(static_cast<uint16_t>(static_cast<int16_t>(v)));
+    };
+    uint64_t v = static_cast<uint64_t>(p.kind) & 0xFFull;
+    v |= clamp16(p.x) << 16;
+    v |= clamp16(p.y) << 32;
+    v |= clamp16(p.wheel) << 48;
+    return v;
+}
+
+PillPost unpack_pill_post(uint64_t packed) noexcept {
+    const auto s16 = [](uint64_t v) noexcept -> int32_t {
+        return static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(v & 0xFFFFull)));
+    };
+    PillPost p;
+    p.kind = static_cast<FilterOutcome::PillPointerKind>(packed & 0xFFull);
+    p.x = s16(packed >> 16);
+    p.y = s16(packed >> 32);
+    p.wheel = s16(packed >> 48);
+    return p;
+}
+
 const char* to_string(ForeignKeyAction a) noexcept {
     switch (a) {
         case ForeignKeyAction::Ignore: return "ignore";
@@ -394,6 +419,7 @@ void InputFilter::begin_session_state(uint64_t now_ms) noexcept {
     // session", which is only meaningful if the next session gets a fresh answer.
     editing_active_ = false;
     ui_fail_open_ = false;
+    pill_dragging_ = false;
     // Seeded from the activation, so that a UI thread which is answering *now* is not judged
     // stale on the very first keystroke merely because nobody has stamped a tick yet.
     ui_heartbeat_ms_ = now_ms;
@@ -421,6 +447,7 @@ void InputFilter::note_session_ended() {
     session_started_ms_ = 0;
     editing_active_ = false;
     ui_fail_open_ = false;
+    pill_dragging_ = false;
     for (size_t i = 0; i < kVkWords; ++i) down_at_activation_[i] = 0;
     // hotkey_chord_consumed_ is deliberately NOT cleared: the binding key may still be held, and
     // its key-up must still be swallowed to match the key-down we swallowed. `swallowed_down_`
@@ -854,6 +881,22 @@ FilterOutcome InputFilter::on_mouse_event(const InputEvent& e) {
 
     switch (e.kind) {
         case InputEvent::Kind::MouseWheel:
+            // Over the pill: scroll it (docs/editing.md §7.3). Scrolling is **not** an edit
+            // gesture and does not close the microphone — the comment below already reasons that
+            // scrolling to re-read what you dictated is a normal thing to do mid-session, and
+            // that stays true when the thing being scrolled is our own pill.
+            //
+            // The anchor's cached click is deliberately NOT invalidated here: the user scrolled
+            // *our* window, so the target's caret has not moved and the cached point is still
+            // where the insertion point is.
+            if (composing() && editing_.mouse && point_in_pill(e.x, e.y)) {
+                out.pill_pointer = true;
+                out.pill_kind = FilterOutcome::PillPointerKind::Scroll;
+                out.pill_x = e.x - pill_left_;
+                out.pill_y = e.y - pill_top_;
+                out.pill_wheel = e.wheel_delta;
+                return out;
+            }
             // plan.md §1.5, source B: scrolling moves the caret with no click, so the cached
             // click is no longer where the insertion point is. Invalidate rather than downgrade
             // — a stale anchor that looks confident is worse than no anchor.
@@ -863,10 +906,26 @@ FilterOutcome InputFilter::on_mouse_event(const InputEvent& e) {
             return out;
 
         case InputEvent::Kind::MouseDown:
+            // Inside the pill: place the caret. **Not** stop-on-input — docs/editing.md §5.2.
+            // The click also never reaches the target, because the overlay drops
+            // WS_EX_TRANSPARENT for the duration of a composing session and absorbs it; the
+            // filter's job here is only to stop reading it as "the user has gone elsewhere".
+            //
+            // Left button only. A right-click opens a context menu and a middle-click pastes,
+            // and neither is a caret placement — they fall through and end the session, which is
+            // what they meant before the pill was clickable and still do.
+            if (e.left_button && composing() && editing_.mouse && point_in_pill(e.x, e.y)) {
+                pill_dragging_ = true;
+                out.pill_pointer = true;
+                out.pill_kind = FilterOutcome::PillPointerKind::Down;
+                out.pill_x = e.x - pill_left_;
+                out.pill_y = e.y - pill_top_;
+                return out;
+            }
             // Left button only for the anchor cache: a right-click opens a context menu and a
             // middle-click pastes on X11, so neither indicates where the insertion point is.
             if (e.left_button) out.click_captured = true;
-            // Every button stops the session, though — plan.md §1.8's "any real click".
+            // Every other button stops the session — plan.md §1.8's "any real click".
             if (session_active_) {
                 out.stop_on_input = true;
                 out.stop_reason = StopInputReason::MouseClick;
@@ -874,11 +933,32 @@ FilterOutcome InputFilter::on_mouse_event(const InputEvent& e) {
             return out;
 
         case InputEvent::Kind::MouseUp:
+            // The end of a drag-select. Reported even when the pointer has left the pill, because
+            // a selection that started inside it is the user's and letting go anywhere ends it.
+            if (pill_dragging_) {
+                pill_dragging_ = false;
+                out.pill_pointer = true;
+                out.pill_kind = FilterOutcome::PillPointerKind::Up;
+                out.pill_x = e.x - pill_left_;
+                out.pill_y = e.y - pill_top_;
+                return out;
+            }
             // The matching button-down already stopped the session and already updated the
             // cache. Acting on the up as well would double-report.
             return out;
 
         case InputEvent::Kind::MouseMove:
+            // Only while dragging. A pointer resting over the pill is not an intention, and
+            // moving the mouse must never stop a session — dictating with a hand on the mouse
+            // would otherwise be impossible.
+            if (pill_dragging_) {
+                out.pill_pointer = true;
+                out.pill_kind = FilterOutcome::PillPointerKind::Move;
+                out.pill_x = e.x - pill_left_;
+                out.pill_y = e.y - pill_top_;
+                return out;
+            }
+            [[fallthrough]];
         case InputEvent::Kind::KeyDown:
         case InputEvent::Kind::KeyUp:
         default:
@@ -897,6 +977,20 @@ bool InputFilter::composing() const noexcept {
 }
 
 bool InputFilter::editing_active() const noexcept { return editing_active_; }
+
+void InputFilter::set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept {
+    pill_left_ = left;
+    pill_top_ = top;
+    pill_right_ = right;
+    pill_bottom_ = bottom;
+}
+
+bool InputFilter::point_in_pill(int32_t x, int32_t y) const noexcept {
+    // An empty (or unpublished) rectangle contains nothing, which is what makes the mouse behave
+    // exactly as it did before this feature when the UI thread has not published one.
+    if (pill_right_ <= pill_left_ || pill_bottom_ <= pill_top_) return false;
+    return x >= pill_left_ && x < pill_right_ && y >= pill_top_ && y < pill_bottom_;
+}
 
 bool InputFilter::session_active() const noexcept { return session_active_; }
 
@@ -1038,6 +1132,18 @@ struct HookRuntime {
     // acquire/release pair would buy an ordering nothing here depends on.
     std::atomic<uint64_t> ui_heartbeat{0};
 
+    // The pill's rectangle in physical screen pixels, published by the UI thread after every
+    // paint and read by the mouse callback (docs/editing.md §5.2). Four independent relaxed
+    // atomics rather than a seqlock: the worst a torn read can produce is one click judged
+    // against a rectangle that is half old and half new, during a frame in which the pill was
+    // moving, and the consequence of getting it wrong in either direction is a single click that
+    // ends the session or does not. A seqlock's retry loop would be a worse trade in a callback
+    // whose budget is measured in microseconds.
+    std::atomic<int32_t> pill_left{0};
+    std::atomic<int32_t> pill_top{0};
+    std::atomic<int32_t> pill_right{0};
+    std::atomic<int32_t> pill_bottom{0};
+
     // ── The last left click, as a seqlock ────────────────────────────────────────────────────
     //
     // The click's x, y and time do not fit in a PostMessage's two parameters, so they live in a
@@ -1137,6 +1243,14 @@ void deliver(HookRuntime* rt, const FilterOutcome& o, const InputEvent& e) noexc
         ep.mods = o.key_mods;
         post_to_owner(rt, HotkeyPost::Edit, static_cast<intptr_t>(pack_edit_post(ep)));
     }
+    if (o.pill_pointer) {
+        PillPost pp;
+        pp.kind = o.pill_kind;
+        pp.x = o.pill_x;
+        pp.y = o.pill_y;
+        pp.wheel = o.pill_wheel;
+        post_to_owner(rt, HotkeyPost::PillPointer, static_cast<intptr_t>(pack_pill_post(pp)));
+    }
     if (o.foreign_key) {
         post_to_owner(rt, HotkeyPost::ForeignKey,
                       static_cast<intptr_t>(o.key_vk | (o.key_mods << 16)));
@@ -1224,7 +1338,12 @@ LRESULT CALLBACK mouse_proc(int code, WPARAM wparam, LPARAM lparam) {
         case WM_MBUTTONUP:
         case WM_XBUTTONUP: e.kind = InputEvent::Kind::MouseUp; break;
         case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL: e.kind = InputEvent::Kind::MouseWheel; break;
+        case WM_MOUSEHWHEEL:
+            e.kind = InputEvent::Kind::MouseWheel;
+            // MSLLHOOKSTRUCT packs the delta in the high word of mouseData, signed.
+            e.wheel_delta = static_cast<int16_t>(
+                (reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam)->mouseData >> 16) & 0xFFFFu);
+            break;
         case WM_MOUSEMOVE: e.kind = InputEvent::Kind::MouseMove; break;
         default: return CallNextHookEx(rt->mouse.get(), code, wparam, lparam);
     }
@@ -1238,6 +1357,14 @@ LRESULT CALLBACK mouse_proc(int code, WPARAM wparam, LPARAM lparam) {
 
     rt->last_event_tick = m->time;
     rt->mouse_events.fetch_add(1, std::memory_order_relaxed);
+
+    // The same two reads the keyboard callback makes: the UI thread's heartbeat, and the pill's
+    // rectangle. Both are relaxed loads of atomics the UI thread wrote, and neither can block.
+    rt->filter.note_ui_heartbeat(rt->ui_heartbeat.load(std::memory_order_relaxed));
+    rt->filter.set_pill_rect(rt->pill_left.load(std::memory_order_relaxed),
+                             rt->pill_top.load(std::memory_order_relaxed),
+                             rt->pill_right.load(std::memory_order_relaxed),
+                             rt->pill_bottom.load(std::memory_order_relaxed));
 
     const FilterOutcome o = rt->filter.on_event(e);
     deliver(rt, o, e);
@@ -1478,6 +1605,15 @@ void HotkeyManager::note_session_started() {
     PostThreadMessageW(rt->thread_id.load(std::memory_order_acquire), kHookMsgSessionStarted, 0, 0);
 }
 
+void HotkeyManager::set_pill_rect(int32_t left, int32_t top, int32_t right,
+                                  int32_t bottom) noexcept {
+    HookRuntime* rt = &impl_->rt;
+    rt->pill_left.store(left, std::memory_order_relaxed);
+    rt->pill_top.store(top, std::memory_order_relaxed);
+    rt->pill_right.store(right, std::memory_order_relaxed);
+    rt->pill_bottom.store(bottom, std::memory_order_relaxed);
+}
+
 void HotkeyManager::heartbeat() noexcept {
     // No `running` check and no PostThreadMessage: this is the one piece of hook-thread-visible
     // state the UI thread writes directly, because a heartbeat delivered through the hook
@@ -1525,6 +1661,9 @@ bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
             rt->listener->on_edit(unpack_edit_post(static_cast<uint64_t>(lparam)));
             break;
         case HotkeyPost::EditingBegan: rt->listener->on_editing_began(); break;
+        case HotkeyPost::PillPointer:
+            rt->listener->on_pill_pointer(unpack_pill_post(static_cast<uint64_t>(lparam)));
+            break;
         case HotkeyPost::ResumeDictation: rt->listener->on_resume_dictation(); break;
         case HotkeyPost::ForeignKey:
             rt->listener->on_foreign_key(static_cast<uint32_t>(lparam) & 0xFFFFu,

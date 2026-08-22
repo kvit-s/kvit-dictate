@@ -235,6 +235,7 @@ struct InputEvent {
     uintptr_t extra_info = 0;     // dwExtraInfo; compared against our InjectionMark
     bool left_button = false;     // mouse events: left button specifically (plan.md §1.5 —
                                   // right-click opens a context menu, middle-click pastes on X11)
+    int32_t wheel_delta = 0;      // WM_MOUSEWHEEL's signed delta; positive is away from the user
     int32_t x = 0, y = 0;         // mouse position, physical pixels
     uint64_t time_ms = 0;
 };
@@ -299,6 +300,24 @@ struct FilterOutcome {
     bool stop_on_input = false;
     StopInputReason stop_reason = StopInputReason::Keystroke;
 
+    // ── The mouse over the pill (docs/editing.md §5.2) ───────────────────────────────────────
+    //
+    // `InputFilter::on_mouse_event` used to end the session on **every** button-down. With a
+    // clickable pill it must not do that for a click inside the pill's rectangle — and the hook
+    // cannot ask the overlay where it is, because that would be a cross-module call from the
+    // callback. So the UI thread publishes the rectangle into a slot and the filter does a
+    // point-in-rect test, exactly as `write_click`/`read_click` publish the click point in the
+    // other direction.
+    //
+    // Coordinates are **relative to the pill's top-left, in physical pixels**, because that is
+    // what the UI thread needs to hit-test against a DirectWrite layout, and because relative
+    // coordinates fit in the message parameter that carries them.
+    bool pill_pointer = false;
+    enum class PillPointerKind : uint8_t { Down, Move, Up, Scroll } pill_kind = PillPointerKind::Down;
+    int32_t pill_x = 0;
+    int32_t pill_y = 0;
+    int32_t pill_wheel = 0;
+
     bool click_captured = false;  // a left click worth caching as anchor source B
     bool click_invalidated = false;  // wheel: scrolling moves the caret with no click
     bool suppress_start_menu = false;  // inject the VK_CONTROL tap before the Win key-up
@@ -333,6 +352,22 @@ struct EditPost {
 
 [[nodiscard]] uint64_t pack_edit_post(const EditPost& p) noexcept;
 [[nodiscard]] EditPost unpack_edit_post(uint64_t packed) noexcept;
+
+// The mouse over the pill, packed into one LPARAM (docs/editing.md §5.2).
+//
+// Coordinates are relative to the pill's top-left in physical pixels, so they fit in sixteen
+// signed bits with room to spare — the pill is capped at OverlayStyle::max_width_dip and eight
+// lines. Absolute screen coordinates would not: a second monitor to the left of the primary has
+// negative x, and a 4K wall exceeds what is left after the kind and the wheel delta.
+struct PillPost {
+    FilterOutcome::PillPointerKind kind = FilterOutcome::PillPointerKind::Down;
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t wheel = 0;
+};
+
+[[nodiscard]] uint64_t pack_pill_post(const PillPost& p) noexcept;
+[[nodiscard]] PillPost unpack_pill_post(uint64_t packed) noexcept;
 
 class InputFilter {
 public:
@@ -380,6 +415,14 @@ public:
     // than by a call back from the UI thread: the UI thread's answer would arrive after the next
     // keystroke, and the hotkey means different things in the two states (§4.5).
     [[nodiscard]] bool editing_active() const noexcept;
+
+    // Where the pill is, in physical screen pixels, published by the UI thread after every
+    // paint. An empty rectangle means "there is no pill" and every click is outside it, which is
+    // exactly today's behaviour — docs/editing.md §16 names this as the `last_voice_ms` shape: a
+    // value the tests supply and the product may not, where the symptom of a missing publisher
+    // is a mouse that silently reverts to ending the session, with a green suite.
+    void set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept;
+    [[nodiscard]] bool point_in_pill(int32_t x, int32_t y) const noexcept;
 
     // Pure decision. No allocation, no syscall, bounded work — safe to call from the hook.
     FilterOutcome on_event(const InputEvent& e);
@@ -446,6 +489,8 @@ private:
     uint64_t ui_heartbeat_ms_ = 0;
     bool ui_fail_open_ = false;   // latched for the rest of the session once it trips
     bool editing_active_ = false;
+    int32_t pill_left_ = 0, pill_top_ = 0, pill_right_ = 0, pill_bottom_ = 0;
+    bool pill_dragging_ = false;  // a button-down landed in the pill and has not been released
     uintptr_t injection_mark_ = 0;
     bool session_active_ = false;
     uint64_t session_started_ms_ = 0;
@@ -482,6 +527,12 @@ public:
     // §4.4's Ignore class. The pill names the key and says what to do about it; nothing else
     // happens, and in particular nothing is committed.
     virtual void on_foreign_key(uint32_t vk, uint32_t mods) = 0;
+
+    // The mouse inside the pill (§5.2). Placing a caret is an edit gesture and closes the
+    // microphone exactly as the first edit key does; scrolling is **not** — hotkey.cpp already
+    // reasons that scrolling to re-read what you dictated is a normal thing to do mid-session,
+    // and that stays true here.
+    virtual void on_pill_pointer(const PillPost& p) = 0;
 
     virtual void on_stop_input(StopInputReason reason) = 0;
 
@@ -525,7 +576,9 @@ enum class HotkeyPost : uint32_t {
     EditingBegan,
     ResumeDictation,
     ForeignKey,      // lParam: vk | (mods << 16)
+    PillPointer,     // lParam: pack_pill_post()
 };
+
 
 // Call from the owner window's WndProc. Returns true if the message belonged to this module,
 // in which case the listener has already been invoked and the WndProc should return 0.
@@ -569,6 +622,11 @@ public:
     // — it is the compose buffer silently ceasing to accept keys about two seconds into every
     // session, which is the safe direction and the reason the check is written this way round.
     void heartbeat() noexcept;
+
+    // Publish the pill's rectangle in physical screen pixels, after every paint that moved or
+    // resized it (docs/editing.md §5.2). An empty rectangle unpublishes it, which is what a
+    // hidden pill means and what every session must end with.
+    void set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept;
 
     [[nodiscard]] bool is_running() const noexcept;
 

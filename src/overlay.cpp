@@ -302,6 +302,13 @@ constexpr float kCaretWidthDip = 1.0f;
 // colours and the committed/unstable split stays readable through it.
 constexpr uint32_t kSelectionFill = 0x552E7D32;
 
+// docs/editing.md §13 stage 3: "the microphone button — the one control that says what it does
+// without anyone having to remember a key, and the answer for whoever finds §4.5's no-op hotkey
+// more confusing than the toggle it replaced."
+constexpr const char* kMicButtonLabel = "\xF0\x9F\x8E\xA4 Resume dictating";  // U+1F3A4
+constexpr uint32_t kMicButtonFill = 0x22000000;
+constexpr float kMicButtonPadDip = 6.0f;
+
 D2D1_COLOR_F argb(uint32_t c) noexcept {
     return D2D1::ColorF(c & 0x00FFFFFFu, static_cast<float>((c >> 24) & 0xFFu) / 255.0f);
 }
@@ -384,6 +391,27 @@ size_t utf16_prefix_units(std::string_view text, size_t byte_off) {
     std::wstring w;
     if (!utf8::to_utf16(text.substr(0, byte_off), w, nullptr)) return 0;
     return w.size();
+}
+
+// The inverse of utf16_prefix_units: the UTF-8 byte offset whose prefix occupies `units` UTF-16
+// code units. Used by the mouse hit test, which gets a UTF-16 position out of DirectWrite and has
+// to hand a byte offset to EditBuffer.
+//
+// Walks code points rather than doing arithmetic on lengths, because the relationship is not a
+// ratio: ASCII is 1:1, most of the BMP is 3 bytes to 1 unit, and everything above it is 4 bytes
+// to 2 units. The result always lands on a code-point boundary; EditBuffer floors it to a
+// grapheme boundary, which is the clamp that keeps a click from splitting a combining sequence.
+size_t utf8_offset_for_utf16_units(std::string_view text, size_t units) {
+    size_t off = 0;
+    size_t seen = 0;
+    while (off < text.size() && seen < units) {
+        char32_t cp = 0;
+        size_t len = 0;
+        if (!utf8::decode(text, off, cp, len)) break;
+        seen += cp >= 0x10000 ? 2u : 1u;
+        off += len;
+    }
+    return off;
 }
 
 // UTF-8 -> UTF-16 at the Windows API boundary, per util/utf8.h. Malformed input is refused
@@ -508,6 +536,15 @@ struct OverlayCore {
     float hit_origin_y = 0.0f;
     size_t hit_cut_units = 0;    // leading UTF-16 units dropped by the front-elision
     uint32_t hit_dpi = USER_DEFAULT_SCREEN_DPI;
+    anchor::Rect painted_rect{};   // physical screen pixels, as of the last paint
+
+    // The microphone button, in DIPs relative to the pill's top-left. Empty unless the last paint
+    // drew one, which it does only while editing.
+    float mic_left = 0.0f, mic_top = 0.0f, mic_right = 0.0f, mic_bottom = 0.0f;
+
+    // docs/editing.md §5.1. False for the whole of a normal session and true only while a
+    // composing session is running; WS_EX_NOACTIVATE is untouched either way.
+    bool click_through = true;
 
     bool want_visible = false;
     bool dirty = true;
@@ -994,11 +1031,31 @@ HRESULT OverlayCore::paint_once() {
     // information gain — and with a session-long buffer behind it, the width would otherwise be
     // pinned at the maximum nearly all the time anyway. The inline overlay keeps shrinking to fit,
     // because there it is a label attached to a caret and its size is what keeps it out of the way.
-    const float measured_w = std::max(body_w, note_w);
+    // The microphone button (docs/editing.md §13 stage 3), drawn only while editing — the one
+    // state where the hotkey's meaning has to be remembered, and therefore the one state where a
+    // control that says what it does earns its space.
+    ComRef<IDWriteTextLayout> mic_layout;
+    DWRITE_TEXT_METRICS mic_metrics{};
+    const bool want_mic = state == OverlayState::Editing && em != OverlayMode::StatusOnly;
+    if (want_mic) {
+        const std::wstring label = utf8::to_utf16_or_empty(kMicButtonLabel);
+        if (SUCCEEDED(dwrite->CreateTextLayout(label.c_str(), static_cast<UINT32>(label.size()),
+                                               format_note.get(), max_text_w, 4096.0f,
+                                               mic_layout.put()))) {
+            if (FAILED(mic_layout->GetMetrics(&mic_metrics))) mic_layout.reset();
+        }
+    }
+    const float mic_w = mic_layout ? mic_metrics.widthIncludingTrailingWhitespace +
+                                         kMicButtonPadDip * 2.0f
+                                   : 0.0f;
+    const float mic_h = mic_layout ? mic_metrics.height + kMicButtonPadDip : 0.0f;
+
+    const float measured_w = std::max(std::max(body_w, note_w), mic_w);
     const float content_w = (mode == OverlayMode::FloatingPill && measured_w > 0.0f)
                                 ? max_text_w
                                 : measured_w;
-    const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f);
+    const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f) +
+                            (mic_layout ? gap + mic_h : 0.0f);
 
     // A minimum height so a bare status dot still reads as a control and not as a speck.
     const float box_w_dip = text_x + std::max(content_w, dot_r * 2.0f) + pad;
@@ -1128,11 +1185,35 @@ HRESULT OverlayCore::paint_once() {
         hit_origin_y = origin_y;
         hit_dpi = monitor_dpi;
     }
+    const float note_y = pad + body_h + (body_layout ? gap : 0.0f);
     if (note_layout) {
-        rt->DrawTextLayout(D2D1::Point2F(text_x, pad + body_h + (body_layout ? gap : 0.0f)),
-                           note_layout.get(),
+        rt->DrawTextLayout(D2D1::Point2F(text_x, note_y), note_layout.get(),
                            violation ? brush_warning.get() : brush_unstable.get(),
                            D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+
+    mic_left = mic_top = mic_right = mic_bottom = 0.0f;
+    if (mic_layout && brush_border && brush_pending) {
+        const float y = note_y + (note_layout ? note_h + gap : 0.0f);
+        mic_left = text_x;
+        mic_top = y;
+        mic_right = text_x + mic_w;
+        mic_bottom = y + mic_h;
+
+        const D2D1_ROUNDED_RECT button = D2D1::RoundedRect(
+            D2D1::RectF(mic_left, mic_top, mic_right, mic_bottom), 4.0f, 4.0f);
+        // The border brush recoloured in place rather than a seventh brush on OverlayCore: the
+        // dot brush already does this, and a brush per decoration is how a render target's
+        // resource list grows without anybody deciding it should.
+        const D2D1_COLOR_F was = brush_border->GetColor();
+        brush_border->SetColor(argb(kMicButtonFill));
+        rt->FillRoundedRectangle(button, brush_border.get());
+        brush_border->SetColor(was);
+        rt->DrawRoundedRectangle(button, brush_border.get(), 1.0f);
+
+        rt->DrawTextLayout(D2D1::Point2F(mic_left + kMicButtonPadDip,
+                                         mic_top + kMicButtonPadDip * 0.5f),
+                           mic_layout.get(), brush_pending.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
     hr = rt->EndDraw();
@@ -1159,6 +1240,12 @@ HRESULT OverlayCore::paint_once() {
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;  // per-pixel alpha; the DIB is premultiplied
+
+    // Where the pill actually is, for the mouse filter's point-in-rect test (docs/editing.md
+    // §5.2) and for hit_test_text's coordinate conversion. Recorded from the values that were
+    // just presented, not from GetWindowRect, so it can never describe a frame that has not
+    // happened yet.
+    painted_rect = anchor::Rect{rect.left, rect.top, rect.left + box_w_px, rect.top + box_h_px};
 
     if (!UpdateLayeredWindow(hwnd, nullptr, &dst, &size, surface.dc, &src, 0, &blend, ULW_ALPHA)) {
         const DWORD err = GetLastError();
@@ -1235,9 +1322,12 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return MA_NOACTIVATE;
 
         case WM_NCHITTEST:
-            // Same reasoning: WS_EX_TRANSPARENT already routes clicks past us, and this makes
-            // the window transparent to WindowFromPoint-style probing as well.
-            return HTTRANSPARENT;
+            // While click-through, this makes the window transparent to WindowFromPoint-style
+            // probing as well as to clicks. While a composing session has dropped
+            // WS_EX_TRANSPARENT (docs/editing.md §5.1), answering HTTRANSPARENT would undo the
+            // whole thing — the click would be routed to the target after all, which is exactly
+            // what the flag was dropped to prevent.
+            return core->click_through ? HTTRANSPARENT : HTCLIENT;
 
         case WM_ERASEBKGND:
             // A layered window's pixels come from UpdateLayeredWindow. Erasing would be a
@@ -1519,6 +1609,118 @@ void Overlay::scroll_to_bottom() {
     }
     impl_->scroll_pinned = true;
     impl_->dirty = true;
+}
+
+void Overlay::set_click_through(bool value) {
+    if (impl_->click_through == value) {
+        return;
+    }
+    impl_->click_through = value;
+    if (!impl_->hwnd) {
+        return;
+    }
+
+    LONG_PTR ex = GetWindowLongPtrW(impl_->hwnd, GWL_EXSTYLE);
+    const LONG_PTR was = ex;
+    if (value) {
+        ex |= WS_EX_TRANSPARENT;
+    } else {
+        ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    }
+    // WS_EX_NOACTIVATE is deliberately untouched. It is what keeps the target foreground when a
+    // click lands here, which is what keeps `validate_target` passing, which is what keeps a
+    // session's text going into the document instead of onto the clipboard (docs/editing.md
+    // §4.6). Dropping WS_EX_TRANSPARENT without it would be the worst failure overlay.h names.
+    if (ex == was) {
+        return;
+    }
+    SetLastError(0);
+    if (SetWindowLongPtrW(impl_->hwnd, GWL_EXSTYLE, ex) == 0 && GetLastError() != 0) {
+        KD_LOG_WARN("could not %s the overlay's click-through flag (err %lu); the pill will not "
+                    "be clickable this session",
+                    value ? "restore" : "drop", GetLastError());
+        impl_->click_through = !value;
+        return;
+    }
+
+    // docs/editing.md §15 question 2 asked whether the change takes effect without this. The
+    // documentation for SetWindowLongPtr says a style change is not applied to some styles until
+    // SetWindowPos is called with SWP_FRAMECHANGED, and it does not enumerate which — so the call
+    // is made rather than the question left open. It costs one syscall per session boundary, and
+    // NOMOVE/NOSIZE/NOZORDER/NOACTIVATE mean it changes nothing else.
+    SetWindowPos(impl_->hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                     SWP_FRAMECHANGED);
+    KD_LOG_INFO("overlay is now %s", value ? "click-through" : "clickable");
+}
+
+bool Overlay::click_through() const noexcept { return impl_->click_through; }
+
+anchor::Rect Overlay::pill_rect() const noexcept {
+    // Empty while hidden. The hook reads an empty rectangle as "there is no pill", so a hidden
+    // overlay cannot swallow a click that was meant for the document.
+    if (!impl_->hwnd || !impl_->want_visible) {
+        return anchor::Rect{};
+    }
+    return impl_->painted_rect;
+}
+
+bool Overlay::hit_test_text(int32_t x, int32_t y, size_t& offset) const {
+    offset = 0;
+    if (!impl_->hit_layout) {
+        return false;
+    }
+    // Physical pixels in, DIPs to DirectWrite. The pill can be on a monitor at a different scale
+    // from the one this process started on, so the divisor is the DPI the last paint used rather
+    // than a constant — the same value that paint chose the layout's own metrics with.
+    const float scale =
+        static_cast<float>(impl_->hit_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+    if (scale <= 0.0f) {
+        return false;
+    }
+    const float px = static_cast<float>(x) / scale - impl_->hit_origin_x;
+    const float py = static_cast<float>(y) / scale - impl_->hit_origin_y;
+
+    BOOL trailing = FALSE;
+    BOOL inside = FALSE;
+    DWRITE_HIT_TEST_METRICS hm{};
+    if (FAILED(impl_->hit_layout->HitTestPoint(px, py, &trailing, &inside, &hm))) {
+        return false;
+    }
+    // `inside` false means the point was past the end of a line or below the last one, and
+    // DirectWrite has answered with the nearest position anyway. That is the right answer for a
+    // click: dragging past the end of a line selects to its end.
+    size_t units = hm.textPosition + (trailing ? hm.length : 0);
+
+    // Undo the front-elision, which shifted every position by the dropped units plus the one
+    // ellipsis that replaced them. A click on the ellipsis itself lands at the start of what is
+    // still shown, which is as far back as the caret can go.
+    if (impl_->hit_cut_units > 0) {
+        units = units == 0 ? 0 : units - 1;
+        units += impl_->hit_cut_units;
+    }
+
+    offset = utf8_offset_for_utf16_units(impl_->pending, units);
+    // docs/editing.md §3: the unstable tail is not addressable. A click on the model's
+    // still-moving words puts the caret at the end of what is settled rather than inside what is
+    // not — the clamp EditBuffer would apply anyway, applied here so the two cannot disagree.
+    if (offset > impl_->pending.size()) offset = impl_->pending.size();
+    return true;
+}
+
+bool Overlay::hit_test_mic_button(int32_t x, int32_t y) const {
+    if (impl_->mic_right <= impl_->mic_left || impl_->mic_bottom <= impl_->mic_top) {
+        return false;  // the last paint drew no button, which means we are not editing
+    }
+    const float scale =
+        static_cast<float>(impl_->hit_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+    if (scale <= 0.0f) {
+        return false;
+    }
+    const float px = static_cast<float>(x) / scale;
+    const float py = static_cast<float>(y) / scale;
+    return px >= impl_->mic_left && px < impl_->mic_right && py >= impl_->mic_top &&
+           py < impl_->mic_bottom;
 }
 
 void Overlay::clear_violation() {

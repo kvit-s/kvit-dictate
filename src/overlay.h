@@ -229,6 +229,43 @@ public:
     void scroll_by_lines(int32_t delta);
     void scroll_to_bottom();
 
+    // ── The mouse (docs/editing.md §5) ──────────────────────────────────────────────────────
+
+    // Drop or restore WS_EX_TRANSPARENT at runtime, **only for the duration of a composing
+    // session** (§5.1). Clicks then land on this window instead of passing through to the target,
+    // which is the entire point: a click meant for the pill must not move the target's caret.
+    //
+    // What makes it safe rather than reckless is that WS_EX_NOACTIVATE stays set. A click on a
+    // NOACTIVATE window does not activate it, so the target stays foreground and
+    // `validate_target` keeps passing. overlay.cpp already returns MA_NOACTIVATE from
+    // WM_MOUSEACTIVATE with a comment saying it is belt-and-braces "if a future change ever drops
+    // that flag"; this is that change.
+    //
+    // **The restore belongs on the one path every session ends through** (§5.3). A pill that
+    // stays non-transparent after a session eats clicks meant for the document, forever, and the
+    // user's only recovery is to restart the process — the same shape as the
+    // `note_session_ended()` bug in progress.md §8.
+    void set_click_through(bool click_through);
+    [[nodiscard]] bool click_through() const noexcept;
+
+    // Where the pill is on screen, in physical pixels, as of the last paint. Empty when it has
+    // never been painted or is hidden. Published to the hook so the mouse filter can tell a click
+    // inside the pill from a click that means "the user has gone elsewhere" (§5.2).
+    [[nodiscard]] anchor::Rect pill_rect() const noexcept;
+
+    // Hit-test a point given **relative to the pill's top-left, in physical pixels** — the units
+    // the hook publishes, because it has the rectangle and the UI thread has the layout.
+    //
+    // Returns false when the point is not over the text at all. On success `offset` is a UTF-8
+    // byte offset into the `pending` half, clamped into it: the unstable tail is not addressable
+    // (docs/editing.md §3), so a click on the model's still-moving words puts the caret at the
+    // end of what is settled rather than inside what is not.
+    [[nodiscard]] bool hit_test_text(int32_t x, int32_t y, size_t& offset) const;
+
+    // True when the point is over the microphone button — the one control that says what it does
+    // without anyone having to remember a key (§13 stage 3), drawn only while editing.
+    [[nodiscard]] bool hit_test_mic_button(int32_t x, int32_t y) const;
+
     // ── Presentation ────────────────────────────────────────────────────────────────────────
 
     void show();

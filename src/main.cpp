@@ -120,6 +120,7 @@ struct HookNote {
         EditingBegan,    // the first edit key: close the microphone (§3.2)
         ResumeDictation, // the hotkey while editing: reopen it (§3.3)
         ForeignKey,      // §4.4's Ignore class: name the key in the pill and do nothing
+        PillPointer,     // the mouse inside the pill (§5.2)
     };
     Kind kind = Kind::Activate;
     kd::StopInputReason reason = kd::StopInputReason::Keystroke;
@@ -128,6 +129,7 @@ struct HookNote {
     uintptr_t window = 0;
     uint64_t time_ms = 0;
     kd::EditPost edit{};
+    kd::PillPost pill{};
 };
 
 std::wstring widen(std::string_view utf8) {
@@ -205,6 +207,12 @@ public:
         n.edit.mods = mods;
         post_hook(n);
     }
+    void on_pill_pointer(const kd::PillPost& p) override {
+        HookNote n;
+        n.kind = HookNote::Kind::PillPointer;
+        n.pill = p;
+        post_hook(n);
+    }
     void on_stop_input(kd::StopInputReason reason) override {
         HookNote n;
         n.kind = HookNote::Kind::StopInput;
@@ -264,6 +272,12 @@ private:
     void begin_editing();      // §3.2: the microphone closes, at the device
     void resume_dictation();   // §3.3: it reopens, the caret moves to the end
     void show_foreign_key_hint(uint32_t vk, uint32_t mods);
+    void apply_pill_pointer(const kd::PillPost& p);
+    // Republish the pill's rectangle to the hook after every paint. docs/editing.md §16 calls
+    // this the `last_voice_ms` shape: if the UI thread never publishes it, the slot reads zero,
+    // every click is outside the pill, and the mouse silently reverts to ending the session —
+    // with a green suite, because the tests write the rectangle themselves.
+    void publish_pill_rect();
     // Pushes the buffer, the caret and the selection at the overlay together, because a caret
     // offset that arrives without the text it indexes is an offset into the previous frame.
     void push_edit_view();
@@ -768,6 +782,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     // it — the preview was invisible for a whole session unless a new anchor
                     // happened to land in the same 50 ms tick.
                     overlay_->render();
+                    publish_pill_rect();
                 }
             }
             return 0;
@@ -895,6 +910,9 @@ void App::drain_hook_queue() {
                 break;
             case HookNote::Kind::ForeignKey:
                 show_foreign_key_hint(n.edit.vk, n.edit.mods);
+                break;
+            case HookNote::Kind::PillPointer:
+                apply_pill_pointer(n.pill);
                 break;
             case HookNote::Kind::LeftClick:
                 // plan.md §1.5 source B. Cached even when no session is running, because the
@@ -1482,6 +1500,52 @@ void App::resume_dictation() {
     push_edit_view();
 }
 
+void App::publish_pill_rect() {
+    if (hotkey_ == nullptr) return;
+    const kd::anchor::Rect r =
+        overlay_ != nullptr ? overlay_->pill_rect() : kd::anchor::Rect{};
+    hotkey_->set_pill_rect(r.left, r.top, r.right, r.bottom);
+}
+
+void App::apply_pill_pointer(const kd::PillPost& p) {
+    if (!composing() || !settings_.editing.mouse || overlay_ == nullptr) return;
+
+    if (p.kind == kd::FilterOutcome::PillPointerKind::Scroll) {
+        // docs/editing.md §5.2: scrolling is **not** an edit gesture and does not close the
+        // microphone. Three lines per notch is the Windows convention and, at eight visible
+        // lines, moves the view by a readable amount without jumping past what the user is
+        // looking for. A positive delta is away from the user, which scrolls back.
+        const int32_t notches = p.wheel / WHEEL_DELTA;
+        overlay_->scroll_by_lines(notches != 0 ? -notches * 3 : (p.wheel > 0 ? -3 : 3));
+        return;
+    }
+
+    if (p.kind == kd::FilterOutcome::PillPointerKind::Up) return;  // the drag simply ends
+
+    if (p.kind == kd::FilterOutcome::PillPointerKind::Down &&
+        overlay_->hit_test_mic_button(p.x, p.y)) {
+        // §13 stage 3: the control that says what it does. It is the same gesture the hotkey
+        // makes, routed to the same place, so there is one resume path rather than two.
+        resume_dictation();
+        return;
+    }
+
+    size_t offset = 0;
+    if (!overlay_->hit_test_text(p.x, p.y, offset)) return;
+
+    // §5.2: placing a caret is an edit gesture, so it closes the microphone exactly as the first
+    // edit key does. The mouse must not open a second route into editing mode that skips the
+    // suspend — that would leave a lit microphone light over a pill claiming to be paused, which
+    // is the failure §3.2 exists to prevent.
+    if (!editing_) begin_editing();
+
+    kd::EditCommand c;
+    c.op = p.kind == kd::FilterOutcome::PillPointerKind::Down ? kd::EditOp::PlaceCaret
+                                                              : kd::EditOp::ExtendCaret;
+    c.offset = offset;
+    if (edit_.apply(c).changed()) render_preview({});
+}
+
 void App::show_foreign_key_hint(uint32_t vk, uint32_t mods) {
     if (!composing() || overlay_ == nullptr) return;
 
@@ -1647,6 +1711,11 @@ void App::begin_dictation() {
     if (overlay_ != nullptr) {
         overlay_->clear_hint();
         overlay_->scroll_to_bottom();
+        // docs/editing.md §5.1: WS_EX_TRANSPARENT is dropped **only for the duration of a
+        // composing session**, so that a click meant for the pill lands on the pill instead of
+        // moving the target's caret. WS_EX_NOACTIVATE stays set, which is what keeps the target
+        // foreground and `validate_target` passing.
+        overlay_->set_click_through(!(composing() && settings_.editing.mouse));
     }
     push_edit_view();
 
@@ -1843,8 +1912,19 @@ void App::finish_dictation(const char* why) {
         overlay_->set_edit_view(false, 0, 0, 0);
         overlay_->scroll_to_bottom();
         overlay_->set_text({}, {});
+        // docs/editing.md §5.3, and it is here rather than in end_dictation() for the reason the
+        // note_session_ended() call above is: the abort paths skip end_dictation entirely. A pill
+        // that stays non-transparent after a session eats clicks meant for the document, forever,
+        // and the user's only recovery is to restart the process — the same shape as the
+        // `note_session_ended()` bug in progress.md §8, and the one this file has already been
+        // bitten by once.
+        overlay_->set_click_through(true);
         overlay_->hide();
     }
+    // The pill is gone, so the hook must stop believing there is one to click inside. Without
+    // this the last session's rectangle would keep absorbing clicks from the mouse filter's
+    // point of view — the session would not end on a click in that region.
+    publish_pill_rect();
     set_tray_state(kd::OverlayState::Idle);
 }
 

@@ -1435,9 +1435,13 @@ enum : int {
     kIdStartup,
     kIdSendContext,
     kIdContextTerms,
+    kIdEditingEnabled,
+    kIdEditingMouse,
+    kIdEditingForeign,
+    kIdEditingStatus,
 };
 
-constexpr int kPageCount = 3;
+constexpr int kPageCount = 4;
 
 struct DialogState {
     Settings settings;                       // the working copy; only copied out on OK
@@ -1774,6 +1778,31 @@ void update_model_status(HWND dlg, DialogState& st) {
     SetWindowTextW(GetDlgItem(dlg, kIdModelStatus), text.c_str());
 }
 
+// docs/editing.md §6.1 and §12: `editing.enabled` is forced off unless the cadence is
+// `end-of-session`, "and the settings dialog must say why rather than silently ignoring it".
+//
+// One function, called from three places — when the page is filled in, when the cadence combo
+// changes, and when the checkbox itself is clicked — so that the answer the dialog shows and the
+// answer Settings::normalise() computes cannot come apart. A dialog that let the user tick a box
+// which the loader then quietly untick is worse than a disabled box: the user believes they
+// configured something.
+void refresh_editing_page(HWND dlg) {
+    const bool eos = SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) ==
+                     cadence_index(Cadence::EndOfSession);
+    EnableWindow(GetDlgItem(dlg, kIdEditingEnabled), eos ? TRUE : FALSE);
+
+    const bool on = eos && IsDlgButtonChecked(dlg, kIdEditingEnabled) == BST_CHECKED;
+    EnableWindow(GetDlgItem(dlg, kIdEditingMouse), on ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(dlg, kIdEditingForeign), on ? TRUE : FALSE);
+
+    SetWindowTextW(GetDlgItem(dlg, kIdEditingStatus),
+                   eos ? L"The compose buffer is available with this cadence."
+                       : L"Unavailable: the cadence on the Dictation page is not "
+                         L"\"end-of-session\". With any other cadence the text is already in "
+                         L"your document as you speak, so there is nothing left in the pill to "
+                         L"edit or for Enter to commit.");
+}
+
 void load_controls(HWND dlg, DialogState& st) {
     const Settings& s = st.settings;
 
@@ -1815,6 +1844,18 @@ void load_controls(HWND dlg, DialogState& st) {
     SendMessageW(cad, CB_SETCURSEL, static_cast<WPARAM>(cadence_index(s.stability.cadence)), 0);
     set_int(GetDlgItem(dlg, kIdCadenceMs), s.stability.cadence_ms);
     EnableWindow(GetDlgItem(dlg, kIdCadenceMs), s.stability.cadence == Cadence::Periodic);
+
+    // The compose buffer (docs/editing.md §12).
+    CheckDlgButton(dlg, kIdEditingEnabled, s.editing.enabled ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdEditingMouse, s.editing.mouse ? BST_CHECKED : BST_UNCHECKED);
+    HWND fk = GetDlgItem(dlg, kIdEditingForeign);
+    SendMessageW(fk, CB_RESETCONTENT, 0, 0);
+    combo_add(fk, L"is ignored \x2014 the pill names it and nothing happens");
+    combo_add(fk, L"finishes the session \x2014 the key reaches your document");
+    SendMessageW(fk, CB_SETCURSEL,
+                 s.editing.on_foreign_key == ForeignKeyAction::EndSession ? 1u : 0u, 0);
+    // After the cadence combo above has been filled in and selected: this reads it.
+    refresh_editing_page(dlg);
 
     // Injection.
     HWND im = GetDlgItem(dlg, kIdInjectMethod);
@@ -1948,6 +1989,16 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         s.stability.cadence_ms = static_cast<uint32_t>(n);
     }
 
+    // The compose buffer. `enabled` is read as the user left it and then forced off by
+    // normalise() if the cadence does not permit it — the dialog disables the box rather than
+    // second-guessing here, so that there is one place that decides (docs/editing.md §6.1).
+    s.editing.enabled = IsDlgButtonChecked(dlg, kIdEditingEnabled) == BST_CHECKED;
+    s.editing.mouse = IsDlgButtonChecked(dlg, kIdEditingMouse) == BST_CHECKED;
+    s.editing.on_foreign_key =
+        SendMessageW(GetDlgItem(dlg, kIdEditingForeign), CB_GETCURSEL, 0, 0) == 1
+            ? ForeignKeyAction::EndSession
+            : ForeignKeyAction::Ignore;
+
     s.inject.method = SendMessageW(GetDlgItem(dlg, kIdInjectMethod), CB_GETCURSEL, 0, 0) == 1
                           ? InjectMethod::Clipboard
                           : InjectMethod::SendInput;
@@ -2065,9 +2116,48 @@ void build_controls(HWND dlg, DialogState& st) {
     const int col2_x = col1_x + col_w + px(st, kMargin);
     const int top = px(st, kMargin + kTabStrip + kMargin);
 
-    // ── Page 0: dictation ───────────────────────────────────────────────────────────────────
+    // ── Page 0: the compose buffer (docs/editing.md) ────────────────────────────────────────
     {
         Cursor c{dlg, inst, &st, 0, col1_x, top, col_w};
+        c.section(L"The pill as a compose buffer");
+        c.note(L"Nothing reaches your document until you say so. Speech accumulates in the pill; "
+               L"Enter types it in and finishes, Esc throws it away, and the hotkey only ever "
+               L"means \"dictate\" — it starts a session and resumes one, and never finishes "
+               L"one.",
+               5);
+        c.check(L"Let me edit the pill before it is typed in", kIdEditingEnabled);
+        c.add(L"STATIC", L"", 0, st.line_h * 5, kIdEditingStatus);
+        c.gap(6);
+
+        c.section(L"While you are editing");
+        c.note(L"The microphone is CLOSED. Editing and speaking are separate states and you are "
+               L"only ever in one of them; the pill and the tray both say which. Press the "
+               L"hotkey, or the button in the pill, to start talking again.",
+               4);
+        c.note(L"The session-silence timer does not run while you are editing, so reading back a "
+               L"long dictation cannot end the session under you.",
+               3);
+    }
+    {
+        Cursor c{dlg, inst, &st, 0, col2_x, top, col_w};
+        c.section(L"The keyboard belongs to the pill");
+        c.note(L"While a session is composing, editing keys — Backspace, Delete, the arrows, "
+               L"Home/End, Ctrl+A/C/X/V/Z and ordinary characters — go to the pill instead of to "
+               L"your document. Volume, media and Print Screen keys are never intercepted.",
+               5);
+        c.label_combo(L"Any other key (Ctrl+S, F5, Alt+Tab)", kIdEditingForeign);
+
+        c.section(L"Mouse");
+        c.note(L"Click in the pill to place the caret, drag to select, and scroll with the wheel "
+               L"to read back what you have said. Clicking anywhere else still finishes the "
+               L"session and types the text in.",
+               4);
+        c.check(L"Let me click and scroll inside the pill", kIdEditingMouse);
+    }
+
+    // ── Page 1: dictation ───────────────────────────────────────────────────────────────────
+    {
+        Cursor c{dlg, inst, &st, 1, col1_x, top, col_w};
         c.section(L"Activation");
         c.label_combo(L"Hotkey (toggle: press to start, press again to finalise)", kIdHotkey);
 
@@ -2086,7 +2176,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Never end the session on silence", kIdSessionNever);
     }
     {
-        Cursor c{dlg, inst, &st, 0, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 1, col2_x, top, col_w};
         c.section(L"Stability — what is SAFE to commit");
         c.note(L"Eligibility is decided by stability alone. Committed text is never repaired, so "
                L"nothing below may ever be widened by the cadence setting.",
@@ -2103,9 +2193,9 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Interval (ms, used only by \"periodic\")", kIdCadenceMs, ES_NUMBER);
     }
 
-    // ── Page 1: injection, audio, model ─────────────────────────────────────────────────────
+    // ── Page 2: injection, audio, model ─────────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 1, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col1_x, top, col_w};
         c.section(L"Text injection");
         c.label_combo(L"Default method", kIdInjectMethod);
         c.label_edit(L"SendInput: characters per batch (0 = one batch)", kIdCharsBatch, ES_NUMBER);
@@ -2119,7 +2209,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_combo(L"Capture device", kIdAudioDevice);
     }
     {
-        Cursor c{dlg, inst, &st, 1, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col2_x, top, col_w};
         c.section(L"Per-app injection policy");
         c.note(L"One line per application:   process.exe = sendinput | clipboard "
                L"[, ctrl-shift-v] [, unsupported]   # note",
@@ -2134,9 +2224,9 @@ void build_controls(HWND dlg, DialogState& st) {
         c.add(L"STATIC", L"", 0, 44, kIdModelStatus);
     }
 
-    // ── Page 2: overlay, privacy, vocabulary ────────────────────────────────────────────────
+    // ── Page 3: overlay, privacy, vocabulary ────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 2, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col1_x, top, col_w};
         c.section(L"Overlay");
         c.label_combo(L"Presentation", kIdOverlayMode);
         c.label_combo(L"When the anchor is not confident enough", kIdFallback);
@@ -2148,7 +2238,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Background colour (#AARRGGBB)", kIdColorBackground);
     }
     {
-        Cursor c{dlg, inst, &st, 2, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col2_x, top, col_w};
         c.section(L"Privacy and diagnostics");
         c.note(L"Shipping policy, not preference: nothing you dictate is written to disk, and "
                L"nothing here ever touches the network.",
@@ -2175,7 +2265,7 @@ void build_controls(HWND dlg, DialogState& st) {
                                 nullptr);
     if (tabs) {
         SendMessageW(tabs, WM_SETFONT, reinterpret_cast<WPARAM>(st.font), TRUE);
-        const wchar_t* names[kPageCount] = {L"Dictation", L"Injection && model",
+        const wchar_t* names[kPageCount] = {L"Compose buffer", L"Dictation", L"Injection && model",
                                             L"Overlay && privacy"};
         for (int i = 0; i < kPageCount; ++i) {
             TCITEMW item{};
@@ -2311,7 +2401,15 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         EnableWindow(GetDlgItem(hwnd, kIdCadenceMs),
                                      SendMessageW(GetDlgItem(hwnd, kIdCadence), CB_GETCURSEL, 0,
                                                   0) == 1);
+                        // The compose buffer's availability follows the cadence, and it is on a
+                        // different page — so the user changes the cadence here and finds the
+                        // other page already telling them what it now permits, rather than
+                        // discovering it on the next launch (docs/editing.md §12).
+                        refresh_editing_page(hwnd);
                     }
+                    return 0;
+                case kIdEditingEnabled:
+                    refresh_editing_page(hwnd);
                     return 0;
                 case kIdModel:
                     if (code == CBN_SELCHANGE) update_model_status(hwnd, *st);
