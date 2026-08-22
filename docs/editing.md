@@ -1,9 +1,20 @@
 # editing — the pill as a compose buffer
 
-**Status: proposal. Nothing described here is implemented.** No code in `src/` does any of this
-as of 2026-08-22 (commit `d53b6a0`). Every mechanism below is traced to the file that would have
-to change, and everything I could not verify from the source is an open question in §15 rather
-than an assertion.
+**Status: implemented, stages 1–3, and unproven in use.** Everything below is in `src/` as of
+2026-08-22 — the document has been left in the future tense it was written in, because it is the
+argument for the design rather than a description of the code, and rewriting it into the past
+tense would lose the reasons. What changed is this header and §17.
+
+The three commits are `Enter finishes the session…` (stage 1), `The pill becomes a compose
+buffer…` (stage 2) and `The pill becomes clickable…` (stage 3). Stage 4's contents arrived inside
+stage 2 rather than after it: §4.3 puts Ctrl+Z, Ctrl+C/X/V and word-wise motion in the Edit class,
+and a key that is swallowed and then does nothing is worse than the feature it was deferring.
+
+**§13's staging gate was not honoured, and that is a real deviation.** "Do not start stage 2
+before stage 1 has been used for a real day of dictation" — stages 1 to 3 were written in one
+sitting. The argument for the gate stands: §4.1's mode is the kind of thing that reads well and
+feels wrong, and nothing here has been used in anger. §17 lists what a day of use is expected to
+answer.
 
 Implements `plan.md` §1.4 (the committed-prefix invariant — this strengthens it), §1.5 (what the
 overlay renders), §1.7 (target safety) and §1.9 (the microphone privacy promise, which §3.2 leans
@@ -757,3 +768,62 @@ unusually good supply of ways to reproduce it. Before believing any part of it w
 
 The habit: before trusting that something works, check which entry points the product actually
 calls.
+
+---
+
+## 17. What is not done, and what a day of use has to answer
+
+Written after the implementation, and deliberately separate from §15: those are questions the
+design could not answer from the source, and these are things the implementation left behind.
+
+### 17.1 Not implemented
+
+* **§10.3's clipboard-rescue test.** "It needs a test before this ships, not after", and it does
+  not have one. The path is `App::flush_deferred_commits` falling back to `set_clipboard_text`
+  when `validate_target` fails, and it lives in `src/main.cpp`, which has no tests and which §11
+  forbids putting anything interesting into. Testing it means extracting the decision — *inject,
+  or rescue* — into somewhere pure, which is a change to a path this feature did not otherwise
+  touch. It is the largest single gap here and it is the one most likely to bite, because §10.3
+  is right that editing makes the path far more likely to run and makes it carry more text.
+* **Dead keys.** `App::apply_edit`'s `char_for_key` calls `ToUnicodeEx` with the flag that
+  forbids changing the kernel keyboard state — which it must, or a dead key typed into the pill
+  would leave the layout's pending-diacritic state set and the *target* would receive the
+  composed character the next time the user typed into it. The consequence is that a dead key
+  produces nothing in the pill. Composing a diacritic needs the state that call is not allowed to
+  keep, and a half-composed accent in the buffer would be worse than a key that did nothing.
+* **`Overlay::scroll_by_lines` has exactly one caller**, the wheel. `editing.mouse = false`
+  therefore also means "no scrollback", which §7.3 calls a trap: the arrow keys still reach the
+  whole buffer, because caret-into-view scrolls for them, but there is no way to *read* back
+  without moving the caret. A Page Up / Page Down pair in the Edit class would close it.
+* **The settings round-trip found a gap it did not fix.** A settings *section* of the wrong type
+  (`"session": 5`) is silently defaulted, because `Obj::member` resolves through
+  `json::Value::find`, which answers nullptr for anything that is not an object. Recorded in
+  `tests/test_settings.cpp` as a KD_INFO rather than fixed: it is a change to how every section
+  is parsed, not to the block this feature added.
+
+### 17.2 §15's questions, still open
+
+Questions 1, 3, 4, 5, 6, 7 and 8 are unanswered, and none of them should be answered by guessing.
+The two that most affect the design rather than the code:
+
+* **Question 4 — resume latency.** §13 says to measure it *before* stage 2, and that was not
+  done. `App::resume_dictation` restarts a WASAPI capture mid-session, which nothing in the
+  product did before; if the first syllable is clipped, the answer already exists in the tree
+  (progress.md §8's fix for the 4.2 s model load: hold the gesture until the machine reports
+  ready). The `discontinuity` with `reason = "editing"` is already on the wire, so a stateful
+  backend is being told the truth either way.
+* **Question 2 — `SWP_FRAMECHANGED`.** Answered by doing it rather than by testing whether it was
+  needed: `Overlay::set_click_through` calls `SetWindowPos` with the flag. One syscall per
+  session boundary, and it removes the question.
+
+### 17.3 What a day of use is expected to answer
+
+* Does §4.1's mode feel wrong? The keyboard belonging to the pill is the price of the feature and
+  the thing most likely to be rejected in use rather than in argument.
+* Does §4.5's no-op hotkey read as broken? §4.5 names the one-line alternative — the hotkey pauses
+  the microphone, symmetrically with resuming it — and says why it is not the default.
+* Does the microphone button make §4.5 tolerable, or is the answer to bring the toggle back for
+  the dictating state only?
+* Does anything reach the fail-open path (§10.1) in ordinary use? It is written to be invisible
+  when the UI thread is healthy; a session that silently stops accepting keys after two seconds
+  would mean the heartbeat is not being stamped, and the log will not say so on its own.
