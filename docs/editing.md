@@ -9,8 +9,9 @@ Implements `plan.md` §1.4 (the committed-prefix invariant — this strengthens 
 overlay renders), §1.7 (target safety) and §1.9 (the microphone privacy promise, which §3.2 leans
 on hard). It **amends** two sections, and both amendments are stated where they happen:
 
-* **§1.8** — stop-on-input stops meaning "end the session" for the keys the pill claims (§4.3–4.4),
-  and the hotkey acquires a second, state-dependent meaning (§4.5).
+* **§1.8** — twice. Stop-on-input stops meaning "end the session" for the keys the pill claims
+  (§4.3–4.4); and **the toggle is gone** — the hotkey only ever starts or resumes dictation, never
+  finalises it, so finishing is always Enter (§4.5).
 * **§1.6** — the session-silence timer measures silence *while listening*, not wall-clock since
   activation, because editing closes the microphone (§9).
 
@@ -31,11 +32,17 @@ A session is in one of two states, and the pill and the tray always say which:
 * **Dictating** — the microphone is open, speech is appended to the end of the buffer.
 * **Editing** — the microphone is **closed**, and the buffer is a text field.
 
+**The hotkey only ever means "dictate".** It starts a session and it resumes one; it never ends
+one and never commits anything. Exactly four things dismiss the pill — Enter (commit), Esc
+(discard), a click outside it, and focus leaving the target window — and every one of them is
+either an explicit decision or the user physically going somewhere else. §4.5 is why this is worth
+giving up `plan.md` §1.8's toggle semantics for.
+
 | gesture | dictating | editing |
 |---|---|---|
 | **speech** | appended to the end of the buffer, as now | the mic is closed; nothing is heard |
 | **any editing key** (Backspace, Delete, arrows, Home/End, Shift+those, printable characters) | **closes the microphone** and switches to editing, then applies the key | edits the buffer in place |
-| **hotkey** | commits, exactly as Enter. §1.8's toggle semantics preserved | **resumes dictating**: reopens the mic, drops the selection, caret to the end |
+| **hotkey** | nothing — you are already dictating | **resumes dictating**: reopens the mic, drops the selection, caret to the end |
 | **Enter** | the buffer is typed into the document; the session ends. **The Enter is consumed** — it is purely "commit", never replayed to the target | the same |
 | **Esc** | everything is discarded; the session ends. Unchanged from §1.8 | the same |
 | **volume, media, brightness, PrtSc, the lock keys** | pass through untouched — none of them types into the target | the same |
@@ -154,7 +161,8 @@ gesture instead of by a timer.
 **Resuming is an explicit gesture**, because a closed microphone cannot notice that you want to
 talk to it:
 
-* **the hotkey** — see §4.5 for why it can carry this meaning without ambiguity;
+* **the hotkey** — which means "dictate" here as it does everywhere else (§4.5), so there is
+  nothing state-dependent to remember;
 * **a microphone button on the pill**, once the mouse exists (stage 3, §13).
 
 On resume the capture restarts, a `discontinuity` is emitted for the gap (the existing
@@ -213,9 +221,10 @@ filter's shape changes.
 
 ### 4.3 The key classes
 
-* **Commit** — Enter (unmodified), and the hotkey chord *while dictating*. **Only these two.**
-  Swallowed, not replayed: press Enter again and it reaches the application.
-* **Resume** — the hotkey chord *while editing*. Reopens the microphone (§3.3).
+* **Commit** — Enter (unmodified). **Only Enter.** Swallowed, not replayed: press it again and it
+  reaches the application.
+* **Dictate** — the hotkey chord. Starts a session from idle, resumes one from editing (§3.3), and
+  does nothing at all while already dictating. It never commits and never cancels.
 * **Cancel** — Esc. Unchanged from §1.8, including that it is **not** swallowed: `hotkey.cpp` gives
   the reason, and it still holds. Esc means "get me out of this" in the target too, and eating it
   would mean a dialog that refused to close while dictation happened to be running.
@@ -261,30 +270,72 @@ this is neither persistent nor about the text.
 `editing.on_foreign_key = "end-session"` (§12) restores today's behaviour for anyone who wants it:
 the key then passes through and ends the session, as it does now.
 
-### 4.5 The hotkey means two things, and it fails in the safe direction
+### 4.5 The hotkey means exactly one thing, and that costs §1.8's toggle
 
-The hotkey commits while dictating and resumes while editing. One key, two meanings, chosen by
-state — which is exactly the shape §4.4 just finished objecting to, so it needs its own defence.
+An earlier revision had the hotkey commit while dictating and resume while editing — one key, two
+meanings, chosen by state — and spent three paragraphs defending it. The defence was sound and the
+design was still worse than this one, which is: **the hotkey means "dictate", and nothing else,
+ever.**
 
-**The common path is untouched.** Speak, press the hotkey, done: §1.8's toggle semantics, the
-existing muscle memory, unchanged. The hotkey only means "resume" once the user has deliberately
-entered editing mode, and entering it is something they did with their own hands.
+What it buys:
 
-**The state is visible, unlike the foreign-key case.** A closed microphone is shown in the tray, in
-the pill, and by the machine's own microphone light. `plan.md` §1.6 already requires listening
-state to be unambiguous, for a different reason; this is the same requirement doing a second job.
+* **No destructive gesture is state-dependent.** §4.4 objects to Ctrl+S committing because it
+  fires an irreversible action from a key that means something else; a hotkey that commits in one
+  state and resumes in another is a milder case of the same complaint, and the reply to it was
+  "the mis-press fails in the safe direction" — which is a good answer to a question better not
+  asked.
+* **Every dismissal is now an explicit decision or a physical departure.** Enter, Esc, a click
+  outside, focus leaving. There is no key that ends a session as a side effect of meaning
+  something else.
+* **The mode is describable in one sentence**, which §4.1's keyboard capture badly needs: *Win+Y
+  talks, Enter finishes, Esc throws it away.*
 
-**And the mis-press is the harmless one.** A user in editing mode who presses the hotkey out of
-habit meaning "I'm finished" gets the mic reopened: nothing is committed, nothing is lost, and
-Enter is one keystroke away. The opposite mapping — where a user who wanted to carry on talking
-instead commits half a paragraph into their document and ends the session — is the irreversible
-one. Given a mapping that must be wrong sometimes, this is the direction to be wrong in.
+What it costs, and it is a real cost:
 
-That third argument is the whole reason this is acceptable and Ctrl+S committing was not.
+* **`plan.md` §1.8's toggle semantics are gone.** "Press to start; stops on … the hotkey again" was
+  chosen to match the `Win+H` gesture the product replaces, and this abandons that half of the
+  match. Finishing is now always Enter. The muscle memory is a genuine loss and it is the reason
+  this is the second amendment §1.8 takes from this document.
+* **The hotkey does nothing while dictating**, which is a key that has to be explained by its
+  absence. The obvious alternative — hotkey pauses the microphone, symmetrically with resuming it
+  — is a one-line change if the no-op turns out to feel dead in use. It is not the default because
+  "always start/continue" is a rule with no exceptions, and "toggle the mic" reintroduces one.
 
-Once the mouse exists (stage 3, §13) the pill also carries a microphone button, which is
-unambiguous in a way no key can be, and is the answer for anyone who does not want to think about
-the state at all.
+Once the mouse exists (stage 3, §13) the pill also carries a microphone button, which says what it
+does without anyone having to remember a key.
+
+### 4.6 The target never loses focus — including while editing
+
+Worth stating on its own, because the natural assumption is the opposite: *while you are editing in
+the pill, is the target window still focused?*
+
+**Yes. Throughout. The pill is never focused, not for a moment.** `WS_EX_NOACTIVATE` is what
+guarantees it, `WM_MOUSEACTIVATE` returning `MA_NOACTIVATE` is the second line of the same defence
+(§5.1), and the window is shown with `SW_SHOWNOACTIVATE` rather than `SW_SHOW` for the same reason.
+
+The consequences are all the good kind:
+
+* **There is nothing to restore at commit time.** `SendInput` types into whatever is focused, and
+  what is focused is — still, unchanged, the whole time — the window the user pressed the hotkey
+  in. No `SetForegroundWindow`, no focus juggling, no dismiss-then-refocus dance. §6 injects and
+  the text lands.
+* **`validate_target` keeps passing**, because its requirement is that the captured window is still
+  the foreground one. The pill cannot violate that; it is not in the running.
+* **Focus moving away is still a real event** — the user clicked another window, or something stole
+  it — and it still ends the session with the buffer going to the clipboard (§10.3). What changed
+  is that *editing* is no longer one of the ways it can happen.
+
+The cost is the one §4.1 already stated, and this is its other half: because the pill is never
+focused, the only way it can receive a keystroke is to take it from the window that *is* focused.
+There is no third option. Either the overlay takes focus — and the target is lost, which is the
+worst failure `overlay.h` names — or the hook steals keys, and the user is in a mode. This design
+steals keys.
+
+One visible artefact falls out of it: **the target's own caret keeps blinking** while the user
+edits in the pill, so there are two carets on screen. In `FloatingPill` mode they are far enough
+apart to read as what they are. In `Inline` mode the pill sits in the target's text flow and they
+would be adjacent, which is one more reason inline is not the mode this feature is designed for
+(`progress.md` §5 has the others).
 
 ## 5. Input: the mouse
 
@@ -334,6 +385,11 @@ session ends through**, and nowhere else. Not in `end_dictation`, which the abor
 Unchanged in mechanism: `App::flush_deferred_commits` injects `deferred_` in one operation after
 revalidating the target, and falls back to the clipboard when the target has gone. The only
 difference is that `deferred_` has been edited.
+
+**In particular there is no focus restoration step, because focus never went anywhere** — §4.6 has
+the argument. Nothing in this feature may add one: `injector.cpp` never restores focus precisely
+because `SendInput` types into whatever *is* focused, and a design that moves focus away and back
+would be racing the user for it.
 
 The `plan.md` §1.4 invariant is untouched, and it is worth being explicit because "editing" sounds
 like it violates it: **editing happens entirely before injection.** One injection, append-only, no
@@ -394,11 +450,11 @@ not a feature; it is a trap. So:
 `OverlayState` gains **`Editing`**, and it must reach the tray as well as the pill.
 
 This is not decoration. Three separate rules in this document rest on the user being able to see
-whether the microphone is open: §3.2's privacy promise (a closed device must look closed), §4.5's
-defence of the hotkey's two meanings (which is only acceptable because the state is visible), and
-§3.3's resume (a gesture nobody makes if they cannot tell it is needed). `plan.md` §1.6 already
-requires listening state to be unambiguous in the tray for its own reasons; this feature gives
-that requirement three more jobs.
+whether the microphone is open: §3.2's privacy promise (a closed device must look closed), §3.3's
+resume (a gesture nobody makes if they cannot tell it is needed), and §4.5's no-op hotkey — a key
+that does nothing while dictating is only tolerable if the user can see *why* it did nothing.
+`plan.md` §1.6 already requires listening state to be unambiguous in the tray for its own reasons;
+this feature gives that requirement three more jobs.
 
 A microphone glyph — live, and struck through — plus the state word. The glyph is what the user
 checks against the hardware light on their machine, so the two must never disagree.
@@ -412,7 +468,7 @@ checks against the hardware light on their machine, so the two must never disagr
 | `src/overlay.h/.cpp` | caret and selection painting, scroll offset, runtime `WS_EX_TRANSPARENT` toggle, publish the pill rect | medium |
 | `src/main.cpp` | route posted edit commands into the buffer; stop and restart the capture on suspend/resume; caret to the end on resume; commit on Enter; restore transparency in `finish_dictation` | small |
 | `src/settings.h/.cpp` | the `editing` block (§12) | small |
-| `src/session.h/.cpp` | two `LocalEvent` values (`EditingBegan` / `DictationResumed`) that pause and re-arm the session-silence timer and flush a mid-utterance suspend (§3.3, §9). No new state, no change to any existing verdict | small |
+| `src/session.h/.cpp` | two `LocalEvent` values (`EditingBegan` / `DictationResumed`) that pause and re-arm the session-silence timer and flush a mid-utterance suspend (§3.3, §9). No new state, no change to any existing verdict. Plus one rename — see below | small |
 | `src/commit_engine.h/.cpp` | **nothing.** The engine keeps its own record and never sees an edit | none |
 | `src/injector.h/.cpp` | **nothing.** One injection of a string, as now | none |
 | `src/audio_capture.h/.cpp` | **nothing.** `start()` and `stop()` already do what suspend and resume need, and `stop()` is already documented as safe when not started | none |
@@ -421,6 +477,19 @@ The last three rows are the point: the commit engine and the injector are where 
 invariant lives, and this feature does not touch either. The session machine's change is the
 smallest thing that can express "the user is present but not speaking", and it is confined to
 timer arming — no verdict, no message, no protocol state.
+
+**The rename is not cosmetic.** `LocalEvent::HotkeyPressed` is the finalise event — "from Running
+it produces `FlushPendingAudio` + `stop`" — and after §4.5 the hotkey no longer does that. Enter
+does. Leaving the name alone would put an enumerator called `HotkeyPressed` on a path the hotkey
+never takes, which is the single most reliable way to make the next reader wrong about what the
+product does. It becomes **`FinalisePressed`**, and the hotkey's own arrival maps to
+`DictationResumed` or to nothing at all.
+
+`to_string(LocalEvent)` spells it `"hotkey_pressed"` and `session.h` warns that the fixture runner
+compares these as strings — but **no fixture under `tests/fixtures/` uses this one** (checked
+2026-08-22: zero files match). So the rename is confined to `src/session.{h,cpp}`,
+`tests/test_session.cpp` and `tests/test_fixtures.cpp`, and the cross-language contract is not
+involved. Confirm that is still true before doing it rather than trusting this paragraph.
 
 ## 9. Session lifetime
 
@@ -539,25 +608,28 @@ first round-trip tests that file has ever had.
 
 Each stage is independently shippable and independently useful, and each one ends at a commit.
 
-1. **Enter commits, and is consumed.** Enter and the hotkey, and nothing else: every other key
-   keeps today's behaviour exactly — it passes through and ends the session. No editing, no
-   buffer, no mouse, and **no mode**. This is the fix for the annoyance that started the feature
-   and it is perhaps fifty lines across `hotkey.cpp` and `main.cpp`.
+1. **Enter commits, and is consumed.** Enter alone: every other key, **including the hotkey**,
+   keeps today's behaviour exactly. No editing, no buffer, no mouse, and **no mode**. This is the
+   fix for the annoyance that started the feature and it is perhaps fifty lines across
+   `hotkey.cpp` and `main.cpp`.
 
-   The Ignore class of §4.4 deliberately does **not** arrive here. Its whole justification is that
-   the user is operating the pill, and in stage 1 they are not — swallowing Ctrl+S to protect a
-   buffer nobody can edit would be a mode with no feature behind it.
+   Two things deliberately do **not** arrive here, for the same reason. The Ignore class of §4.4
+   is justified by the user operating the pill, and in stage 1 they are not — swallowing Ctrl+S to
+   protect a buffer nobody can edit is a mode with no feature behind it. And §4.5's hotkey change
+   is justified by there being an editing state for it to resume *into*; land it in stage 1 and it
+   only subtracts, leaving a key that used to finish a session and now does nothing.
 2. **Keyboard editing.** `EditBuffer`, caret and selection painting, scrollback, key classification
    including §4.4's Ignore class and its hint line, the microphone suspend and resume of §3.2–3.3
-   with `OverlayState::Editing` reaching both pill and tray, the paused session timer, and the
-   fail-open heartbeat. This is the bulk of the work, and it is the stage that introduces the mode.
+   with `OverlayState::Editing` reaching both pill and tray, §4.5's hotkey change and the
+   `FinalisePressed` rename that goes with it, the paused session timer, and the fail-open
+   heartbeat. This is the bulk of the work, and it is the stage that introduces the mode.
 
    **Measure the resume latency first** (§15 question 4). It is the one thing in this stage that
    could change its design rather than its code, and it costs an afternoon to find out.
 3. **Mouse.** The transparency toggle, the pill-rect hit test in the mouse hook, click-to-place,
-   drag-select, wheel-scroll, and the microphone button — which is the unambiguous form of §4.5's
-   overloaded hotkey and the reason that overload is acceptable in the meantime rather than
-   forever.
+   drag-select, wheel-scroll, and the microphone button — the one control that says what it does
+   without anyone having to remember a key, and the answer for whoever finds §4.5's no-op hotkey
+   more confusing than the toggle it replaced.
 4. **Optional.** Ctrl+Z undo over a bounded snapshot stack; Ctrl+C / Ctrl+X / Ctrl+V within the
    pill; word-wise motion.
 
@@ -581,10 +653,17 @@ wrong.
   under a user mid-edit) and unavailable on the facts (`audio_capture.h` makes `start()`/`stop()`
   the privacy promise, so a discarded feed would be a lit microphone light over a pill claiming to
   be paused).
-* **A dedicated resume chord — Ctrl+Space, Ctrl+Enter — instead of overloading the hotkey.** One
-  more thing to learn, for a state the user is already looking at, and Ctrl+Enter in particular
-  sits one slip away from the irreversible key. §4.5 is why the overload is safe; the pill's
-  microphone button (stage 3) is the answer for anyone it is not safe enough for.
+* **A dedicated resume chord — Ctrl+Space, Ctrl+Enter.** Unnecessary once the hotkey means only
+  one thing, and Ctrl+Enter in particular sits one slip away from the irreversible key.
+* **The hotkey commits while dictating and resumes while editing.** Two revisions of this document
+  said so, the second with a three-paragraph defence; §4.5 has the retraction. The defence was
+  sound and the design was still worse, because it made a destructive gesture state-dependent —
+  the same objection §4.4 raises against Ctrl+S, applied more gently to a key the user presses far
+  more often.
+* **Keeping `plan.md` §1.8's toggle.** It is the `Win+H` gesture this product set out to match, and
+  giving it up is the largest single behaviour change in this document. Kept losing to the rule
+  that no key should end a session as a side effect of meaning something else — and the toggle's
+  second press means exactly that once there is a buffer worth protecting.
 * **Replay the committed key to the target after the text lands.** One Enter would then both commit
   and send, which is nicer in a chat box — and occasionally sends a half-finished message. The user
   chose consumed; safety agrees.
@@ -664,6 +743,11 @@ unusually good supply of ways to reproduce it. Before believing any part of it w
   renders but the tray does not — or that `set_tray_state` maps onto `Listening` because the
   switch has no case for it — reproduces that exactly, and §7.4 lists three separate rules that
   quietly stop holding when it does.
+* **After §4.5 the hotkey no longer finalises, so `HotkeyPressed`'s Running branch is dead code.**
+  `session.cpp:635` is the only place a session produces `stop` from a hotkey, and nothing will
+  reach it. Left in place it is the `overlay_mode_for` situation exactly — correct, tested,
+  called by nobody — except worse, because its *name* still claims the hotkey does this. Rename it
+  and repoint it (§8), or delete the branch; do not leave it looking live.
 * **`LocalEvent::EditingBegan` is the `SpeechDetected` shape**, and that one has already cost a
   session. `SpeechDetected` was raised from nowhere in `src/` — all four call sites were in
   `tests/` — so both silence timers hung off a value nothing computed, and the suite was green
