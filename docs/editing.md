@@ -391,6 +391,26 @@ can end through.
 So the restore goes in `App::finish_dictation`, which is documented as **the one path every
 session ends through**, and nowhere else. Not in `end_dictation`, which the abort paths skip.
 
+### 5.4 The pointer shape is the only affordance the pill has
+
+The pill takes no focus, has no border a mouse can grab and no control that looks like a control
+apart from the microphone button. Nothing about it says "you may click here" — so the pointer has
+to, and it is the one channel that costs nothing and is read without being taught.
+
+`overlay.cpp` answers `WM_SETCURSOR`: an **I-beam** over the pill, because the pill *is* a text
+buffer and a click places the caret, and a **hand** over the microphone button, because a click
+there acts. The message only ever arrives while `WS_EX_TRANSPARENT` is dropped — while
+click-through, the window underneath answers it and the pointer is none of our business — so the
+shape is true by construction: it changes exactly when, and only when, a click would land here.
+
+The window class cursor is an arrow rather than `nullptr`. A null class cursor leaves the pointer
+wearing whatever shape it arrived in, which is how a busy cursor from another window ends up
+sitting over a pill that is not busy.
+
+A drawn microphone cursor was considered and not built. It would need a resource the client does
+not otherwise have, and it would say *what the window is* — which the pill already says, in
+words — where the I-beam says *what the click will do*, which is the thing that was missing.
+
 ## 6. What reaches the document
 
 Unchanged in mechanism: `App::flush_deferred_commits` injects `deferred_` in one operation after

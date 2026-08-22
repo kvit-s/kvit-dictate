@@ -24,7 +24,8 @@
 //
 //  2. **Click-through.** With the overlay visible over a browser, click a link *underneath* it.
 //     Failure looks like: the click does nothing, or the cursor changes over the overlay. That
-//     is WS_EX_TRANSPARENT lost.
+//     is WS_EX_TRANSPARENT lost. The converse is step 9: *during* a composing session the cursor
+//     is supposed to change, and only then.
 //
 //  3. **Capture exclusion.** With the overlay visible, run `tools/probe` in its anchor mode (or
 //     press PrtSc and paste into Paint). Look at the captured image where the overlay is.
@@ -65,6 +66,14 @@
 //     machine, or update the display driver. The overlay must repaint normally afterwards.
 //     Failure looks like: the overlay freezes on its last frame or disappears — that is
 //     D2DERR_RECREATE_TARGET being logged instead of handled.
+//
+//  9. **Pointer shape.** With `editing.mouse` on, start a session and move the pointer over the
+//     pill. Over the text it must be an I-beam and over the microphone button a hand; move off
+//     the pill and it must go back to whatever the window underneath asks for, immediately.
+//     Failure looks like: a busy or app-starting cursor over the pill (the class cursor is back
+//     to nullptr, or WM_SETCURSOR is not answered), or an I-beam that persists after the session
+//     ends — which is not a cursor bug but §5.3's: WS_EX_TRANSPARENT was never restored, and the
+//     pill is eating clicks meant for the document.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
@@ -541,6 +550,24 @@ struct OverlayCore {
     // The microphone button, in DIPs relative to the pill's top-left. Empty unless the last paint
     // drew one, which it does only while editing.
     float mic_left = 0.0f, mic_top = 0.0f, mic_right = 0.0f, mic_bottom = 0.0f;
+
+    // Is a point — physical pixels, relative to the pill's top-left, the units the hook publishes
+    // — over that button? Asked by two callers that must agree: the click filter, which resumes
+    // dictation, and WM_SETCURSOR, which promises with the pointer shape that the click will do
+    // something. A cursor that said "button" where the click lands on text would be a lie.
+    [[nodiscard]] bool point_in_mic(int32_t x, int32_t y) const noexcept {
+        if (mic_right <= mic_left || mic_bottom <= mic_top) {
+            return false;  // the last paint drew no button, which means we are not editing
+        }
+        const float scale =
+            static_cast<float>(hit_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+        if (scale <= 0.0f) {
+            return false;
+        }
+        const float px = static_cast<float>(x) / scale;
+        const float py = static_cast<float>(y) / scale;
+        return px >= mic_left && px < mic_right && py >= mic_top && py < mic_bottom;
+    }
 
     // docs/editing.md §5.1. False for the whole of a normal session and true only while a
     // composing session is running; WS_EX_NOACTIVATE is untouched either way.
@@ -1329,6 +1356,32 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             // what the flag was dropped to prevent.
             return core->click_through ? HTTRANSPARENT : HTCLIENT;
 
+        case WM_SETCURSOR: {
+            // The pill's pointer shape is the only thing that says the pill can be clicked at
+            // all: it takes no focus, it has no title bar, and nothing else about it looks like a
+            // control (docs/editing.md §5.4). While click-through this message never arrives —
+            // WS_EX_TRANSPARENT means the window under us answers it — so reaching here at all
+            // means a composing session has made the pill clickable and the shape can promise
+            // something true.
+            if (core->click_through || LOWORD(lparam) != HTCLIENT) {
+                break;  // the frame, or a state where a click is not ours: let the class cursor win
+            }
+            POINT pt{};
+            if (!GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt)) {
+                break;  // an arrow from the class cursor beats guessing
+            }
+            // Client coordinates of a per-monitor-DPI-aware window are physical pixels measured
+            // from the client origin, which for this borderless window is the pill's top-left —
+            // exactly the units point_in_mic and hit_test_text take.
+            const bool over_mic = core->point_in_mic(pt.x, pt.y);
+            // A hand for the button, because it acts on a click; an I-beam everywhere else,
+            // because everywhere else *is* the compose buffer and a click there places the caret.
+            // Both are the shapes Windows has trained everyone to read, which is worth more than
+            // a bespoke microphone cursor that would have to be drawn and would say less.
+            SetCursor(LoadCursorW(nullptr, over_mic ? IDC_HAND : IDC_IBEAM));
+            return TRUE;
+        }
+
         case WM_ERASEBKGND:
             // A layered window's pixels come from UpdateLayeredWindow. Erasing would be a
             // wasted GDI round trip on the message-loop thread.
@@ -1385,7 +1438,12 @@ ATOM ensure_window_class(HINSTANCE instance) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = &overlay_wndproc;
         wc.hInstance = instance;
-        wc.hCursor = nullptr;  // a click-through window never owns the cursor
+        // A click-through window never owns the cursor, and for most of a session this one is
+        // click-through. But a composing session drops WS_EX_TRANSPARENT (docs/editing.md §5.1)
+        // and the window then does own it, so a class cursor of nullptr would leave whatever
+        // shape the pointer arrived wearing — including the busy shape it was wearing over
+        // something else. An arrow is the floor; WM_SETCURSOR sharpens it per region.
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr;  // see WM_ERASEBKGND
         wc.lpszClassName = kWindowClass;
         return RegisterClassExW(&wc);
@@ -1709,18 +1767,7 @@ bool Overlay::hit_test_text(int32_t x, int32_t y, size_t& offset) const {
 }
 
 bool Overlay::hit_test_mic_button(int32_t x, int32_t y) const {
-    if (impl_->mic_right <= impl_->mic_left || impl_->mic_bottom <= impl_->mic_top) {
-        return false;  // the last paint drew no button, which means we are not editing
-    }
-    const float scale =
-        static_cast<float>(impl_->hit_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
-    if (scale <= 0.0f) {
-        return false;
-    }
-    const float px = static_cast<float>(x) / scale;
-    const float py = static_cast<float>(y) / scale;
-    return px >= impl_->mic_left && px < impl_->mic_right && py >= impl_->mic_top &&
-           py < impl_->mic_bottom;
+    return impl_->point_in_mic(x, y);
 }
 
 void Overlay::clear_violation() {
