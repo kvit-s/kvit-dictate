@@ -232,3 +232,48 @@ KD_TEST(overlay, an_unknown_work_area_still_produces_a_rect) {
         kd::layout_overlay(plain_anchor(), 28, 19, none, OverlayMode::FloatingPill);
     KD_CHECK(!r.empty());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  clamp_scroll_line — docs/editing.md §7.3
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Scrollback is a prerequisite, not a nicety: the pill shows the newest eight lines with
+// front-elision, so a session-long buffer sits behind that window unseen, and
+// editable-but-unreachable text is not a feature but a trap. The off-by-one at each end is the
+// kind of thing that is obvious in a table of cases and invisible inside a paint function, which
+// is why the arithmetic is out here.
+
+KD_TEST(overlay, everything_that_fits_starts_at_the_top) {
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 0, false, 3, 8), uint32_t{0});
+    KD_CHECK_EQ(kd::clamp_scroll_line(5, 0, false, 3, 8), uint32_t{0});
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 2, true, 8, 8), uint32_t{0});
+    // A visible count of zero has no valid non-zero start, whatever was asked for.
+    KD_CHECK_EQ(kd::clamp_scroll_line(4, 4, true, 40, 0), uint32_t{0});
+}
+
+KD_TEST(overlay, the_requested_start_is_clamped_to_the_last_full_screen) {
+    // A buffer that shrank under a stale offset must not leave the pill showing blank space
+    // below its own text.
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 0, false, 40, 8), uint32_t{0});
+    KD_CHECK_EQ(kd::clamp_scroll_line(10, 0, false, 40, 8), uint32_t{10});
+    KD_CHECK_EQ(kd::clamp_scroll_line(32, 0, false, 40, 8), uint32_t{32});
+    KD_CHECK_EQ(kd::clamp_scroll_line(33, 0, false, 40, 8), uint32_t{32});
+    KD_CHECK_EQ(kd::clamp_scroll_line(9999, 0, false, 40, 8), uint32_t{32});
+}
+
+KD_TEST(overlay, any_caret_movement_scrolls_the_caret_into_view) {
+    // The rule that makes the arrow keys able to reach the top of a long buffer at all. It is
+    // applied *after* the clamp rather than before it, because it overrides the requested
+    // position and not the other way round.
+    KD_CHECK_EQ(kd::clamp_scroll_line(30, 2, true, 40, 8), uint32_t{2});   // caret above: scroll back
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 20, true, 40, 8), uint32_t{13});  // caret below: caret on the last line
+    KD_CHECK_EQ(kd::clamp_scroll_line(10, 12, true, 40, 8), uint32_t{10}); // already visible: left alone
+    KD_CHECK_EQ(kd::clamp_scroll_line(10, 17, true, 40, 8), uint32_t{10}); // the last visible line
+    KD_CHECK_EQ(kd::clamp_scroll_line(10, 18, true, 40, 8), uint32_t{11}); // one past it
+}
+
+KD_TEST(overlay, the_caret_on_the_last_line_pins_the_view_to_the_bottom) {
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 39, true, 40, 8), uint32_t{32});
+    // ...and never past it, however far the caret is claimed to be.
+    KD_CHECK_EQ(kd::clamp_scroll_line(0, 500, true, 40, 8), uint32_t{32});
+}

@@ -65,12 +65,51 @@ static_assert(vk::kF1 == VK_F1 && vk::kF13 == VK_F13 && vk::kF24 == VK_F24, "VK 
 static_assert(vk::kLShift == VK_LSHIFT && vk::kRShift == VK_RSHIFT, "VK drift");
 static_assert(vk::kLControl == VK_LCONTROL && vk::kRControl == VK_RCONTROL, "VK drift");
 static_assert(vk::kLMenu == VK_LMENU && vk::kRMenu == VK_RMENU, "VK drift");
+static_assert(vk::kPageUp == VK_PRIOR && vk::kPageDown == VK_NEXT, "VK drift");
+static_assert(vk::kEnd == VK_END && vk::kHome == VK_HOME, "VK drift");
+static_assert(vk::kPrintScreen == VK_SNAPSHOT && vk::kInsert == VK_INSERT, "VK drift");
+static_assert(vk::kDelete == VK_DELETE, "VK drift");
+static_assert(vk::kC == 'C' && vk::kV == 'V' && vk::kX == 'X', "VK drift");
+static_assert(vk::kNumpad0 == VK_NUMPAD0 && vk::kDivide == VK_DIVIDE, "VK drift");
+static_assert(vk::kNumLock == VK_NUMLOCK && vk::kScrollLock == VK_SCROLL, "VK drift");
+static_assert(vk::kVolumeMute == VK_VOLUME_MUTE && vk::kVolumeUp == VK_VOLUME_UP, "VK drift");
+static_assert(vk::kVolumeDown == VK_VOLUME_DOWN, "VK drift");
+static_assert(vk::kMediaNextTrack == VK_MEDIA_NEXT_TRACK, "VK drift");
+static_assert(vk::kMediaPrevTrack == VK_MEDIA_PREV_TRACK, "VK drift");
+static_assert(vk::kMediaStop == VK_MEDIA_STOP && vk::kMediaPlayPause == VK_MEDIA_PLAY_PAUSE,
+              "VK drift");
+static_assert(vk::kOem1 == VK_OEM_1 && vk::kOem3 == VK_OEM_3, "VK drift");
+static_assert(vk::kOem4 == VK_OEM_4 && vk::kOem8 == VK_OEM_8 && vk::kOem102 == VK_OEM_102,
+              "VK drift");
 static_assert(vk::kF24 - vk::kF1 == 23, "VK_F1..VK_F24 must stay contiguous; the F-key naming relies on it");
 static_assert(kMsgHotkey == WM_APP + 0x11u, "kMsgHotkey must be inside the WM_APP range");
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 //  StopInputReason
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+uint64_t pack_edit_post(const EditPost& p) noexcept {
+    uint64_t v = static_cast<uint64_t>(p.op) & 0xFFull;
+    if (p.shift) v |= 1ull << 8;
+    if (p.caps_lock) v |= 1ull << 9;
+    if (p.needs_char) v |= 1ull << 10;
+    v |= (static_cast<uint64_t>(p.vk) & 0xFFull) << 16;
+    v |= (static_cast<uint64_t>(p.scan) & 0xFFFFull) << 32;
+    v |= (static_cast<uint64_t>(p.mods) & 0xFull) << 48;
+    return v;
+}
+
+EditPost unpack_edit_post(uint64_t packed) noexcept {
+    EditPost p;
+    p.op = static_cast<EditOp>(packed & 0xFFull);
+    p.shift = (packed & (1ull << 8)) != 0;
+    p.caps_lock = (packed & (1ull << 9)) != 0;
+    p.needs_char = (packed & (1ull << 10)) != 0;
+    p.vk = static_cast<uint32_t>((packed >> 16) & 0xFFull);
+    p.scan = static_cast<uint32_t>((packed >> 32) & 0xFFFFull);
+    p.mods = static_cast<uint32_t>((packed >> 48) & 0xFull);
+    return p;
+}
 
 const char* to_string(ForeignKeyAction a) noexcept {
     switch (a) {
@@ -321,7 +360,13 @@ constexpr void bit_clear(uint64_t* words, uint32_t v) noexcept {
 
 }  // namespace
 
-InputFilter::InputFilter() = default;
+InputFilter::InputFilter() {
+    // See the member's comment in hotkey.h. An unconfigured filter classifies exactly as it did
+    // before docs/editing.md existed; HotkeyManager::set_editing() is what turns the compose
+    // buffer on, and main.cpp calls it before start() so that the very first chord is classified
+    // against the user's configuration.
+    editing_.enabled = false;
+}
 
 void InputFilter::set_hotkey(const HotkeySpec& spec) {
     spec_ = spec;
@@ -344,6 +389,14 @@ void InputFilter::begin_session_state(uint64_t now_ms) noexcept {
     for (size_t i = 0; i < kVkWords; ++i) down_at_activation_[i] = down_[i];
     session_active_ = true;
     session_started_ms_ = now_ms;
+    // A session starts dictating, never editing (docs/editing.md §1), and the fail-open latch is
+    // per-session by definition — §10.1 says the filter stops swallowing "permanently, for that
+    // session", which is only meaningful if the next session gets a fresh answer.
+    editing_active_ = false;
+    ui_fail_open_ = false;
+    // Seeded from the activation, so that a UI thread which is answering *now* is not judged
+    // stale on the very first keystroke merely because nobody has stamped a tick yet.
+    ui_heartbeat_ms_ = now_ms;
 }
 
 void InputFilter::note_session_started(uint64_t now_ms) {
@@ -366,6 +419,8 @@ void InputFilter::note_session_started(uint64_t now_ms) {
 void InputFilter::note_session_ended() {
     session_active_ = false;
     session_started_ms_ = 0;
+    editing_active_ = false;
+    ui_fail_open_ = false;
     for (size_t i = 0; i < kVkWords; ++i) down_at_activation_[i] = 0;
     // hotkey_chord_consumed_ is deliberately NOT cleared: the binding key may still be held, and
     // its key-up must still be swallowed to match the key-down we swallowed. `swallowed_down_`
@@ -415,6 +470,125 @@ bool InputFilter::chord_matches(const InputEvent& e) const noexcept {
     return current_mods(spec_.vk) == spec_.mods;
 }
 
+bool InputFilter::is_passthrough(uint32_t v) const noexcept {
+    // docs/editing.md §4.3's two disjoint Passthrough groups. Never swallowed, never committing.
+
+    // 1. A bare modifier expresses no intention on its own, and swallowing a modifier's key-up is
+    //    how "my Shift key is stuck on" bugs are born — the reasoning this file already applies
+    //    to the binding key, applied to the rest.
+    switch (v) {
+        case vk::kShift:
+        case vk::kLShift:
+        case vk::kRShift:
+        case vk::kControl:
+        case vk::kLControl:
+        case vk::kRControl:
+        case vk::kMenu:
+        case vk::kLMenu:
+        case vk::kRMenu:
+        case vk::kLWin:
+        case vk::kRWin:
+            return true;
+        default:
+            break;
+    }
+
+    // 2. The keys that change the machine rather than the document. None of them can put a
+    //    character anywhere, so swallowing them is pure loss: turning the volume down
+    //    mid-dictation should simply work.
+    //
+    //    "unless one of them is the binding" — CapsLock is an offered binding (hotkey_presets),
+    //    and a bound key must reach chord_matches rather than being excused here.
+    if (v == spec_.vk) return false;
+    switch (v) {
+        case vk::kVolumeMute:
+        case vk::kVolumeDown:
+        case vk::kVolumeUp:
+        case vk::kMediaNextTrack:
+        case vk::kMediaPrevTrack:
+        case vk::kMediaStop:
+        case vk::kMediaPlayPause:
+        case vk::kPrintScreen:
+        case vk::kCapsLock:
+        case vk::kNumLock:
+        case vk::kScrollLock:
+            return true;
+        default:
+            return false;
+    }
+}
+
+namespace {
+
+// A key that carries a character on some layout. Deliberately a range test over the blocks
+// Windows reserves for character keys rather than a list of characters: *which* character a key
+// produces is a property of the layout, resolved on the UI thread (docs/editing.md §4.2), and a
+// filter that tried to know would be wrong on every layout but the one it was written on.
+bool is_character_vk(uint32_t v) noexcept {
+    if (v >= vk::k0 && v <= vk::k9) return true;
+    if (v >= vk::kA && v <= vk::kZ) return true;
+    if (v == vk::kSpace) return true;
+    if (v >= vk::kNumpad0 && v <= vk::kDivide) return true;   // the numeric keypad block
+    if (v >= vk::kOem1 && v <= vk::kOem3) return true;        // ;=,-./` on a US layout
+    if (v >= vk::kOem4 && v <= vk::kOem8) return true;        // [\]' on a US layout
+    if (v == vk::kOem102) return true;                        // the extra key on 102-key boards
+    return false;
+}
+
+}  // namespace
+
+EditOp InputFilter::classify_edit(uint32_t v, uint32_t mods, bool& needs_char) const noexcept {
+    needs_char = false;
+
+    const bool ctrl = (mods & kModCtrl) != 0;
+    const bool alt = (mods & kModAlt) != 0;
+    const bool win = (mods & kModWin) != 0;
+
+    // Anything with the Win key belongs to the shell, not to the buffer.
+    if (win) return EditOp::None;
+
+    switch (v) {
+        case vk::kBack: return ctrl ? EditOp::DeleteWordBack : EditOp::Backspace;
+        case vk::kDelete: return ctrl ? EditOp::DeleteWordForward : EditOp::Delete;
+        case vk::kLeft: return ctrl ? EditOp::MoveWordLeft : EditOp::MoveLeft;
+        case vk::kRight: return ctrl ? EditOp::MoveWordRight : EditOp::MoveRight;
+        case vk::kUp: return EditOp::MoveUp;
+        case vk::kDown: return EditOp::MoveDown;
+        case vk::kHome: return ctrl ? EditOp::MoveDocStart : EditOp::MoveLineStart;
+        case vk::kEnd: return ctrl ? EditOp::MoveDocEnd : EditOp::MoveLineEnd;
+        default: break;
+    }
+
+    // The Ctrl chords the pill claims. An exact match on Ctrl alone: Ctrl+Shift+A is somebody
+    // else's shortcut and Ctrl+Alt is AltGr, which produces a character on many layouts and is
+    // handled below.
+    if (mods == kModCtrl) {
+        switch (v) {
+            case vk::kA: return EditOp::SelectAll;
+            case vk::kC: return EditOp::Copy;
+            case vk::kX: return EditOp::Cut;
+            case vk::kZ: return EditOp::Undo;
+            // Ctrl+V is deliberately absent from this switch: the clipboard is a Windows API and
+            // EditBuffer has none, so the UI thread reads it and issues InsertText. Returning
+            // InsertText here with an empty payload is what tells it to.
+            case vk::kV:
+                needs_char = true;
+                return EditOp::InsertText;
+            default: return EditOp::None;
+        }
+    }
+
+    // A printable character. Ctrl+Alt together is AltGr — the third level on most European
+    // layouts, where it is the only way to type @ or backslash — so it is allowed through;
+    // Ctrl alone is not, because a Ctrl chord means a command everywhere.
+    if (is_character_vk(v) && (!ctrl || alt)) {
+        needs_char = true;
+        return EditOp::InsertText;
+    }
+
+    return EditOp::None;
+}
+
 FilterOutcome InputFilter::on_event(const InputEvent& e) {
     FilterOutcome out;
 
@@ -429,6 +603,26 @@ FilterOutcome InputFilter::on_event(const InputEvent& e) {
     // physically holding, and a synthetic Ctrl tap does not put the user's finger on Ctrl.
     if (e.injected) return out;
     if (injection_mark_ != 0 && e.extra_info == injection_mark_) return out;
+
+    // ── Rule 0.5: fail open (docs/editing.md §10.1) ──────────────────────────────────────────
+    //
+    // Checked here, before any branch can decide to swallow, because the property has to hold
+    // for every path rather than for the ones somebody remembered. The UI thread stamps a tick
+    // every message-loop iteration; a low-level hook event carries the same clock (both are
+    // GetTickCount), so the comparison is a subtraction with no syscall.
+    //
+    // Signed, and through uint32_t first, because tick counts wrap every 49.7 days: an unsigned
+    // compare would declare the UI thread dead for the whole second half of that cycle, which is
+    // the one bug this check must not have.
+    //
+    // Latched, not sampled: §10.1 says the hook stops swallowing "permanently, for that session".
+    // A UI thread that recovers mid-session would otherwise re-enter a mode the user has already
+    // been thrown out of, halfway through whatever they typed to get out of it.
+    if (session_active_ && editing_.enabled && !ui_fail_open_) {
+        const int32_t behind = static_cast<int32_t>(static_cast<uint32_t>(e.time_ms) -
+                                                    static_cast<uint32_t>(ui_heartbeat_ms_));
+        if (behind > static_cast<int32_t>(kUiStaleMs)) ui_fail_open_ = true;
+    }
 
     switch (e.kind) {
         case InputEvent::Kind::KeyDown: return on_key_event(e, true);
@@ -494,11 +688,33 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
         out.swallow = true;  // including auto-repeats: the target must never see this key
         if (!hotkey_chord_consumed_) {
             hotkey_chord_consumed_ = true;  // one action per physical press, not per repeat
-            if (session_active_) {
-                out.toggle_finalize = true;
-            } else {
+            if (!session_active_) {
                 out.activate = true;
                 begin_session_state(e.time_ms);
+            } else if (!composing()) {
+                // plan.md §1.8's toggle, exactly as it was. It survives wherever the compose
+                // buffer does not exist — `editing.enabled` false, or a cadence other than
+                // end-of-session — which is also why session.cpp's finalise-from-Running branch
+                // is live code rather than the dead branch docs/editing.md §16 feared.
+                out.toggle_finalize = true;
+            } else if (editing_active_) {
+                // docs/editing.md §3.3 and §4.5. Reopen the microphone; the caret moves to the
+                // end of the buffer and the selection is dropped, on the UI thread.
+                //
+                // Cleared here rather than on a call back from the UI thread, for the same reason
+                // begin_session_state() snapshots at chord-recognition time: the answer has to be
+                // right for the *next* keystroke, which reaches this hook long before a posted
+                // message reaches the UI thread and comes back.
+                editing_active_ = false;
+                out.resume_dictation = true;
+            } else {
+                // Already dictating. §4.5: the hotkey means "dictate" and nothing else, ever, so
+                // there is deliberately nothing to do — and it is still swallowed, because a
+                // target that received the chord's second key would be worse off than one that
+                // saw nothing. The obvious alternative (pause the microphone, symmetrically with
+                // resuming it) is a one-line change here if the no-op turns out to feel dead in
+                // use; it is not the default because "always start or continue" is a rule with no
+                // exceptions and "toggle the mic" reintroduces one.
             }
             // False for every F13–F24 and modifier-key binding, which is the whole point of
             // offering them: those paths never call SendInput at all.
@@ -538,7 +754,7 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
     // Swallowed rather than passed through, which is the entire fix for the ordering bug in
     // docs/editing.md §2: stop-on-input let the Enter reach the application first and the
     // session's text was injected after it, one line below where the user was typing.
-    if (editing_.enabled && e.vk == editing_.commit_vk &&
+    if (composing() && e.vk == editing_.commit_vk &&
         current_mods(editing_.commit_vk) == kModNone) {
         out.swallow = true;
         bit_set(swallowed_down_, e.vk);
@@ -566,6 +782,66 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
     // running. If the user goes on to press some other key (Win+E), that key still stops the
     // session on the line below, which is the outcome plan.md §1.8 asks for.
     if (is_binding_modifier(e.vk)) return out;
+
+    // ── While composing, the keyboard belongs to the pill ────────────────────────────────────
+    //
+    // docs/editing.md §4.1 states the price of the feature in one line and it is worth repeating
+    // where it is charged: the pill can never be given focus (WS_EX_NOACTIVATE is the flag
+    // overlay.h calls the worst failure in the product), so the only way a keystroke can reach it
+    // is to be taken from the window that *is* focused. There is no third option.
+    //
+    // Note what this branch is placed *after*: the fail-open latch in on_event, the chord, Esc
+    // and Commit. Every one of those is a way out of the mode, and none of them may be reachable
+    // only through a classification that might fail.
+    if (composing()) {
+        const uint32_t mods = current_mods(e.vk);
+
+        // §4.3's Passthrough class: never swallowed, never committing.
+        if (is_passthrough(e.vk)) return out;
+
+        bool needs_char = false;
+        const EditOp op = classify_edit(e.vk, mods, needs_char);
+        if (op != EditOp::None) {
+            out.swallow = true;
+            bit_set(swallowed_down_, e.vk);
+            out.edit_op = op;
+            out.edit_shift = (mods & kModShift) != 0;
+            out.edit_needs_char = needs_char;
+            out.key_vk = e.vk;
+            out.key_scan = e.scan_code;
+            out.key_mods = mods;
+            out.caps_lock = e.caps_lock;
+
+            // §3.2: the first edit key **stops the capture** — not gates it, not discards its
+            // frames; stops it, at the device. Reported once, on the transition, because closing
+            // an already-closed microphone is not a state change the session machine should see.
+            if (!editing_active_) {
+                editing_active_ = true;
+                out.editing_began = true;
+            }
+            return out;
+        }
+
+        // §4.4's Ignore class: Ctrl+S, F5, Alt+Tab, Win+E. Swallowed, and nothing happens.
+        //
+        // An earlier revision of the design had this commit, exactly as Enter does — which is
+        // right for a passive preview and wrong for a surface the user is operating: someone
+        // editing a paragraph presses Ctrl+S from habit and their half-finished text is typed
+        // into the document and the session is over. An irreversible action, from a key that
+        // means something else, with no warning. The cost of the retraction is that Ctrl+S
+        // silently does nothing, so it is not silent: `foreign_key` puts one line in the pill
+        // naming the key and saying what to do about it.
+        if (editing_.on_foreign_key == ForeignKeyAction::Ignore) {
+            out.swallow = true;
+            bit_set(swallowed_down_, e.vk);
+            out.foreign_key = true;
+            out.key_vk = e.vk;
+            out.key_mods = mods;
+            return out;
+        }
+        // ForeignKeyAction::EndSession — today's behaviour, kept one setting away (§12): the key
+        // passes through to the target and stop-on-input ends the session, below.
+    }
 
     // ── Anything else is the user doing something else ───────────────────────────────────────
     out.stop_on_input = true;
@@ -611,6 +887,16 @@ FilterOutcome InputFilter::on_mouse_event(const InputEvent& e) {
             return out;
     }
 }
+
+void InputFilter::note_ui_heartbeat(uint64_t tick_ms) noexcept { ui_heartbeat_ms_ = tick_ms; }
+
+bool InputFilter::failed_open() const noexcept { return ui_fail_open_; }
+
+bool InputFilter::composing() const noexcept {
+    return session_active_ && editing_.enabled && !ui_fail_open_;
+}
+
+bool InputFilter::editing_active() const noexcept { return editing_active_; }
 
 bool InputFilter::session_active() const noexcept { return session_active_; }
 
@@ -747,6 +1033,11 @@ struct HookRuntime {
     std::atomic<uint64_t> reinstalls{0};
     std::atomic<uint64_t> max_callback_us{0};
 
+    // docs/editing.md §10.1's heartbeat: written by the UI thread every message-loop iteration,
+    // read by the hook callback. Relaxed on both sides — it is a staleness estimate, and an
+    // acquire/release pair would buy an ordering nothing here depends on.
+    std::atomic<uint64_t> ui_heartbeat{0};
+
     // ── The last left click, as a seqlock ────────────────────────────────────────────────────
     //
     // The click's x, y and time do not fit in a PostMessage's two parameters, so they live in a
@@ -829,6 +1120,27 @@ void deliver(HookRuntime* rt, const FilterOutcome& o, const InputEvent& e) noexc
     if (o.toggle_finalize) post_to_owner(rt, HotkeyPost::Finalize, 0);
     if (o.cancel) post_to_owner(rt, HotkeyPost::Cancel, 0);
     if (o.commit) post_to_owner(rt, HotkeyPost::Commit, 0);
+    // Order matters and is the order the UI thread must see them in: the microphone closes
+    // before the keystroke that closed it is applied, so the session machine's flush of the
+    // in-flight utterance (docs/editing.md §3.3) happens against a buffer the edit has not yet
+    // touched.
+    if (o.editing_began) post_to_owner(rt, HotkeyPost::EditingBegan, 0);
+    if (o.resume_dictation) post_to_owner(rt, HotkeyPost::ResumeDictation, 0);
+    if (o.edit_op != EditOp::None) {
+        EditPost ep;
+        ep.op = o.edit_op;
+        ep.shift = o.edit_shift;
+        ep.caps_lock = o.caps_lock;
+        ep.needs_char = o.edit_needs_char;
+        ep.vk = o.key_vk;
+        ep.scan = o.key_scan;
+        ep.mods = o.key_mods;
+        post_to_owner(rt, HotkeyPost::Edit, static_cast<intptr_t>(pack_edit_post(ep)));
+    }
+    if (o.foreign_key) {
+        post_to_owner(rt, HotkeyPost::ForeignKey,
+                      static_cast<intptr_t>(o.key_vk | (o.key_mods << 16)));
+    }
     if (o.stop_on_input) post_to_owner(rt, HotkeyPost::StopInput, static_cast<intptr_t>(o.stop_reason));
     if (o.click_invalidated) post_to_owner(rt, HotkeyPost::Wheel, 0);
     if (o.click_captured) {
@@ -856,13 +1168,25 @@ LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam) {
 
     const KBDLLHOOKSTRUCT* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lparam);
     e.vk = k->vkCode;
+    e.scan_code = k->scanCode;
     e.injected = (k->flags & LLKHF_INJECTED) != 0;
     e.extra_info = static_cast<uintptr_t>(k->dwExtraInfo);
     e.time_ms = k->time;
 
+    // Caps lock is read here, in the callback, because it is read *at the moment of the
+    // keystroke* and the UI thread resolves the character some milliseconds later — by which time
+    // the user may have pressed Caps again. GetKeyState is a read of this thread's cached key
+    // state: no syscall, no blocking, and nothing the hook budget can notice.
+    e.caps_lock = (GetKeyState(VK_CAPITAL) & 1) != 0;
+
     // k->time is already the tick count of the event, so the watchdog's clock costs no call.
     rt->last_event_tick = k->time;
     rt->key_events.fetch_add(1, std::memory_order_relaxed);
+
+    // docs/editing.md §10.1. A relaxed load of one atomic, handed to the pure filter that owns
+    // the decision — the filter is where the comparison lives so that a stale stamp can be
+    // injected in a unit test without a hung thread.
+    rt->filter.note_ui_heartbeat(rt->ui_heartbeat.load(std::memory_order_relaxed));
 
     const FilterOutcome o = rt->filter.on_event(e);
     deliver(rt, o, e);
@@ -1154,6 +1478,14 @@ void HotkeyManager::note_session_started() {
     PostThreadMessageW(rt->thread_id.load(std::memory_order_acquire), kHookMsgSessionStarted, 0, 0);
 }
 
+void HotkeyManager::heartbeat() noexcept {
+    // No `running` check and no PostThreadMessage: this is the one piece of hook-thread-visible
+    // state the UI thread writes directly, because a heartbeat delivered through the hook
+    // thread's message queue would stop being delivered at exactly the moment it matters — a UI
+    // thread that is wedged is not posting, and a hook thread that is busy is not draining.
+    impl_->rt.ui_heartbeat.store(GetTickCount64() & 0xFFFFFFFFull, std::memory_order_relaxed);
+}
+
 void HotkeyManager::note_session_ended() {
     HookRuntime* rt = &impl_->rt;
     if (!rt->running.load(std::memory_order_acquire)) {
@@ -1189,6 +1521,15 @@ bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
         case HotkeyPost::Finalize: rt->listener->on_finalize(); break;
         case HotkeyPost::Cancel: rt->listener->on_cancel(); break;
         case HotkeyPost::Commit: rt->listener->on_commit(); break;
+        case HotkeyPost::Edit:
+            rt->listener->on_edit(unpack_edit_post(static_cast<uint64_t>(lparam)));
+            break;
+        case HotkeyPost::EditingBegan: rt->listener->on_editing_began(); break;
+        case HotkeyPost::ResumeDictation: rt->listener->on_resume_dictation(); break;
+        case HotkeyPost::ForeignKey:
+            rt->listener->on_foreign_key(static_cast<uint32_t>(lparam) & 0xFFFFu,
+                                         static_cast<uint32_t>(lparam) >> 16);
+            break;
         case HotkeyPost::StopInput:
             rt->listener->on_stop_input(static_cast<StopInputReason>(lparam));
             break;

@@ -697,15 +697,32 @@ KD_TEST(hotkey, a_held_enter_commits_once_and_swallows_every_repeat) {
 
 KD_TEST(hotkey, only_an_unmodified_enter_commits) {
     // Ctrl+Enter, Shift+Enter and Alt+Enter mean something in the target — send-and-keep-open,
-    // soft line break, properties — and are not this gesture.
+    // soft line break, properties — and are not this gesture. What happens to them instead
+    // depends on whether the pill owns the keyboard, and both answers are checked because the
+    // difference is exactly docs/editing.md §4.4's retraction.
     for (uint32_t mod : {kd::vk::kLControl, kd::vk::kLShift, kd::vk::kLMenu}) {
+        // Composing: a modified Enter is a foreign key. Swallowed, hinted, and — the point of
+        // §4.4 — it does **not** commit. An irreversible action must not fire from a key that
+        // means something else.
         kd::InputFilter f;
         activate_composing(f);
         f.on_event(kdown(mod, 400));
-        const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 410));
+        kd::FilterOutcome o = f.on_event(kdown(kd::vk::kReturn, 410));
+        KD_CHECK(!o.commit);
+        KD_CHECK(o.swallow);
+        KD_CHECK(o.foreign_key);
+        KD_CHECK(!o.stop_on_input);
+
+        // Editing off: today's behaviour, unchanged. The key reaches the target and stop-on-input
+        // ends the session.
+        kd::InputFilter g;
+        activate_win_y(g, 100);
+        release_win_y(g, 120);
+        g.on_event(kdown(mod, 400));
+        o = g.on_event(kdown(kd::vk::kReturn, 410));
         KD_CHECK(!o.commit);
         KD_CHECK(!o.swallow);
-        KD_CHECK(o.stop_on_input);  // it is the user doing something else, exactly as before
+        KD_CHECK(o.stop_on_input);
     }
 }
 
@@ -763,6 +780,322 @@ KD_TEST(hotkey, foreign_key_action_round_trips_through_its_spelling) {
     KD_CHECK(!kd::parse_foreign_key_action("Ignore", a));  // the file's spelling is exact
     KD_CHECK_EQ(kd::to_string(kd::ForeignKeyAction::Ignore), "ignore");
     KD_CHECK_EQ(kd::to_string(kd::ForeignKeyAction::EndSession), "end-session");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The key classes — docs/editing.md §4.3
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Press `mods` then `vk`, with the UI thread answering, and hand back the outcome for the vk.
+kd::FilterOutcome press(kd::InputFilter& f, uint32_t vk, std::initializer_list<uint32_t> mods = {},
+                        uint64_t t = 400) {
+    for (uint32_t m : mods) f.on_event(kdown(m, t++));
+    return f.on_event(kdown(vk, t));
+}
+
+}  // namespace
+
+KD_TEST(hotkey, the_editing_keys_are_classified_and_swallowed) {
+    struct Case {
+        uint32_t vk;
+        std::initializer_list<uint32_t> mods;
+        kd::EditOp op;
+    };
+    const Case cases[] = {
+        {kd::vk::kBack, {}, kd::EditOp::Backspace},
+        {kd::vk::kBack, {kd::vk::kLControl}, kd::EditOp::DeleteWordBack},
+        {kd::vk::kDelete, {}, kd::EditOp::Delete},
+        {kd::vk::kDelete, {kd::vk::kLControl}, kd::EditOp::DeleteWordForward},
+        {kd::vk::kLeft, {}, kd::EditOp::MoveLeft},
+        {kd::vk::kRight, {}, kd::EditOp::MoveRight},
+        {kd::vk::kLeft, {kd::vk::kLControl}, kd::EditOp::MoveWordLeft},
+        {kd::vk::kRight, {kd::vk::kLControl}, kd::EditOp::MoveWordRight},
+        {kd::vk::kUp, {}, kd::EditOp::MoveUp},
+        {kd::vk::kDown, {}, kd::EditOp::MoveDown},
+        {kd::vk::kHome, {}, kd::EditOp::MoveLineStart},
+        {kd::vk::kEnd, {}, kd::EditOp::MoveLineEnd},
+        {kd::vk::kHome, {kd::vk::kLControl}, kd::EditOp::MoveDocStart},
+        {kd::vk::kEnd, {kd::vk::kLControl}, kd::EditOp::MoveDocEnd},
+        {kd::vk::kA, {kd::vk::kLControl}, kd::EditOp::SelectAll},
+        {kd::vk::kC, {kd::vk::kLControl}, kd::EditOp::Copy},
+        {kd::vk::kX, {kd::vk::kLControl}, kd::EditOp::Cut},
+        {kd::vk::kZ, {kd::vk::kLControl}, kd::EditOp::Undo},
+        {kd::vk::kA, {}, kd::EditOp::InsertText},
+        {kd::vk::kSpace, {}, kd::EditOp::InsertText},
+    };
+
+    for (const Case& c : cases) {
+        kd::InputFilter f;
+        activate_composing(f);
+        const kd::FilterOutcome o = press(f, c.vk, c.mods);
+        KD_CHECK_EQ(kd::to_string(o.edit_op), kd::to_string(c.op));
+        KD_CHECK(o.swallow);
+        KD_CHECK(!o.stop_on_input);   // docs/editing.md §4.4: no stray key ends the session
+        KD_CHECK(!o.commit);
+    }
+}
+
+KD_TEST(hotkey, shift_extends_the_selection_rather_than_typing) {
+    kd::InputFilter f;
+    activate_composing(f);
+    const kd::FilterOutcome o = press(f, kd::vk::kLeft, {kd::vk::kLShift});
+    KD_CHECK_EQ(kd::to_string(o.edit_op), kd::to_string(kd::EditOp::MoveLeft));
+    KD_CHECK(o.edit_shift);
+}
+
+KD_TEST(hotkey, a_printable_key_asks_the_ui_thread_for_its_character) {
+    // docs/editing.md §4.2: the hook classifies, the UI thread resolves. Turning a virtual key
+    // into a character means asking the keyboard layout, which the callback may not do — so what
+    // travels is the key, the scan code, the modifiers and the caps state, and the answer is
+    // produced where a layout call is legal.
+    kd::InputFilter f;
+    activate_composing(f);
+
+    kd::InputEvent e = kdown(kd::vk::kA, 400);
+    e.scan_code = 0x1E;
+    e.caps_lock = true;
+    const kd::FilterOutcome o = f.on_event(e);
+    KD_CHECK(o.edit_needs_char);
+    KD_CHECK_EQ(o.key_vk, kd::vk::kA);
+    KD_CHECK_EQ(o.key_scan, uint32_t{0x1E});
+    KD_CHECK(o.caps_lock);
+}
+
+KD_TEST(hotkey, an_edit_post_survives_the_round_trip_through_one_lparam) {
+    kd::EditPost p;
+    p.op = kd::EditOp::MoveWordRight;
+    p.shift = true;
+    p.caps_lock = true;
+    p.needs_char = true;
+    p.vk = 0xDE;
+    p.scan = 0xABCD;
+    p.mods = kd::kModCtrl | kd::kModShift;
+
+    const kd::EditPost q = kd::unpack_edit_post(kd::pack_edit_post(p));
+    KD_CHECK_EQ(kd::to_string(q.op), kd::to_string(p.op));
+    KD_CHECK_EQ(q.shift, p.shift);
+    KD_CHECK_EQ(q.caps_lock, p.caps_lock);
+    KD_CHECK_EQ(q.needs_char, p.needs_char);
+    KD_CHECK_EQ(q.vk, p.vk);
+    KD_CHECK_EQ(q.scan, p.scan);
+    KD_CHECK_EQ(q.mods, p.mods);
+}
+
+KD_TEST(hotkey, the_machine_keys_pass_straight_through) {
+    // docs/editing.md §4.3's second Passthrough group: none of them can put a character
+    // anywhere, so swallowing them is pure loss. Turning the volume down mid-dictation should
+    // simply work.
+    for (uint32_t v : {kd::vk::kVolumeUp, kd::vk::kVolumeDown, kd::vk::kVolumeMute,
+                       kd::vk::kMediaPlayPause, kd::vk::kMediaNextTrack, kd::vk::kMediaPrevTrack,
+                       kd::vk::kMediaStop, kd::vk::kPrintScreen, kd::vk::kNumLock,
+                       kd::vk::kScrollLock, kd::vk::kCapsLock}) {
+        kd::InputFilter f;
+        activate_composing(f);
+        const kd::FilterOutcome o = press(f, v);
+        KD_CHECK(!o.swallow);
+        KD_CHECK(!o.stop_on_input);
+        KD_CHECK(!o.commit);
+        KD_CHECK_EQ(kd::to_string(o.edit_op), kd::to_string(kd::EditOp::None));
+    }
+}
+
+KD_TEST(hotkey, a_bare_modifier_expresses_no_intention) {
+    // Swallowing a modifier's key-up is how "my Shift key is stuck on" bugs are born, and
+    // hotkey.cpp already reasons this way for the binding key.
+    for (uint32_t v : {kd::vk::kLShift, kd::vk::kRShift, kd::vk::kLControl, kd::vk::kRControl,
+                       kd::vk::kLMenu, kd::vk::kRMenu, kd::vk::kLWin, kd::vk::kRWin}) {
+        kd::InputFilter f;
+        activate_composing(f);
+        const kd::FilterOutcome o = press(f, v);
+        KD_CHECK(!o.swallow);
+        KD_CHECK(!o.commit);
+        KD_CHECK_EQ(kd::to_string(o.edit_op), kd::to_string(kd::EditOp::None));
+    }
+}
+
+KD_TEST(hotkey, a_foreign_key_is_swallowed_and_does_not_commit) {
+    // docs/editing.md §4.4, and this is the retraction it records. An earlier revision had every
+    // non-editing key commit, exactly as Enter does — right for a passive preview, and wrong the
+    // moment the pill is something the user is operating: Ctrl+S from habit would type a
+    // half-finished paragraph into the document and end the session. An irreversible action,
+    // fired by a key that means something else, with no warning.
+    kd::InputFilter f;
+    activate_composing(f);
+    const kd::FilterOutcome o = press(f, 0x53 /* S */, {kd::vk::kLControl});
+    KD_CHECK(o.foreign_key);
+    KD_CHECK(o.swallow);
+    KD_CHECK(!o.commit);
+    KD_CHECK(!o.stop_on_input);
+    KD_CHECK_EQ(o.key_vk, uint32_t{0x53});
+    KD_CHECK_EQ(o.key_mods, kd::kModCtrl);
+}
+
+KD_TEST(hotkey, end_session_restores_todays_behaviour_for_a_foreign_key) {
+    // docs/editing.md §12: the setting is an enum and not a boolean precisely because the two
+    // values name two different things that happen.
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    cfg.on_foreign_key = kd::ForeignKeyAction::EndSession;
+    f.set_editing(cfg);
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    const kd::FilterOutcome o = press(f, 0x53 /* S */, {kd::vk::kLControl});
+    KD_CHECK(!o.foreign_key);
+    KD_CHECK(!o.swallow);
+    KD_CHECK(o.stop_on_input);
+}
+
+KD_TEST(hotkey, an_editing_key_swallows_its_own_release) {
+    kd::InputFilter f;
+    activate_composing(f);
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kBack, 400)).swallow);
+    KD_CHECK(f.on_event(kup(kd::vk::kBack, 420)).swallow);
+    // Once only: the set is drained on the release, so a second release cannot swallow again.
+    KD_CHECK(!f.on_event(kup(kd::vk::kBack, 440)).swallow);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The two states, and the hotkey's one meaning — docs/editing.md §3.2, §4.5
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(hotkey, the_first_edit_key_closes_the_microphone_and_only_the_first) {
+    kd::InputFilter f;
+    activate_composing(f);
+    KD_CHECK(!f.editing_active());
+
+    const kd::FilterOutcome first = f.on_event(kdown(kd::vk::kLeft, 400));
+    KD_CHECK(first.editing_began);
+    KD_CHECK(f.editing_active());
+
+    // Reported once, on the transition: closing an already-closed microphone is not a state
+    // change the session machine should be told about.
+    const kd::FilterOutcome second = f.on_event(kdown(kd::vk::kLeft, 450));
+    KD_CHECK(!second.editing_began);
+    KD_CHECK(f.editing_active());
+}
+
+KD_TEST(hotkey, the_hotkey_resumes_from_editing_and_does_nothing_while_dictating) {
+    // docs/editing.md §4.5: the hotkey means "dictate", and nothing else, ever. No destructive
+    // gesture is state-dependent — which is the objection §4.4 raises against Ctrl+S, applied to
+    // a key the user presses far more often.
+    kd::InputFilter f;
+    activate_composing(f);
+
+    // While dictating: nothing at all. Still swallowed — a target that received the chord's
+    // second key would be worse off than one that saw nothing.
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kLWin, 300));
+    o = f.on_event(kdown(kd::vk::kY, 310));
+    KD_CHECK(o.swallow);
+    KD_CHECK(!o.toggle_finalize);   // the toggle is gone while composing
+    KD_CHECK(!o.resume_dictation);
+    KD_CHECK(!o.commit);
+    KD_CHECK(!o.cancel);
+    release_win_y(f, 320);
+
+    // Now edit, then press it again: it resumes.
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kBack, 400)).editing_began);
+    f.on_event(kup(kd::vk::kBack, 410));
+    f.on_event(kdown(kd::vk::kLWin, 500));
+    o = f.on_event(kdown(kd::vk::kY, 510));
+    KD_CHECK(o.resume_dictation);
+    KD_CHECK(o.swallow);
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(!f.editing_active());
+}
+
+KD_TEST(hotkey, with_editing_off_the_hotkey_keeps_plan_1_8s_toggle) {
+    // The cost §4.5 accepts is confined to sessions the compose buffer actually runs in.
+    // `editing.enabled` is forced false for any cadence but end-of-session, so the muscle memory
+    // survives everywhere the pill is still a passive preview — and session.cpp's
+    // finalise-from-Running branch is live code rather than the dead branch §16 feared.
+    kd::InputFilter f;
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+    f.on_event(kdown(kd::vk::kLWin, 300));
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kY, 310));
+    KD_CHECK(o.toggle_finalize);
+    KD_CHECK(!o.resume_dictation);
+}
+
+KD_TEST(hotkey, ending_a_session_leaves_no_editing_state_behind) {
+    kd::InputFilter f;
+    activate_composing(f);
+    f.on_event(kdown(kd::vk::kBack, 400));
+    KD_REQUIRE(f.editing_active());
+    f.note_session_ended();
+    KD_CHECK(!f.editing_active());
+    KD_CHECK(!f.composing());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  Fail open — docs/editing.md §10.1
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(hotkey, a_wedged_ui_thread_gives_the_keyboard_back) {
+    // The single most important property of the feature. The hook swallows keys on a thread that
+    // stays healthy whatever happens to the UI thread; without this the user's keyboard is dead
+    // in every application with no way out short of Ctrl+Alt+Del, which is strictly worse than
+    // any failure this product can produce today.
+    //
+    // Testable at the filter level by injecting a stale stamp, without a hung thread — which is
+    // the whole reason the comparison lives in the pure classifier.
+    kd::InputFilter f;
+    activate_composing(f, 100);
+
+    // Answering: the pill has the keyboard.
+    f.note_ui_heartbeat(500);
+    KD_CHECK(f.on_event(kdown(kd::vk::kBack, 520)).swallow);
+    KD_CHECK(f.composing());
+    KD_CHECK(!f.failed_open());
+    f.on_event(kup(kd::vk::kBack, 530));
+
+    // Two seconds behind: it stops swallowing and stops posting.
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kBack, 500 + 2001));
+    KD_CHECK(f.failed_open());
+    KD_CHECK(!f.composing());
+    KD_CHECK(!o.swallow);
+    KD_CHECK_EQ(kd::to_string(o.edit_op), kd::to_string(kd::EditOp::None));
+
+    // Enter goes with it. Nothing may be swallowed on the pill's behalf once the consumer is
+    // gone, including the one key that would otherwise commit.
+    KD_CHECK(!f.on_event(kdown(kd::vk::kReturn, 500 + 2100)).swallow);
+}
+
+KD_TEST(hotkey, failing_open_is_latched_for_the_session_and_cleared_by_the_next_one) {
+    // Latched: a UI thread that recovers mid-session would otherwise re-enter a mode the user has
+    // already been thrown out of, halfway through whatever they typed to get out of it.
+    kd::InputFilter f;
+    activate_composing(f, 100);
+    f.note_ui_heartbeat(500);
+    f.on_event(kdown(kd::vk::kBack, 500 + 3000));
+    KD_REQUIRE(f.failed_open());
+
+    f.note_ui_heartbeat(500 + 3100);
+    KD_CHECK(f.failed_open());
+    KD_CHECK(!f.on_event(kdown(kd::vk::kLeft, 500 + 3200)).swallow);
+
+    // A new session starts from a clean answer — §10.1 says "permanently, for that session",
+    // which is only meaningful if the next one gets to try again.
+    f.note_session_ended();
+    activate_win_y(f, 500 + 4000);
+    KD_CHECK(!f.failed_open());
+    KD_CHECK(f.composing());
+}
+
+KD_TEST(hotkey, the_stale_check_survives_a_tick_count_wrap) {
+    // Tick counts wrap every 49.7 days. An unsigned compare would declare the UI thread dead for
+    // the whole second half of that cycle, which is the one bug this check must not have.
+    kd::InputFilter f;
+    activate_composing(f, 0xFFFFFF00u);
+    f.note_ui_heartbeat(0xFFFFFF00u);
+    // 0x100 ms later, having wrapped past 2^32.
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kBack, 0x100000000ull));
+    KD_CHECK(!f.failed_open());
+    KD_CHECK(o.swallow);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════

@@ -83,6 +83,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 #include <utility>
 
 #include "overlay.h"
@@ -128,6 +129,18 @@ public:
     T** put() noexcept {
         reset();
         return &p_;
+    }
+
+    // A second owning reference to the same interface. COM's own answer — AddRef — rather than
+    // a std::shared_ptr, because the interface is already reference-counted and wrapping it in a
+    // second counter is how an object ends up released while somebody still holds it. Used by
+    // paint_once() to keep the layout it just drew, so a mouse hit test asks the same layout the
+    // user is looking at rather than building a second one that could disagree with it.
+    [[nodiscard]] ComRef clone() const noexcept {
+        ComRef c;
+        c.p_ = p_;
+        if (c.p_ != nullptr) c.p_->AddRef();
+        return c;
     }
 
     [[nodiscard]] T* get() const noexcept { return p_; }
@@ -245,6 +258,10 @@ constexpr uint32_t kDotFinalizing = 0xFF1565C0;
 constexpr uint32_t kDotLoading = 0xFFB8860B;
 constexpr uint32_t kDotUnsupported = 0xFF757575;
 constexpr uint32_t kDotError = 0xFFC62828;
+// Editing: the same amber family as a paused thing, deliberately not the green of Listening.
+// The user checks this against the microphone light on their machine (docs/editing.md §7.4), so
+// the two must never disagree — and green over a closed device is exactly that disagreement.
+constexpr uint32_t kDotEditing = 0xFF6A1B9A;
 
 // Upper bound on the number of wrapped lines the preview may occupy. An overlay that grows with
 // the utterance covers the document it is annotating; OverlayStyle::max_width_dip caps the
@@ -263,8 +280,27 @@ constexpr uint32_t kDotError = 0xFFC62828;
 // value here.
 constexpr uint32_t kMaxLines = 8;
 
-// Starting budget, in UTF-16 code units, for the front-elision loop below.
-constexpr size_t kInitialDisplayBudget = 512;
+// Hard cap on the buffer laid out for display, in UTF-16 code units.
+//
+// This used to be a *starting* budget for a loop that shrank it until the text fitted
+// `kMaxLines`. Scrollback (docs/editing.md §7.3) replaces that: the whole buffer is laid out and
+// the view shows a window onto it, so the loop's job — pick a length that happens to be eight
+// lines — no longer exists. What remains is a ceiling, because a twenty-minute session laid out
+// on every repaint is a cost nobody asked for and docs/editing.md §15 question 5 records that
+// the right size for it is unmeasured.
+//
+// 32768 units is roughly 5000 words, well past any session anyone has run, and the one time it
+// bites it is logged rather than silently truncating.
+constexpr size_t kMaxDisplayUnits = 32768;
+
+// A caret is a solid 1-DIP bar and does not blink (docs/editing.md §7.1). overlay.h is explicit
+// that this window runs no render loop, and a blinking caret needs a ~530 ms timer for the whole
+// session to buy nothing but familiarity.
+constexpr float kCaretWidthDip = 1.0f;
+
+// The selection's fill, as 0xAARRGGBB. Painted *under* the text, so the glyphs keep their own
+// colours and the committed/unstable split stays readable through it.
+constexpr uint32_t kSelectionFill = 0x552E7D32;
 
 D2D1_COLOR_F argb(uint32_t c) noexcept {
     return D2D1::ColorF(c & 0x00FFFFFFu, static_cast<float>((c >> 24) & 0xFFu) / 255.0f);
@@ -279,6 +315,7 @@ uint32_t dot_color(OverlayState s, const OverlayStyle& style) noexcept {
         case OverlayState::ModelLoading: return kDotLoading;
         case OverlayState::Warning: return style.color_warning;
         case OverlayState::Unsupported: return kDotUnsupported;
+        case OverlayState::Editing: return kDotEditing;
         case OverlayState::Error: return kDotError;
     }
     return kDotIdle;
@@ -291,12 +328,20 @@ uint32_t dot_color(OverlayState s, const OverlayStyle& style) noexcept {
 const char* state_label(OverlayState s) noexcept {
     switch (s) {
         case OverlayState::Idle: return "";
-        case OverlayState::Listening: return "Listening";
-        case OverlayState::Speaking: return "Listening \xE2\x80\xA2";  // U+2022, speech in progress
+        // The microphone glyph is what the user checks against the hardware light on their
+        // machine (docs/editing.md §7.4), so it is on every state where the device is open and
+        // struck through on the one where it is not. The words carry the same information, for
+        // the case where the font has no colour emoji and draws a box.
+        case OverlayState::Listening: return "\xF0\x9F\x8E\xA4 Listening";  // U+1F3A4
+        case OverlayState::Speaking: return "\xF0\x9F\x8E\xA4 Listening \xE2\x80\xA2";  // + U+2022
         case OverlayState::Finalizing: return "Finishing\xE2\x80\xA6";
         case OverlayState::ModelLoading: return "Loading model\xE2\x80\xA6";
         case OverlayState::Warning: return "Correction could not be applied";
         case OverlayState::Unsupported: return "Dictation is not supported in this target";
+        case OverlayState::Editing:
+            // U+1F3A4 MICROPHONE + U+0338 COMBINING LONG SOLIDUS OVERLAY. The words are what
+            // carry the meaning if the font declines to compose the two.
+            return "\xF0\x9F\x8E\xA4\xCC\xB8 Editing \xE2\x80\x94 microphone off";
         case OverlayState::Error: return "Dictation stopped";
     }
     return "";
@@ -326,6 +371,19 @@ std::wstring elide_front(const std::wstring& s, size_t keep, size_t& cut_out) {
     out.push_back(L'\x2026');  // U+2026 HORIZONTAL ELLIPSIS — the mark that text was dropped
     out.append(s, cut, std::wstring::npos);
     return out;
+}
+
+// How many UTF-16 code units the first `byte_off` bytes of `text` occupy.
+//
+// This is the one conversion the caret needs: EditBuffer speaks UTF-8 byte offsets (util/utf8.h
+// §1: "every offset in this program is a UTF-8 byte offset"), DirectWrite's hit-testing speaks
+// UTF-16 code-unit positions, and the boundary between them is here — the same boundary utf8.h
+// §2 says is the only place UTF-16 is crossed.
+size_t utf16_prefix_units(std::string_view text, size_t byte_off) {
+    if (byte_off > text.size()) byte_off = text.size();
+    std::wstring w;
+    if (!utf8::to_utf16(text.substr(0, byte_off), w, nullptr)) return 0;
+    return w.size();
 }
 
 // UTF-8 -> UTF-16 at the Windows API boundary, per util/utf8.h. Malformed input is refused
@@ -392,6 +450,7 @@ const char* to_string(OverlayState s) noexcept {
         case OverlayState::ModelLoading: return "ModelLoading";
         case OverlayState::Warning: return "Warning";
         case OverlayState::Unsupported: return "Unsupported";
+        case OverlayState::Editing: return "editing";
         case OverlayState::Error: return "Error";
     }
     return "Idle";
@@ -424,6 +483,32 @@ struct OverlayCore {
     bool violation = false;
     std::string violation_reason;
 
+    // ── The compose buffer (docs/editing.md §7) ─────────────────────────────────────────────
+    //
+    // All three offsets are UTF-8 byte offsets into `pending`, clamped into it on the way in.
+    bool edit_active = false;
+    size_t caret = 0;
+    size_t sel_begin = 0;
+    size_t sel_end = 0;
+
+    // §4.4's one-line hint, expired by the caller on the tick it already runs.
+    std::string hint;
+
+    // §7.3. `scroll_pinned` is the default and is what makes a session with no editing look and
+    // behave exactly as it does today: the view follows the bottom of a transcript that only ever
+    // grows. The wheel and any caret movement unpin it.
+    uint32_t scroll_line = 0;
+    bool scroll_pinned = true;
+
+    // What the last paint laid out, kept so a mouse hit test can ask the same layout the user is
+    // looking at rather than building a second one that might disagree with it (§5.2). Cleared
+    // whenever the layout is rebuilt.
+    ComRef<IDWriteTextLayout> hit_layout;
+    float hit_origin_x = 0.0f;   // DIPs, relative to the pill's own top-left
+    float hit_origin_y = 0.0f;
+    size_t hit_cut_units = 0;    // leading UTF-16 units dropped by the front-elision
+    uint32_t hit_dpi = USER_DEFAULT_SCREEN_DPI;
+
     bool want_visible = false;
     bool dirty = true;
 
@@ -451,6 +536,7 @@ struct OverlayCore {
     // ── Device resources ────────────────────────────────────────────────────────────────────
 
     void release_device_resources() noexcept {
+        hit_layout.reset();
         brush_dot.reset();
         brush_border.reset();
         brush_warning.reset();
@@ -461,6 +547,7 @@ struct OverlayCore {
     }
 
     void release_text_formats() noexcept {
+        hit_layout.reset();  // a layout outlives neither the format it was built from nor the DPI
         format_note.reset();
         format_body.reset();
     }
@@ -705,7 +792,12 @@ HRESULT OverlayCore::paint_once() {
     }
 
     std::wstring note;
-    if (violation) {
+    if (!hint.empty() && !violation) {
+        // docs/editing.md §4.4: `Ctrl+S — press Enter to finish first`. It takes the note slot
+        // ahead of the state label because it is the only line here the user has to act on, and
+        // it yields to a violation because a violation is about the text and this is not.
+        note = wide_or_log(hint, "hint");
+    } else if (violation) {
         // plan.md §1.4: a visible, persistent mark naming which utterance is suspect — not a
         // toast that disappears before the user has finished reading their own document.
         note = utf8::to_utf16_or_empty("\xE2\x9A\xA0 ");  // U+26A0 WARNING SIGN
@@ -728,28 +820,40 @@ HRESULT OverlayCore::paint_once() {
     DWRITE_TEXT_METRICS body_metrics{};
     size_t cut = 0;
     size_t shown_len = 0;
+
+    // The scrolled view, in DIPs relative to the top of the laid-out text. Everything the draw
+    // section below needs to put a window onto a buffer taller than the pill.
+    float view_top = 0.0f;      // how far down the layout the visible window starts
+    float view_height = 0.0f;   // how tall that window is
+    bool caret_known = false;
+    float caret_x = 0.0f, caret_y = 0.0f, caret_h = 0.0f;
+    std::vector<DWRITE_HIT_TEST_METRICS> selection_boxes;
+
+    hit_layout.reset();
+
     if (!body.empty()) {
-        // Front-elision loop: shrink the budget until the preview fits kMaxLines. Bounded to a
-        // handful of iterations over a few hundred characters — this runs on the UI thread and
-        // "never block" (overlay.h) rules out anything that could iterate over a whole session.
-        size_t budget = kInitialDisplayBudget;
-        for (int attempt = 0; attempt < 6; ++attempt) {
-            std::wstring shown = elide_front(body, budget, cut);
-            shown_len = shown.size();
-            hr = dwrite->CreateTextLayout(shown.c_str(), static_cast<UINT32>(shown.size()),
-                                          format_body.get(), max_text_w, 4096.0f,
-                                          body_layout.put());
-            if (FAILED(hr)) {
-                return hr;
-            }
-            hr = body_layout->GetMetrics(&body_metrics);
-            if (FAILED(hr)) {
-                return hr;
-            }
-            if (body_metrics.lineCount <= kMaxLines || budget <= 24) {
-                break;
-            }
-            budget = budget * 2 / 3;
+        // One front-elision, as a ceiling rather than as a fitting loop — see kMaxDisplayUnits.
+        // Scrollback is what shows the rest, so nothing below this line depends on the text
+        // happening to be short.
+        if (body.size() > kMaxDisplayUnits) {
+            KD_LOG_WARN("overlay: %zu UTF-16 units exceeds the %zu-unit display cap; the oldest "
+                        "text is elided and cannot be scrolled back to",
+                        body.size(), kMaxDisplayUnits);
+        }
+        const std::wstring shown = elide_front(body, kMaxDisplayUnits, cut);
+        shown_len = shown.size();
+
+        // A tall box, not 4096: the layout is the whole buffer now and its height is the thing
+        // being scrolled through. A max height that truncated it would make the lines below the
+        // cut unreachable — which is exactly the trap §7.3 exists to close.
+        hr = dwrite->CreateTextLayout(shown.c_str(), static_cast<UINT32>(shown.size()),
+                                      format_body.get(), max_text_w, 1.0e6f, body_layout.put());
+        if (FAILED(hr)) {
+            return hr;
+        }
+        hr = body_layout->GetMetrics(&body_metrics);
+        if (FAILED(hr)) {
+            return hr;
         }
 
         // Colour the unstable tail differently so the user can see which part is still moving.
@@ -770,6 +874,95 @@ HRESULT OverlayCore::paint_once() {
                 brush_unstable.get(),
                 DWRITE_TEXT_RANGE{pending_end, static_cast<UINT32>(total) - pending_end});
         }
+
+        // ── Where each line starts, so the view can be a whole number of lines ──────────────
+        //
+        // Not `metrics.height / lineCount`: a line carrying a font fallback (an emoji among
+        // Latin text, say) is taller than its neighbours, and an averaged line height would
+        // drift a fraction of a line per line until the window showed half of one at each end.
+        std::vector<DWRITE_LINE_METRICS> lines(std::max<UINT32>(body_metrics.lineCount, 1));
+        UINT32 line_count = 0;
+        if (SUCCEEDED(body_layout->GetLineMetrics(lines.data(),
+                                                  static_cast<UINT32>(lines.size()), &line_count)) &&
+            line_count > 0) {
+            std::vector<float> line_top(static_cast<size_t>(line_count) + 1, 0.0f);
+            for (UINT32 i = 0; i < line_count; ++i) {
+                line_top[i + 1] = line_top[i] + lines[i].height;
+            }
+
+            // ── The caret's line, which is what the view is required to keep visible ─────────
+            //
+            // §3's freeze rule again, arriving as a clamp: the caret is an offset into the
+            // settled region, and the display string is the settled region with an ellipsis in
+            // front of whatever was elided. A caret behind the elision has nowhere to be drawn,
+            // so it is pinned to just after the ellipsis rather than silently drawn at zero.
+            UINT32 caret_line = 0;
+            if (edit_active) {
+                const size_t caret_units = utf16_prefix_units(pending, caret);
+                const size_t shown_caret =
+                    caret_units > cut ? (caret_units - cut) + (cut > 0 ? 1 : 0) : (cut > 0 ? 1 : 0);
+                DWRITE_HIT_TEST_METRICS hm{};
+                if (SUCCEEDED(body_layout->HitTestTextPosition(
+                        static_cast<UINT32>(std::min<size_t>(shown_caret, shown_len)), FALSE,
+                        &caret_x, &caret_y, &hm))) {
+                    caret_h = hm.height > 0.0f ? hm.height : lines[0].height;
+                    caret_known = true;
+                    for (UINT32 i = 0; i < line_count; ++i) {
+                        if (caret_y + 0.5f < line_top[i + 1]) {
+                            caret_line = i;
+                            break;
+                        }
+                        caret_line = i;
+                    }
+                }
+
+                // The selection, as the rectangles DirectWrite reports for the range. A
+                // multi-line selection comes back as several; all of them are painted (§7.2).
+                if (sel_end > sel_begin) {
+                    const size_t b_units = utf16_prefix_units(pending, sel_begin);
+                    const size_t e_units = utf16_prefix_units(pending, sel_end);
+                    const size_t b = b_units > cut ? (b_units - cut) + (cut > 0 ? 1 : 0)
+                                                   : (cut > 0 ? 1 : 0);
+                    const size_t e = e_units > cut ? (e_units - cut) + (cut > 0 ? 1 : 0)
+                                                   : (cut > 0 ? 1 : 0);
+                    if (e > b) {
+                        UINT32 actual = 0;
+                        // Ask for the count first: HitTestTextRange returns E_NOT_SUFFICIENT_
+                        // BUFFER with the required size rather than truncating, and a fixed-size
+                        // array here would silently drop the tail of a long selection.
+                        body_layout->HitTestTextRange(static_cast<UINT32>(b),
+                                                      static_cast<UINT32>(e - b), 0.0f, 0.0f,
+                                                      nullptr, 0, &actual);
+                        if (actual > 0) {
+                            selection_boxes.resize(actual);
+                            UINT32 got = 0;
+                            if (FAILED(body_layout->HitTestTextRange(
+                                    static_cast<UINT32>(b), static_cast<UINT32>(e - b), 0.0f, 0.0f,
+                                    selection_boxes.data(), actual, &got))) {
+                                selection_boxes.clear();
+                            } else {
+                                selection_boxes.resize(got);
+                            }
+                        }
+                    }
+                }
+            }
+
+            const uint32_t visible = std::min<uint32_t>(kMaxLines, line_count);
+            const uint32_t desired =
+                scroll_pinned ? (line_count > visible ? line_count - visible : 0u) : scroll_line;
+            scroll_line = clamp_scroll_line(desired, caret_line, caret_known, line_count, visible);
+
+            view_top = line_top[scroll_line];
+            view_height = line_top[scroll_line + visible] - view_top;
+        } else {
+            view_height = body_metrics.height;
+        }
+
+        // Kept for the mouse hit test, which must ask the same layout the user is looking at
+        // rather than build a second one that could disagree with it (docs/editing.md §5.2).
+        hit_layout = body_layout.clone();
+        hit_cut_units = cut;
     }
 
     ComRef<IDWriteTextLayout> note_layout;
@@ -790,7 +983,10 @@ HRESULT OverlayCore::paint_once() {
     // (plan.md §1.4) and clipping it would make the unstable tail sit against the previous word.
     const float body_w = body_layout ? body_metrics.widthIncludingTrailingWhitespace : 0.0f;
     const float note_w = note_layout ? note_metrics.widthIncludingTrailingWhitespace : 0.0f;
-    const float body_h = body_layout ? body_metrics.height : 0.0f;
+    // The *visible* height, which is the scrolled window onto the layout rather than the
+    // layout's own height. A pill sized to a session-long buffer would cover the document it is
+    // annotating, which is the whole reason kMaxLines exists.
+    const float body_h = body_layout ? view_height : 0.0f;
     const float note_h = note_layout ? note_metrics.height : 0.0f;
 
     // The pill does not resize with its contents. It sits in one fixed place at the bottom of the
@@ -890,8 +1086,47 @@ HRESULT OverlayCore::paint_once() {
     rt->FillEllipse(D2D1::Ellipse(dot_centre, dot_r, dot_r), brush_dot.get());
 
     if (body_layout) {
-        rt->DrawTextLayout(D2D1::Point2F(text_x, pad), body_layout.get(), brush_pending.get(),
-                           D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // The scrolled window. Everything is drawn at `-view_top` and clipped to the pill's text
+        // area, so the lines above and below the window exist in the layout — which is what makes
+        // them reachable by scrolling and by the arrow keys — without being painted.
+        const D2D1_RECT_F clip = D2D1::RectF(text_x, pad, text_x + std::max(content_w, 1.0f),
+                                             pad + body_h);
+        rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+
+        const float origin_x = text_x;
+        const float origin_y = pad - view_top;
+
+        // Under the text, so the glyphs keep their own colours and the committed/unstable split
+        // stays readable through the selection (docs/editing.md §7.2).
+        if (!selection_boxes.empty() && brush_unstable) {
+            const D2D1_COLOR_F was = brush_unstable->GetColor();
+            brush_unstable->SetColor(argb(kSelectionFill));
+            for (const DWRITE_HIT_TEST_METRICS& b : selection_boxes) {
+                rt->FillRectangle(D2D1::RectF(origin_x + b.left, origin_y + b.top,
+                                              origin_x + b.left + b.width,
+                                              origin_y + b.top + b.height),
+                                  brush_unstable.get());
+            }
+            brush_unstable->SetColor(was);
+        }
+
+        rt->DrawTextLayout(D2D1::Point2F(origin_x, origin_y), body_layout.get(),
+                           brush_pending.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+
+        // A solid bar, never a blinking one (docs/editing.md §7.1). No timer, no power cost, and
+        // no ambiguity about whether the caret is there.
+        if (caret_known && brush_pending) {
+            rt->FillRectangle(D2D1::RectF(origin_x + caret_x, origin_y + caret_y,
+                                          origin_x + caret_x + kCaretWidthDip,
+                                          origin_y + caret_y + caret_h),
+                              brush_pending.get());
+        }
+
+        rt->PopAxisAlignedClip();
+
+        hit_origin_x = origin_x;
+        hit_origin_y = origin_y;
+        hit_dpi = monitor_dpi;
     }
     if (note_layout) {
         rt->DrawTextLayout(D2D1::Point2F(text_x, pad + body_h + (body_layout ? gap : 0.0f)),
@@ -1184,6 +1419,13 @@ void Overlay::set_text(std::string_view pending, std::string_view unstable) {
     }
     impl_->pending.assign(pending);
     impl_->unstable.assign(unstable);
+    // The caret and the selection are offsets into the string that has just been replaced.
+    // Leaving them alone would point them into text that is no longer there — the caller sets
+    // them again immediately, but only when there is a compose buffer, and a session with none
+    // must not inherit an offset from one that had.
+    if (impl_->caret > impl_->pending.size()) impl_->caret = impl_->pending.size();
+    if (impl_->sel_begin > impl_->pending.size()) impl_->sel_begin = impl_->pending.size();
+    if (impl_->sel_end > impl_->pending.size()) impl_->sel_end = impl_->pending.size();
     impl_->dirty = true;
 }
 
@@ -1216,6 +1458,67 @@ void Overlay::flag_violation(std::string_view reason) {
     // the diagnostic channel. The reason string comes from commit_engine and is a description,
     // not a transcript, but its length is all this line needs.
     KD_LOG_WARN("overlay flagged a committed-prefix violation (%zu byte reason)", reason.size());
+}
+
+void Overlay::set_edit_view(bool active, size_t caret_off, size_t sel_b, size_t sel_e) {
+    // Clamped against `pending` here rather than trusted, for the reason docs/editing.md §3 gives
+    // the caret clamp in EditBuffer: the unstable tail is not addressable, and an offset that
+    // reached past the settled region would draw a caret sitting in text the model is still
+    // revising — which is the one place the user must be able to see they cannot edit.
+    const size_t n = impl_->pending.size();
+    const size_t c = std::min(caret_off, n);
+    const size_t b = std::min(sel_b, n);
+    const size_t e = std::min(sel_e, n);
+
+    if (impl_->edit_active == active && impl_->caret == c && impl_->sel_begin == b &&
+        impl_->sel_end == e) {
+        return;
+    }
+    // Any caret movement unpins the view, so that the next paint scrolls the caret into view
+    // rather than staying at the bottom of a buffer the user has arrowed away from (§7.3).
+    if (impl_->caret != c) impl_->scroll_pinned = false;
+    impl_->edit_active = active;
+    impl_->caret = c;
+    impl_->sel_begin = b;
+    impl_->sel_end = e;
+    impl_->dirty = true;
+}
+
+void Overlay::set_hint(std::string_view h) {
+    if (impl_->hint == h) {
+        return;
+    }
+    impl_->hint.assign(h);
+    impl_->dirty = true;
+}
+
+void Overlay::clear_hint() {
+    if (impl_->hint.empty()) {
+        return;
+    }
+    impl_->hint.clear();
+    impl_->dirty = true;
+}
+
+void Overlay::scroll_by_lines(int32_t delta) {
+    if (delta == 0) {
+        return;
+    }
+    // Clamped against the real line count on the next paint, which is the only place that knows
+    // it. Here the offset is only ever moved and floored at zero; letting it run past the end
+    // and be clamped later is what keeps this function free of a layout it would have to build.
+    const int64_t next = static_cast<int64_t>(impl_->scroll_line) + delta;
+    impl_->scroll_line = next <= 0 ? 0u : static_cast<uint32_t>(next);
+    impl_->scroll_pinned = false;
+    impl_->dirty = true;
+}
+
+void Overlay::scroll_to_bottom() {
+    if (impl_->scroll_pinned) {
+        return;
+    }
+    impl_->scroll_pinned = true;
+    impl_->dirty = true;
 }
 
 void Overlay::clear_violation() {
@@ -1272,6 +1575,30 @@ const OverlayStyle& Overlay::style() const noexcept { return impl_->style; }
 //
 // The gap between the overlay and the anchor line is derived from `text_height_px` rather than
 // being a constant, so it scales with DPI without this function needing to know the DPI.
+
+uint32_t clamp_scroll_line(uint32_t desired, uint32_t caret_line, bool caret_known,
+                           uint32_t total_lines, uint32_t visible_lines) noexcept {
+    if (visible_lines == 0 || total_lines <= visible_lines) {
+        return 0;  // everything fits; there is nothing to scroll and no valid non-zero start
+    }
+    const uint32_t max_start = total_lines - visible_lines;
+    uint32_t start = desired > max_start ? max_start : desired;
+
+    // docs/editing.md §7.3: "any caret movement scrolls the caret into view". Applied *after*
+    // the clamp above rather than before it, because it is the rule that overrides the requested
+    // position and not the other way round — a caret above the view scrolls back to it even
+    // though the user had scrolled forward, which is what makes the arrow keys able to reach the
+    // top of a long buffer at all.
+    if (caret_known) {
+        if (caret_line < start) {
+            start = caret_line;
+        } else if (caret_line >= start + visible_lines) {
+            start = caret_line - visible_lines + 1;
+        }
+    }
+
+    return start > max_start ? max_start : start;
+}
 
 anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int32_t text_height_px,
                             const anchor::Rect& monitor_work_area, OverlayMode mode) {

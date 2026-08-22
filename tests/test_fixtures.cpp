@@ -475,7 +475,7 @@ void run_session(const std::string& id, const Value& doc) {
             if (t == "cancel") {
                 machine.on_local(kd::LocalEvent::EscPressed);
             } else if (t == "stop" || t == "start") {
-                machine.on_local(kd::LocalEvent::HotkeyPressed);
+                machine.on_local(kd::LocalEvent::FinalisePressed);
             }
             if (t == "hello") {
                 // The machine writes `hello` itself, but only once the pipe has connected and the

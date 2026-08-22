@@ -63,6 +63,7 @@
 #include <utility>
 #include <vector>
 
+#include "edit_buffer.h"
 #include "util/result.h"
 
 namespace kd {
@@ -85,19 +86,31 @@ inline constexpr uint32_t kMenu = 0x12;     // input (including our own Ctrl tap
 inline constexpr uint32_t kCapsLock = 0x14;
 inline constexpr uint32_t kEscape = 0x1B;
 inline constexpr uint32_t kSpace = 0x20;
+inline constexpr uint32_t kPageUp = 0x21;
+inline constexpr uint32_t kPageDown = 0x22;
+inline constexpr uint32_t kEnd = 0x23;
+inline constexpr uint32_t kHome = 0x24;
 inline constexpr uint32_t kLeft = 0x25;
 inline constexpr uint32_t kUp = 0x26;
 inline constexpr uint32_t kRight = 0x27;
 inline constexpr uint32_t kDown = 0x28;
+inline constexpr uint32_t kPrintScreen = 0x2C;  // VK_SNAPSHOT
+inline constexpr uint32_t kInsert = 0x2D;
+inline constexpr uint32_t kDelete = 0x2E;
 inline constexpr uint32_t k0 = 0x30;
 inline constexpr uint32_t k9 = 0x39;
 inline constexpr uint32_t kA = 0x41;
+inline constexpr uint32_t kC = 0x43;
 inline constexpr uint32_t kJ = 0x4A;
 inline constexpr uint32_t kO = 0x4F;
+inline constexpr uint32_t kV = 0x56;
+inline constexpr uint32_t kX = 0x58;
 inline constexpr uint32_t kY = 0x59;
 inline constexpr uint32_t kZ = 0x5A;
 inline constexpr uint32_t kLWin = 0x5B;
 inline constexpr uint32_t kRWin = 0x5C;
+inline constexpr uint32_t kNumpad0 = 0x60;
+inline constexpr uint32_t kDivide = 0x6F;   // the last of the numeric-keypad block
 inline constexpr uint32_t kF1 = 0x70;
 inline constexpr uint32_t kF13 = 0x7C;
 inline constexpr uint32_t kF24 = 0x87;
@@ -107,6 +120,26 @@ inline constexpr uint32_t kLControl = 0xA2;
 inline constexpr uint32_t kRControl = 0xA3;
 inline constexpr uint32_t kLMenu = 0xA4;
 inline constexpr uint32_t kRMenu = 0xA5;
+inline constexpr uint32_t kNumLock = 0x90;
+inline constexpr uint32_t kScrollLock = 0x91;
+// The keys that change the machine rather than the document (docs/editing.md §4.3). None of them
+// can put a character anywhere, so the pill never swallows one — turning the volume down
+// mid-dictation should simply work.
+inline constexpr uint32_t kVolumeMute = 0xAD;
+inline constexpr uint32_t kVolumeDown = 0xAE;
+inline constexpr uint32_t kVolumeUp = 0xAF;
+inline constexpr uint32_t kMediaNextTrack = 0xB0;
+inline constexpr uint32_t kMediaPrevTrack = 0xB1;
+inline constexpr uint32_t kMediaStop = 0xB2;
+inline constexpr uint32_t kMediaPlayPause = 0xB3;
+// The OEM punctuation blocks, which carry a printable character on every layout but whose
+// meaning is layout-dependent — which is exactly why the *character* is resolved on the UI
+// thread and only the class is decided here (docs/editing.md §4.2).
+inline constexpr uint32_t kOem1 = 0xBA;
+inline constexpr uint32_t kOem3 = 0xC0;
+inline constexpr uint32_t kOem4 = 0xDB;
+inline constexpr uint32_t kOem8 = 0xDF;
+inline constexpr uint32_t kOem102 = 0xE2;
 
 inline constexpr uint32_t kCount = 256;  // the width of InputFilter's key bitsets
 
@@ -194,6 +227,10 @@ struct InputEvent {
 
     Kind kind = Kind::KeyDown;
     uint32_t vk = 0;              // key events only
+    uint32_t scan_code = 0;       // key events only; carried so the UI thread can ask the
+                                  // keyboard layout what character this key produces
+                                  // (docs/editing.md §4.2 — the hook may not ask)
+    bool caps_lock = false;       // read at the keystroke, not when the character is resolved
     bool injected = false;        // LLKHF_INJECTED / LLMHF_INJECTED
     uintptr_t extra_info = 0;     // dwExtraInfo; compared against our InjectionMark
     bool left_button = false;     // mouse events: left button specifically (plan.md §1.5 —
@@ -220,6 +257,45 @@ struct FilterOutcome {
     // again once the session is over and it reaches the application normally.
     bool commit = false;
 
+    // ── The compose buffer (docs/editing.md §4.3) ────────────────────────────────────────────
+    //
+    // The hook **classifies and posts; it never edits** (§4.2). Everything below is a decision
+    // about what the key means, taken in the callback because it is O(1) and allocation-free.
+    // Applying it — moving a caret, inserting a character, repainting — happens on the UI thread.
+
+    // The first edit key of a session. The microphone closes on this, at the device: §3.2 makes
+    // speech and editing disjoint states, because audio_capture.h's "the mic is open only between
+    // start() and stop()" is plan.md §1.9's privacy promise, and a pill that says *paused* over a
+    // lit microphone light breaks the one promise the product makes about the microphone.
+    bool editing_began = false;
+
+    // The hotkey, pressed while editing (§4.5). It reopens the microphone; the caret moves to the
+    // end of the buffer and the selection is dropped, because the user has just made a gesture
+    // that means "I am going to talk now".
+    bool resume_dictation = false;
+
+    // What the key means to the buffer. `EditOp::None` when the key was not an edit key.
+    EditOp edit_op = EditOp::None;
+    bool edit_shift = false;   // extend the selection
+
+    // InsertText, whose payload this filter cannot produce: turning a virtual key into a
+    // character means asking the keyboard layout, and the hook may not. So the class is decided
+    // here and the character is resolved on the UI thread from the fields below.
+    bool edit_needs_char = false;
+
+    // §4.4's Ignore class — Ctrl+S, F5, Alt+Tab, Win+E. Swallowed, and **nothing happens**; the
+    // pill shows one line naming the key. It does not commit, and that is the retraction §4.4
+    // records: a rule that was right for a passive preview fires an irreversible action from a
+    // key that means something else, the moment the pill is a surface the user is operating.
+    bool foreign_key = false;
+
+    // Carried for the two cases above: `edit_needs_char` needs all four to ask the layout, and
+    // `foreign_key` needs the virtual key and the modifiers to name the key in the hint.
+    uint32_t key_vk = 0;
+    uint32_t key_scan = 0;
+    uint32_t key_mods = 0;
+    bool caps_lock = false;
+
     bool stop_on_input = false;
     StopInputReason stop_reason = StopInputReason::Keystroke;
 
@@ -227,6 +303,36 @@ struct FilterOutcome {
     bool click_invalidated = false;  // wheel: scrolling moves the caret with no click
     bool suppress_start_menu = false;  // inject the VK_CONTROL tap before the Win key-up
 };
+
+// ─── The Edit post's payload ────────────────────────────────────────────────────────────────
+//
+// Everything the UI thread needs in order to apply one keystroke, packed into a single LPARAM.
+//
+// A single-slot cache in the style of the click seqlock would be wrong here, and the difference
+// matters: clicks arrive one at a time and only the newest is of interest, whereas a fast typist
+// can put several keystrokes into the queue before the UI thread drains any of them, and a slot
+// would silently drop all but the last. Packing keeps each keystroke with its own message, on a
+// queue that already exists and already preserves order.
+//
+//   bits  0.. 7  EditOp
+//   bit      8   shift (extend the selection)
+//   bit      9   caps lock is on
+//   bit     10   the payload is a character the UI thread must resolve
+//   bits 16..23  virtual key
+//   bits 32..47  scan code
+//   bits 48..51  modifier mask
+struct EditPost {
+    EditOp op = EditOp::None;
+    bool shift = false;
+    bool caps_lock = false;
+    bool needs_char = false;
+    uint32_t vk = 0;
+    uint32_t scan = 0;
+    uint32_t mods = 0;
+};
+
+[[nodiscard]] uint64_t pack_edit_post(const EditPost& p) noexcept;
+[[nodiscard]] EditPost unpack_edit_post(uint64_t packed) noexcept;
 
 class InputFilter {
 public:
@@ -242,6 +348,38 @@ public:
     // the concrete form of "ignore key-up events for keys already down at activation".
     void note_session_started(uint64_t now_ms);
     void note_session_ended();
+
+    // ── Fail open: the single most important property of the feature (docs/editing.md §10.1) ──
+    //
+    // The hook runs on its own thread and swallows keys **independently of the UI thread**. If
+    // the UI thread hangs while a session is composing, keys are swallowed by a thread that is
+    // still healthy and delivered to a thread that will never process them: the user's keyboard
+    // is dead, in every application, with no way out short of Ctrl+Alt+Del. That is strictly
+    // worse than any failure this product can produce today, and the existing hook watchdog does
+    // not help — the hook is fine, the consumer is not.
+    //
+    // So the UI thread stamps a monotonic tick every message-loop iteration, and before
+    // swallowing anything on the pill's behalf the filter compares it against the event's own
+    // timestamp. More than `kUiStaleMs` behind and the filter stops swallowing and stops posting,
+    // permanently, for that session. Keys go to the application. The user has their machine back.
+    //
+    // The comparison is a load and a subtraction, which costs nothing against the callback budget
+    // `Stats::max_callback_us` exists to watch.
+    static constexpr uint32_t kUiStaleMs = 2000;
+    void note_ui_heartbeat(uint64_t tick_ms) noexcept;
+    [[nodiscard]] bool failed_open() const noexcept;
+
+    // True while the pill owns the keyboard: a session is running, editing is enabled, and the UI
+    // thread is answering. docs/editing.md §4.1 states the price of the feature in one line —
+    // "While a session is composing, the keyboard belongs to the pill" — and this is that line as
+    // a predicate.
+    [[nodiscard]] bool composing() const noexcept;
+
+    // True once the first edit key has closed the microphone, until the user resumes or the
+    // session ends. Set by the filter itself at the instant it classifies an Edit key, rather
+    // than by a call back from the UI thread: the UI thread's answer would arrive after the next
+    // keystroke, and the hotkey means different things in the two states (§4.5).
+    [[nodiscard]] bool editing_active() const noexcept;
 
     // Pure decision. No allocation, no syscall, bounded work — safe to call from the hook.
     FilterOutcome on_event(const InputEvent& e);
@@ -262,6 +400,15 @@ private:
     // allocation-free; none of them may grow a call into anything that can block.
     FilterOutcome on_key_event(const InputEvent& e, bool down);
     FilterOutcome on_mouse_event(const InputEvent& e);
+
+    // docs/editing.md §4.3's class table, as a pure function of (vk, modifiers). Returns
+    // EditOp::None for a key that is not an edit key. `needs_char` comes back true for a
+    // printable character, whose payload only the UI thread can produce.
+    [[nodiscard]] EditOp classify_edit(uint32_t vk, uint32_t mods, bool& needs_char) const noexcept;
+
+    // The two never-swallowed groups of §4.3: bare modifiers, and the keys that change the
+    // machine rather than the document.
+    [[nodiscard]] bool is_passthrough(uint32_t vk) const noexcept;
 
     // Modifier bitmask implied by the keys currently down. `ignore_vk` is excluded, which is what
     // lets a modifier key itself be the binding (right Ctrl, right Alt): otherwise pressing the
@@ -290,6 +437,15 @@ private:
     uint64_t swallowed_down_[kVkWords]{};
     HotkeySpec spec_{};
     EditingConfig editing_{};
+    // Constructed **disabled**, deliberately, even though EditingConfig's own default is
+    // enabled. Until the owner has told this filter what the user configured, it must not be
+    // eating keys on behalf of a pill that may or may not exist — the fail-safe direction is a
+    // filter that behaves exactly as it did before the compose buffer was written. The two
+    // defaults are not in conflict: EditingConfig's is what a settings file with no `editing`
+    // block means, and this is what a filter nobody has configured means. See the constructor.
+    uint64_t ui_heartbeat_ms_ = 0;
+    bool ui_fail_open_ = false;   // latched for the rest of the session once it trips
+    bool editing_active_ = false;
     uintptr_t injection_mark_ = 0;
     bool session_active_ = false;
     uint64_t session_started_ms_ = 0;
@@ -311,6 +467,21 @@ public:
     // (docs/editing.md §4.3). Distinct from on_finalize() so the log — and anyone reading this
     // interface — can tell the two gestures apart.
     virtual void on_commit() = 0;
+
+    // The compose buffer. `p.op` is what the key meant; when `p.needs_char` is set the UI thread
+    // must ask the keyboard layout for the character before it can insert anything
+    // (docs/editing.md §4.2 — the hook is not allowed to make that call).
+    virtual void on_edit(const EditPost& p) = 0;
+
+    // The first edit key: close the microphone (§3.2).
+    virtual void on_editing_began() = 0;
+
+    // The hotkey while editing: reopen it, drop the selection, caret to the end (§3.3).
+    virtual void on_resume_dictation() = 0;
+
+    // §4.4's Ignore class. The pill names the key and says what to do about it; nothing else
+    // happens, and in particular nothing is committed.
+    virtual void on_foreign_key(uint32_t vk, uint32_t mods) = 0;
 
     virtual void on_stop_input(StopInputReason reason) = 0;
 
@@ -350,6 +521,10 @@ enum class HotkeyPost : uint32_t {
     Commit,     // Enter — docs/editing.md §4.3. Appended, not inserted: the values are compared
                 // as integers across a PostMessage boundary and renumbering them would make an
                 // in-flight message mean something else.
+    Edit,            // lParam: pack_edit_post()
+    EditingBegan,
+    ResumeDictation,
+    ForeignKey,      // lParam: vk | (mods << 16)
 };
 
 // Call from the owner window's WndProc. Returns true if the message belonged to this module,
@@ -385,6 +560,15 @@ public:
     // Tell the filter about the session lifecycle. Called from the UI thread.
     void note_session_started();
     void note_session_ended();
+
+    // docs/editing.md §10.1's fail-open heartbeat. **Call this every message-loop iteration on
+    // the UI thread.** It is one relaxed atomic store and one GetTickCount, and it is what stands
+    // between a hung UI thread and a keyboard that is dead in every application on the machine.
+    //
+    // If it is ever removed, or a loop is added that does not call it, the symptom is not a crash
+    // — it is the compose buffer silently ceasing to accept keys about two seconds into every
+    // session, which is the safe direction and the reason the check is written this way round.
+    void heartbeat() noexcept;
 
     [[nodiscard]] bool is_running() const noexcept;
 

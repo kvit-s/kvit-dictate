@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <deque>
+#include <iterator>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -76,6 +77,11 @@ constexpr uint64_t kFinalizeGraceMs = 5000;
 // (windows-speech, cold).
 constexpr uint64_t kActivationWaitMs = 30000;
 
+// How long docs/editing.md §4.4's one-line hint stays in the pill. "A couple of seconds", says
+// §4.4, on the tick App already runs — no new timer, and deliberately not flag_violation(),
+// which is a persistent mark on text that may be wrong (plan.md §1.4).
+constexpr uint64_t kHintMs = 2500;
+
 // Is this connection state one that still reaches IDLE on its own? The four states of a child
 // coming up are; the three that mean a session is already in flight are handled before this is
 // asked; DEAD is not, and waiting in it would be waiting for nothing.
@@ -109,7 +115,11 @@ const wchar_t kSingleInstanceMutex[] = L"Local\\kvit-dictate-single-instance";
 struct HookNote {
     enum class Kind : uint8_t {
         Activate, Finalize, Cancel, StopInput, LeftClick, Wheel, HookLost,
-        Commit,   // Enter — docs/editing.md §4.3
+        Commit,          // Enter — docs/editing.md §4.3
+        Edit,            // a keystroke the compose buffer claimed (§4.3)
+        EditingBegan,    // the first edit key: close the microphone (§3.2)
+        ResumeDictation, // the hotkey while editing: reopen it (§3.3)
+        ForeignKey,      // §4.4's Ignore class: name the key in the pill and do nothing
     };
     Kind kind = Kind::Activate;
     kd::StopInputReason reason = kd::StopInputReason::Keystroke;
@@ -117,6 +127,7 @@ struct HookNote {
     int32_t y = 0;
     uintptr_t window = 0;
     uint64_t time_ms = 0;
+    kd::EditPost edit{};
 };
 
 std::wstring widen(std::string_view utf8) {
@@ -179,6 +190,21 @@ public:
     void on_finalize() override { post_hook(HookNote{HookNote::Kind::Finalize}); }
     void on_cancel() override { post_hook(HookNote{HookNote::Kind::Cancel}); }
     void on_commit() override { post_hook(HookNote{HookNote::Kind::Commit}); }
+    void on_edit(const kd::EditPost& p) override {
+        HookNote n;
+        n.kind = HookNote::Kind::Edit;
+        n.edit = p;
+        post_hook(n);
+    }
+    void on_editing_began() override { post_hook(HookNote{HookNote::Kind::EditingBegan}); }
+    void on_resume_dictation() override { post_hook(HookNote{HookNote::Kind::ResumeDictation}); }
+    void on_foreign_key(uint32_t vk, uint32_t mods) override {
+        HookNote n;
+        n.kind = HookNote::Kind::ForeignKey;
+        n.edit.vk = vk;
+        n.edit.mods = mods;
+        post_hook(n);
+    }
     void on_stop_input(kd::StopInputReason reason) override {
         HookNote n;
         n.kind = HookNote::Kind::StopInput;
@@ -226,8 +252,23 @@ private:
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
     void finish_dictation(const char* why);
-    // Empties `deferred_` into the document, or onto the clipboard when the target is gone.
-    // Safe to call with nothing deferred: it returns having done nothing.
+
+    // ── The compose buffer (docs/editing.md) ────────────────────────────────────────────────
+    //
+    // True when the pill owns the keyboard for this session: the setting is on, which
+    // Settings::normalise() only permits under Cadence::EndOfSession (§6.1). Read in one place
+    // so that nothing downstream re-derives it and disagrees — §16's `min_confidence` shape.
+    [[nodiscard]] bool composing() const noexcept;
+
+    void apply_edit(const kd::EditPost& p);
+    void begin_editing();      // §3.2: the microphone closes, at the device
+    void resume_dictation();   // §3.3: it reopens, the caret moves to the end
+    void show_foreign_key_hint(uint32_t vk, uint32_t mods);
+    // Pushes the buffer, the caret and the selection at the overlay together, because a caret
+    // offset that arrives without the text it indexes is an offset into the previous frame.
+    void push_edit_view();
+    // Empties the compose buffer into the document, or onto the clipboard when the target is
+    // gone. Safe to call with nothing buffered: it returns having done nothing.
     void flush_deferred_commits(const char* why);
     // What the overlay should be showing right now, given the cadence. `tail` is the engine's
     // unstable text for the utterance in progress.
@@ -273,7 +314,26 @@ private:
     // TEXT rather than the ops because that is all the injector needs, and because the leading
     // space between utterances is decided by `CommitOp::leading_space` in the one place that
     // already decides it (plan.md §1.6) rather than re-derived later from a list of ops.
-    std::string deferred_;
+    //
+    // docs/editing.md §3: the settled region — text the commit engine has finalised and handed
+    // over under Cadence::EndOfSession. Complete, not going to change on its own, and the only
+    // region the caret can occupy. The unstable tail is deliberately *not* in here; because it
+    // is absent, the buffer's own caret clamp is §3's freeze rule in its entirety.
+    //
+    // It replaces a plain std::string, and with no editing it behaves as one: append at the end,
+    // take it all at the end of the session.
+    kd::EditBuffer edit_;
+
+    // Which of the two states this session is in (§1). Dictating: the microphone is open and
+    // speech is appended. Editing: the microphone is **closed** and the buffer is a text field.
+    bool editing_ = false;
+    uint64_t editing_began_ms_ = 0;   // for the resume `discontinuity` (§3.3)
+
+    // §4.4's hint line, expired on the tick App already runs. Not flag_violation(): a violation
+    // is a persistent mark on text that may be wrong (plan.md §1.4), and this is neither
+    // persistent nor about the text.
+    uint64_t hint_expires_ms_ = 0;
+
     kd::OverlayState tray_state_ = kd::OverlayState::Idle;
     // What apply_overlay_mode() last pushed to the overlay, so the transition is logged
     // once rather than on every tick that carries an anchor.
@@ -465,6 +525,17 @@ bool App::startup() {
     // end-of-session and this is the one place that answer is consumed.
     hotkey_->set_editing(settings_.editing);
 
+    // Said out loud at startup, because the way this feature disappears is silent.
+    // docs/editing.md §16: `editing.enabled` defaults to true and Cadence::Immediate is still the
+    // default in commit_engine.h, so a user who has changed nothing has a compose buffer that
+    // parses, validates, round-trips through settings.json — and is off. That is
+    // `min_confidence` and `is_usable()` verbatim, and one line in the log is the difference
+    // between "the pill will not let me edit" and an hour of looking for the bug.
+    KD_LOG_INFO("compose buffer: %s (cadence=%s, mouse=%d, on_foreign_key=%s)",
+                settings_.editing.enabled ? "ENABLED" : "off - it needs cadence=end-of-session",
+                kd::to_string(settings_.stability.cadence), settings_.editing.mouse ? 1 : 0,
+                kd::to_string(settings_.editing.on_foreign_key));
+
     if (const kd::Status st = hotkey_->start(settings_.hotkey,
                                              reinterpret_cast<uintptr_t>(hwnd_), this);
         !st.ok()) {
@@ -576,6 +647,18 @@ bool App::spawn_sidecar() {
 int App::run() {
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // docs/editing.md §10.1's fail-open heartbeat, and it is the single most important line
+        // in this function. While a session is composing the hook swallows most of the keyboard
+        // on a thread that stays healthy whatever happens here; if this loop stops turning, the
+        // hook sees the stamp go stale and stops swallowing, and the user gets their machine
+        // back. Two calls — GetTickCount and a relaxed store — per message.
+        //
+        // **Any future loop that dispatches messages must call this too.** The settings dialog
+        // runs a nested loop (settings.h: "modal with respect to the owner"), and a session
+        // cannot be composing while it is up — the dialog is opened from the tray, which needs a
+        // click, and a click ends the session — but a nested loop that is added later and does
+        // not stamp is a keyboard that dies two seconds into it.
+        if (hotkey_ != nullptr) hotkey_->heartbeat();
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -661,6 +744,11 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     set_tray_state(kd::OverlayState::Error);
                     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Error);
                 }
+                // docs/editing.md §4.4's hint, expired on the tick that already exists.
+                if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
+                    hint_expires_ms_ = 0;
+                    if (overlay_ != nullptr) overlay_->clear_hint();
+                }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
                 if (overlay_ != nullptr) {
@@ -697,7 +785,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 case kMenuToggle:
                     if (session_ != nullptr) {
                         if (target_.has_value()) {
-                            end_dictation(kd::LocalEvent::HotkeyPressed);
+                            end_dictation(kd::LocalEvent::FinalisePressed);
                         } else {
                             begin_dictation();
                         }
@@ -772,7 +860,7 @@ void App::drain_hook_queue() {
                 begin_dictation();
                 break;
             case HookNote::Kind::Finalize:
-                end_dictation(kd::LocalEvent::HotkeyPressed);
+                end_dictation(kd::LocalEvent::FinalisePressed);
                 break;
             case HookNote::Kind::Cancel:
                 end_dictation(kd::LocalEvent::EscPressed);
@@ -784,7 +872,7 @@ void App::drain_hook_queue() {
                 // swallowed the Enter, so the target never receives it and the session's text can
                 // no longer land after a line break the user meant to come *after* it (§2).
                 KD_LOG_INFO("commit: Enter");
-                end_dictation(kd::LocalEvent::HotkeyPressed);
+                end_dictation(kd::LocalEvent::FinalisePressed);
                 break;
             case HookNote::Kind::StopInput:
                 // The reason is known here and was being dropped one line later: end_dictation
@@ -795,6 +883,18 @@ void App::drain_hook_queue() {
                 // into, the second is worth investigating.
                 KD_LOG_INFO("stop-on-input: %s", kd::to_string(n.reason));
                 end_dictation(kd::LocalEvent::StopOnInput);
+                break;
+            case HookNote::Kind::Edit:
+                apply_edit(n.edit);
+                break;
+            case HookNote::Kind::EditingBegan:
+                begin_editing();
+                break;
+            case HookNote::Kind::ResumeDictation:
+                resume_dictation();
+                break;
+            case HookNote::Kind::ForeignKey:
+                show_foreign_key_hint(n.edit.vk, n.edit.mods);
                 break;
             case HookNote::Kind::LeftClick:
                 // plan.md §1.5 source B. Cached even when no session is running, because the
@@ -1160,9 +1260,13 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     // nothing injected the document has not changed and the caret has not moved, so submitting a
     // before/after frame pair would ask the estimator to find a change that does not exist.
     if (settings_.stability.cadence == kd::Cadence::EndOfSession) {
-        deferred_ += text;
+        // §1's invariant: dictation only ever appends. EditBuffer::append() puts the text at the
+        // end and takes the caret with it — which is safe here, and only here, because §3.2
+        // closes the microphone at the first edit key, so the only way speech reaches this line
+        // is after the user's own resume gesture.
+        edit_.append(text);
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
-                     text.size(), deferred_.size());
+                     text.size(), edit_.size());
         // Again, because the buffer just grew. Without this the preview empties at every
         // utterance boundary: the call above renders the engine's `pending_text`, which is scoped
         // to the utterance in progress and is empty on a `final` — so everything said so far
@@ -1196,6 +1300,198 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     // inline overlay was correct for three seconds and then degraded to the floating pill for the
     // rest of the session, which is exactly what the first person to watch it reported seeing.
     if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
+}
+
+// ─── The compose buffer (docs/editing.md) ───────────────────────────────────────────────────
+
+bool App::composing() const noexcept {
+    // One reader of one answer. `Settings::normalise()` has already forced `editing.enabled`
+    // false for any cadence but end-of-session (§6.1), so this does not re-derive that condition
+    // — re-deriving it is exactly how the two halves of a rule come to disagree.
+    return settings_.editing.enabled && target_.has_value();
+}
+
+// The virtual key a keystroke produced, as text, asked of the keyboard layout the *target* is
+// using. docs/editing.md §4.2 puts this on the UI thread deliberately: the hook may not call
+// into the layout, and the layout is a property of the focused window's thread rather than of
+// this one — a user typing into a Greek-layout window must get Greek letters in the pill.
+static std::string char_for_key(const kd::EditPost& p) {
+    BYTE state[256] = {};
+    // Rebuilt from the modifiers the filter recorded at the keystroke rather than read with
+    // GetKeyboardState here. This runs some milliseconds later, on a different thread, and by
+    // then the user may have let go of Shift — which would silently lower-case the character
+    // they typed. The high bit is "down"; the low bit of VK_CAPITAL is the toggle.
+    if (p.mods & kd::kModShift) state[VK_SHIFT] = 0x80;
+    if (p.mods & kd::kModCtrl) state[VK_CONTROL] = 0x80;
+    if (p.mods & kd::kModAlt) state[VK_MENU] = 0x80;
+    if (p.caps_lock) state[VK_CAPITAL] = 0x01;
+
+    HKL layout = nullptr;
+    if (HWND fg = GetForegroundWindow(); fg != nullptr) {
+        layout = GetKeyboardLayout(GetWindowThreadProcessId(fg, nullptr));
+    }
+    if (layout == nullptr) layout = GetKeyboardLayout(0);
+
+    // The 1<<2 flag means "do not change the kernel keyboard state", which matters more here
+    // than anywhere else: without it a dead key typed into the pill would leave the layout's
+    // pending-diacritic state set, and the *target* would then receive the composed character
+    // the next time the user typed into it.
+    wchar_t buf[8] = {};
+    const int n = ToUnicodeEx(p.vk, p.scan, state, buf, static_cast<int>(std::size(buf)), 1u << 2,
+                              layout);
+    if (n <= 0) {
+        // n < 0 is a dead key, which has produced no character yet. Dropping it is the honest
+        // answer for now: composing a diacritic needs the layout state this call is deliberately
+        // not allowed to keep, and a half-composed accent in the buffer would be worse than a
+        // key that did nothing. Recorded here rather than in a document nobody reads.
+        return {};
+    }
+
+    std::string out;
+    size_t bad = 0;
+    if (!kd::utf8::from_utf16(std::wstring_view(buf, static_cast<size_t>(n)), out, &bad)) {
+        KD_LOG_WARN("the keyboard layout produced text this build cannot encode (at %zu)", bad);
+        return {};
+    }
+    // Control characters are what a Ctrl chord produces on most layouts, and the pill has no use
+    // for one: Enter commits, Tab is a foreign key, and the rest would be invisible bytes in the
+    // user's document.
+    if (out.size() == 1 && static_cast<unsigned char>(out[0]) < 0x20) return {};
+    return out;
+}
+
+void App::apply_edit(const kd::EditPost& p) {
+    if (!composing()) return;
+
+    kd::EditCommand c;
+    c.op = p.op;
+    c.extend = p.shift;
+
+    if (p.op == kd::EditOp::InsertText) {
+        if (p.vk == kd::vk::kV && (p.mods & kd::kModCtrl) != 0) {
+            // Ctrl+V. EditBuffer is pure and has no clipboard, so the read happens here and the
+            // result is handed to it as an ordinary insertion — one insertion path rather than
+            // two (edit_buffer.h).
+            std::string pasted;
+            if (!kd::get_clipboard_text(pasted)) return;
+            c.text = std::move(pasted);
+        } else {
+            c.text = char_for_key(p);
+        }
+        if (c.text.empty()) return;
+    }
+
+    // Ctrl+C and Ctrl+X: the selection has to be read *before* the command is applied, because
+    // Cut removes it. Nothing is put on the clipboard when there is no selection — silently
+    // clearing what the user had copied would be worse than the key doing nothing.
+    if (p.op == kd::EditOp::Copy || p.op == kd::EditOp::Cut) {
+        const std::string_view sel = edit_.selected_text();
+        if (sel.empty()) return;
+        if (!kd::set_clipboard_text(sel)) {
+            KD_LOG_WARN("could not put %zu selected bytes on the clipboard", sel.size());
+            if (p.op == kd::EditOp::Copy) return;
+            // A Cut whose copy failed still removes the text, and that would lose it outright.
+            // Refusing the whole command is the recoverable failure.
+            return;
+        }
+    }
+
+    const kd::EditResult r = edit_.apply(c);
+    if (!r.changed()) return;
+
+    render_preview({});
+}
+
+void App::begin_editing() {
+    if (!composing() || editing_) return;
+
+    editing_ = true;
+    editing_began_ms_ = clock_.now_ms();
+
+    // docs/editing.md §3.2: **the first edit key stops the capture** — not gates it, not discards
+    // its frames; stops it, at the device. audio_capture.h states the rule this obeys: "the mic
+    // is open only between start() and stop() — plan.md §1.9 makes that a privacy promise, and
+    // the tray state is driven from it, so nothing else may hold the device open." A pill that
+    // said *paused* over a lit microphone light would break the one promise the product makes
+    // about the microphone.
+    if (audio_running_) {
+        capture_->stop();
+        audio_running_ = false;
+    }
+
+    // §3.3, and §16's sixth open question. An utterance that was open when the edit key arrived
+    // is flushed rather than abandoned: the user pressed an arrow key to go and fix something
+    // they just said, and the thing they just said had better be editable by the time they get
+    // there. The session machine raises FlushPendingAudio; the `final` it produces lands in the
+    // settled region through the ordinary commit path.
+    if (session_ != nullptr) apply(session_->on_local(kd::LocalEvent::EditingBegan));
+
+    KD_LOG_INFO("editing: the microphone is closed and the pill has the keyboard");
+    set_tray_state(kd::OverlayState::Editing);
+    if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Editing);
+    push_edit_view();
+}
+
+void App::resume_dictation() {
+    if (!composing() || !editing_) return;
+
+    // §1's invariant, and note *why* the caret moves: the user has made a gesture that means "I
+    // am going to talk now". It is a consequence of an explicit action rather than a microphone
+    // surprising them mid-correction, which is the whole difference between this design and the
+    // one §14 records as retracted.
+    edit_.set_caret(edit_.size(), false);
+
+    kd::audio::CaptureConfig cfg;
+    cfg.device_id = settings_.audio_device_id;
+    if (const kd::Status st = capture_->start(cfg, this); !st.ok()) {
+        // The buffer is intact and the session is still running, so this is recoverable: stay in
+        // editing, say so, and let the user press Enter to keep what they have.
+        KD_LOG_ERROR("could not reopen the microphone: %s", st.message().c_str());
+        set_tray_state(kd::OverlayState::Error);
+        if (overlay_ != nullptr) {
+            overlay_->set_state(kd::OverlayState::Editing);
+            overlay_->set_hint("The microphone could not be reopened — press Enter to keep this");
+        }
+        hint_expires_ms_ = clock_.now_ms() + kHintMs;
+        return;
+    }
+    audio_running_ = true;
+    editing_ = false;
+
+    // §3.3: a stateful backend must not be told that nothing happened. The gap is real — the
+    // device was closed for it — and plan.md §1.6 forbids papering over a gap by padding or
+    // splicing, which is exactly what saying nothing would amount to.
+    const uint64_t now = clock_.now_ms();
+    const uint32_t gap = editing_began_ms_ == 0 || now <= editing_began_ms_
+                             ? 0u
+                             : static_cast<uint32_t>(now - editing_began_ms_);
+    if (session_ != nullptr) {
+        apply(session_->on_capture_glitch(gap, "editing"));
+        apply(session_->on_local(kd::LocalEvent::DictationResumed));
+    }
+    editing_began_ms_ = 0;
+
+    KD_LOG_INFO("dictation resumed after %u ms of editing", gap);
+    set_tray_state(kd::OverlayState::Listening);
+    if (overlay_ != nullptr) {
+        overlay_->set_state(kd::OverlayState::Listening);
+        overlay_->scroll_to_bottom();
+        overlay_->clear_hint();
+    }
+    hint_expires_ms_ = 0;
+    push_edit_view();
+}
+
+void App::show_foreign_key_hint(uint32_t vk, uint32_t mods) {
+    if (!composing() || overlay_ == nullptr) return;
+
+    // Named through HotkeySpec so that "Ctrl+S" is spelled here exactly as it is spelled in the
+    // settings file and the hotkey dialog. One table, three readers.
+    kd::HotkeySpec spec;
+    spec.vk = vk;
+    spec.mods = mods;
+    overlay_->set_hint(spec.to_display_string() + " \xE2\x80\x94 press Enter to finish first");
+    hint_expires_ms_ = clock_.now_ms() + kHintMs;
 }
 
 // ─── Session lifecycle ──────────────────────────────────────────────────────────────────────
@@ -1330,7 +1626,7 @@ void App::begin_dictation() {
     // The session machine's refusals (password field, elevated target, secure desktop) all take
     // that path, and so did the model-load press until the check above. §8's shape exactly: one
     // side decides, the other never asks.
-    const kd::SessionMachine::Outcome o = session_->on_local(kd::LocalEvent::HotkeyPressed);
+    const kd::SessionMachine::Outcome o = session_->on_local(kd::LocalEvent::FinalisePressed);
     apply(o);
     if (o.verdict == kd::Verdict::Refused) {
         KD_LOG_WARN("the session machine refused the activation (%s); closing the microphone",
@@ -1344,15 +1640,26 @@ void App::begin_dictation() {
         return;
     }
 
+    // A session starts dictating, never editing (§1), with an empty buffer and nothing hinted.
+    editing_ = false;
+    editing_began_ms_ = 0;
+    hint_expires_ms_ = 0;
+    if (overlay_ != nullptr) {
+        overlay_->clear_hint();
+        overlay_->scroll_to_bottom();
+    }
+    push_edit_view();
+
     set_tray_state(kd::OverlayState::Listening);
     if (overlay_ != nullptr) {
         overlay_->set_state(kd::OverlayState::Listening);
         overlay_->show();
     }
-    KD_LOG_INFO("dictation started: process=%s pid=%lu password_field=%d console=%d",
+    KD_LOG_INFO("dictation started: process=%s pid=%lu password_field=%d console=%d compose=%d",
                 target_->process_name.c_str(),
                 static_cast<unsigned long>(target_->process_id),
-                target_->is_password_field ? 1 : 0, target_->is_console ? 1 : 0);
+                target_->is_password_field ? 1 : 0, target_->is_console ? 1 : 0,
+                composing() ? 1 : 0);
 }
 
 // The hotkey (or Esc, or stop-on-input) has ended the *user's* part of the session. The session
@@ -1388,9 +1695,9 @@ void App::end_dictation(kd::LocalEvent why) {
     // finalises, so the undecoded tail is dropped too). Under Cadence::EndOfSession that has to
     // discard the accumulated buffer as well, or Esc would type in everything the user just asked
     // to abandon — the exact opposite of what they pressed.
-    if (why == kd::LocalEvent::EscPressed && !deferred_.empty()) {
-        KD_LOG_INFO("discarding %zu deferred bytes: Esc cancels the session", deferred_.size());
-        deferred_.clear();
+    if (why == kd::LocalEvent::EscPressed && !edit_.empty()) {
+        KD_LOG_INFO("discarding %zu deferred bytes: Esc cancels the session", edit_.size());
+        edit_.clear();
     }
 
     apply(session_->on_local(why));
@@ -1418,8 +1725,9 @@ void App::render_preview(std::string_view tail) {
     // utterance is still being revised. With Cadence::Immediate the settled half is in the
     // document rather than in the overlay, so there is nothing to put in it.
     if (settings_.stability.cadence == kd::Cadence::EndOfSession) {
-        if (deferred_.empty() || tail.empty()) {
-            overlay_->set_text(deferred_, tail);
+        if (edit_.empty() || tail.empty()) {
+            overlay_->set_text(edit_.text(), tail);
+            push_edit_view();
             return;
         }
         // The overlay concatenates its two halves with no separator, and committed text never
@@ -1428,19 +1736,32 @@ void App::render_preview(std::string_view tail) {
         // the space that actually reaches the document still comes from `leading_space`, so this
         // cannot double it.
         std::string settled;
-        settled.reserve(deferred_.size() + 1);
-        settled += deferred_;
+        settled.reserve(edit_.size() + 1);
+        settled += edit_.text();
         settled.push_back(' ');
         overlay_->set_text(settled, tail);
+        push_edit_view();
         return;
     }
     overlay_->set_text(tail, {});
 }
 
+// docs/editing.md §7. The caret and the selection are offsets into the string set_text() has just
+// been given, so they are pushed immediately after it and never on their own: an offset that
+// arrives without the text it indexes is an offset into the previous frame.
+void App::push_edit_view() {
+    if (overlay_ == nullptr) return;
+    overlay_->set_edit_view(composing() && editing_, edit_.caret(), edit_.selection_begin(),
+                            edit_.selection_end());
+}
+
 void App::flush_deferred_commits(const char* why) {
-    if (deferred_.empty()) return;
-    std::string text;
-    text.swap(deferred_);   // taken first, so no path can flush the same text twice
+    if (edit_.empty()) return;
+    // Taken first, so no path can flush the same text twice. EditBuffer::take() moves the text
+    // out and leaves the buffer empty in one step, which is the same rule the previous
+    // `text.swap(deferred_)` enforced and the reason it is a single call rather than a read
+    // followed by a clear.
+    const std::string text = edit_.take();
 
     // The target has to be revalidated here for the same reason perform_commit revalidates:
     // SendInput types into whatever is focused *now*, not into the window we were aiming at.
@@ -1509,7 +1830,18 @@ void App::finish_dictation(const char* why) {
         audio_running_ = false;
     }
     target_.reset();
+    // Cleared on the ONE path every session ends through, for the reason the note_session_ended()
+    // call above is here rather than in end_dictation(): the abort paths skip end_dictation
+    // entirely, and an `editing_` left true would make the next session's first speech look like
+    // a resume and its hotkey press mean the wrong thing. progress.md §8 is a catalogue of state
+    // cleared on one of the two paths a session can end through.
+    editing_ = false;
+    editing_began_ms_ = 0;
+    hint_expires_ms_ = 0;
     if (overlay_ != nullptr) {
+        overlay_->clear_hint();
+        overlay_->set_edit_view(false, 0, 0, 0);
+        overlay_->scroll_to_bottom();
         overlay_->set_text({}, {});
         overlay_->hide();
     }
@@ -1705,6 +2037,11 @@ void App::update_tray() {
         case kd::OverlayState::Finalizing:   text = L"kvit-dictate — finalising"; break;
         case kd::OverlayState::ModelLoading: text = L"kvit-dictate — loading model"; break;
         case kd::OverlayState::Warning:      text = L"kvit-dictate — WARNING: a correction could not be applied"; break;
+        // docs/editing.md §7.4 and §16's fifth bullet: a state the pill renders and the tray
+        // does not is `Effect::SurfaceWarning`'s shape, where one fixed string served seven
+        // raisers and nobody noticed for months. The microphone is closed in this state and the
+        // tray is where the user checks that.
+        case kd::OverlayState::Editing:      text = L"kvit-dictate — editing (mic CLOSED)"; break;
         case kd::OverlayState::Unsupported:  text = L"kvit-dictate — this window cannot be dictated into"; break;
         case kd::OverlayState::Error:        text = L"kvit-dictate — ERROR (see log)"; break;
     }

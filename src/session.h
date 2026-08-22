@@ -116,7 +116,21 @@ const char* to_string(Effect e) noexcept;
 // Things the user or the local system did. Everything the hotkey module, the mouse hook, the
 // timers and the audio path can say.
 enum class LocalEvent : uint8_t {
-    HotkeyPressed,        // toggle: starts from Idle, finalises from Running (plan.md §1.8)
+    // The user's start-or-finish gesture. From Idle it produces `start`; from Running it
+    // finalises — FlushPendingAudio, then `stop`, then the last `final`.
+    //
+    // **Renamed from `HotkeyPressed`, and the rename is not cosmetic** (docs/editing.md §8).
+    // After §4.5 the hotkey no longer finalises anything while the compose buffer is running:
+    // Enter does. An enumerator called `HotkeyPressed` sitting on a path the hotkey never takes
+    // is the single most reliable way to make the next reader wrong about what the product does.
+    //
+    // Both branches are live. Idle -> `start` is still reached by the hotkey, which is the only
+    // thing that starts a session. Running -> finalise is reached by Enter when editing is on,
+    // and by the hotkey's second press when it is off — `editing.enabled` is forced false for
+    // any cadence but end-of-session, so plan.md §1.8's toggle survives wherever the compose
+    // buffer does not exist. docs/editing.md §16 expected this branch to become dead code; it
+    // does not, and that is why it is kept rather than deleted.
+    FinalisePressed,
     EscPressed,           // cancel — discards everything uncommitted
     StopOnInput,          // a real click or keystroke ended the session (plan.md §1.8)
     EndpointSilence,      // utterance boundary; the session continues (plan.md §1.6)
@@ -134,6 +148,31 @@ enum class LocalEvent : uint8_t {
     // other way to learn that the user is still talking. Appended to the enum rather than
     // inserted, because the earlier values are compared as strings by the fixture runner.
     SpeechDetected,
+
+    // ── The compose buffer's two states (docs/editing.md §3.2, §3.3, §9) ────────────────────
+    //
+    // Appended, like SpeechDetected above and for the same reason: the earlier values are
+    // compared as strings by the fixture runner.
+    //
+    // Neither carries a verdict of its own and neither changes a protocol state. What they change
+    // is which timers are armed, which is the smallest thing that can express "the user is
+    // present but not speaking".
+
+    // The first edit key closed the microphone. If an utterance was open it is flushed rather
+    // than abandoned (§3.3): the user pressed an arrow key to go and fix something they just
+    // said, and the thing they just said had better be editable by the time they get there.
+    //
+    // It also **pauses the session-silence timer**, and §9 is emphatic that this is a decision
+    // rather than a preference. That timer measures how long a session survives *with no speech*;
+    // during editing there is no microphone to be silent into, so leaving it armed would end the
+    // session — typing a half-finished buffer into the document — because the user spent two
+    // minutes reading what they had dictated. progress.md §8 records what happened the last time
+    // "silence" and "wall-clock since activation" were confused.
+    EditingBegan,
+
+    // The hotkey, pressed while editing: the microphone reopens and the session-silence timer is
+    // armed again from now.
+    DictationResumed,
 };
 
 const char* to_string(LocalEvent e) noexcept;
@@ -312,7 +351,7 @@ public:
     // before its `seq` is allowed to move the current session's high-water mark.
     Outcome on_message(const proto::Message& m);
 
-    // A local event. `on_local(HotkeyPressed)` from Idle produces the `start` message and the
+    // A local event. `on_local(FinalisePressed)` from Idle produces the `start` message and the
     // new session_id; from Running it produces FlushPendingAudio + `stop`.
     Outcome on_local(LocalEvent e);
 

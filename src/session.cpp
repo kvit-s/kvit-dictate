@@ -113,7 +113,7 @@ const char* to_string(Effect e) noexcept {
 
 const char* to_string(LocalEvent e) noexcept {
     switch (e) {
-        case LocalEvent::HotkeyPressed: return "hotkey_pressed";
+        case LocalEvent::FinalisePressed: return "finalise_pressed";
         case LocalEvent::EscPressed: return "esc_pressed";
         case LocalEvent::StopOnInput: return "stop_on_input";
         case LocalEvent::EndpointSilence: return "endpoint_silence";
@@ -124,6 +124,8 @@ const char* to_string(LocalEvent e) noexcept {
         case LocalEvent::TargetChanged: return "target_changed";
         case LocalEvent::StabilityViolation: return "stability_violation";
         case LocalEvent::SpeechDetected: return "speech_detected";
+        case LocalEvent::EditingBegan: return "editing_began";
+        case LocalEvent::DictationResumed: return "dictation_resumed";
     }
     return "unknown";
 }
@@ -190,6 +192,13 @@ struct SessionMachine::Impl {
     Millis activation_ms = 0;
     Millis last_voice_ms = 0;
     bool utterance_open = false;
+
+    // docs/editing.md §3.2 and §9: the microphone is closed and the user is editing the pill.
+    // The session-silence timer does not run in this state, because it measures **silence while
+    // listening** and there is nothing listening. That amends plan.md §1.6's wording — the timer
+    // was described there as wall-clock since activation — and the amendment is the whole point
+    // of the state.
+    bool editing = false;
     bool utterance_counted = false;
     uint64_t utterances_completed = 0;
 
@@ -221,6 +230,9 @@ struct SessionMachine::Impl {
         utterance_open = false;
         utterance_counted = false;
         utterances_completed = 0;
+        // Scoped to one session like everything else here: a session that ended while the user
+        // was editing must not leave the next one's timers disarmed (docs/editing.md §9).
+        editing = false;
         target = TargetIdentity{};
     }
 
@@ -632,10 +644,14 @@ SessionMachine::Outcome SessionMachine::on_local(LocalEvent e) {
     Impl& s = *impl_;
 
     switch (e) {
-        case LocalEvent::HotkeyPressed: {
+        case LocalEvent::FinalisePressed: {
             if (s.state == proto::ConnState::Running) {
-                // The second press: finalise. Commit the stable prefix and discard the unstable
-                // tail *after* a final decode — which is `stop`, not `cancel` (plan.md §1.8).
+                // Finalise: commit the stable prefix and discard the unstable tail *after* a
+                // final decode — which is `stop`, not `cancel` (plan.md §1.8).
+                //
+                // Reached by Enter while the compose buffer is running (docs/editing.md §4.3),
+                // and by the hotkey's second press when it is not (§4.5 gives up the toggle only
+                // where there is an editing state for the hotkey to resume into).
                 s.finalise_session(out);
                 out.verdict = Verdict::Sent;
                 return out;
@@ -778,6 +794,45 @@ SessionMachine::Outcome SessionMachine::on_local(LocalEvent e) {
                 s.utterance_open = true;
                 out.effects.push_back(Effect::StartEndpointTimer);
             }
+            out.verdict = Verdict::Accept;
+            return out;
+        }
+
+        case LocalEvent::EditingBegan: {
+            if (s.state != proto::ConnState::Running) {
+                out.verdict = Verdict::Accept;
+                return out;
+            }
+            // docs/editing.md §3.3. An utterance that is open when the edit key arrives is
+            // flushed, not abandoned: FlushPendingAudio pushes what has been captured, the
+            // sidecar finishes decoding it, and the resulting `final` joins the settled region —
+            // where the user can edit it, which is the whole reason they pressed the key.
+            //
+            // No protocol change and no new state: this is the endpoint path, reached by a
+            // gesture instead of by a timer.
+            if (s.utterance_open) {
+                out.effects.push_back(Effect::FlushPendingAudio);
+                s.close_utterance();
+            }
+            s.editing = true;
+            // Both timers stop. The endpoint timer has nothing left to end; the session timer is
+            // measuring silence into a microphone that is about to be closed (§9).
+            out.effects.push_back(Effect::StopTimers);
+            out.verdict = Verdict::Accept;
+            return out;
+        }
+
+        case LocalEvent::DictationResumed: {
+            if (s.state != proto::ConnState::Running) {
+                out.verdict = Verdict::Accept;
+                return out;
+            }
+            s.editing = false;
+            // Armed from *now*, not from whenever speech was last heard. The time spent editing
+            // was not silence — there was no microphone open to be silent into — so charging it
+            // against the session timer would end the session moments after the user resumed.
+            s.last_voice_ms = s.now();
+            out.effects.push_back(Effect::StartSessionTimer);
             out.verdict = Verdict::Accept;
             return out;
         }
@@ -1006,6 +1061,13 @@ SessionMachine::Outcome SessionMachine::on_tick() {
     // minute thinking pause costs exactly one utterance boundary. Session silence is measured
     // from the last *speech*, not from the last utterance boundary, because that is what
     // plan.md §1.6 defines it as: "how long the session survives with no speech at all".
+    // docs/editing.md §9. Editing closes the microphone, so there is no speech for either
+    // threshold to be measured against: the endpoint timer has no open utterance to end (§3.3
+    // flushed it) and the session timer would be counting a user reading their own transcript as
+    // if it were a user who had walked away. Returning here rather than guarding each threshold
+    // separately, because the two must not be able to disagree about which state they are in.
+    if (s.editing) return out;
+
     const Millis quiet = s.since(s.last_voice_ms);
 
     if (s.utterance_open && quiet >= static_cast<Millis>(s.cfg.endpoint_silence_ms)) {
@@ -1142,6 +1204,7 @@ void SessionMachine::restore(const SessionSnapshot& s) {
     i.utterance_open = false;
     i.utterance_counted = false;
     i.utterances_completed = 0;
+    i.editing = false;
 }
 
 void SessionMachine::restart_connection() {

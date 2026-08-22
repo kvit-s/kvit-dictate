@@ -112,6 +112,7 @@ set(KD_CORE_SOURCES
     src/util/json.cpp
     src/util/log.cpp
     src/settings.cpp
+    src/edit_buffer.cpp
 
     # Windows-facing.
     src/hotkey.cpp
@@ -133,6 +134,7 @@ set(KD_CORE_HEADERS
     src/ipc_client.h
     src/overlay.h
     src/settings.h
+    src/edit_buffer.h
     src/util/clock.h
     src/util/json.h
     src/util/log.h
@@ -270,6 +272,7 @@ if(KD_BUILD_TESTS)
         tests/test_anchor.cpp
         tests/test_overlay.cpp
         tests/test_settings.cpp
+        tests/test_edit_buffer.cpp
         tests/test_injector.cpp
         tests/test_fixtures.cpp
     )
@@ -319,6 +322,7 @@ if(KD_BUILD_TESTS)
         ipc             # src/ipc_client.cpp — pipe naming and the DACL
         anchor          # src/anchor.cpp — diff scorer and DPI maths on synthetic bitmaps
         overlay         # src/overlay.cpp — overlay_mode_for, plan.md §1.5's degradation rule
+        edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module

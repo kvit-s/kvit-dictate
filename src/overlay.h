@@ -117,6 +117,20 @@ enum class OverlayState : uint8_t {
     Warning,         // a stability violation or a degraded anchor; the utterance is flagged
     Unsupported,     // elevated target, password field, secure desktop — an explicit state
     Error,
+
+    // docs/editing.md §7.4 — and this one is load-bearing rather than decorative. Three separate
+    // rules in that document rest on the user being able to see whether the microphone is open:
+    // §3.2's privacy promise (a closed device must look closed), §3.3's resume (a gesture nobody
+    // makes if they cannot tell it is needed), and §4.5's no-op hotkey (a key that does nothing
+    // while dictating is only tolerable if the user can see *why*).
+    //
+    // **It must reach the tray as well as the pill.** §16 names the failure precisely: a new
+    // state the pill renders but `set_tray_state` maps onto Listening because its switch has no
+    // case for it is `Effect::SurfaceWarning`'s shape, where one fixed string served seven
+    // raisers and a refusal during a model load was reported as a stability violation for
+    // months. Appended to the enum rather than inserted, so a value already on the wire keeps
+    // meaning what it meant.
+    Editing,
 };
 
 const char* to_string(OverlayState s) noexcept;
@@ -187,6 +201,34 @@ public:
     void flag_violation(std::string_view reason);
     void clear_violation();
 
+    // ── The compose buffer (docs/editing.md §7) ─────────────────────────────────────────────
+
+    // Where the caret is and what is selected, as **UTF-8 byte offsets into `pending`** — the
+    // same units everything else in this program uses (util/utf8.h §1). The unstable tail is not
+    // addressable and offsets into it are clamped away, which is docs/editing.md §3's freeze
+    // rule arriving here for free rather than being re-implemented.
+    //
+    // `active` false draws neither caret nor selection, which is what a session that has not
+    // been edited looks like — identical to today.
+    void set_edit_view(bool active, size_t caret, size_t selection_begin, size_t selection_end);
+
+    // §4.4's one-line hint: `Ctrl+S — press Enter to finish first`. Deliberately not
+    // flag_violation(): a violation is a persistent mark on text that may be wrong (plan.md
+    // §1.4), and this is neither persistent nor about the text. The caller expires it on the
+    // tick it already runs.
+    void set_hint(std::string_view hint);
+    void clear_hint();
+
+    // §7.3. Scrollback is a prerequisite, not a nicety: the pill shows the newest `kMaxLines`
+    // with front-elision, so a session-long buffer sits behind that window unseen, and
+    // editable-but-unreachable text is not a feature but a trap.
+    //
+    // Negative scrolls back (older text), positive forward. The view is pinned to the bottom
+    // until the first call, and any caret movement scrolls the caret into view regardless — which
+    // is what makes the arrow keys able to reach the top of a long buffer at all.
+    void scroll_by_lines(int32_t delta);
+    void scroll_to_bottom();
+
     // ── Presentation ────────────────────────────────────────────────────────────────────────
 
     void show();
@@ -213,5 +255,21 @@ private:
 // mixed-DPI and multi-monitor cases plan.md §7 gates on are unit-tested rather than eyeballed.
 anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int32_t text_height_px,
                             const anchor::Rect& monitor_work_area, OverlayMode mode);
+
+// ─── The scroll arithmetic, also pure ───────────────────────────────────────────────────────
+//
+// docs/editing.md §7.3's three rules in one function, in the order they override each other:
+//
+//   * the view shows `visible_lines` of `total_lines`, starting at `desired`;
+//   * **any caret movement scrolls the caret into view** — so `caret_line`, when it is known,
+//     wins over `desired`;
+//   * the result is always a valid start line, so a buffer that shrank under a stale offset
+//     cannot leave the pill showing blank space below its own text.
+//
+// Separated out and tested rather than written inline in paint_once() for the reason
+// `layout_overlay` was: the off-by-one at each end is the kind of thing that is obvious in a
+// table of cases and invisible in a paint function.
+[[nodiscard]] uint32_t clamp_scroll_line(uint32_t desired, uint32_t caret_line, bool caret_known,
+                                         uint32_t total_lines, uint32_t visible_lines) noexcept;
 
 }  // namespace kd

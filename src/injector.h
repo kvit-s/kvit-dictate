@@ -154,6 +154,16 @@ bool secure_desktop_active();
 // tray. UI thread only, like everything else here.
 bool set_clipboard_text(std::string_view utf8);
 
+// Read CF_UNICODETEXT off the clipboard. Returns false when the clipboard holds no text, cannot
+// be opened, or holds text that is not well-formed once converted — never a partial or repaired
+// answer, because util/utf8.h forbids U+FFFD substitution anywhere and this text is on its way
+// into a buffer bound for the user's document.
+//
+// Added for Ctrl+V inside the compose buffer (docs/editing.md §4.3): EditBuffer is pure and has
+// no Windows API, so the UI thread reads the clipboard here and hands the result to it as an
+// ordinary insertion. That keeps one insertion path rather than two. UI thread only.
+bool get_clipboard_text(std::string& out);
+
 // ─── Self-injection marking ─────────────────────────────────────────────────────────────────
 //
 // The handshake between this module and the hooks. Before injecting, the injector publishes a

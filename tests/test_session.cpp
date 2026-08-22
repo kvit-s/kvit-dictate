@@ -118,7 +118,7 @@ void bring_to_idle(kd::SessionMachine& m) {
 
 // Start a session and return its id, asserting that a `start` frame was produced.
 std::string start_session(kd::SessionMachine& m) {
-    const auto out = m.on_local(LocalEvent::HotkeyPressed);
+    const auto out = m.on_local(LocalEvent::FinalisePressed);
     KD_REQUIRE_EQ(out.verdict, Verdict::Sent);
     KD_REQUIRE_EQ(out.to_send.size(), size_t{1});
     KD_REQUIRE_EQ(out.to_send[0].type(), proto::MessageType::Start);
@@ -226,6 +226,161 @@ KD_TEST(session, thinking_pause_ends_the_utterance_and_not_the_session) {
     KD_CHECK(m.utterance_open());
     KD_CHECK(m.next_utterance_needs_leading_space());
     KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  Editing pauses the session-silence timer — docs/editing.md §9
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(session, editing_disarms_the_session_silence_timer) {
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    KD_CHECK_EQ(m.on_local(LocalEvent::EditingBegan).verdict, Verdict::Accept);
+
+    clock.advance(60000);
+    KD_CHECK_EQ(m.on_tick().verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+}
+
+KD_TEST(session, a_session_that_spends_longer_than_the_timer_editing_does_not_end) {
+    // docs/editing.md §11 names this one as "the one that will actually break", and §9 says why
+    // it matters: the timer measures how long a session survives *with no speech*, and during
+    // editing there is no microphone to be silent into. Leaving it armed would type a
+    // half-finished buffer into the document because the user spent two minutes reading what
+    // they had dictated. progress.md §8 records what happened the last time "silence" and
+    // "wall-clock since activation" were confused: a hard two-minute cap on every dictation,
+    // with a green test suite.
+    kd::ManualClock clock(1000);
+    kd::SessionConfig cfg;  // 120 s
+    kd::SessionMachine m(clock, cfg);
+    bring_to_idle(m);
+    start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    m.on_local(LocalEvent::EditingBegan);
+
+    // Five minutes of editing — well past `session_silence_ms`, ticked the way App ticks.
+    for (int i = 0; i < 300; ++i) {
+        clock.advance(1000);
+        const auto t = m.on_tick();
+        KD_REQUIRE(t.to_send.empty());
+    }
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+}
+
+KD_TEST(session, resuming_re_arms_the_session_timer_from_now) {
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    m.on_local(LocalEvent::EditingBegan);
+    clock.advance(300000);  // five minutes of editing
+
+    // Armed from *now*, not from whenever speech was last heard. Charging the editing time
+    // against the timer would end the session moments after the user resumed — which is the
+    // failure that makes the resume gesture useless.
+    KD_CHECK_EQ(m.on_local(LocalEvent::DictationResumed).verdict, Verdict::Accept);
+    clock.advance(60000);
+    KD_CHECK_EQ(m.on_tick().verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+
+    // ...and it is armed, not disabled. Two more minutes of real silence still ends it.
+    clock.advance(61000);
+    const auto t = m.on_tick();
+    KD_CHECK_EQ(t.verdict, Verdict::Sent);
+    KD_CHECK(sends(t, proto::MessageType::Stop));
+}
+
+KD_TEST(session, an_open_utterance_is_flushed_when_editing_begins) {
+    // docs/editing.md §3.3: the user pressed an arrow key to go and fix something they just
+    // said, and the thing they just said had better be editable by the time they get there. So
+    // the in-flight utterance is flushed rather than abandoned — the endpoint path, reached by a
+    // gesture instead of by a timer.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    KD_REQUIRE(m.utterance_open());
+
+    const auto out = m.on_local(LocalEvent::EditingBegan);
+    KD_CHECK(out.has_effect(Effect::FlushPendingAudio));
+    KD_CHECK(!m.utterance_open());
+    KD_CHECK_EQ(m.utterances_completed(), uint64_t{1});
+
+    // No `stop`, no `cancel`: the session is still the user's and the microphone closing is not
+    // the session ending.
+    KD_CHECK(out.to_send.empty());
+    KD_CHECK_EQ(m.state(), proto::ConnState::Running);
+}
+
+KD_TEST(session, editing_with_no_open_utterance_flushes_nothing) {
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    start_session(m);
+
+    const auto out = m.on_local(LocalEvent::EditingBegan);
+    KD_CHECK(!out.has_effect(Effect::FlushPendingAudio));
+    KD_CHECK_EQ(out.verdict, Verdict::Accept);
+}
+
+KD_TEST(session, the_editing_events_are_inert_outside_a_running_session) {
+    // Both arrive from the hook thread by way of a posted message, so both can land after the
+    // session they belong to has ended — a `stopped` that overtook them, or an abort. Accepting
+    // and doing nothing is the only answer that does not make the timing a bug.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    const proto::ConnState before = m.state();
+    KD_CHECK_EQ(m.on_local(LocalEvent::EditingBegan).verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.on_local(LocalEvent::DictationResumed).verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.state(), before);
+
+    bring_to_idle(m);
+    KD_CHECK_EQ(m.on_local(LocalEvent::EditingBegan).verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.on_local(LocalEvent::DictationResumed).verdict, Verdict::Accept);
+    KD_CHECK_EQ(m.state(), proto::ConnState::Idle);
+}
+
+KD_TEST(session, a_session_that_ended_while_editing_does_not_disarm_the_next_ones_timer) {
+    // The shape progress.md §8 is a catalogue of: state cleared on one of the two paths a session
+    // can end through. `editing` is session-scoped, so clear_session() has to clear it — or the
+    // next session runs with no session-silence timer at all and nobody notices, because the only
+    // symptom is a session that never times out.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    const std::string sid = start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    m.on_local(LocalEvent::EditingBegan);
+    m.on_local(LocalEvent::FinalisePressed);
+    m.on_message(stopped_msg(sid));
+    KD_REQUIRE_EQ(m.state(), proto::ConnState::Idle);
+
+    start_session(m);
+    m.on_local(LocalEvent::SpeechDetected);
+    clock.advance(121000);
+    const auto t = m.on_tick();
+    KD_CHECK_EQ(t.verdict, Verdict::Sent);
+    KD_CHECK(sends(t, proto::MessageType::Stop));
+}
+
+KD_TEST(session, the_finalise_event_still_spells_itself_for_the_fixture_runner) {
+    // session.h warns that the fixture runner compares these as strings. The rename in
+    // docs/editing.md §8 changed one, and no fixture under tests/fixtures/ uses it — but the
+    // spelling is part of the cross-language contract's vocabulary either way, so it is pinned
+    // here rather than left to be discovered by a fixture that starts using it.
+    KD_CHECK_EQ(kd::to_string(LocalEvent::FinalisePressed), "finalise_pressed");
+    KD_CHECK_EQ(kd::to_string(LocalEvent::EditingBegan), "editing_began");
+    KD_CHECK_EQ(kd::to_string(LocalEvent::DictationResumed), "dictation_resumed");
 }
 
 KD_TEST(session, an_utterance_boundary_does_not_reset_the_commit_engine) {
@@ -569,7 +724,7 @@ KD_TEST(session, elevated_target_is_refused_at_session_start) {
     // The refusal happens at the press. Not after a sentence has been spoken, not inferred from
     // an injection that "seemed not to work" — SendInput into a higher-integrity window is
     // silently ignored and its return value does not identify UIPI as the cause.
-    const auto out = m.on_local(LocalEvent::HotkeyPressed);
+    const auto out = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(out.verdict, Verdict::Refused);
     KD_CHECK(out.to_send.empty());  // no `start` frame: the mic never opens
     KD_CHECK(out.has_effect(Effect::SurfaceWarning));
@@ -581,7 +736,7 @@ KD_TEST(session, elevated_target_is_refused_at_session_start) {
     // Lowering the target below us makes it work, which is the proof that the integrity
     // comparison — and not something incidental — is what refused.
     targets.foreground.integrity = kd::IntegrityLevel::Medium;
-    const auto ok = m.on_local(LocalEvent::HotkeyPressed);
+    const auto ok = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(ok.verdict, Verdict::Sent);
     KD_CHECK_EQ(m.refusal(), kd::InjectStatus::Ok);
 }
@@ -597,7 +752,7 @@ KD_TEST(session, unknown_integrity_does_not_refuse) {
     kd::SessionMachine m(clock, kd::SessionConfig{});
     m.set_target_provider(&targets);
     bring_to_idle(m);
-    KD_CHECK_EQ(m.on_local(LocalEvent::HotkeyPressed).verdict, Verdict::Sent);
+    KD_CHECK_EQ(m.on_local(LocalEvent::FinalisePressed).verdict, Verdict::Sent);
 }
 
 KD_TEST(session, password_field_and_secure_desktop_are_refused_at_session_start) {
@@ -609,14 +764,14 @@ KD_TEST(session, password_field_and_secure_desktop_are_refused_at_session_start)
     m.set_target_provider(&targets);
     bring_to_idle(m);
 
-    auto out = m.on_local(LocalEvent::HotkeyPressed);
+    auto out = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(out.verdict, Verdict::Refused);
     KD_CHECK_EQ(m.refusal(), kd::InjectStatus::PasswordField);
     KD_CHECK(out.to_send.empty());
 
     targets.foreground.is_password_field = false;
     targets.secure = true;
-    out = m.on_local(LocalEvent::HotkeyPressed);
+    out = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(out.verdict, Verdict::Refused);
     KD_CHECK_EQ(m.refusal(), kd::InjectStatus::SecureDesktop);
     KD_CHECK(out.to_send.empty());
@@ -626,7 +781,7 @@ KD_TEST(session, password_field_and_secure_desktop_are_refused_at_session_start)
     // is exactly the failure the identity rules exist to prevent.
     targets.secure = false;
     targets.capture_fails = true;
-    out = m.on_local(LocalEvent::HotkeyPressed);
+    out = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(out.verdict, Verdict::Refused);
     KD_CHECK_EQ(m.refusal(), kd::InjectStatus::Failed);
 }
@@ -788,7 +943,7 @@ KD_TEST(session, second_press_finalises_and_esc_cancels_produce_different_text) 
         auto out = m.on_message(partial_msg(sid, 1, 1, "can you change the", 8));
         if (out.has_effect(Effect::ApplyText)) finalised = "can you ";
 
-        out = m.on_local(LocalEvent::HotkeyPressed);  // second press
+        out = m.on_local(LocalEvent::FinalisePressed);  // second press
         KD_CHECK_EQ(out.verdict, Verdict::Sent);
         KD_CHECK(sends(out, proto::MessageType::Stop));
         KD_CHECK_EQ(m.state(), proto::ConnState::Finalizing);
@@ -846,7 +1001,7 @@ KD_TEST(session, esc_during_finalizing_still_cancels) {
     bring_to_idle(m);
     const std::string sid = start_session(m);
 
-    m.on_local(LocalEvent::HotkeyPressed);
+    m.on_local(LocalEvent::FinalisePressed);
     KD_REQUIRE_EQ(m.state(), proto::ConnState::Finalizing);
 
     const auto out = m.on_local(LocalEvent::EscPressed);
@@ -960,7 +1115,7 @@ KD_TEST(session, hotkey_before_ready_does_not_produce_a_start_frame) {
     m.on_message(proto::Message::of(ack));
     KD_REQUIRE_EQ(m.state(), proto::ConnState::Loading);
 
-    const auto out = m.on_local(LocalEvent::HotkeyPressed);
+    const auto out = m.on_local(LocalEvent::FinalisePressed);
     KD_CHECK_EQ(out.verdict, Verdict::Refused);
     KD_CHECK(out.to_send.empty());
     KD_CHECK_EQ(m.state(), proto::ConnState::Loading);

@@ -1065,6 +1065,53 @@ bool validate_target(const TargetIdentity& t) {
     return true;
 }
 
+bool get_clipboard_text(std::string& out) {
+    out.clear();
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == FALSE) return false;
+
+    uint32_t os_error = 0;
+    // Reached through injector_detail because the retry ladder lives in an anonymous namespace
+    // inside it — one implementation of "open the clipboard without giving up on the first
+    // ERROR_ACCESS_DENIED", shared with the injection path.
+    if (!injector_detail::open_clipboard_with_retry(&os_error)) {
+        // Losing a paste is a small thing next to the failures this file usually reports, so this
+        // is a debug line rather than a warning: another process holding the clipboard for a few
+        // milliseconds is routine, and the retry ladder above has already waited out the common
+        // case.
+        KD_LOG_DEBUG("clipboard read: could not open (os_error=%lu)",
+                     static_cast<unsigned long>(os_error));
+        return false;
+    }
+    // Every path out from here must close the clipboard, including the early returns below.
+    struct Closer {
+        ~Closer() { CloseClipboard(); }
+    } closer;
+
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h == nullptr) return false;
+    const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(h));
+    if (p == nullptr) return false;
+
+    // GlobalSize is a bound, not a length: the block is NUL-terminated and may be padded.
+    const size_t units = GlobalSize(h) / sizeof(wchar_t);
+    size_t len = 0;
+    while (len < units && p[len] != L'\0') ++len;
+
+    size_t bad = 0;
+    const bool ok = utf8::from_utf16(std::wstring_view(p, len), out, &bad);
+    GlobalUnlock(h);
+    if (!ok) {
+        // No repair, ever: util/utf8.h forbids U+FFFD substitution anywhere in this program, and
+        // this text is on its way into a buffer bound for the user's document.
+        KD_LOG_WARN("clipboard holds text that is not well-formed at index %zu; refusing to "
+                    "paste it rather than repairing it",
+                    bad);
+        out.clear();
+        return false;
+    }
+    return !out.empty();
+}
+
 bool set_clipboard_text(std::string_view utf8) {
     if (utf8.empty()) return false;
     // The guard state is required by the shared helper and discarded here: it exists to decide
