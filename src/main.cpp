@@ -42,6 +42,7 @@
 #include "protocol.h"
 #include "session.h"
 #include "settings.h"
+#include "theme.h"
 #include "util/clock.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -481,6 +482,12 @@ bool App::startup() {
     // `default_model` *is* that choice. Without this, the first launch resolves the empty id,
     // reports "no model is selected" and never starts a sidecar at all.
     if (settings_.model_id.empty()) settings_.model_id = manifest_.default_model;
+
+    // Before the first window of any kind: theme.h is explicit that a control created before
+    // the process is opted in stays light, and this is also what makes the tray's popup menu
+    // follow the scheme — a menu is drawn by the system from a cache built at first use, so
+    // there is no later moment at which it can be fixed.
+    kd::theme::init_app_dark_mode();
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);

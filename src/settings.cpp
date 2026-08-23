@@ -43,6 +43,7 @@
 
 #include <commctrl.h>
 #include <shlobj.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <cctype>
@@ -60,6 +61,7 @@
 #include "settings.h"
 
 #include "audio_capture.h"
+#include "theme.h"
 #include "util/json.h"
 #include "util/log.h"
 #include "util/utf8.h"
@@ -320,6 +322,13 @@ constexpr EnumName kOverlayModes[] = {
     {"status-only", static_cast<int>(OverlayMode::StatusOnly)},
 };
 
+constexpr EnumName kThemeModes[] = {
+    {"system", static_cast<int>(ThemeMode::System)},
+    {"light", static_cast<int>(ThemeMode::Light)},
+    {"dark", static_cast<int>(ThemeMode::Dark)},
+    {"custom", static_cast<int>(ThemeMode::Custom)},
+};
+
 constexpr EnumName kCadences[] = {
     {"immediate", static_cast<int>(Cadence::Immediate)},
     {"periodic", static_cast<int>(Cadence::Periodic)},
@@ -341,6 +350,23 @@ inline int cadence_index(Cadence c) noexcept {
 inline Cadence cadence_at(LRESULT sel) noexcept {
     if (sel < 0 || sel >= static_cast<LRESULT>(std::size(kCadenceOrder))) return Cadence::Immediate;
     return kCadenceOrder[sel];
+}
+
+// The colour-scheme combo's item order, on the same principle as the cadence one above: the
+// dialog populates it, reads it back and enables the three colour fields off this one array.
+constexpr ThemeMode kThemeOrder[] = {ThemeMode::System, ThemeMode::Light, ThemeMode::Dark,
+                                     ThemeMode::Custom};
+
+inline int theme_index(ThemeMode m) noexcept {
+    for (int i = 0; i < static_cast<int>(std::size(kThemeOrder)); ++i) {
+        if (kThemeOrder[i] == m) return i;
+    }
+    return 0;
+}
+
+inline ThemeMode theme_at(LRESULT sel) noexcept {
+    if (sel < 0 || sel >= static_cast<LRESULT>(std::size(kThemeOrder))) return ThemeMode::System;
+    return kThemeOrder[sel];
 }
 
 constexpr EnumName kFallbacks[] = {
@@ -783,8 +809,9 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "anchor":    { "min_confidence": 0.5, "below_threshold": "floating-pill", ... },
 //     "editing":   { "enabled": true, "mouse": true,      // docs/editing.md §12
 //                    "on_foreign_key": "ignore", "commit_key": "enter" },
-//     "overlay":   { "mode": "inline", "font_family": "Segoe UI", "font_size_dip": 14.0,
-//                    "color_pending": "#FF3C3C3C", ... },
+//     "overlay":   { "mode": "inline", "theme": "system",   // system | light | dark | custom
+//                    "font_family": "Segoe UI", "font_size_dip": 14.0,
+//                    "color_pending": "#FF3C3C3C", ... },   // read only under theme "custom"
 //     "audio_device_id": "",
 //     "privacy":   { "log_level": "info", "diagnostics_file_enabled": false,
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
@@ -1064,6 +1091,8 @@ std::string serialize_settings(const Settings& s) {
     {
         json::Value o = json::Value::object();
         put_str(o, "mode", enum_to_text(kOverlayModes, static_cast<int>(s.overlay_mode), "inline"));
+        put_str(o, "theme",
+                enum_to_text(kThemeModes, static_cast<int>(s.overlay_style.theme), "system"));
         put_str(o, "font_family", s.overlay_style.font_family);
         put_f32(o, "font_size_dip", s.overlay_style.font_size_dip);
         put_color(o, "color_pending", s.overlay_style.color_pending);
@@ -1299,6 +1328,12 @@ Result<Settings> parse_settings(std::string_view json_text) {
         Obj o(*v, "settings.overlay");
         std::string mode = enum_to_text(kOverlayModes, static_cast<int>(s.overlay_mode), "inline");
         o.str_opt("mode", mode);
+        std::string theme =
+            enum_to_text(kThemeModes, static_cast<int>(s.overlay_style.theme), "system");
+        // Noted before the colours are read, because the migration below turns on exactly this:
+        // a file written before `theme` existed.
+        const bool file_names_a_theme = v->has("theme");
+        o.str_opt("theme", theme);
         o.str_opt("font_family", s.overlay_style.font_family);
         o.f32_opt("font_size_dip", s.overlay_style.font_size_dip, 6.0f, 96.0f);
         o.color_opt("color_pending", s.overlay_style.color_pending);
@@ -1316,6 +1351,39 @@ Result<Settings> parse_settings(std::string_view json_text) {
                           "settings.overlay.mode: \"" + mode + "\" is not a known overlay mode"};
         }
         s.overlay_mode = static_cast<OverlayMode>(value);
+        if (!enum_from_text(kThemeModes, theme, value)) {
+            return Status{StatusCode::Malformed, "settings.overlay.theme: \"" + theme +
+                                                     "\" is not one of system, light, dark, "
+                                                     "custom"};
+        }
+        s.overlay_style.theme = static_cast<ThemeMode>(value);
+
+        // ── Migration: a file written before the pill had a colour scheme ───────────────────
+        //
+        // The default is System, which is right for the overwhelming majority — a file whose
+        // colours are the shipped defaults means "I never chose", and following Windows is the
+        // better answer to that than repainting light forever.
+        //
+        // But a file that names colours *different* from the defaults is a choice someone made,
+        // and a new key silently overriding it is exactly the "silently discarding a user's
+        // configuration is indistinguishable from losing it" failure this parser is written to
+        // avoid. So that file, and only that file, is migrated to Custom: it keeps painting what
+        // it painted, and the dialog's scheme box tells the user which mode they are in and what
+        // the alternative is.
+        if (!file_names_a_theme && s.overlay_style.theme == ThemeMode::System) {
+            const OverlayStyle shipped{};
+            const bool colored = s.overlay_style.color_pending != shipped.color_pending ||
+                                 s.overlay_style.color_unstable != shipped.color_unstable ||
+                                 s.overlay_style.color_background != shipped.color_background ||
+                                 s.overlay_style.color_warning != shipped.color_warning ||
+                                 s.overlay_style.color_border != shipped.color_border;
+            if (colored) {
+                s.overlay_style.theme = ThemeMode::Custom;
+                KD_LOG_INFO(
+                    "settings.overlay has hand-picked colours and no theme; keeping them as "
+                    "theme=custom rather than replacing them with the system scheme");
+            }
+        }
     }
 
     if (const json::Value* v = root.find("privacy")) {
@@ -1422,6 +1490,7 @@ enum : int {
     kIdOverlayMode,
     kIdFallback,
     kIdMinConfidence,
+    kIdTheme,
     kIdFontFamily,
     kIdFontSize,
     kIdColorPending,
@@ -1463,6 +1532,17 @@ struct DialogState {
     int line_h = 15;
     bool accepted = false;
     bool running = true;
+
+    // ── The colour scheme (theme.h) ─────────────────────────────────────────────────────────
+    //
+    // The dialog paints in whichever scheme the pill is set to, resolved once when it opens and
+    // again whenever the user moves the combo or Windows moves underneath it. `dark` is the
+    // answer; the two brushes exist only while it is true, because light mode takes the same
+    // path it always took — the system's own COLOR_BTNFACE brush and the system's own control
+    // colours — and a hand-written light palette here could only differ from the system's.
+    bool dark = false;
+    HBRUSH face_brush = nullptr;
+    HBRUSH field_brush = nullptr;
 };
 
 int px(const DialogState& st, int logical) { return MulDiv(logical, st.dpi, 96); }
@@ -1803,6 +1883,90 @@ void refresh_editing_page(HWND dlg) {
                          L"edit or for Enter to commit.");
 }
 
+// The three colour fields belong to the "custom colours" scheme and to nothing else, so they are
+// enabled by it and greyed the rest of the time. Same rule as refresh_editing_page above and for
+// the same reason: a field the user can type into, whose value the program then ignores, is a
+// setting they believe they changed.
+//
+// The values are left in the boxes rather than blanked. They are still what the file holds and
+// still what choosing "custom colours" would apply, and a field that emptied itself when greyed
+// would read as having thrown the user's colours away.
+// Defined further down with the rest of the tab-strip drawing, and declared here because
+// apply_dialog_theme is what installs it.
+LRESULT CALLBACK tab_strip_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                    DWORD_PTR ref);
+
+// Repaint the dialog itself in `dark` (or out of it). Called when the window is created, when
+// the colour-scheme combo moves, and when Windows changes scheme while the dialog is open.
+//
+// Three separate mechanisms, none of which covers the others, and all three are needed for the
+// window not to end up half-dark: theme.h's per-window and per-control theming (the title bar,
+// the frames Windows draws), the two brushes below (everything this file paints — the face and
+// the WM_CTLCOLOR* replies), and the tab control, which is the one common control with no dark
+// theme class at all and is drawn by hand in WM_NOTIFY.
+void apply_dialog_theme(HWND dlg, DialogState& st, bool dark) {
+    st.dark = dark;
+
+    if (st.face_brush) DeleteObject(st.face_brush);
+    if (st.field_brush) DeleteObject(st.field_brush);
+    st.face_brush = nullptr;
+    st.field_brush = nullptr;
+    if (dark) {
+        const theme::DialogPalette& p = theme::dialog_palette(true);
+        st.face_brush = CreateSolidBrush(p.face);
+        st.field_brush = CreateSolidBrush(p.field);
+    }
+
+    theme::apply_window_dark_mode(reinterpret_cast<uintptr_t>(dlg), dark);
+
+    // The tab control, explicitly and after the pass above, which has just given it a theme
+    // class it has no dark variant of. Three things, in this order:
+    //
+    //   an empty theme class  "no visual style at all", so the frames it draws underneath are
+    //                         classic 3D lines rather than a themed light strip.
+    //   the subclass          which repaints the whole strip after the control has had its say.
+    //                         Installed once and left in place: it is inert while `dark` is
+    //                         false, and removing it on every scheme change would be one more
+    //                         thing to get wrong.
+    if (HWND tabs = GetDlgItem(dlg, kIdTabs)) {
+        SetWindowTheme(tabs, dark ? L"" : L"Explorer", nullptr);
+        SetWindowSubclass(tabs, tab_strip_subclass, 1, reinterpret_cast<DWORD_PTR>(&st));
+        InvalidateRect(tabs, nullptr, TRUE);
+    }
+
+    // RDW_ALLCHILDREN and UPDATENOW for the same reason show_page() spells out below: the erase
+    // and the children's repaint have to happen in this call, not at the next idle, or the
+    // window is briefly two schemes at once.
+    RedrawWindow(dlg, nullptr, nullptr,
+                 RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+// Put the dialog in whatever scheme the combo currently names, resolved against Windows.
+//
+// The *combo*, not st.settings: the scheme is the one setting in this dialog whose effect the
+// user can see while choosing it, so it follows the selection immediately rather than waiting
+// for OK. Nothing is written by this — cancelling still leaves the file untouched, and the
+// dialog was only ever borrowing the colours.
+//
+// The dialog has no colour setting of its own. Two schemes for one application is a question
+// nobody wants to be asked, so it takes the pill's. ThemeMode::Custom paints it light: those
+// colours are the *pill's*, and there is nothing in them to derive a dialog face from (see
+// theme_paints_dark in overlay.h).
+void refresh_dialog_theme(HWND dlg, DialogState& st) {
+    const ThemeMode chosen = theme_at(SendMessageW(GetDlgItem(dlg, kIdTheme), CB_GETCURSEL, 0, 0));
+    apply_dialog_theme(dlg, st, theme_paints_dark(chosen, theme::system_prefers_dark()));
+}
+
+void refresh_theme_fields(HWND dlg) {
+    const BOOL custom =
+        theme_at(SendMessageW(GetDlgItem(dlg, kIdTheme), CB_GETCURSEL, 0, 0)) == ThemeMode::Custom
+            ? TRUE
+            : FALSE;
+    EnableWindow(GetDlgItem(dlg, kIdColorPending), custom);
+    EnableWindow(GetDlgItem(dlg, kIdColorUnstable), custom);
+    EnableWindow(GetDlgItem(dlg, kIdColorBackground), custom);
+}
+
 void load_controls(HWND dlg, DialogState& st) {
     const Settings& s = st.settings;
 
@@ -1924,6 +2088,19 @@ void load_controls(HWND dlg, DialogState& st) {
     SendMessageW(fb, CB_SETCURSEL,
                  s.anchor.below_threshold == anchor::Fallback::NoPreview ? 1u : 0u, 0);
     set_float(GetDlgItem(dlg, kIdMinConfidence), s.anchor.min_confidence);
+    HWND th = GetDlgItem(dlg, kIdTheme);
+    SendMessageW(th, CB_RESETCONTENT, 0, 0);
+    // Prose, not the enum's spelling: "system" in a settings file is unambiguous, and "system"
+    // in a combo box is a word the user has to guess the meaning of.
+    combo_add(th, L"follow Windows (light or dark)");
+    combo_add(th, L"always light");
+    combo_add(th, L"always dark");
+    combo_add(th, L"custom colours (the three below)");
+    SendMessageW(th, CB_SETCURSEL, static_cast<WPARAM>(theme_index(s.overlay_style.theme)), 0);
+    refresh_theme_fields(dlg);
+    // Also on "Restore defaults", which is the other caller of load_controls and is entitled to
+    // put the dialog back to following Windows in front of the user.
+    refresh_dialog_theme(dlg, st);
     SetWindowTextW(GetDlgItem(dlg, kIdFontFamily), wide(s.overlay_style.font_family).c_str());
     set_float(GetDlgItem(dlg, kIdFontSize), s.overlay_style.font_size_dip);
     set_color(GetDlgItem(dlg, kIdColorPending), s.overlay_style.color_pending);
@@ -2049,6 +2226,7 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
                     s.anchor.min_confidence)) {
         return false;
     }
+    s.overlay_style.theme = theme_at(SendMessageW(GetDlgItem(dlg, kIdTheme), CB_GETCURSEL, 0, 0));
     s.overlay_style.font_family = narrow(get_text(GetDlgItem(dlg, kIdFontFamily)));
     if (!read_float(dlg, kIdFontSize, L"Overlay font size", 6.0f, 96.0f,
                     s.overlay_style.font_size_dip)) {
@@ -2231,11 +2409,17 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_combo(L"Presentation", kIdOverlayMode);
         c.label_combo(L"When the anchor is not confident enough", kIdFallback);
         c.label_edit(L"Minimum anchor confidence (0.0 - 1.0)", kIdMinConfidence);
+        // The scheme sits above the three colours it governs, and the colours name it in their
+        // labels, because a greyed-out field says "not now" and never says "why". No explanatory
+        // note under it: this column is 419 of kPageHeight's 430 logical px as it stands, and one
+        // more line of prose here is a control pushed off the page rather than a page that
+        // scrolls — see the top of this file on what this dialog deliberately does not have.
+        c.label_combo(L"Colour scheme (this dialog follows it too)", kIdTheme);
         c.label_edit(L"Font family", kIdFontFamily);
         c.label_edit(L"Font size (DIP)", kIdFontSize);
-        c.label_edit(L"Pending text colour (#AARRGGBB)", kIdColorPending);
-        c.label_edit(L"Unstable text colour (#AARRGGBB)", kIdColorUnstable);
-        c.label_edit(L"Background colour (#AARRGGBB)", kIdColorBackground);
+        c.label_edit(L"Pending text, custom scheme only (#AARRGGBB)", kIdColorPending);
+        c.label_edit(L"Unstable text, custom scheme only (#AARRGGBB)", kIdColorUnstable);
+        c.label_edit(L"Background, custom scheme only (#AARRGGBB)", kIdColorBackground);
     }
     {
         Cursor c{dlg, inst, &st, 3, col2_x, top, col_w};
@@ -2302,6 +2486,100 @@ void build_controls(HWND dlg, DialogState& st) {
                                  nullptr);
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(st.font), TRUE);
     }
+}
+
+// ─── The tab strip, drawn by hand, and only in dark mode ────────────────────────────────────
+//
+// The tab control is the one common control Microsoft shipped no dark theme class for. Every
+// other control here is opted in by name in theme.cpp; this one has to be painted, and getting
+// there took three attempts that are worth recording, because each failed in a way that looked
+// like progress:
+//
+//   NM_CUSTOMDRAW      never arrives. The tab control is not one of the controls that send it,
+//                      so the handler was simply never called and the strip stayed entirely
+//                      light while every other surface went dark.
+//   TCS_OWNERDRAWFIXED + WM_DRAWITEM draws the tab *interiors*, and the control still draws its
+//                      own 3D frame around each tab and the pane edge under the row — in
+//                      COLOR_3DHIGHLIGHT, i.e. white. Dark tabs in white boxes.
+//   painting after it  works, and is what this does: let the control paint whatever it likes,
+//                      then draw the whole strip over the top from a subclass on WM_PAINT.
+//
+// Everything in the strip is therefore ours: the background, each tab's fill, and each label.
+// The result is flat — no frames — and the selected tab is told apart by its lighter fill, which
+// is what a modern tab strip does anyway.
+void paint_tab_strip_dark(HWND tabs, DialogState& st) {
+    const theme::DialogPalette& p = theme::dialog_palette(true);
+    HDC dc = GetDC(tabs);
+    if (dc == nullptr) return;
+
+    RECT client{};
+    GetClientRect(tabs, &client);
+    FillRect(dc, &client, st.face_brush);
+
+    const int selected = static_cast<int>(SendMessageW(tabs, TCM_GETCURSEL, 0, 0));
+    const int count = static_cast<int>(SendMessageW(tabs, TCM_GETITEMCOUNT, 0, 0));
+    HBRUSH face = CreateSolidBrush(p.tab_face);
+    HBRUSH chosen = CreateSolidBrush(p.tab_selected);
+    HGDIOBJ previous_font = SelectObject(dc, st.font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, p.text);
+
+    for (int i = 0; i < count; ++i) {
+        RECT rc{};
+        if (!SendMessageW(tabs, TCM_GETITEMRECT, static_cast<WPARAM>(i),
+                          reinterpret_cast<LPARAM>(&rc))) {
+            continue;
+        }
+        RECT fill_rc = rc;
+        // Two pixels proud on every side, which is where the frame the control just drew is.
+        // The label is still laid out in the item's own rectangle, so it stays centred on the
+        // tab rather than on the overspill.
+        InflateRect(&fill_rc, 2, 2);
+        FillRect(dc, &fill_rc, i == selected ? chosen : face);
+
+        wchar_t text[64]{};
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = text;
+        item.cchTextMax = ARRAYSIZE(text);
+        SendMessageW(tabs, TCM_GETITEMW, static_cast<WPARAM>(i), reinterpret_cast<LPARAM>(&item));
+        // Prefix processing left ON, deliberately: the tab names are written with "&&" and the
+        // control's own drawing turns that into one ampersand. DT_NOPREFIX here would print
+        // "Injection && model" on the dark dialog and "Injection & model" on the light one, which
+        // is the kind of difference nobody attributes to the colour scheme.
+        DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    SelectObject(dc, previous_font);
+    if (face) DeleteObject(face);
+    if (chosen) DeleteObject(chosen);
+    ReleaseDC(tabs, dc);
+}
+
+LRESULT CALLBACK tab_strip_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                    DWORD_PTR ref) {
+    auto* st = reinterpret_cast<DialogState*>(ref);
+    const bool dark = st != nullptr && st->dark && st->face_brush != nullptr;
+
+    if (msg == WM_ERASEBKGND && dark) {
+        // Not sufficient on its own — the control paints over this — but it stops the light
+        // button face flashing up between the erase and the repaint below.
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wp), &rc, st->face_brush);
+        return 1;
+    }
+
+    if (msg == WM_PAINT && dark) {
+        const LRESULT painted = DefSubclassProc(hwnd, msg, wp, lp);
+        paint_tab_strip_dark(hwnd, *st);
+        return painted;
+    }
+
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, tab_strip_subclass, id);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 // Every page's controls occupy the same rectangle, so the three pages are stacked overlapping
@@ -2414,16 +2692,65 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kIdModel:
                     if (code == CBN_SELCHANGE) update_model_status(hwnd, *st);
                     return 0;
+                case kIdTheme:
+                    if (code == CBN_SELCHANGE) {
+                        refresh_theme_fields(hwnd);
+                        refresh_dialog_theme(hwnd, *st);
+                    }
+                    return 0;
                 default:
                     break;
             }
             break;
         }
 
+        case WM_ERASEBKGND:
+            // Light mode keeps the class background brush (COLOR_BTNFACE) and this message is
+            // not ours. Dark mode has no system brush to name, so the face is painted here — and
+            // it must be *this* message rather than WM_PAINT, because show_page() below relies
+            // on the parent's erase to clear the region a hidden page's control vacated.
+            if (st && st->dark && st->face_brush) {
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                FillRect(reinterpret_cast<HDC>(wp), &rc, st->face_brush);
+                return 1;
+            }
+            break;
+
         case WM_CTLCOLORSTATIC:
-            // Static text over the dialog face; without this the labels get a white block.
+        case WM_CTLCOLORBTN:
+            // Static text and check-box text over the dialog face; without this the labels get a
+            // white block. TRANSPARENT keeps the face — painted above, or by the class brush —
+            // showing through the glyphs' own background.
             SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+            if (st && st->dark && st->face_brush) {
+                SetTextColor(reinterpret_cast<HDC>(wp), theme::dialog_palette(true).text);
+                return reinterpret_cast<LRESULT>(st->face_brush);
+            }
             return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+            // The inside of an edit, of a combo's own field, and of its dropped-down list. A
+            // *disabled* edit is not this message — it comes through WM_CTLCOLORSTATIC above and
+            // so takes the face colour, which is exactly right: the three greyed colour fields
+            // should read as part of the dialog rather than as wells you can type into.
+            if (st && st->dark && st->field_brush) {
+                const theme::DialogPalette& p = theme::dialog_palette(true);
+                SetTextColor(reinterpret_cast<HDC>(wp), p.field_text);
+                SetBkColor(reinterpret_cast<HDC>(wp), p.field);
+                return reinterpret_cast<LRESULT>(st->field_brush);
+            }
+            break;
+
+        case WM_SETTINGCHANGE:
+            // Windows switched scheme under an open dialog. Only meaningful while the combo says
+            // "follow Windows", and refresh_dialog_theme is what decides that — it re-reads both
+            // halves of the answer, so a dialog set to "always dark" stays dark.
+            if (st && theme::is_color_scheme_change(static_cast<intptr_t>(lp))) {
+                refresh_dialog_theme(hwnd, *st);
+            }
+            break;
 
         case WM_CLOSE:
             if (st) {
@@ -2455,6 +2782,11 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
     // tray, and a missing tab control presents as "the dialog is blank", not as an error.
     INITCOMMONCONTROLSEX icc{sizeof(INITCOMMONCONTROLSEX), ICC_TAB_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
+
+    // Before any of this dialog's windows exist: theme.h is explicit that a control created
+    // before the process was opted in stays light. Called here as well as at startup for the
+    // same reason as the line above — a tools/ binary may open this dialog without main.cpp.
+    theme::init_app_dark_mode();
 
     static bool registered = false;
     if (!registered) {
@@ -2561,6 +2893,9 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
     if (IsWindow(dlg)) DestroyWindow(dlg);
     if (owner_hwnd) SetActiveWindow(owner_hwnd);
     if (st.font) DeleteObject(st.font);
+    // After the window is gone, so nothing can be asked to paint with a deleted brush.
+    if (st.face_brush) DeleteObject(st.face_brush);
+    if (st.field_brush) DeleteObject(st.field_brush);
 
     if (st.accepted) s = st.settings;
     return st.accepted;

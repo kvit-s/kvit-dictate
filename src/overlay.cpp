@@ -96,6 +96,7 @@
 #include <utility>
 
 #include "overlay.h"
+#include "theme.h"
 #include "util/log.h"
 #include "util/utf8.h"
 
@@ -260,17 +261,32 @@ struct DibSurface {
 // microphone state unambiguous (plan.md §1.6), and a user-recolourable "is the mic on" light is
 // a way to make it ambiguous again.
 
-constexpr uint32_t kDotIdle = 0xFF9E9E9E;
-constexpr uint32_t kDotListening = 0xFF2E7D32;
-constexpr uint32_t kDotSpeaking = 0xFF43A047;
-constexpr uint32_t kDotFinalizing = 0xFF1565C0;
-constexpr uint32_t kDotLoading = 0xFFB8860B;
-constexpr uint32_t kDotUnsupported = 0xFF757575;
-constexpr uint32_t kDotError = 0xFFC62828;
-// Editing: the same amber family as a paused thing, deliberately not the green of Listening.
-// The user checks this against the microphone light on their machine (docs/editing.md §7.4), so
-// the two must never disagree — and green over a closed device is exactly that disagreement.
-constexpr uint32_t kDotEditing = 0xFF6A1B9A;
+// Two sets, indexed by whether the pill is painting dark. The *hues* are identical in both and
+// only the lightness moves: a dot that changed colour with the desktop scheme would break the
+// one thing it is for. These are the mid-500 tones of each hue on light, and the 300s on dark,
+// which is the smallest change that keeps them legible on a near-black pill.
+struct DotColors {
+    uint32_t idle;
+    uint32_t listening;
+    uint32_t speaking;
+    uint32_t finalizing;
+    uint32_t loading;
+    uint32_t unsupported;
+    uint32_t error;
+    // Editing: a violet, deliberately not the green of Listening. The user checks this against
+    // the microphone light on their machine (docs/editing.md §7.4), so the two must never
+    // disagree — and green over a closed device is exactly that disagreement.
+    uint32_t editing;
+};
+
+constexpr DotColors kDots[2] = {
+    // light
+    {0xFF9E9E9E, 0xFF2E7D32, 0xFF43A047, 0xFF1565C0, 0xFFB8860B, 0xFF757575, 0xFFC62828,
+     0xFF6A1B9A},
+    // dark
+    {0xFFBDBDBD, 0xFF66BB6A, 0xFF81C784, 0xFF64B5F6, 0xFFFFD54F, 0xFF9E9E9E, 0xFFEF5350,
+     0xFFBA68C8},
+};
 
 // Upper bound on the number of wrapped lines the preview may occupy. An overlay that grows with
 // the utterance covers the document it is annotating; OverlayStyle::max_width_dip caps the
@@ -307,34 +323,43 @@ constexpr size_t kMaxDisplayUnits = 32768;
 // session to buy nothing but familiarity.
 constexpr float kCaretWidthDip = 1.0f;
 
-// The selection's fill, as 0xAARRGGBB. Painted *under* the text, so the glyphs keep their own
-// colours and the committed/unstable split stays readable through it.
-constexpr uint32_t kSelectionFill = 0x552E7D32;
+// The selection's fill, as 0xAARRGGBB, light scheme then dark. Painted *under* the text, so the
+// glyphs keep their own colours and the committed/unstable split stays readable through it —
+// which is why the dark one is lighter rather than merely the same green: a wash that darkens a
+// near-black pill would hide the selection instead of showing it.
+constexpr uint32_t kSelectionFill[2] = {0x552E7D32, 0x6643A047};
 
 // docs/editing.md §13 stage 3: "the microphone button — the one control that says what it does
 // without anyone having to remember a key, and the answer for whoever finds §4.5's no-op hotkey
 // more confusing than the toggle it replaced."
 constexpr const char* kMicButtonLabel = "\xF0\x9F\x8E\xA4 Resume dictating";  // U+1F3A4
-constexpr uint32_t kMicButtonFill = 0x22000000;
+// Light scheme then dark. A wash of the *opposite* colour to the pill in each, because the
+// button has to read as a raised patch on the background it is actually sitting on.
+constexpr uint32_t kMicButtonFill[2] = {0x22000000, 0x22FFFFFF};
 constexpr float kMicButtonPadDip = 6.0f;
 
 D2D1_COLOR_F argb(uint32_t c) noexcept {
     return D2D1::ColorF(c & 0x00FFFFFFu, static_cast<float>((c >> 24) & 0xFFu) / 255.0f);
 }
 
-uint32_t dot_color(OverlayState s, const OverlayStyle& style) noexcept {
+// `style` is the **resolved** style — the one the palette has already been folded into — and
+// `dark` says which of the two dot sets goes with it. Warning is the exception that reads its
+// colour from the style, because the warning border and the warning dot are one signal and must
+// not be able to differ.
+uint32_t dot_color(OverlayState s, const OverlayStyle& style, bool dark) noexcept {
+    const DotColors& d = kDots[dark ? 1 : 0];
     switch (s) {
-        case OverlayState::Idle: return kDotIdle;
-        case OverlayState::Listening: return kDotListening;
-        case OverlayState::Speaking: return kDotSpeaking;
-        case OverlayState::Finalizing: return kDotFinalizing;
-        case OverlayState::ModelLoading: return kDotLoading;
+        case OverlayState::Idle: return d.idle;
+        case OverlayState::Listening: return d.listening;
+        case OverlayState::Speaking: return d.speaking;
+        case OverlayState::Finalizing: return d.finalizing;
+        case OverlayState::ModelLoading: return d.loading;
         case OverlayState::Warning: return style.color_warning;
-        case OverlayState::Unsupported: return kDotUnsupported;
-        case OverlayState::Editing: return kDotEditing;
-        case OverlayState::Error: return kDotError;
+        case OverlayState::Unsupported: return d.unsupported;
+        case OverlayState::Editing: return d.editing;
+        case OverlayState::Error: return d.error;
     }
-    return kDotIdle;
+    return d.idle;
 }
 
 // Deliberately *not* to_string(OverlayState). to_string is the programmatic spelling used in
@@ -542,6 +567,68 @@ const char* to_string(OverlayState s) noexcept {
     return "Idle";
 }
 
+const char* to_string(ThemeMode m) noexcept {
+    switch (m) {
+        case ThemeMode::System: return "system";
+        case ThemeMode::Light: return "light";
+        case ThemeMode::Dark: return "dark";
+        case ThemeMode::Custom: return "custom";
+    }
+    return "system";
+}
+
+const OverlayPalette& overlay_palette(bool dark) noexcept {
+    // The light half is OverlayStyle's declared defaults, character for character. That is not a
+    // coincidence to be tidied away: it is what makes a settings file written before this
+    // existed paint identically after it, and what makes `Custom` on an untouched file look like
+    // `Light` rather than like a reset.
+    static constexpr OverlayPalette kLight{
+        0xFF3C3C3C,  // pending    — near-black text on a near-white pill
+        0x993C3C3C,  // unstable   — the same ink, 60 % opaque
+        0xE6FFFFFF,  // background — white, slightly transparent, so the document shows through
+        0xFFB34700,  // warning
+        0x33000000,  // border     — a wash of the text colour, not a line
+    };
+    // The dark half is the same construction with the ink and the ground exchanged, at the same
+    // opacities: the transparency is what makes the pill read as sitting *over* the document
+    // rather than as a hole cut in it, and that has to survive the scheme change.
+    static constexpr OverlayPalette kDark{
+        0xFFE8E8E8,  // pending    — not pure white; white on near-black vibrates
+        0x99E8E8E8,  // unstable
+        0xE61E1E1E,  // background
+        0xFFFFB74D,  // warning    — the same amber, lightened until it carries on near-black
+        0x33FFFFFF,  // border
+    };
+    return dark ? kDark : kLight;
+}
+
+bool theme_paints_dark(ThemeMode mode, bool system_dark) noexcept {
+    switch (mode) {
+        case ThemeMode::System: return system_dark;
+        case ThemeMode::Light: return false;
+        case ThemeMode::Dark: return true;
+        // Not "false because Custom is light" — false because nothing about a hand-picked
+        // palette may be second-guessed, and every consumer of this answer (the dot set, the
+        // selection wash, the microphone button) would be doing exactly that.
+        case ThemeMode::Custom: return false;
+    }
+    return system_dark;
+}
+
+OverlayStyle resolve_overlay_style(const OverlayStyle& base, bool system_dark) {
+    OverlayStyle out = base;
+    if (base.theme == ThemeMode::Custom) {
+        return out;
+    }
+    const OverlayPalette& p = overlay_palette(theme_paints_dark(base.theme, system_dark));
+    out.color_pending = p.pending;
+    out.color_unstable = p.unstable;
+    out.color_background = p.background;
+    out.color_warning = p.warning;
+    out.color_border = p.border;
+    return out;
+}
+
 namespace {
 
 // ─── The window's state ─────────────────────────────────────────────────────────────────────
@@ -558,7 +645,16 @@ struct OverlayCore {
     HWND hwnd = nullptr;
     HINSTANCE instance = nullptr;
 
+    // Two styles, and the distinction is load-bearing. `style` is what the caller configured and
+    // what style() hands back — it is the user's settings and this file never edits it.
+    // `painted` is that style with the colour scheme folded in, recomputed whenever either half
+    // moves, and it is what every brush and every colour in paint_once() is built from. Reading
+    // `style` for a colour would paint the *custom* palette in every mode.
     OverlayStyle style{};
+    OverlayStyle painted{};
+    bool system_dark = false;  // the OS's answer, refreshed on WM_SETTINGCHANGE
+    bool painting_dark = false;
+
     OverlayMode mode = OverlayMode::Inline;
     OverlayState state = OverlayState::Idle;
 
@@ -650,6 +746,35 @@ struct OverlayCore {
     ComRef<ID2D1SolidColorBrush> brush_warning;
     ComRef<ID2D1SolidColorBrush> brush_border;
     ComRef<ID2D1SolidColorBrush> brush_dot;
+
+    // ── The colour scheme ───────────────────────────────────────────────────────────────────
+
+    // Recompute `painted` from `style` and the OS's current answer. Called from create(), from
+    // set_style(), and from the WM_SETTINGCHANGE that says the scheme moved.
+    //
+    // Returns true when the colours actually changed, because the brushes are device resources
+    // and throwing them away is not free: WM_SETTINGCHANGE arrives for a great many things that
+    // are not the colour scheme, and under any mode but System the answer is the same one every
+    // time. A repaint that rebuilt the render target on every taskbar move would be a cost paid
+    // for nothing.
+    bool refresh_theme(bool ask_the_os) {
+        if (ask_the_os) {
+            system_dark = theme::system_prefers_dark();
+        }
+        const OverlayStyle next = resolve_overlay_style(style, system_dark);
+        const bool changed = next.color_pending != painted.color_pending ||
+                             next.color_unstable != painted.color_unstable ||
+                             next.color_background != painted.color_background ||
+                             next.color_warning != painted.color_warning ||
+                             next.color_border != painted.color_border;
+        painted = next;
+        painting_dark = theme_paints_dark(style.theme, system_dark);
+        if (changed) {
+            release_device_resources();
+            dirty = true;
+        }
+        return changed;
+    }
 
     // ── Device resources ────────────────────────────────────────────────────────────────────
 
@@ -792,9 +917,12 @@ HRESULT OverlayCore::ensure_render_target() {
         uint32_t color;
     };
     const BrushSpec specs[] = {
-        {&brush_pending, style.color_pending},   {&brush_unstable, style.color_unstable},
-        {&brush_background, style.color_background}, {&brush_warning, style.color_warning},
-        {&brush_border, style.color_border},     {&brush_dot, dot_color(state, style)},
+        {&brush_pending, painted.color_pending},
+        {&brush_unstable, painted.color_unstable},
+        {&brush_background, painted.color_background},
+        {&brush_warning, painted.color_warning},
+        {&brush_border, painted.color_border},
+        {&brush_dot, dot_color(state, painted, painting_dark)},
     };
     for (const BrushSpec& spec : specs) {
         hr = rt->CreateSolidColorBrush(argb(spec.color), spec.slot->put());
@@ -1223,7 +1351,7 @@ HRESULT OverlayCore::paint_once() {
     // The dot brush is the only one whose colour depends on state; update it in place rather
     // than recreating the render target on every state change.
     if (brush_dot) {
-        brush_dot->SetColor(argb(dot_color(state, style)));
+        brush_dot->SetColor(argb(dot_color(state, painted, painting_dark)));
     }
 
     rt->BeginDraw();
@@ -1260,7 +1388,7 @@ HRESULT OverlayCore::paint_once() {
         // stays readable through the selection (docs/editing.md §7.2).
         if (!selection_boxes.empty() && brush_unstable) {
             const D2D1_COLOR_F was = brush_unstable->GetColor();
-            brush_unstable->SetColor(argb(kSelectionFill));
+            brush_unstable->SetColor(argb(kSelectionFill[painting_dark ? 1 : 0]));
             for (const DWRITE_HIT_TEST_METRICS& b : selection_boxes) {
                 rt->FillRectangle(D2D1::RectF(origin_x + b.left, origin_y + b.top,
                                               origin_x + b.left + b.width,
@@ -1309,7 +1437,7 @@ HRESULT OverlayCore::paint_once() {
         // dot brush already does this, and a brush per decoration is how a render target's
         // resource list grows without anybody deciding it should.
         const D2D1_COLOR_F was = brush_border->GetColor();
-        brush_border->SetColor(argb(kMicButtonFill));
+        brush_border->SetColor(argb(kMicButtonFill[painting_dark ? 1 : 0]));
         rt->FillRoundedRectangle(button, brush_border.get());
         brush_border->SetColor(was);
         rt->DrawRoundedRectangle(button, brush_border.get(), 1.0f);
@@ -1500,7 +1628,16 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
         case WM_DISPLAYCHANGE:
         case WM_SETTINGCHANGE:
-            // Work areas move when a taskbar does; a stale work area puts the overlay under it.
+            // Two unrelated things arrive on the same message. Work areas move when a taskbar
+            // does, and a stale work area puts the overlay under it — that is the unconditional
+            // re-render below. The other is the colour scheme, which is only this message when
+            // it names "ImmersiveColorSet", and is the one case worth re-reading the registry
+            // for; refresh_theme() decides whether anything actually moved.
+            if (msg == WM_SETTINGCHANGE && theme::is_color_scheme_change(lparam) &&
+                core->refresh_theme(true)) {
+                KD_LOG_INFO("the system colour scheme changed; the pill is now %s",
+                            core->painting_dark ? "dark" : "light");
+            }
             core->dirty = true;
             core->render();
             return 0;
@@ -1556,6 +1693,9 @@ Status Overlay::create(uintptr_t instance, const OverlayStyle& style) {
     }
 
     impl_->style = style;
+    // Before the window exists, so the very first paint is already in the right scheme. A pill
+    // that flashes white on a dark desktop for one frame is a pill that flashes white.
+    impl_->refresh_theme(true);
     impl_->instance = instance ? reinterpret_cast<HINSTANCE>(instance) : GetModuleHandleW(nullptr);
 
     if (ensure_window_class(impl_->instance) == 0) {
@@ -1900,6 +2040,10 @@ void Overlay::render() {
 
 void Overlay::set_style(const OverlayStyle& s) {
     impl_->style = s;
+    // The OS is not re-asked here: nothing about a settings change moves the *system* scheme,
+    // and the cached answer is kept fresh by WM_SETTINGCHANGE. What has moved is which scheme
+    // the user wants, so the palette is refolded either way.
+    impl_->refresh_theme(false);
     // Font family/size live in the text formats and the colours live in the brushes, so both
     // caches are invalidated. The render target itself survives — it is device state, not style.
     impl_->release_text_formats();

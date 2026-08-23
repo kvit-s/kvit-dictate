@@ -51,6 +51,7 @@ kd::Settings unusual() {
     s.overlay_mode = kd::OverlayMode::FloatingPill;
     s.overlay_style.font_family = "Cascadia Code";
     s.overlay_style.font_size_dip = 17.5f;
+    s.overlay_style.theme = kd::ThemeMode::Custom;
     s.overlay_style.color_pending = 0xFF102030;
     s.overlay_style.color_unstable = 0x80405060;
     s.overlay_style.max_width_dip = 640.0f;
@@ -114,6 +115,8 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(static_cast<int>(out.overlay_mode), static_cast<int>(in.overlay_mode));
     KD_CHECK_EQ(out.overlay_style.font_family, in.overlay_style.font_family);
     KD_CHECK_NEAR(out.overlay_style.font_size_dip, in.overlay_style.font_size_dip, 0.001);
+    KD_CHECK_EQ(static_cast<int>(out.overlay_style.theme),
+                static_cast<int>(in.overlay_style.theme));
     KD_CHECK_EQ(out.overlay_style.color_pending, in.overlay_style.color_pending);
     KD_CHECK_EQ(out.overlay_style.color_unstable, in.overlay_style.color_unstable);
     KD_CHECK_NEAR(out.overlay_style.max_width_dip, in.overlay_style.max_width_dip, 0.001);
@@ -294,4 +297,69 @@ KD_TEST(settings, a_session_timer_below_the_endpoint_timer_is_refused) {
     s.session.session_silence_ms = 2000;
     s.session.session_silence_never = false;
     KD_CHECK(!s.validate().is_ok());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The pill's colour scheme, and the file that predates it
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(settings, a_file_with_no_theme_and_default_colours_follows_windows) {
+    // The overwhelmingly common upgrade: a settings file written before `theme` existed, whose
+    // colours are the ones this program shipped. That is not a choice anyone made, so it becomes
+    // "follow the system" — which is the whole point of the feature.
+    kd::Result<kd::Settings> parsed =
+        kd::parse_settings("{\"overlay\": {\"mode\": \"inline\", \"font_family\": \"Segoe UI\"}}");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed.value().overlay_style.theme == kd::ThemeMode::System);
+}
+
+KD_TEST(settings, a_file_with_hand_picked_colours_and_no_theme_keeps_them) {
+    // The migration that matters. Someone set a colour; a new key must not quietly repaint over
+    // it. The file predates `theme`, so it is read as `custom` and paints exactly what it did.
+    kd::Result<kd::Settings> parsed =
+        kd::parse_settings("{\"overlay\": {\"color_background\": \"#FF001122\"}}");
+    KD_REQUIRE(parsed.is_ok());
+    const kd::Settings& s = parsed.value();
+    KD_CHECK(s.overlay_style.theme == kd::ThemeMode::Custom);
+    KD_CHECK_EQ(s.overlay_style.color_background, 0xFF001122u);
+    // And what the pill will actually paint with, which is the point of keeping them: the
+    // user's colour, whatever the desktop is doing.
+    KD_CHECK_EQ(kd::resolve_overlay_style(s.overlay_style, true).color_background, 0xFF001122u);
+}
+
+KD_TEST(settings, a_file_that_names_its_theme_is_never_migrated) {
+    // The other side of the same rule: once `theme` is in the file it is the answer, even when
+    // the colours beside it are not the defaults. Without this, a user who chose "follow
+    // Windows" *and* kept a custom palette to switch back to would be dragged into `custom` on
+    // every load.
+    kd::Result<kd::Settings> parsed = kd::parse_settings(
+        "{\"overlay\": {\"theme\": \"system\", \"color_background\": \"#FF001122\"}}");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed.value().overlay_style.theme == kd::ThemeMode::System);
+    KD_CHECK_EQ(parsed.value().overlay_style.color_background, 0xFF001122u);
+}
+
+KD_TEST(settings, every_theme_name_round_trips_and_an_unknown_one_is_refused) {
+    struct Case {
+        const char* text;
+        kd::ThemeMode mode;
+    };
+    for (const Case& c : {Case{"system", kd::ThemeMode::System}, Case{"light", kd::ThemeMode::Light},
+                          Case{"dark", kd::ThemeMode::Dark},
+                          Case{"custom", kd::ThemeMode::Custom}}) {
+        const std::string text =
+            std::string("{\"overlay\": {\"theme\": \"") + c.text + "\"}}";
+        kd::Result<kd::Settings> parsed = kd::parse_settings(text);
+        KD_REQUIRE(parsed.is_ok());
+        KD_CHECK(parsed.value().overlay_style.theme == c.mode);
+        // And the spelling survives being written back out, which is what keeps a settings file
+        // stable across a save the user did not ask for.
+        KD_CHECK(kd::serialize_settings(parsed.value()).find(std::string("\"") + c.text + "\"") !=
+                 std::string::npos);
+    }
+
+    // Named rather than silently defaulted, like every other enum in this file.
+    kd::Result<kd::Settings> bad = kd::parse_settings("{\"overlay\": {\"theme\": \"midnight\"}}");
+    KD_CHECK(!bad.is_ok());
+    KD_CHECK(bad.status().message().find("theme") != std::string::npos);
 }

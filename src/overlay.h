@@ -137,12 +137,56 @@ const char* to_string(OverlayState s) noexcept;
 
 // ─── Appearance ─────────────────────────────────────────────────────────────────────────────
 
+// Where the pill's five colours come from.
+//
+// plan.md §1.5 says the overlay's appearance is fixed in settings and never sampled from the
+// target — and that is still true, because the *system* colour scheme is not the target. It is a
+// setting like any other; the only difference is that Windows owns it and can change it while
+// the program runs. The pill sits on top of the user's document, so a light pill on a dark
+// desktop is not a cosmetic complaint: it is the brightest thing on the screen.
+//
+// `Custom` is what the five colour fields below are for, and it exists so that a user who has
+// set them keeps them. Everything else ignores those fields and paints from `overlay_palette`.
+enum class ThemeMode {
+    System,  // follow Windows, and follow it again when Windows changes mid-session
+    Light,
+    Dark,
+    Custom,  // the colour fields below, exactly as written
+};
+
+const char* to_string(ThemeMode m) noexcept;
+
+// The five colours of one scheme, in the order OverlayStyle declares them.
+struct OverlayPalette {
+    uint32_t pending;
+    uint32_t unstable;
+    uint32_t background;
+    uint32_t warning;
+    uint32_t border;
+};
+
+// `overlay_palette(false)` is exactly OverlayStyle's own defaults, so `Custom` on a file that
+// never touched a colour is indistinguishable from `Light` — which is what makes the migration
+// in settings.cpp honest rather than a visible change.
+[[nodiscard]] const OverlayPalette& overlay_palette(bool dark) noexcept;
+
+// Does `mode` paint dark, given what Windows currently says? `Custom` is neither: it answers
+// false, because the user's own colours are not a scheme and nothing may second-guess them.
+[[nodiscard]] bool theme_paints_dark(ThemeMode mode, bool system_dark) noexcept;
+
 struct OverlayStyle {
     std::string font_family = "Segoe UI";
     float font_size_dip = 14.0f;
 
+    // Which of the three fixed schemes paints the pill, or Custom for the colours below.
+    ThemeMode theme = ThemeMode::System;
+
     // 0xAARRGGBB. Committed-but-not-yet-typed text and unstable text are drawn differently so
     // the user can see which part is still moving.
+    //
+    // **Read only under ThemeMode::Custom.** Under the other three these are still parsed,
+    // serialised and shown in the dialog — so switching to Custom gets the user's colours back
+    // rather than a reset — but the pill paints from `overlay_palette` instead.
     uint32_t color_pending = 0xFF3C3C3C;
     uint32_t color_unstable = 0x993C3C3C;
     uint32_t color_background = 0xE6FFFFFF;
@@ -156,6 +200,15 @@ struct OverlayStyle {
     // grows without bound covers the document it is annotating.
     float max_width_dip = 720.0f;
 };
+
+// `base` with the palette for its ThemeMode folded into its five colour fields. Under `Custom`
+// the colours are returned untouched. Font, padding, radius and width are never touched by this:
+// they are the user's layout, not a scheme.
+//
+// `system_dark` is the answer to theme::system_prefers_dark(), passed in rather than read here so
+// that this stays pure and testable — overlay.h is the half of this file that has no Windows in
+// it, and a registry read in the middle of it would end that.
+[[nodiscard]] OverlayStyle resolve_overlay_style(const OverlayStyle& base, bool system_dark);
 
 // ─── The window ─────────────────────────────────────────────────────────────────────────────
 

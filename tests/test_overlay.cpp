@@ -371,3 +371,111 @@ KD_TEST(overlay, an_unspellable_binding_drops_its_item_rather_than_printing_a_bl
     KD_CHECK(!mentions(plain, "to finish"));
     KD_CHECK(mentions(plain, "Esc to cancel"));
 }
+
+// ─── The colour scheme ──────────────────────────────────────────────────────────────────────
+//
+// `resolve_overlay_style` is the second pure decision in this file: which five colours the pill
+// paints with, given the user's ThemeMode and what Windows currently says. The Windows half —
+// reading the registry, WM_SETTINGCHANGE, the brushes — is verified by looking at it. This half
+// is arithmetic on a struct, and it is where the two failures worth testing live: a scheme that
+// ignores the user's own colours, and a scheme change that quietly rewrites their layout.
+
+KD_TEST(overlay, system_follows_windows_in_both_directions) {
+    kd::OverlayStyle s;
+    s.theme = kd::ThemeMode::System;
+    KD_CHECK_EQ(kd::resolve_overlay_style(s, false).color_background,
+                kd::overlay_palette(false).background);
+    KD_CHECK_EQ(kd::resolve_overlay_style(s, true).color_background,
+                kd::overlay_palette(true).background);
+    KD_CHECK(kd::theme_paints_dark(kd::ThemeMode::System, true));
+    KD_CHECK(!kd::theme_paints_dark(kd::ThemeMode::System, false));
+}
+
+KD_TEST(overlay, light_and_dark_ignore_what_windows_says) {
+    // The two explicit choices are choices, not preferences to be overridden by the desktop.
+    kd::OverlayStyle light;
+    light.theme = kd::ThemeMode::Light;
+    KD_CHECK_EQ(kd::resolve_overlay_style(light, true).color_pending,
+                kd::overlay_palette(false).pending);
+
+    kd::OverlayStyle dark;
+    dark.theme = kd::ThemeMode::Dark;
+    KD_CHECK_EQ(kd::resolve_overlay_style(dark, false).color_pending,
+                kd::overlay_palette(true).pending);
+}
+
+KD_TEST(overlay, custom_colours_survive_every_scheme_windows_is_in) {
+    // The whole reason ThemeMode::Custom exists. A user who set five colours keeps five colours,
+    // and `theme_paints_dark` answers false for them so that nothing downstream — the state dot,
+    // the selection wash, the microphone button — picks a set to match a scheme they are not in.
+    kd::OverlayStyle s;
+    s.theme = kd::ThemeMode::Custom;
+    s.color_pending = 0xFF112233;
+    s.color_unstable = 0x80112233;
+    s.color_background = 0xE6445566;
+    s.color_warning = 0xFF778899;
+    s.color_border = 0x33AABBCC;
+
+    for (bool system_dark : {false, true}) {
+        const kd::OverlayStyle out = kd::resolve_overlay_style(s, system_dark);
+        KD_CHECK_EQ(out.color_pending, s.color_pending);
+        KD_CHECK_EQ(out.color_unstable, s.color_unstable);
+        KD_CHECK_EQ(out.color_background, s.color_background);
+        KD_CHECK_EQ(out.color_warning, s.color_warning);
+        KD_CHECK_EQ(out.color_border, s.color_border);
+        KD_CHECK(!kd::theme_paints_dark(kd::ThemeMode::Custom, system_dark));
+    }
+}
+
+KD_TEST(overlay, the_light_palette_is_exactly_the_shipped_defaults) {
+    // Not a tautology: it is what makes a settings file written before the pill had a scheme
+    // paint identically after it, and what makes the settings.cpp migration to `custom` a
+    // no-op for anyone who never touched a colour. If a default here is ever changed alone,
+    // this is the test that says which of the two spellings is now wrong.
+    const kd::OverlayStyle shipped;
+    const kd::OverlayPalette& light = kd::overlay_palette(false);
+    KD_CHECK_EQ(shipped.color_pending, light.pending);
+    KD_CHECK_EQ(shipped.color_unstable, light.unstable);
+    KD_CHECK_EQ(shipped.color_background, light.background);
+    KD_CHECK_EQ(shipped.color_warning, light.warning);
+    KD_CHECK_EQ(shipped.color_border, light.border);
+}
+
+KD_TEST(overlay, a_scheme_never_touches_the_layout) {
+    // The scheme owns colours and nothing else. A dark pill in a different font, at a different
+    // size, or at a different width would be a scheme that rewrote settings the user set.
+    kd::OverlayStyle s;
+    s.theme = kd::ThemeMode::System;
+    s.font_family = "Cascadia Code";
+    s.font_size_dip = 21.0f;
+    s.corner_radius_dip = 2.0f;
+    s.padding_dip = 11.0f;
+    s.max_width_dip = 480.0f;
+
+    const kd::OverlayStyle out = kd::resolve_overlay_style(s, true);
+    KD_CHECK_EQ(out.font_family, s.font_family);
+    KD_CHECK_EQ(out.font_size_dip, s.font_size_dip);
+    KD_CHECK_EQ(out.corner_radius_dip, s.corner_radius_dip);
+    KD_CHECK_EQ(out.padding_dip, s.padding_dip);
+    KD_CHECK_EQ(out.max_width_dip, s.max_width_dip);
+    KD_CHECK(out.theme == s.theme);
+}
+
+KD_TEST(overlay, the_dark_pill_is_still_translucent_and_still_two_inks) {
+    // Two properties the dark palette shares with the light one by construction, and both are
+    // load-bearing rather than decorative. The pill is drawn over the user's document, so an
+    // opaque background would read as a hole cut in it; and docs/editing.md's committed/unstable
+    // split is *only* visible as the difference between those two alphas.
+    const kd::OverlayPalette& dark = kd::overlay_palette(true);
+    KD_CHECK((dark.background >> 24) < 0xFFu);
+    KD_CHECK((dark.border >> 24) < 0xFFu);
+    KD_CHECK((dark.pending >> 24) > (dark.unstable >> 24));
+    KD_CHECK_EQ(dark.pending & 0x00FFFFFFu, dark.unstable & 0x00FFFFFFu);
+
+    // And the property that makes it dark at all: the ink is lighter than the ground, which is
+    // the reverse of the light scheme. Compared on the green channel, which is where perceived
+    // lightness mostly lives.
+    const kd::OverlayPalette& light = kd::overlay_palette(false);
+    KD_CHECK(((dark.pending >> 8) & 0xFFu) > ((dark.background >> 8) & 0xFFu));
+    KD_CHECK(((light.pending >> 8) & 0xFFu) < ((light.background >> 8) & 0xFFu));
+}

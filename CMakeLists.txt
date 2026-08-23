@@ -121,6 +121,7 @@ set(KD_CORE_SOURCES
     src/anchor.cpp
     src/injector.cpp
     src/overlay.cpp
+    src/theme.cpp
 )
 
 set(KD_CORE_HEADERS
@@ -134,6 +135,7 @@ set(KD_CORE_HEADERS
     src/ipc_client.h
     src/overlay.h
     src/settings.h
+    src/theme.h
     src/edit_buffer.h
     src/util/clock.h
     src/util/json.h
@@ -181,7 +183,11 @@ target_link_libraries(kd_core PUBLIC kd_common_flags)
 #   dwrite    overlay — DirectWrite text layout and measurement
 #   dwmapi    overlay/anchor — DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) for a window
 #             rectangle that excludes the invisible resize border, which the naive GetWindowRect
-#             includes and which would offset every capture
+#             includes and which would offset every capture; theme — DwmSetWindowAttribute
+#             (DWMWA_USE_IMMERSIVE_DARK_MODE), which is the only way to darken a title bar
+#   uxtheme   theme — SetWindowTheme, which opts one control at a time into the DarkMode_* theme
+#             classes. The undocumented ordinals theme.cpp also uses are resolved by hand at
+#             runtime and need no import library; this line is for the documented call alone.
 #   shcore    overlay/anchor — GetDpiForMonitor for the mixed-DPI cases plan.md §7 gates on.
 #             NOTE: PROCESS_PER_MONITOR_DPI_AWARE_V2 is *not* shcore's SetProcessDpiAwareness
 #             (that API's enum only reaches v1); v2 comes from the application manifest or from
@@ -212,6 +218,7 @@ target_link_libraries(kd_core PUBLIC
     d2d1
     dwrite
     dwmapi
+    uxtheme
     shcore
     shell32
     comctl32
