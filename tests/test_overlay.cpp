@@ -39,6 +39,7 @@
 
 #include "anchor.h"
 #include "overlay.h"
+#include "util/utf8.h"
 
 #include <optional>
 #include <string>
@@ -343,6 +344,19 @@ KD_TEST(overlay, without_the_compose_buffer_enter_is_not_a_commit_and_is_not_nam
     KD_CHECK(mentions(line, "Win+Y to finish"));
     KD_CHECK(mentions(line, "Esc to cancel"));
     KD_CHECK(mentions(line, "any key ends it"));
+}
+
+KD_TEST(overlay, the_separator_is_one_middle_dot_and_the_line_is_valid_utf8) {
+    // It shipped as `\xC3\x82\xC2\xB7` — the UTF-8 encoding of U+00B7 encoded a second time —
+    // and the pill drew a capital A-circumflex before every dot. Nothing above caught it:
+    // every check here was a substring search, and mojibake in the glue between substrings
+    // passes all of them. So the bytes are asserted, and so is the property that would have caught any such
+    // corruption anywhere in the line — `to_utf16_or_empty` answers an empty string for invalid
+    // UTF-8, so a legend that failed this would not be mis-drawn but absent.
+    const std::string line = key_legend(OverlayState::Editing, true, "Win+Y");
+    KD_CHECK(kd::utf8::validate(line));
+    KD_CHECK(mentions(line, " \xC2\xB7 "));
+    KD_CHECK(!mentions(line, "\xC3\x82"));  // the double-encoding, in any position
 }
 
 KD_TEST(overlay, an_unspellable_binding_drops_its_item_rather_than_printing_a_blank) {

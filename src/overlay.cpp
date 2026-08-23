@@ -490,7 +490,7 @@ std::string key_legend(OverlayState state, bool composing, std::string_view hotk
 
     std::string out;
     const auto item = [&out](std::string_view text) {
-        if (!out.empty()) out.append(" Â· ");  // U+00B7 MIDDLE DOT
+        if (!out.empty()) out.append(" \xC2\xB7 ");  // U+00B7 MIDDLE DOT
         out.append(text);
     };
 
