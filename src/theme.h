@@ -45,6 +45,16 @@ namespace kd::theme {
 // cache would need an invalidation path that is exactly this call.
 [[nodiscard]] bool system_prefers_dark();
 
+// Is the *taskbar* dark? A different question with a different answer, and the tray icon is
+// drawn from this one.
+//
+// Windows keeps two switches next to each other: AppsUseLightTheme, which is what a window
+// should follow, and SystemUsesLightTheme, which is what the taskbar, the Start menu and the
+// notification area follow. They are set independently, and the combination that catches a
+// program reading only the first is the common one — light apps on a dark taskbar — where a
+// tray icon drawn dark to match the settings dialog becomes a black smudge on black.
+[[nodiscard]] bool taskbar_prefers_dark();
+
 // Is this WM_SETTINGCHANGE the one that means "the colour scheme moved"?
 //
 // `lparam` is the message's LPARAM, as an intptr_t so this header stays Windows-free. It may be

@@ -90,22 +90,34 @@ BOOL CALLBACK theme_child(HWND child, LPARAM param) {
 
 }  // namespace
 
-bool system_prefers_dark() {
+namespace {
+
+// The two Personalize switches, read the same way. `value_name` is AppsUseLightTheme or
+// SystemUsesLightTheme; both are "1 means light", so a missing key, a missing value and a value
+// of the wrong type all answer light — which is what a fresh profile and a build older than 1809
+// both look like, and both should be light.
+bool personalize_says_dark(const wchar_t* value_name) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0,
                       KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
-        return false;  // no key at all: a build older than 1809, which had no dark mode
+        return false;
     }
-    DWORD value = 1;  // the value is AppsUse*Light*Theme, so 1 — light — is the safe default
+    DWORD value = 1;  // the values are named *Light*Theme, so 1 — light — is the safe default
     DWORD size = sizeof(value);
     DWORD type = 0;
-    const LSTATUS st = RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type,
+    const LSTATUS st = RegQueryValueExW(key, value_name, nullptr, &type,
                                         reinterpret_cast<LPBYTE>(&value), &size);
     RegCloseKey(key);
     if (st != ERROR_SUCCESS || type != REG_DWORD) return false;
     return value == 0;
 }
+
+}  // namespace
+
+bool system_prefers_dark() { return personalize_says_dark(L"AppsUseLightTheme"); }
+
+bool taskbar_prefers_dark() { return personalize_says_dark(L"SystemUsesLightTheme"); }
 
 bool is_color_scheme_change(intptr_t lparam) noexcept {
     const wchar_t* section = reinterpret_cast<const wchar_t*>(lparam);

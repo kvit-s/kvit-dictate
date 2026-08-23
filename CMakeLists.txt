@@ -122,6 +122,7 @@ set(KD_CORE_SOURCES
     src/injector.cpp
     src/overlay.cpp
     src/theme.cpp
+    src/tray_icon.cpp
 )
 
 set(KD_CORE_HEADERS
@@ -136,6 +137,7 @@ set(KD_CORE_HEADERS
     src/overlay.h
     src/settings.h
     src/theme.h
+    src/tray_icon.h
     src/edit_buffer.h
     src/util/clock.h
     src/util/json.h
@@ -179,7 +181,9 @@ target_link_libraries(kd_core PUBLIC kd_common_flags)
 #   ksuser    audio_capture — KSDATAFORMAT_SUBTYPE_PCM / KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, needed
 #             to interpret a WAVEFORMATEXTENSIBLE mix format. If the implementation ends up
 #             comparing those GUIDs by value instead, delete this line.
-#   d2d1      overlay — Direct2D device context and the layered-window render target
+#   d2d1      overlay — Direct2D device context and the layered-window render target;
+#             tray_icon — the same DC-render-target-into-a-DIB technique, for a notification
+#             icon that is drawn at run time rather than shipped as artwork
 #   dwrite    overlay — DirectWrite text layout and measurement
 #   dwmapi    overlay/anchor — DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) for a window
 #             rectangle that excludes the invisible resize border, which the naive GetWindowRect
@@ -278,6 +282,7 @@ if(KD_BUILD_TESTS)
         tests/test_hotkey.cpp
         tests/test_anchor.cpp
         tests/test_overlay.cpp
+        tests/test_tray_icon.cpp
         tests/test_settings.cpp
         tests/test_edit_buffer.cpp
         tests/test_injector.cpp
@@ -329,6 +334,7 @@ if(KD_BUILD_TESTS)
         ipc             # src/ipc_client.cpp — pipe naming and the DACL
         anchor          # src/anchor.cpp — diff scorer and DPI maths on synthetic bitmaps
         overlay         # src/overlay.cpp — overlay_mode_for, plan.md §1.5's degradation rule
+        tray_icon       # src/tray_icon.cpp — the drawn notification icon: fill means mic-open
         edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
     )

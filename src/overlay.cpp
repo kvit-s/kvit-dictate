@@ -347,19 +347,12 @@ D2D1_COLOR_F argb(uint32_t c) noexcept {
 // colour from the style, because the warning border and the warning dot are one signal and must
 // not be able to differ.
 uint32_t dot_color(OverlayState s, const OverlayStyle& style, bool dark) noexcept {
-    const DotColors& d = kDots[dark ? 1 : 0];
-    switch (s) {
-        case OverlayState::Idle: return d.idle;
-        case OverlayState::Listening: return d.listening;
-        case OverlayState::Speaking: return d.speaking;
-        case OverlayState::Finalizing: return d.finalizing;
-        case OverlayState::ModelLoading: return d.loading;
-        case OverlayState::Warning: return style.color_warning;
-        case OverlayState::Unsupported: return d.unsupported;
-        case OverlayState::Editing: return d.editing;
-        case OverlayState::Error: return d.error;
-    }
-    return d.idle;
+    // Warning is the one state that does not read the shared table: the warning border and the
+    // warning dot are one signal on the pill and must not be able to differ, so the dot takes
+    // the border's colour. Everywhere else this is state_dot_color verbatim, which is what keeps
+    // the pill and the tray icon in agreement.
+    if (s == OverlayState::Warning) return style.color_warning;
+    return state_dot_color(s, dark);
 }
 
 // Deliberately *not* to_string(OverlayState). to_string is the programmatic spelling used in
@@ -575,6 +568,24 @@ const char* to_string(ThemeMode m) noexcept {
         case ThemeMode::Custom: return "custom";
     }
     return "system";
+}
+
+uint32_t state_dot_color(OverlayState s, bool dark) noexcept {
+    const DotColors& d = kDots[dark ? 1 : 0];
+    switch (s) {
+        case OverlayState::Idle: return d.idle;
+        case OverlayState::Listening: return d.listening;
+        case OverlayState::Speaking: return d.speaking;
+        case OverlayState::Finalizing: return d.finalizing;
+        case OverlayState::ModelLoading: return d.loading;
+        // The pill overrides this one with its own border colour — see dot_color below. The
+        // shared answer is the amber of the table, which is what the tray shows.
+        case OverlayState::Warning: return d.loading;
+        case OverlayState::Unsupported: return d.unsupported;
+        case OverlayState::Editing: return d.editing;
+        case OverlayState::Error: return d.error;
+    }
+    return d.idle;
 }
 
 const OverlayPalette& overlay_palette(bool dark) noexcept {

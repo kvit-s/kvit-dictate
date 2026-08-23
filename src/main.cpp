@@ -43,6 +43,7 @@
 #include "session.h"
 #include "settings.h"
 #include "theme.h"
+#include "tray_icon.h"
 #include "util/clock.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -104,6 +105,11 @@ bool connection_can_become_idle(kd::proto::ConnState s) noexcept {
 }
 
 constexpr UINT kTrayId = 1;
+
+// How many ticks between asking the registry whether the taskbar changed scheme. At kTickIntervalMs
+// this is about two seconds — slow enough to be free, fast enough that nobody catches the icon in
+// the old scheme. See App::poll_taskbar_theme for why this is a poll and not a message.
+constexpr uint32_t kTrayThemePollTicks = 40;
 constexpr UINT kMenuToggle = 100;
 constexpr UINT kMenuSettings = 101;
 constexpr UINT kMenuOpenLogs = 102;
@@ -298,6 +304,7 @@ private:
 
     void set_tray_state(kd::OverlayState s);
     void update_tray();
+    void poll_taskbar_theme();
     void show_tray_menu();
 
     HINSTANCE instance_ = nullptr;
@@ -350,6 +357,12 @@ private:
     uint64_t hint_expires_ms_ = 0;
 
     kd::OverlayState tray_state_ = kd::OverlayState::Idle;
+    // The icon currently in the notification area, and the taskbar scheme it was drawn for.
+    // Owned here: tray_icon.h's icons are ours to destroy, and the old one is only released
+    // *after* the shell has been handed its replacement.
+    HICON tray_icon_ = nullptr;
+    bool tray_icon_dark_ = false;
+    uint32_t tray_theme_tick_ = 0;
     // What apply_overlay_mode() last pushed to the overlay, so the transition is logged
     // once rather than on every tick that carries an anchor.
     kd::OverlayMode overlay_mode_applied_ = kd::OverlayMode::Hidden;
@@ -572,7 +585,13 @@ bool App::startup() {
     nid.uID = kTrayId;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = kMsgTray;
-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    // Drawn, not loaded: see tray_icon.h. A failure to draw it is not a reason to have no tray
+    // icon at all, so the stock application icon remains the fallback — which is what this
+    // showed before there was a microphone to show.
+    tray_icon_dark_ = kd::theme::taskbar_prefers_dark();
+    tray_icon_ = reinterpret_cast<HICON>(
+        kd::make_tray_icon(kd::OverlayState::Idle, tray_icon_dark_));
+    nid.hIcon = tray_icon_ != nullptr ? tray_icon_ : LoadIcon(nullptr, IDI_APPLICATION);
     lstrcpynW(nid.szTip, L"kvit-dictate — idle", ARRAYSIZE(nid.szTip));
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
 
@@ -769,6 +788,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
                     hint_expires_ms_ = 0;
                     if (overlay_ != nullptr) overlay_->clear_hint();
+                }
+                // Two seconds' worth of ticks. See poll_taskbar_theme() for why the taskbar's
+                // scheme is polled at all rather than arriving as a message.
+                if (++tray_theme_tick_ >= kTrayThemePollTicks) {
+                    tray_theme_tick_ = 0;
+                    poll_taskbar_theme();
                 }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
@@ -2147,12 +2172,42 @@ void App::update_tray() {
     nid.hWnd = hwnd_;
     nid.uID = kTrayId;
     nid.uFlags = NIF_TIP | NIF_ICON;
-    nid.hIcon = LoadIcon(nullptr, tray_state_ == kd::OverlayState::Error ||
-                                          tray_state_ == kd::OverlayState::Warning
-                                      ? IDI_WARNING
-                                      : IDI_APPLICATION);
+    HICON drawn = reinterpret_cast<HICON>(kd::make_tray_icon(tray_state_, tray_icon_dark_));
+    nid.hIcon = drawn != nullptr
+                    ? drawn
+                    : LoadIcon(nullptr, tray_state_ == kd::OverlayState::Error ||
+                                                tray_state_ == kd::OverlayState::Warning
+                                            ? IDI_WARNING
+                                            : IDI_APPLICATION);
     lstrcpynW(nid.szTip, tip.c_str(), ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+    // Only now. The shell has been given the new icon, so the one it was showing until this line
+    // is no longer in use — destroying it any earlier is a handle the notification area is still
+    // drawing from, which presents as an icon that vanishes at a state change.
+    if (drawn != nullptr) {
+        if (tray_icon_ != nullptr) DestroyIcon(tray_icon_);
+        tray_icon_ = drawn;
+    }
+}
+
+// Has the *taskbar* changed scheme under us?
+//
+// Polled rather than pushed, and the reason is structural: WM_SETTINGCHANGE is broadcast to
+// top-level windows, and this program's window is message-only (see startup()), so it never
+// arrives here. The overlay is top-level and does get it — that is how the pill follows the
+// scheme — but the tray icon belongs to this file, and routing a message through the overlay to
+// reach it would make the pill responsible for something it knows nothing about.
+//
+// So: one registry read every kTrayThemePollTicks ticks. At 50 ms a tick that is once every two
+// seconds, against a poll that already runs the anchor, the session machine and the commit
+// engine on every one of them.
+void App::poll_taskbar_theme() {
+    const bool dark = kd::theme::taskbar_prefers_dark();
+    if (dark == tray_icon_dark_) return;
+    tray_icon_dark_ = dark;
+    KD_LOG_INFO("the taskbar is now %s; redrawing the tray icon", dark ? "dark" : "light");
+    update_tray();
 }
 
 void App::show_tray_menu() {
@@ -2203,6 +2258,12 @@ void App::shutdown() {
         nid.uID = kTrayId;
         Shell_NotifyIconW(NIM_DELETE, &nid);
         tray_added_ = false;
+    }
+    if (tray_icon_ != nullptr) {
+        // After NIM_DELETE, for the same reason update_tray() destroys the old icon last: while
+        // the notification area still has an entry, it still has this handle.
+        DestroyIcon(tray_icon_);
+        tray_icon_ = nullptr;
     }
 
     kd::log::shutdown();

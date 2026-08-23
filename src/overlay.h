@@ -135,6 +135,15 @@ enum class OverlayState : uint8_t {
 
 const char* to_string(OverlayState s) noexcept;
 
+// The colour that stands for `s`, as 0xAARRGGBB, in whichever scheme is painting.
+//
+// One table, two surfaces. The pill draws it as the state dot and the tray icon tints its
+// microphone with it, and they have to agree: docs/editing.md §16 records what it costs when the
+// pill and the tray disagree about a state, and "the tray says green while the pill says violet"
+// is that failure with the colours instead of the words. The pill overrides exactly one entry —
+// Warning, which takes its own border colour so the border and the dot cannot differ.
+[[nodiscard]] uint32_t state_dot_color(OverlayState s, bool dark) noexcept;
+
 // ─── Appearance ─────────────────────────────────────────────────────────────────────────────
 
 // Where the pill's five colours come from.
