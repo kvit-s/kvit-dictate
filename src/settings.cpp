@@ -1543,6 +1543,11 @@ struct DialogState {
     bool dark = false;
     HBRUSH face_brush = nullptr;
     HBRUSH field_brush = nullptr;
+
+    // Which push button the pointer is over, or null. Owner-drawn buttons are told whether they
+    // are pressed, focused or disabled and are never told they are hot, so the hover state is
+    // tracked here — one HWND, because the pointer is only ever over one of them.
+    HWND hot_button = nullptr;
 };
 
 int px(const DialogState& st, int logical) { return MulDiv(logical, st.dpi, 96); }
@@ -1893,8 +1898,91 @@ void refresh_editing_page(HWND dlg) {
 // would read as having thrown the user's colours away.
 // Defined further down with the rest of the tab-strip drawing, and declared here because
 // apply_dialog_theme is what installs it.
+// ─── Push buttons, drawn by hand, and only in dark mode ─────────────────────────────────────
+//
+// The same hole as the tab strip, in a different shape. There is no dark theme class that takes
+// for a BS_PUSHBUTTON on this build: naming one that does not exist un-themes the control
+// instead, and an unthemed button draws its 3D frame in COLOR_3DHIGHLIGHT and its label in
+// COLOR_BTNTEXT — both system colours, neither of which WM_CTLCOLORBTN can change. The result
+// was the giveaway: a correctly dark button face inside a white box, with a black label on it.
+//
+// So the buttons are BS_OWNERDRAW while the dialog is dark, and this draws them: a flat fill, a
+// one-pixel border a step lighter than the face, and the label in the dialog's text colour. The
+// three states Windows reports are honoured, plus hover, which it does not report — see
+// button_hover_subclass.
+
+void draw_dialog_button(DialogState& st, const DRAWITEMSTRUCT* di) {
+    if (di == nullptr || !st.dark) return;
+    const theme::DialogPalette& p = theme::dialog_palette(true);
+
+    const bool pressed = (di->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (di->itemState & ODS_DISABLED) != 0;
+    const bool focused = (di->itemState & ODS_FOCUS) != 0;
+    const bool hot = di->hwndItem == st.hot_button;
+    // Which button Enter presses. Read from the id and not from BS_DEFPUSHBUTTON, because
+    // BS_OWNERDRAW *is* the type bits — turning it on is what removed that style in the first
+    // place, and it is why dialog_proc answers DM_GETDEFID by hand.
+    const bool is_default = di->CtlID == kIdOk;
+
+    uint32_t fill = p.button;
+    if (is_default) fill = p.button_default;
+    if (hot) fill = p.button_hot;
+    if (pressed) fill = p.button_pressed;
+
+    RECT rc = di->rcItem;
+    if (HBRUSH brush = CreateSolidBrush(fill)) {
+        FillRect(di->hDC, &rc, brush);
+        DeleteObject(brush);
+    }
+    // The focus ring is the only place a bright line belongs: it is the answer to "where does
+    // the keyboard go next", and it is drawn only while the button actually has the focus.
+    if (HBRUSH edge = CreateSolidBrush(focused ? p.text : p.button_border)) {
+        FrameRect(di->hDC, &rc, edge);
+        DeleteObject(edge);
+    }
+
+    wchar_t text[128]{};
+    GetWindowTextW(di->hwndItem, text, ARRAYSIZE(text));
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, disabled ? p.disabled_text : p.text);
+    HGDIOBJ previous = SelectObject(di->hDC, st.font);
+    // Pressed buttons move their label a pixel down and right, which is the other half of what
+    // makes a flat button feel like it was clicked.
+    if (pressed) OffsetRect(&rc, 1, 1);
+    DrawTextW(di->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(di->hDC, previous);
+}
+
+// Hover, which DRAWITEMSTRUCT does not carry.
+//
+// A themed button gets its hot state from the theme engine; an owner-drawn one gets nothing, and
+// a button that does not react to the pointer at all reads as disabled. TrackMouseEvent is what
+// turns "the pointer is here" into a WM_MOUSELEAVE when it is not, without a timer.
+LRESULT CALLBACK button_hover_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                       DWORD_PTR ref) {
+    auto* st = reinterpret_cast<DialogState*>(ref);
+    if (st != nullptr && st->dark) {
+        if (msg == WM_MOUSEMOVE && st->hot_button != hwnd) {
+            st->hot_button = hwnd;
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&track);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        } else if (msg == WM_MOUSELEAVE && st->hot_button == hwnd) {
+            st->hot_button = nullptr;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+    }
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, button_hover_subclass, id);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 LRESULT CALLBACK tab_strip_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
                                     DWORD_PTR ref);
+
+LRESULT CALLBACK button_hover_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                       DWORD_PTR ref);
 
 // Repaint the dialog itself in `dark` (or out of it). Called when the window is created, when
 // the colour-scheme combo moves, and when Windows changes scheme while the dialog is open.
@@ -1933,6 +2021,26 @@ void apply_dialog_theme(HWND dlg, DialogState& st, bool dark) {
         SetWindowSubclass(tabs, tab_strip_subclass, 1, reinterpret_cast<DWORD_PTR>(&st));
         InvalidateRect(tabs, nullptr, TRUE);
     }
+
+    // The three push buttons. BS_OWNERDRAW is what makes WM_DRAWITEM arrive for them, and it
+    // occupies the same four style bits as BS_PUSHBUTTON and BS_DEFPUSHBUTTON — so the type has
+    // to be put back explicitly on the way to light, and OK has to be put back as the *default*
+    // button specifically, or Enter would stop being the accept key.
+    const struct { int id; bool is_default; } push_buttons[] = {
+        {kIdOk, true}, {kIdCancel, false}, {kIdDefaults, false}};
+    for (const auto& b : push_buttons) {
+        HWND h = GetDlgItem(dlg, b.id);
+        if (h == nullptr) continue;
+        LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE) & ~static_cast<LONG_PTR>(BS_TYPEMASK);
+        style |= dark ? BS_OWNERDRAW : (b.is_default ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON);
+        SetWindowLongPtrW(h, GWL_STYLE, style);
+        // Inert while `dark` is false, like the tab strip's, and installed once for the same
+        // reason: a subclass added and removed on every scheme change is one more thing to get
+        // wrong for no gain.
+        SetWindowSubclass(h, button_hover_subclass, 1, reinterpret_cast<DWORD_PTR>(&st));
+        InvalidateRect(h, nullptr, TRUE);
+    }
+    st.hot_button = nullptr;
 
     // RDW_ALLCHILDREN and UPDATENOW for the same reason show_page() spells out below: the erase
     // and the children's repaint have to happen in this call, not at the next idle, or the
@@ -2703,6 +2811,22 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         }
+
+        case DM_GETDEFID:
+            // Which button Enter presses. Normally IsDialogMessageW finds this from the
+            // BS_DEFPUSHBUTTON style — and in dark mode there is no such style on any of them,
+            // because BS_OWNERDRAW replaced it. Answered here so the answer does not depend on
+            // the colour scheme: Enter is OK in both.
+            return MAKELRESULT(kIdOk, DC_HASDEFID);
+
+        case WM_DRAWITEM:
+            // The three push buttons, and only while the dialog is dark — nothing else in this
+            // dialog is ever owner-drawn.
+            if (st && st->dark) {
+                draw_dialog_button(*st, reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+                return TRUE;
+            }
+            break;
 
         case WM_ERASEBKGND:
             // Light mode keeps the class background brush (COLOR_BTNFACE) and this message is

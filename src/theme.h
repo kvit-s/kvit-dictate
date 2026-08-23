@@ -90,6 +90,17 @@ struct DialogPalette {
     uint32_t field_text;
     uint32_t tab_face;      // an unselected tab
     uint32_t tab_selected;  // the selected one, which must read as raised, not as a hole
+
+    // Push buttons. They are drawn by hand for the same reason the tab strip is: there is no
+    // dark theme class that takes for a BS_PUSHBUTTON, so an unthemed button draws its 3D frame
+    // in COLOR_3DHIGHLIGHT (white) and its label in COLOR_BTNTEXT (black) whatever the parent
+    // says through WM_CTLCOLORBTN — a dark face in a white box with unreadable text.
+    uint32_t button;
+    uint32_t button_hot;      // under the pointer
+    uint32_t button_pressed;
+    uint32_t button_border;
+    uint32_t button_default;  // the fill of the default button, which must be findable by eye
+    uint32_t disabled_text;
 };
 
 [[nodiscard]] const DialogPalette& dialog_palette(bool dark) noexcept;

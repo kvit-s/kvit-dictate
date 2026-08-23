@@ -177,6 +177,7 @@ const DialogPalette& dialog_palette(bool dark) noexcept {
     static constexpr DialogPalette kLight{
         0x00F0F0F0,  // face — COLOR_BTNFACE's usual value; present only so the struct is total
         0x00000000, 0x00FFFFFF, 0x00000000, 0x00F0F0F0, 0x00FFFFFF,
+        0x00F0F0F0, 0x00F0F0F0, 0x00F0F0F0, 0x00A0A0A0, 0x00F0F0F0, 0x006D6D6D,
     };
     static constexpr DialogPalette kDark{
         0x00202020,  // face   — the shell's own dark window background (#202020)
@@ -185,6 +186,16 @@ const DialogPalette& dialog_palette(bool dark) noexcept {
         0x00E8E8E8,  // field text
         0x00272727,  // tab face
         0x00323232,  // tab selected — lighter, because a selected tab reads as nearer
+        // The button ramp. Three steps in the same direction — a button lightens as the pointer
+        // arrives and darkens as it goes down, which is the convention every dark shell uses and
+        // the only feedback an owner-drawn button has left once its 3D frame is gone.
+        0x002D2D2D,  // button
+        0x00383838,  // hot
+        0x00262626,  // pressed
+        0x00454545,  // border  — a step above the face, not a highlight; a white line here is
+                     //           exactly the defect this palette exists to remove
+        0x00383838,  // default — the fill Enter would press, a step up from its neighbours
+        0x007A7A7A,  // disabled text
     };
     return dark ? kDark : kLight;
 }
