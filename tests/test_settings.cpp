@@ -66,6 +66,15 @@ kd::Settings unusual() {
     s.context_terms = {"llama.cpp", "Qwen3", "WASAPI"};
     s.send_context = true;
 
+    // The cadence above is end-of-session, which is the only one under which this may be on.
+    s.normalizer.enabled = true;
+    s.normalizer.url = "http://strixhalo.lan:10301/v1/text/normalize";
+    s.normalizer.timeout_ms = 2500;
+    s.normalizer.max_bytes = 3000;
+    s.normalizer.styling = "formal";
+    s.normalizer.structure = "lists";
+    s.normalizer.context = "email";
+
     s.normalise();
     return s;
 }
@@ -131,6 +140,14 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(out.start_with_windows, in.start_with_windows);
     KD_CHECK_EQ(out.context_terms.size(), in.context_terms.size());
     KD_CHECK_EQ(out.send_context, in.send_context);
+
+    KD_CHECK_EQ(out.normalizer.enabled, in.normalizer.enabled);
+    KD_CHECK_EQ(out.normalizer.url, in.normalizer.url);
+    KD_CHECK_EQ(out.normalizer.timeout_ms, in.normalizer.timeout_ms);
+    KD_CHECK_EQ(out.normalizer.max_bytes, in.normalizer.max_bytes);
+    KD_CHECK_EQ(out.normalizer.styling, in.normalizer.styling);
+    KD_CHECK_EQ(out.normalizer.structure, in.normalizer.structure);
+    KD_CHECK_EQ(out.normalizer.context, in.normalizer.context);
 }
 
 KD_TEST(settings, the_round_trip_is_a_fixed_point) {
@@ -362,4 +379,80 @@ KD_TEST(settings, every_theme_name_round_trips_and_an_unknown_one_is_refused) {
     kd::Result<kd::Settings> bad = kd::parse_settings("{\"overlay\": {\"theme\": \"midnight\"}}");
     KD_CHECK(!bad.is_ok());
     KD_CHECK(bad.status().message().find("theme") != std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The normalizer block (normalizer.h)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(settings, the_normalizer_is_forced_off_unless_the_cadence_is_end_of_session) {
+    // The same forcing `editing.enabled` gets, for a harder reason: a rewrite is not
+    // prefix-stable, so under a cadence that has already typed the text, applying one would mean
+    // retracting bytes from the user's document (plan.md §1.4).
+    for (kd::Cadence c : {kd::Cadence::Immediate, kd::Cadence::Periodic}) {
+        kd::Settings s;
+        s.stability.cadence = c;
+        s.normalizer.enabled = true;
+        s.normalizer.url = "http://strixhalo.lan:10301/v1/text/normalize";
+        s.normalise();
+        KD_CHECK(!s.normalizer.enabled);
+        // ...and forced, not rejected: a user who switches cadence back gets a working program,
+        // not a settings file that refuses to load.
+        KD_CHECK(s.validate().ok());
+    }
+}
+
+KD_TEST(settings, the_normalizer_protects_the_terms_the_user_already_maintains) {
+    // Derived in normalise(), exactly as session.context is. One list to edit, two things
+    // protected — the recogniser's vocabulary and the rewriter's floor.
+    kd::Settings s;
+    s.stability.cadence = kd::Cadence::EndOfSession;
+    s.context_terms = {"llama.cpp", "strixhalo"};
+    s.normalise();
+    KD_REQUIRE_EQ(s.normalizer.protect_terms.size(), size_t{2});
+    KD_CHECK_EQ(s.normalizer.protect_terms[1], std::string("strixhalo"));
+}
+
+KD_TEST(settings, the_derived_term_list_is_not_persisted) {
+    // A derived field written to the file is how two answers to one question come to exist. The
+    // terms live in `context`; the normalizer block must not carry a stale copy.
+    kd::Settings s;
+    s.stability.cadence = kd::Cadence::EndOfSession;
+    s.context_terms = {"llama.cpp"};
+    s.normalise();
+    const std::string text = kd::serialize_settings(s);
+    KD_CHECK(text.find("protect_terms") == std::string::npos);
+}
+
+KD_TEST(settings, an_untrained_control_value_is_named_rather_than_ignored) {
+    // The endpoint answers an untrained control with 400 rather than sending it to the model,
+    // which invents text for one. The settings file is where that should be caught.
+    kd::Result<kd::Settings> parsed = kd::parse_settings(R"({
+        "cadence": { "mode": "end-of-session" },
+        "normalizer": { "enabled": true,
+                        "url": "http://strixhalo.lan:10301/v1/text/normalize",
+                        "styling": "breezy" }
+    })");
+    KD_REQUIRE(!parsed.is_ok());
+    KD_CHECK(parsed.status().message().find("styling") != std::string::npos);
+}
+
+KD_TEST(settings, a_file_that_enables_the_normalizer_under_end_of_session_loads) {
+    kd::Result<kd::Settings> parsed = kd::parse_settings(R"({
+        "cadence": { "mode": "end-of-session" },
+        "normalizer": { "enabled": true,
+                        "url": "http://strixhalo.lan:10301/v1/text/normalize",
+                        "timeout_ms": 2000 }
+    })");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed->normalizer.enabled);
+    KD_CHECK_EQ(parsed->normalizer.timeout_ms, uint32_t{2000});
+}
+
+KD_TEST(settings, a_file_with_no_normalizer_block_leaves_it_off) {
+    // plan.md §1.9: enabling this sends every dictated word to another machine. A first run, or
+    // any file written before this feature existed, must not turn it on.
+    kd::Result<kd::Settings> parsed = kd::parse_settings("{}");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(!parsed->normalizer.enabled);
 }

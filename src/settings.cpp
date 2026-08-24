@@ -817,7 +817,12 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,
-//     "context":   { "send": true, "terms": [ "llama.cpp", "Qwen3" ] }
+//     "context":   { "send": true, "terms": [ "llama.cpp", "Qwen3" ] },
+//     "normalizer":{ "enabled": false,                     // normalizer.h; off by default
+//                    "url": "http://strixhalo.lan:10301/v1/text/normalize",
+//                    "timeout_ms": 3000, "max_bytes": 4000,
+//                    "styling": "semi-formal", "structure": "prose",
+//                    "context": "general" }
 //   }
 //
 // **Cadence is a sibling of stability, not a member of it**, even though StabilityParams carries
@@ -869,6 +874,18 @@ void Settings::normalise() {
     // `editing.enabled` — the input filter, the overlay, the settings dialog — sees one answer.
     if (stability.cadence != Cadence::EndOfSession) editing.enabled = false;
 
+    // The same rule, and for a harder reason than the compose buffer's. normalizer.h: a rewrite
+    // is not prefix-stable, so under any cadence that has already typed the text, applying one
+    // means retracting bytes from the user's document. Forced rather than checked at each use,
+    // so the app, the settings dialog and validate() cannot hold different opinions — and forced
+    // rather than merely rejected, because a user who switches cadence back to `immediate`
+    // should get a working program, not a settings file that refuses to load.
+    if (stability.cadence != Cadence::EndOfSession) normalizer.enabled = false;
+
+    // Derived, exactly as `session.context` is: the terms the user maintains for the recogniser
+    // are the terms the rewriter may not lose. One list to edit, two things protected.
+    normalizer.protect_terms = context_terms;
+
     // The commit key is offered as "enter" and nothing else. A file that names some other key
     // still round-trips, but a file that names *no* key would silently disable the one gesture
     // that ends a composing session.
@@ -895,6 +912,17 @@ Status Settings::validate() const {
 
     if (hotkey.vk == 0) {
         return Status{StatusCode::InvalidArgument, "hotkey: no key is bound"};
+    }
+
+    // normalizer.h owns its own rules; this is the one call site. The cadence is passed in
+    // rather than read there, so that normalizer.h stays free of commit_engine.h and the rule
+    // reads where it is enforced. normalise() has already forced `enabled` off under any other
+    // cadence, so the cadence check below can only fire for a Settings built programmatically —
+    // which is exactly the case that should not be able to skip it.
+    if (const Status st =
+            normalizer.validate(stability.cadence == Cadence::EndOfSession);
+        !st.ok()) {
+        return st;
     }
 
     // The endpoint timer ends an utterance; the session timer ends the session. They are unrelated
@@ -1128,6 +1156,20 @@ std::string serialize_settings(const Settings& s) {
         put_bool(o, "send", s.send_context);
         put_strings(o, "terms", s.context_terms);
         root.set("context", std::move(o));
+    }
+    {
+        json::Value o = json::Value::object();
+        put_bool(o, "enabled", s.normalizer.enabled);
+        put_str(o, "url", s.normalizer.url);
+        put_u64(o, "timeout_ms", s.normalizer.timeout_ms);
+        put_u64(o, "max_bytes", static_cast<uint64_t>(s.normalizer.max_bytes));
+        put_str(o, "styling", s.normalizer.styling);
+        put_str(o, "structure", s.normalizer.structure);
+        put_str(o, "context", s.normalizer.context);
+        // `protect_terms` is deliberately NOT written: normalise() derives it from
+        // `context_terms`, and persisting a derived field is how the two drift apart and the
+        // file grows a second, stale answer to the same question.
+        root.set("normalizer", std::move(o));
     }
 
     return json::serialize_pretty(root, 2);
@@ -1416,6 +1458,23 @@ Result<Settings> parse_settings(std::string_view json_text) {
         o.strings_opt("terms", s.context_terms, proto::kMaxContextItems,
                       proto::kMaxContextItemBytes);
         if (o.failed()) return Status{StatusCode::Malformed, o.error()};
+    }
+
+    if (const json::Value* v = root.find("normalizer")) {
+        Obj o(*v, "settings.normalizer");
+        o.bool_opt("enabled", s.normalizer.enabled);
+        o.str_opt("url", s.normalizer.url);
+        o.u32_opt("timeout_ms", s.normalizer.timeout_ms, 100, 30000);
+        uint64_t max_bytes = static_cast<uint64_t>(s.normalizer.max_bytes);
+        o.u64_opt("max_bytes", max_bytes, 64, 65536);
+        s.normalizer.max_bytes = static_cast<size_t>(max_bytes);
+        o.str_opt("styling", s.normalizer.styling);
+        o.str_opt("structure", s.normalizer.structure);
+        o.str_opt("context", s.normalizer.context);
+        if (o.failed()) return Status{StatusCode::Malformed, o.error()};
+        // The control values are checked by NormalizerConfig::validate(), reached through
+        // Settings::validate() below, so that the endpoint's vocabulary is enforced in exactly
+        // one place rather than once here and once there.
     }
 
     s.normalise();

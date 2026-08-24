@@ -88,6 +88,7 @@
 #include "anchor.h"
 #include "commit_engine.h"
 #include "hotkey.h"
+#include "normalizer.h"
 #include "injector.h"
 #include "overlay.h"
 #include "protocol.h"
@@ -188,6 +189,13 @@ struct Settings {
     // still the default in commit_engine.h, so a user who has changed nothing would otherwise
     // get a feature that parses, validates, round-trips and does nothing.
     EditingConfig editing;
+
+    // The remote text rewriter (normalizer.h). Forced off by normalise() under any cadence but
+    // `end-of-session`, for the same reason `editing.enabled` is and with more at stake: a
+    // rewrite is not prefix-stable, so under Cadence::Immediate it would revise text that is
+    // already in the user's document. Seeded from `context_terms` there too, so the vocabulary
+    // the user maintains for the recogniser also protects them from the rewriter.
+    NormalizerConfig normalizer;
 
     // plan.md §1.5 / §1.3.
     anchor::AnchorConfig anchor;
