@@ -1436,7 +1436,7 @@ void hook_thread_main(HookRuntime* rt, std::promise<Status> ready) {
                                static_cast<uint32_t>(err)});
         return;
     }
-    ready.set_value(Status::ok());
+    ready.set_value(Status::success());
 
     const UINT_PTR timer = SetTimer(nullptr, 0, kWatchdogPeriodMs, nullptr);
 
@@ -1532,7 +1532,7 @@ Status HotkeyManager::start(const HotkeySpec& spec, uintptr_t owner_window,
 
     rt->running.store(true, std::memory_order_release);
     KD_LOG_INFO("hotkey installed: %s", spec.to_display_string().c_str());
-    return Status::ok();
+    return Status::success();
 }
 
 void HotkeyManager::stop() {

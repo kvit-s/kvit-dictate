@@ -403,7 +403,7 @@ Status SecurityDescriptorBuilder::build() {
     // The child opens the pipe by name; it must never inherit the pipe-server handle (§2.2).
     im.sa.bInheritHandle = FALSE;
     im.built = true;
-    return Status::ok();
+    return Status::success();
 }
 
 bool SecurityDescriptorBuilder::is_built() const noexcept { return impl_->built; }
@@ -1341,7 +1341,7 @@ Status IpcClient::start(const ChildSpec& child, Callbacks cb) {
     im.log_thread = std::thread([&im] { im.log_main(); });
     im.io_thread = std::thread([&im, dwpid = pi.dwProcessId] { im.io_main(true, dwpid); });
     im.io_native = im.io_thread.native_handle();
-    return Status::ok();
+    return Status::success();
 }
 
 Status IpcClient::attach_connected(uintptr_t connected_pipe_handle, Callbacks cb) {
@@ -1382,7 +1382,7 @@ Status IpcClient::attach_connected(uintptr_t connected_pipe_handle, Callbacks cb
     im.set_state(proto::ConnState::Validating);
     im.io_thread = std::thread([&im] { im.io_main(false, 0); });
     im.io_native = im.io_thread.native_handle();
-    return Status::ok();
+    return Status::success();
 }
 
 void IpcClient::stop() {
@@ -1487,7 +1487,7 @@ Status IpcClient::send_control(const proto::Message& m) {
     }
 
     SetEvent(im.ev_wake.get());
-    return Status::ok();
+    return Status::success();
 }
 
 Status IpcClient::send_audio(const int16_t* samples, size_t count) {
@@ -1537,19 +1537,19 @@ Status IpcClient::send_audio(const int16_t* samples, size_t count) {
         im.audio_samples += count;
     }
     SetEvent(im.ev_wake.get());
-    return Status::ok();
+    return Status::success();
 }
 
 Status IpcClient::flush_audio(uint32_t timeout_ms) {
     Impl& im = *impl_;
     std::unique_lock<std::mutex> lk(im.mu);
-    if (!im.running) return Status::ok();  // nothing can be in flight on a dead connection
+    if (!im.running) return Status::success();  // nothing can be in flight on a dead connection
     const bool drained = im.cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
                                         [&im] { return im.audio_items == 0 || !im.running; });
     if (!drained) {
         return Status{StatusCode::Timeout, "queued audio did not drain before the timeout"};
     }
-    return Status::ok();
+    return Status::success();
 }
 
 void IpcClient::discard_queued_audio() {

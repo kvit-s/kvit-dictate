@@ -381,7 +381,7 @@ Status AudioConverter::configure(const AudioFormat& in) {
     impl_->configured = true;
     KD_LOG_DEBUG("converter configured: %s -> 16000 Hz mono s16 (L=%u M=%u taps/phase=%zu)",
                  in.to_string().c_str(), impl_->L, impl_->M, impl_->taps_per_phase);
-    return Status::ok();
+    return Status::success();
 }
 
 const AudioFormat& AudioConverter::input_format() const noexcept { return impl_->in; }
@@ -554,12 +554,12 @@ Status WavWriter::open(const std::string& utf8_path, const AudioFormat& fmt) {
     impl_->frames = 0;
     impl_->data_bytes = 0;
     impl_->open = true;
-    return Status::ok();
+    return Status::success();
 }
 
 Status WavWriter::write(const void* frames, size_t frame_count) {
     if (!impl_->open) return Status{StatusCode::Unavailable, "WavWriter: not open"};
-    if (frame_count == 0) return Status::ok();
+    if (frame_count == 0) return Status::success();
     if (frames == nullptr) return Status{StatusCode::InvalidArgument, "WavWriter: null frames"};
 
     const uint64_t n = static_cast<uint64_t>(frame_count) * impl_->fmt.bytes_per_frame();
@@ -575,14 +575,14 @@ Status WavWriter::write(const void* frames, size_t frame_count) {
 
     impl_->data_bytes += n;
     impl_->frames += frame_count;
-    return Status::ok();
+    return Status::success();
 }
 
 Status WavWriter::close() {
-    if (!impl_->open) return Status::ok();
+    if (!impl_->open) return Status::success();
     impl_->open = false;
 
-    Status result = Status::ok();
+    Status result = Status::success();
 
     // RIFF chunks are word-aligned. Every format this writer accepts has an even frame size, so
     // the pad byte is unreachable today; it is written anyway because "unreachable" is a
@@ -612,7 +612,7 @@ Status WavWriter::close() {
     impl_->file.close();
     if (!result.is_ok()) return result;
     if (impl_->file.fail()) return Status{StatusCode::OsError, "WavWriter: close failed"};
-    return Status::ok();
+    return Status::success();
 }
 
 bool WavWriter::is_open() const noexcept { return impl_->open; }
@@ -1427,7 +1427,7 @@ void AudioCapture::Impl::thread_main() {
         KD_LOG_INFO("capture started on \"%s\" (%s)", info.friendly_name.c_str(),
                     fmt.to_string().c_str());
 
-        init_status = Status::ok();
+        init_status = Status::success();
         ready_event.set();
 
         // ─── The loop ───────────────────────────────────────────────────────────────────────
@@ -1522,7 +1522,7 @@ Status AudioCapture::start(const CaptureConfig& cfg, IAudioSink* sink) {
 
     impl_->cfg = cfg;
     impl_->sink = sink;
-    impl_->init_status = Status::ok();
+    impl_->init_status = Status::success();
 
     if (!impl_->stop_event.create(true) || !impl_->audio_event.create(false) ||
         !impl_->device_event.create(false) || !impl_->ready_event.create(true)) {
@@ -1555,7 +1555,7 @@ Status AudioCapture::start(const CaptureConfig& cfg, IAudioSink* sink) {
         stop();
         return s;
     }
-    return Status::ok();
+    return Status::success();
 }
 
 void AudioCapture::stop() {

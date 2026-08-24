@@ -732,7 +732,7 @@ public:
 
 private:
     Status ensure_surface(HDC reference_dc, int32_t w, int32_t h) {
-        if (mem_dc_ != nullptr && dib_ != nullptr && w == w_ && h == h_) return Status::ok();
+        if (mem_dc_ != nullptr && dib_ != nullptr && w == w_ && h == h_) return Status::success();
         release_surface();
 
         ScopedDc dc;
@@ -773,7 +773,7 @@ private:
         bits_ = static_cast<uint8_t*>(bits);
         w_ = w;
         h_ = h;
-        return Status::ok();
+        return Status::success();
     }
 
     void release_surface() noexcept {
@@ -1223,7 +1223,7 @@ AnchorEstimator::~AnchorEstimator() {
 Status AnchorEstimator::start() {
     {
         std::lock_guard<std::mutex> lk(impl_->m);
-        if (impl_->running) return Status::ok();
+        if (impl_->running) return Status::success();
         impl_->stopping = false;
         impl_->running = true;
     }
@@ -1235,7 +1235,7 @@ Status AnchorEstimator::start() {
         return Status{StatusCode::Internal,
                       std::string("could not start the anchor worker thread: ") + e.what()};
     }
-    return Status::ok();
+    return Status::success();
 }
 
 void AnchorEstimator::stop() {

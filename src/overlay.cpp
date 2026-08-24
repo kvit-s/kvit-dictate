@@ -1700,7 +1700,7 @@ Overlay::~Overlay() {
 
 Status Overlay::create(uintptr_t instance, const OverlayStyle& style) {
     if (impl_->hwnd) {
-        return Status::ok();  // idempotent: re-creating would orphan the window
+        return Status::success();  // idempotent: re-creating would orphan the window
     }
 
     impl_->style = style;
@@ -1772,7 +1772,7 @@ Status Overlay::create(uintptr_t instance, const OverlayStyle& style) {
 
     KD_LOG_INFO("overlay created (capture_excluded=%d, mode=%s)",
                 impl_->capture_excluded ? 1 : 0, to_string(impl_->mode));
-    return Status::ok();
+    return Status::success();
 }
 
 void Overlay::destroy() {

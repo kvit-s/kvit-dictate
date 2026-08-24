@@ -490,7 +490,7 @@ Status parse_model_entry(const json::Value& v, size_t index, ModelEntry& out) {
     }
 
     if (o.failed()) return Status{StatusCode::Malformed, o.error()};
-    return Status::ok();
+    return Status::success();
 }
 
 // ─── Atomic file write ──────────────────────────────────────────────────────────────────────
@@ -574,7 +574,7 @@ Status write_file_atomic(const std::filesystem::path& file, const std::string& b
         DeleteFileW(tmp.c_str());
         return Status{StatusCode::OsError, "could not replace " + path_to_utf8(file), err};
     }
-    return Status::ok();
+    return Status::success();
 }
 
 Result<std::string> read_file(const std::filesystem::path& file, size_t max_bytes) {
@@ -781,7 +781,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
             "kvit-dictate never installs or downloads anything at runtime.";
         return Status{StatusCode::NotFound, std::move(msg)};
     }
-    return Status::ok();
+    return Status::success();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -976,7 +976,7 @@ Status Settings::validate() const {
         }
     }
 
-    return Status::ok();
+    return Status::success();
 }
 
 // ─── Paths ──────────────────────────────────────────────────────────────────────────────────

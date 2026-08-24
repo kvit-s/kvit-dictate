@@ -84,9 +84,24 @@ public:
     Status(StatusCode code, std::string message, uint32_t os_error)
         : code_(code), os_error_(os_error), message_(std::move(message)) {}
 
-    static Status ok() noexcept { return Status{}; }
+    // NOT named `ok()`, and that is the whole point.
+    //
+    // It was, and because a static member may be called through an instance, `st.ok()` compiled
+    // everywhere and meant `Status::ok()` — a fresh *successful* status, discarding `st`. So
+    // `if (!st.ok())` was the constant `false` and thirteen error branches in main.cpp were
+    // dead code: a settings file that failed validation, a hotkey that could not install and a
+    // model that was not launchable all took the success path in silence. /W4 says nothing about
+    // it, because there is nothing ill-formed to say anything about.
+    //
+    // The fix is deliberately source-breaking rather than clever. `ok()` is now the instance
+    // predicate that every call site already believed it was calling, and the factory is
+    // `success()`, so every one of the 29 `Status::ok()` construction sites had to be rewritten
+    // under the compiler's supervision. A rename that left both spellings valid would have fixed
+    // the sites that existed and none of the ones written next year.
+    static Status success() noexcept { return Status{}; }
 
     [[nodiscard]] bool is_ok() const noexcept { return code_ == StatusCode::Ok; }
+    [[nodiscard]] bool ok() const noexcept { return is_ok(); }
     explicit operator bool() const noexcept { return is_ok(); }
 
     [[nodiscard]] StatusCode code() const noexcept { return code_; }
