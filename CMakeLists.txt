@@ -115,6 +115,7 @@ set(KD_CORE_SOURCES
     src/edit_buffer.cpp
 
     # Windows-facing.
+    src/normalizer.cpp
     src/hotkey.cpp
     src/audio_capture.cpp
     src/ipc_client.cpp
@@ -127,6 +128,7 @@ set(KD_CORE_SOURCES
 
 set(KD_CORE_HEADERS
     src/protocol.h
+    src/normalizer.h
     src/session.h
     src/commit_engine.h
     src/anchor.h
@@ -198,6 +200,11 @@ target_link_libraries(kd_core PUBLIC kd_common_flags)
 #             user32's SetProcessDpiAwarenessContext. The manifest is preferred because it
 #             applies before any window exists — see the TODO under kvit-dictate below.
 #   shell32   main — Shell_NotifyIconW (tray icon), SHGetKnownFolderPath (%APPDATA% settings path)
+#   winhttp   normalizer — the POST to the text-normalizer endpoint (normalizer.h).
+#             Synchronous WinHTTP on a thread of its own, the same shape ipc_client
+#             uses for the pipe. This is the ONLY outbound network call in the
+#             program, it is off by default, and plan.md §1.9's "nothing is sent"
+#             is why enabling it has to be an explicit act by the user.
 #   comctl32  main/settings — InitCommonControlsEx and the common controls used by the settings
 #             dialog; also required for the v6 visual styles the dialog assumes
 #
@@ -226,6 +233,7 @@ target_link_libraries(kd_core PUBLIC
     shcore
     shell32
     comctl32
+    winhttp
 )
 
 # ─── kvit-dictate.exe ────────────────────────────────────────────────────────────────────────
@@ -285,6 +293,7 @@ if(KD_BUILD_TESTS)
         tests/test_tray_icon.cpp
         tests/test_settings.cpp
         tests/test_edit_buffer.cpp
+        tests/test_normalizer.cpp
         tests/test_injector.cpp
         tests/test_fixtures.cpp
     )
@@ -337,6 +346,7 @@ if(KD_BUILD_TESTS)
         tray_icon       # src/tray_icon.cpp — the drawn notification icon: fill means mic-open
         edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
+        normalizer      # src/normalizer.cpp — the term guard and the request/response codecs
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module
     # starts here, disabled and visible, instead of being silently uncovered.
