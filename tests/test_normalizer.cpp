@@ -12,6 +12,11 @@
 
 #include "normalizer.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
+
 #include "kd_test.h"
 #include "util/json.h"
 
@@ -331,4 +336,76 @@ KD_TEST(normalizer, cancel_all_without_anything_outstanding_is_harmless) {
     KD_REQUIRE(n.start(enabled_config(), {}).ok());
     n.cancel_all();
     n.stop();
+}
+
+// ─── The live path, opt-in ──────────────────────────────────────────────────────────────────
+//
+// Everything above is pure and runs anywhere. The WinHTTP half cannot be tested that way and
+// must not be tested by default: a suite that reaches the network fails on an aeroplane, in CI,
+// and on any machine where strixhalo is off, and a test that fails for reasons unrelated to the
+// code is a test people learn to ignore.
+//
+// So it runs only when an operator points it at a server:
+//
+//     set KD_NORMALIZER_URL=http://strixhalo.lan:10301/v1/text/normalize
+//     build-windows-msvc-debugin\Debug\kd_tests.exe --suite normalizer --verbose
+//
+// Without the variable it records why it did nothing, which is the honest form of a skip in a
+// harness that (deliberately) has no skip.
+
+KD_TEST(normalizer, live_endpoint_round_trip) {
+    const char* url = std::getenv("KD_NORMALIZER_URL");
+    if (url == nullptr || url[0] == 0) {
+        KD_INFO("not run: set KD_NORMALIZER_URL to exercise the WinHTTP path against a server");
+        return;
+    }
+
+    kd::NormalizerConfig c;
+    c.enabled = true;
+    c.url = url;
+    c.timeout_ms = 10000;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    kd::Normalizer::Result got;
+
+    kd::Normalizer::Callbacks cb;
+    cb.on_result = [&](kd::Normalizer::Result r) {
+        std::lock_guard<std::mutex> lock(mu);
+        got = std::move(r);
+        done = true;
+        cv.notify_one();
+    };
+
+    kd::Normalizer n;
+    KD_REQUIRE(n.start(c, std::move(cb)).ok());
+
+    // The endpoint's own example, so a failure here is about the transport rather than about
+    // whether the model happens to agree with this test's taste.
+    const std::string raw =
+        "so um i need to like send the the report by uh friday no wait make that thursday";
+    const uint64_t id = n.request(raw);
+    KD_REQUIRE(id != 0);
+
+    {
+        std::unique_lock<std::mutex> lock(mu);
+        KD_REQUIRE(cv.wait_for(lock, std::chrono::seconds(20), [&] { return done; }));
+    }
+    n.stop();
+
+    KD_CHECK_EQ(got.id, id);
+    KD_CHECK_EQ(got.raw, raw);
+    if (!got.status.ok()) {
+        KD_REQUIRE_FAIL(("live call failed: " + got.status.to_string()).c_str());
+    }
+    KD_CHECK(!got.normalized.empty());
+    KD_INFO(("in : " + raw).c_str());
+    KD_INFO(("out: " + got.normalized).c_str());
+    KD_INFO(("elapsed: " + std::to_string(got.elapsed_ms) + " ms").c_str());
+
+    // The guard is applied to the real answer, not to a fixture: this is the one place where
+    // what the model actually does meets the rule the app enforces.
+    const kd::GuardResult g = kd::guard_verdict(raw, got.normalized, kNoExtra);
+    KD_INFO((std::string("guard: ") + kd::to_string(g.verdict)).c_str());
 }
