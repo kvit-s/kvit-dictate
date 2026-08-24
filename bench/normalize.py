@@ -53,10 +53,15 @@ USAGE
     python bench/normalize.py --url ... --json results.json    # machine-readable, for a ledger
     python bench/normalize.py --url ... --quant Q4_K_M         # recorded in the output header
 
-Use the **Q4_K_M** build unless you mean otherwise: the model card's 94.8% token accuracy was
-measured on that quantisation, and measuring bf16 while quoting that number compares two
-different artifacts. `--quant` is recorded in the JSON so a run can never be mistaken for one
-taken against a different build.
+`--quant` is a **label, not a request**. Nothing about it is sent to the server: the endpoint
+serves whatever weights it was started with and has no dtype parameter, so this flag exists only
+so the JSON records which build the operator believes they measured. Getting it wrong mislabels
+a result; it cannot change one.
+
+Record it anyway, because the model card's 94.8% token accuracy was measured on `Q4_K_M` and a
+deployment serving bf16 is a different artifact. Note the direction: bf16 is the *unquantised*
+model, so it is the ceiling of what these weights do. Damage measured there cannot be blamed on
+quantisation.
 """
 
 from __future__ import annotations
@@ -191,7 +196,7 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"# normalize do-no-harm — {len(cases)} prompts")
     print(f"# endpoint : {args.url}")
-    print(f"# quant    : {args.quant or '(not recorded — pass --quant)'}")
+    print(f"# weights  : {args.quant or '(unlabelled — pass --quant, it is a label only)'}")
     print(f"# controls : styling={args.styling} structure={args.structure} "
           f"context={args.context}")
     print()
@@ -344,7 +349,9 @@ def main() -> int:
     ap.add_argument("--context", default="general")
     ap.add_argument("--timeout", type=float, default=30.0, help="seconds per call")
     ap.add_argument("--quant", default="",
-                    help="the quantisation under test, e.g. Q4_K_M — recorded in --json")
+                    help="label for the weights being served, e.g. bf16 or Q4_K_M. Recorded in "
+                         "the output only — the endpoint has no dtype parameter and nothing is "
+                         "sent to it")
     ap.add_argument("--json", help="write a machine-readable result file")
     ap.add_argument("--verbose", action="store_true", help="print every input and output")
     return run(ap.parse_args())

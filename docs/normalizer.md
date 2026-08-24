@@ -170,6 +170,10 @@ llama.cpp  →  LLMCpp       not a mis-rendering but a rename of a real identifi
 `LLMCpp` is the one to keep in mind. A recogniser cannot fail that way — it mishears sounds. A
 rewriter can, because it is a language model with an opinion about what you probably meant.
 
+Both came out of **bf16 weights**, the unquantised model. The card's 94.8% token accuracy was
+measured on `Q4_K_M`, which is lossier, so quantisation is not available as an explanation and a
+better build is not available as a fix: this is the better build.
+
 The guard's rejection rate was 6.0%, and **not all of it is damage.** `hard-003` lost `ONNX`
 because the speaker abandoned the clause containing it, which is the model resolving a false
 start exactly as designed. The guard cannot tell that from a loss, so it throws away a correct
@@ -210,8 +214,6 @@ machine, so:
   the other. `bench/prompts/hard.jsonl`'s references are verbatim-as-spoken by construction
   ("Reference is verbatim as spoken, including the correction"), so a *correct* normalisation
   scores as pure error against them. Recording that corpus is Phase 1 work.
-* **Whether `Q4_K_M` behaves the same.** The card's 94.8% is for that build; the run in §6 was
-  taken with the quantisation unrecorded.
 * **Whether the endpoint's `context` control fixes the damage.** If passing the user's terms
   prevents the `llama.cpp` and `sm_120` rewrites, the term list stops being only a veto and
   becomes a fix. Nothing currently sends it.
