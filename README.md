@@ -190,6 +190,7 @@ its job.
 | **Protocol spec** | ✅ done — `docs/protocol.md` (proto 1 draft) + 20 fixtures, run by BOTH endpoints. Freezes in Phase 2. |
 | **C++ client** | ✅ implemented — every module under `src/`, wired together in `main.cpp`. 303 tests. The whole path has now been executed against a real target: hotkey, microphone, session, commit, injection, finalisation. |
 | **Python sidecar** | ✅ implemented — transport, VAD, stability, session, backends (mock, sherpa-onnx, zipformer, whisper, faster-whisper, openai-http, windows-speech), joined by `kvit_asr/connection.py`. 419 tests. Two have run against real audio: `openai-http` (Qwen3-ASR on the LAN) and `windows-speech` (Microsoft's on-device model, via `tools/kvit-speech`). The four that need a model on disk and an environment that does not exist yet still have not. |
+| **Text normalizer** | ⚠️ implemented, off by default, never used in real dictation — `docs/normalizer.md`. Client-side (`src/normalizer.cpp`), `Cadence::EndOfSession` only, guarded. The first measurement caught the model rewriting `llama.cpp` as `LLMCpp` and `sm_120` as `SM120`; the guard rejects both. |
 | **Bench harness** | ✅ implemented — recorder, metrics (incl. ICER), matrix runner with the pre-registered selection rule. 129 tests. |
 | **Phase 0B** | ⚠️ started — 11 of 162 cells measured, all on `A09` (`tools/testtarget`), automated by `tools/phase0b/`. Read `docs/supported-targets.md` §5.9.1 and §5.9.2 before adding cells: they record why REF-1 cannot measure anchor error, and what the first eleven cells do and do not say. |
 | **0B** Windows feasibility spike | ⚠️ **instrument ready, not run — this is the critical gate.** `tools/probe` builds and walks a resumable 162-cell matrix; 0 cells are measured. Until an operator runs it, the inline-overlay UX is unproven and `docs/supported-targets.md` contains no measurements. |
@@ -231,9 +232,12 @@ produces warnings this one does not, that is the moment to look at them, not to 
    another way. §1.4 (the commit invariant) and §1.5 (anchor estimation, including an honest list
    of where it fails) are the two that most affect how the code reads.
 2. [`docs/protocol.md`](docs/protocol.md) — normative for both endpoints.
-3. [`bench/CANDIDATES.md`](bench/CANDIDATES.md) — which models are real, what they need, and why
+3. [`docs/normalizer.md`](docs/normalizer.md) — the text rewriter: why it is on the client
+   rather than in the sidecar, why it may only run under one cadence, and what the term guard
+   caught the first time it was pointed at a real model.
+4. [`bench/CANDIDATES.md`](bench/CANDIDATES.md) — which models are real, what they need, and why
    the shortlist is four entries.
-4. `src/*.h` — each header states its responsibility, the `plan.md` section it implements, and its
+5. `src/*.h` — each header states its responsibility, the `plan.md` section it implements, and its
    **threading contract**. The threading contracts are not boilerplate: the low-level keyboard
    hook must never block or Windows silently unhooks it, the WASAPI callback runs on its own
    thread under a latency budget, and the pure state machines are single-threaded on purpose.
