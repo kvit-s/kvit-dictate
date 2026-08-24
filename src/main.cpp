@@ -36,6 +36,7 @@
 #include "audio_capture.h"
 #include "commit_engine.h"
 #include "hotkey.h"
+#include "normalizer.h"
 #include "injector.h"
 #include "ipc_client.h"
 #include "overlay.h"
@@ -63,6 +64,7 @@ constexpr UINT kMsgAudioQueue  = WM_APP + 3;
 constexpr UINT kMsgHotkeyQueue = WM_APP + 4;
 constexpr UINT kMsgTray        = WM_APP + 5;
 constexpr UINT kMsgShowSettings = WM_APP + 6;
+constexpr UINT kMsgNormalized  = WM_APP + 7;
 
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
@@ -288,6 +290,10 @@ private:
     // Pushes the buffer, the caret and the selection at the overlay together, because a caret
     // offset that arrives without the text it indexes is an offset into the previous frame.
     void push_edit_view();
+
+    void request_normalize();
+    void drain_normalize_queue();
+    void cancel_normalize();
     // Empties the compose buffer into the document, or onto the clipboard when the target is
     // gone. Safe to call with nothing buffered: it returns having done nothing.
     void flush_deferred_commits(const char* why);
@@ -345,6 +351,24 @@ private:
     // It replaces a plain std::string, and with no editing it behaves as one: append at the end,
     // take it all at the end of the session.
     kd::EditBuffer edit_;
+
+    // The rewriter (normalizer.h). Only ever touches `edit_`, only under Cadence::EndOfSession,
+    // and never after the user has started editing.
+    std::unique_ptr<kd::Normalizer> normalizer_;
+    // The raw accumulation, kept alongside `edit_` because a rewriter is not idempotent: feeding
+    // it its own output makes it keep editing, and the drift is toward shorter. Every request
+    // sends this, never the pill's current contents.
+    std::string normalize_raw_;
+    uint64_t normalize_pending_id_ = 0;
+    // Cleared for the session the moment the user edits. Their text is authoritative and a
+    // rewrite arriving afterwards would silently discard the correction they just made.
+    bool normalize_active_ = false;
+    // `stopped` arrived while a rewrite was still in flight. The target is held (it already is,
+    // for `final`) until the answer lands or the finalize grace expires, because the last
+    // utterance of a session is otherwise the one utterance that never gets normalized.
+    bool finish_awaiting_normalize_ = false;
+    std::mutex normalize_mutex_;
+    std::vector<kd::Normalizer::Result> normalize_queue_;
 
     // Which of the two states this session is in (§1). Dictating: the microphone is open and
     // speech is appended. Editing: the microphone is **closed** and the buffer is a text field.
@@ -579,6 +603,29 @@ bool App::startup() {
                     L"kvit-dictate", MB_OK | MB_ICONWARNING);
     }
 
+    // The rewriter. Started even when disabled — start() is cheap, the worker parks on a
+    // condition variable, and request() refuses while `enabled` is false — so that turning it on
+    // in the settings dialog needs no lifecycle handling beyond set_config().
+    normalizer_ = std::make_unique<kd::Normalizer>();
+    {
+        kd::Normalizer::Callbacks ncb;
+        // Worker thread. Enqueue and wake; decide nothing here — EditBuffer is single-threaded
+        // by design (edit_buffer.h) and the UI thread is the only one allowed to touch it.
+        ncb.on_result = [this](kd::Normalizer::Result r) {
+            {
+                std::lock_guard<std::mutex> lock(normalize_mutex_);
+                normalize_queue_.push_back(std::move(r));
+            }
+            PostMessageW(hwnd_, kMsgNormalized, 0, 0);
+        };
+        if (const kd::Status st = normalizer_->start(settings_.normalizer, std::move(ncb));
+            !st.ok()) {
+            // Not fatal, and deliberately not a message box: a normalizer that will not start is
+            // a machine that dictates without it, which is the shipped default anyway.
+            KD_LOG_ERROR("normalizer disabled: %s", st.to_string().c_str());
+        }
+    }
+
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd_;
@@ -735,6 +782,10 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             drain_hook_queue();
             return 0;
 
+        case kMsgNormalized:
+            drain_normalize_queue();
+            return 0;
+
         case kMsgIpcQueue:
             drain_ipc_queue();
             return 0;
@@ -754,8 +805,18 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kTickTimer) {
                 if (finalizing_ && clock_.now_ms() >= finalize_deadline_ms_) {
-                    KD_LOG_WARN("no `stopped` within %llu ms of `stop`; releasing the target",
-                                static_cast<unsigned long long>(kFinalizeGraceMs));
+                    // Covers both waits: for `stopped`, and for a rewrite that `stopped` is
+                    // being held on. A normalizer that has stopped answering must never be the
+                    // reason a session fails to end, so the raw text is committed and the reason
+                    // is logged.
+                    if (finish_awaiting_normalize_) {
+                        KD_LOG_WARN("normalize did not answer within the finalize grace; "
+                                    "committing the raw text");
+                        cancel_normalize();
+                    } else {
+                        KD_LOG_WARN("no `stopped` within %llu ms of `stop`; releasing the target",
+                                    static_cast<unsigned long long>(kFinalizeGraceMs));
+                    }
                     finish_dictation("finalize grace expired");
                 }
                 // The held press, honoured the moment the machine itself says it can accept a
@@ -1017,7 +1078,19 @@ void App::drain_ipc_queue() {
 
         if (m.get_if<kd::proto::StoppedMsg>() != nullptr &&
             outcome.verdict == kd::Verdict::Accept) {
-            finish_dictation("stopped");
+            // The last utterance's `final` arrives moments before `stopped`, so a rewrite fired
+            // from it is almost always still in flight right here. Committing now would make the
+            // last utterance of every session the one utterance that never gets normalized. The
+            // target is already held for exactly this kind of wait, and finalize_deadline_ms_
+            // still bounds it — NormalizerConfig::validate caps the timeout well inside the
+            // grace, so this can defer the commit but never prevent it.
+            if (normalize_pending_id_ != 0) {
+                finish_awaiting_normalize_ = true;
+                KD_LOG_DEBUG("`stopped` held: normalize #%llu is still in flight",
+                             static_cast<unsigned long long>(normalize_pending_id_));
+            } else {
+                finish_dictation("stopped");
+            }
         }
     }
 }
@@ -1315,8 +1388,17 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         // closes the microphone at the first edit key, so the only way speech reaches this line
         // is after the user's own resume gesture.
         edit_.append(text);
+        // The raw baseline grows in step, and it is what every request sends. normalizer.h: a
+        // rewriter is not idempotent, so re-sending its own output makes it keep editing.
+        normalize_raw_ += text;
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
                      text.size(), edit_.size());
+        // At an utterance boundary, which is the one moment in a session when both machines are
+        // idle: the endpointer has just fired on silence, so the recogniser is not decoding, and
+        // the user has stopped talking. The rewrite lands in the pill during that pause, so by
+        // the time they press Enter they have already read what they are committing — which is
+        // the whole of docs/editing.md §2, and the reason this needs no extra keystroke.
+        request_normalize();
         // Again, because the buffer just grew. Without this the preview empties at every
         // utterance boundary: the call above renders the engine's `pending_text`, which is scoped
         // to the utterance in progress and is empty on a `final` — so everything said so far
@@ -1454,6 +1536,15 @@ void App::apply_edit(const kd::EditPost& p) {
 
 void App::begin_editing() {
     if (!composing() || editing_) return;
+
+    // The user's text is authoritative from here. A rewrite still in flight would land on top of
+    // the correction they just made and discard it silently, which is the one failure mode a
+    // compose buffer exists to prevent — so the rewriter is done for this session, not merely
+    // paused. It resumes at the next session, which starts from a raw buffer again.
+    if (normalize_active_) {
+        KD_LOG_DEBUG("normalizer stood down for this session: the user is editing");
+        cancel_normalize();
+    }
 
     editing_ = true;
     editing_began_ms_ = clock_.now_ms();
@@ -1740,6 +1831,10 @@ void App::begin_dictation() {
     editing_ = false;
     editing_began_ms_ = 0;
     hint_expires_ms_ = 0;
+    // Cleared here for the reason note_session_ended() is: the abort paths skip end_dictation
+    // entirely, and a baseline left behind would make the next session's first rewrite request
+    // carry the previous session's words.
+    cancel_normalize();
     if (overlay_ != nullptr) {
         overlay_->clear_hint();
         overlay_->scroll_to_bottom();
@@ -1799,6 +1894,7 @@ void App::end_dictation(kd::LocalEvent why) {
     if (why == kd::LocalEvent::EscPressed && !edit_.empty()) {
         KD_LOG_INFO("discarding %zu deferred bytes: Esc cancels the session", edit_.size());
         edit_.clear();
+        cancel_normalize();
     }
 
     apply(session_->on_local(why));
@@ -1850,6 +1946,94 @@ void App::render_preview(std::string_view tail) {
 // docs/editing.md §7. The caret and the selection are offsets into the string set_text() has just
 // been given, so they are pushed immediately after it and never on their own: an offset that
 // arrives without the text it indexes is an offset into the previous frame.
+// ─── The rewriter (normalizer.h) ────────────────────────────────────────────────────────────
+
+void App::request_normalize() {
+    if (normalizer_ == nullptr || normalize_raw_.empty()) return;
+    // Belt and braces with Settings::normalise(), which already forces `enabled` off under any
+    // other cadence. Stated here too because this is the line that would corrupt a document if
+    // the forcing ever regressed: under Cadence::Immediate the text is already typed.
+    if (settings_.stability.cadence != kd::Cadence::EndOfSession) return;
+    if (editing_) return;
+
+    const uint64_t id = normalizer_->request(normalize_raw_);
+    if (id == 0) return;  // disabled, empty, or past max_bytes — each logged by the module
+    normalize_pending_id_ = id;
+    normalize_active_ = true;
+}
+
+void App::cancel_normalize() {
+    if (normalizer_ != nullptr) normalizer_->cancel_all();
+    normalize_pending_id_ = 0;
+    normalize_active_ = false;
+    finish_awaiting_normalize_ = false;
+    normalize_raw_.clear();
+}
+
+void App::drain_normalize_queue() {
+    std::vector<kd::Normalizer::Result> batch;
+    {
+        std::lock_guard<std::mutex> lock(normalize_mutex_);
+        batch.swap(normalize_queue_);
+    }
+
+    for (kd::Normalizer::Result& r : batch) {
+        // Everything below is a reason to leave the raw text alone. The user keeps their words in
+        // every one of them; that is the whole failure policy (normalizer.h).
+        if (r.id != normalize_pending_id_) {
+            KD_LOG_DEBUG("ignoring normalize #%llu: superseded",
+                         static_cast<unsigned long long>(r.id));
+            continue;
+        }
+        normalize_pending_id_ = 0;
+
+        if (!r.status.ok()) {
+            KD_LOG_WARN("normalize #%llu failed after %llu ms (%s); the text stands as spoken",
+                        static_cast<unsigned long long>(r.id),
+                        static_cast<unsigned long long>(r.elapsed_ms),
+                        r.status.to_string().c_str());
+        } else if (editing_ || !composing()) {
+            // The user started editing, or the session ended, between the request and the
+            // answer. Their text wins.
+            KD_LOG_DEBUG("dropping normalize #%llu: the buffer is no longer ours to rewrite",
+                         static_cast<unsigned long long>(r.id));
+        } else if (r.raw != normalize_raw_) {
+            // More speech landed while this was in flight. A newer request is already out for the
+            // longer buffer, and applying this one would drop the words that arrived since.
+            KD_LOG_DEBUG("dropping normalize #%llu: the buffer grew while it was in flight",
+                         static_cast<unsigned long long>(r.id));
+        } else {
+            const kd::GuardResult g =
+                kd::guard_verdict(r.raw, r.normalized, settings_.normalizer.protect_terms);
+            if (!g.accepted()) {
+                // Named, not counted. bench/metrics.py:675 predicted `sm 120` for `sm_120`
+                // before this model existed, and a log line that says which term died is the
+                // difference between tuning the term table and guessing at it.
+                KD_LOG_WARN("normalize #%llu rejected (%s%s%s); the text stands as spoken",
+                            static_cast<unsigned long long>(r.id), kd::to_string(g.verdict),
+                            g.lost_term.empty() ? "" : ": ", g.lost_term.c_str());
+            } else {
+                KD_LOG_INFO("normalize #%llu applied in %llu ms: %zu -> %zu bytes",
+                            static_cast<unsigned long long>(r.id),
+                            static_cast<unsigned long long>(r.elapsed_ms), r.raw.size(),
+                            r.normalized.size());
+                // The pill's text is replaced wholesale; `normalize_raw_` is deliberately left
+                // as it was, so the next utterance extends the raw baseline and the next request
+                // still sends text the model has never seen.
+                edit_.clear();
+                edit_.append(r.normalized);
+                render_preview({});
+            }
+        }
+
+        // Whatever the verdict, a session that was waiting on this answer may now end.
+        if (finish_awaiting_normalize_) {
+            finish_awaiting_normalize_ = false;
+            finish_dictation("stopped");
+        }
+    }
+}
+
 void App::push_edit_view() {
     if (overlay_ == nullptr) return;
     overlay_->set_edit_view(composing() && editing_, edit_.caret(), edit_.selection_begin(),
@@ -2088,6 +2272,7 @@ void App::apply_settings(kd::Settings next) {
     // idempotent and cheap next to the dialog the user just closed, and a "did it change" test per
     // field is one more place for a field to be forgotten.
     if (injector_ != nullptr) injector_->set_config(settings_.inject);
+    if (normalizer_ != nullptr) normalizer_->set_config(settings_.normalizer);
     if (commit_ != nullptr) commit_->set_params(settings_.stability);
     if (session_ != nullptr) session_->set_config(settings_.session);
     if (overlay_ != nullptr) {
