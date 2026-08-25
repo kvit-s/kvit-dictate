@@ -280,6 +280,23 @@ KD_TEST(overlay, the_caret_on_the_last_line_pins_the_view_to_the_bottom) {
     KD_CHECK_EQ(kd::clamp_scroll_line(0, 500, true, 40, 8), uint32_t{32});
 }
 
+KD_TEST(overlay, only_a_caret_the_user_moved_unpins_the_view) {
+    // The bug this closes, in one line: during dictation the caret moves once per utterance,
+    // because EditBuffer::append leaves it at the end of the text, and App::push_edit_view sends
+    // that caret to the overlay with `active` false. Unpinning on it stopped the view following
+    // the text — a long dictation grew to eight lines and then froze there while the newest
+    // words accumulated off the bottom, unreachable and unseen.
+    //
+    // The other half of why it froze rather than merely lagged: with `active` false paint_once()
+    // never hit-tests the caret, so `caret_known` is false and clamp_scroll_line's rescue — the
+    // rule directly above — cannot fire. An unpinned view with no known caret has nothing left
+    // to move it.
+    KD_CHECK(!kd::caret_move_unpins_scroll(false, true));   // speech appended; the view stays pinned
+    KD_CHECK(kd::caret_move_unpins_scroll(true, true));     // the user arrowed away; it does not
+    KD_CHECK(!kd::caret_move_unpins_scroll(true, false));   // a selection change is not a move
+    KD_CHECK(!kd::caret_move_unpins_scroll(false, false));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 //  key_legend — docs/editing.md §7.5
 // ═══════════════════════════════════════════════════════════════════════════════════════════

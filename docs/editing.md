@@ -470,7 +470,12 @@ not a feature; it is a trap. So:
 
 * a scroll offset in lines, with the wheel driving it while the pointer is over the pill;
 * **any caret movement scrolls the caret into view** — this is what makes arrow keys able to reach
-  the top of a long buffer at all;
+  the top of a long buffer at all. *Movement the user made*: outside the compose buffer the caret
+  also moves once per utterance, because `EditBuffer::append` leaves it at the end of the text, and
+  treating that as a scroll gesture unpins a view whose caret the pill is not even drawing. A long
+  dictation then grew to eight lines and froze there, its newest words off the bottom — the exact
+  trap this section exists to close. `caret_move_unpins_scroll` in `overlay.h` is the rule with
+  both halves;
 * the default position stays pinned to the bottom, so a session with no editing looks and behaves
   exactly as it does today;
 * the pill's rectangle stays fixed, as §3c already made it, which is also what makes the hit-test

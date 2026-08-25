@@ -395,4 +395,20 @@ anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int3
 [[nodiscard]] uint32_t clamp_scroll_line(uint32_t desired, uint32_t caret_line, bool caret_known,
                                          uint32_t total_lines, uint32_t visible_lines) noexcept;
 
+// ─── When a moved caret unpins the view ─────────────────────────────────────────────────────
+//
+// §7.3's second rule — "any caret movement scrolls the caret into view" — is about a caret the
+// *user* moved. Outside the compose buffer the caret still moves, once per utterance, because
+// EditBuffer::append leaves it at the end of the text; and `edit_active` false is exactly the
+// state in which paint_once() does not know where the caret's line is, so an unpin there leaves
+// the view frozen wherever it last was while the transcript grows past it — which is the bottom
+// of the window for the first eight lines and then, silently, the top of a buffer whose newest
+// words are off the bottom. That is the opposite of what §7.3's third rule promises, and it is
+// what a long dictation actually looked like.
+//
+// So the rule needs both halves: the caret moved, *and* the pill is drawing that caret.
+[[nodiscard]] constexpr bool caret_move_unpins_scroll(bool edit_active, bool caret_moved) noexcept {
+    return edit_active && caret_moved;
+}
+
 }  // namespace kd

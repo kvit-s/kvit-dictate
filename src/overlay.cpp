@@ -1859,9 +1859,10 @@ void Overlay::set_edit_view(bool active, size_t caret_off, size_t sel_b, size_t 
         impl_->sel_end == e) {
         return;
     }
-    // Any caret movement unpins the view, so that the next paint scrolls the caret into view
-    // rather than staying at the bottom of a buffer the user has arrowed away from (§7.3).
-    if (impl_->caret != c) impl_->scroll_pinned = false;
+    // A caret the user moved unpins the view, so that the next paint scrolls the caret into view
+    // rather than staying at the bottom of a buffer the user has arrowed away from (§7.3). A
+    // caret that merely followed appended speech does not — see caret_move_unpins_scroll().
+    if (caret_move_unpins_scroll(active, impl_->caret != c)) impl_->scroll_pinned = false;
     impl_->edit_active = active;
     impl_->caret = c;
     impl_->sel_begin = b;
