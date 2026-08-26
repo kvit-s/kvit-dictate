@@ -269,6 +269,9 @@ private:
     void begin_dictation();
     void end_dictation(kd::LocalEvent why);
     void finish_dictation(const char* why);
+    // Holds the display awake for as long as a session is running. See the definition for why a
+    // dictation that types nothing looks exactly like an idle machine to Windows.
+    void keep_display_awake(bool on);
 
     // ── The compose buffer (docs/editing.md) ────────────────────────────────────────────────
     //
@@ -392,6 +395,7 @@ private:
     kd::OverlayMode overlay_mode_applied_ = kd::OverlayMode::Hidden;
     std::string loaded_model_;
     bool audio_running_ = false;
+    bool display_awake_ = false;    // an ES_DISPLAY_REQUIRED request is outstanding
     unsigned respawn_attempts_ = 0;
     bool sidecar_respawn_ = false;  // this spawn is §10.3's recovery, not the first launch
     bool settings_open_ = false;
@@ -1827,6 +1831,10 @@ void App::begin_dictation() {
         return;
     }
 
+    // Windows resets its idle timers on *input*, and dictation produces none — see
+    // keep_display_awake(). Held from here, released on the one path every session ends through.
+    keep_display_awake(true);
+
     // A session starts dictating, never editing (§1), with an empty buffer and nothing hinted.
     editing_ = false;
     editing_began_ms_ = 0;
@@ -1837,6 +1845,18 @@ void App::begin_dictation() {
     cancel_normalize();
     if (overlay_ != nullptr) {
         overlay_->clear_hint();
+        // The violation mark is persistent by design (plan.md §1.4: the user has to be able to
+        // see which sentence in their document may be wrong), but it is persistent *within the
+        // session it belongs to*. clear_violation() existed, was tested by nobody and called by
+        // nobody, so the mark outlived its session and every later one: a session ended by
+        // `target_changed` left "⚠ target_changed" painted on the pill of the next dictation,
+        // and of the one after that, until the process was restarted. Reported as "it warns me
+        // the target changed when I start a new dictation somewhere else".
+        //
+        // Cleared here rather than in finish_dictation() precisely so the mark survives the end
+        // of its own session — it is still on screen while the user reads what was typed, and it
+        // goes when they start dictating again.
+        overlay_->clear_violation();
         overlay_->scroll_to_bottom();
         // docs/editing.md §5.1: WS_EX_TRANSPARENT is dropped **only for the duration of a
         // composing session**, so that a click meant for the pill lands on the pill instead of
@@ -1866,6 +1886,38 @@ void App::begin_dictation() {
 // that every session lost its last words: `final` arrived a few milliseconds later, perform_commit
 // found no target and returned, and the text went nowhere. The microphone closes now (nothing more
 // will be transcribed), the target closes at `stopped`.
+// ─── Keeping the screen alive while the user is only talking ────────────────────────────────
+//
+// Windows resets its idle timers on *input*. Dictation produces none: the whole point is that the
+// user is talking instead of typing, so to the power manager a long utterance is indistinguishable
+// from a machine nobody is sitting at. The display blanks mid-sentence, and waking it moves the
+// foreground — which plan.md §1.7 reads, correctly, as the target changing, so the next commit
+// ends the session and the text goes to the clipboard. The session was lost to the *screen
+// blanking*, not to anything the user did, and the log said `target_changed` with no hint that
+// the power manager was involved.
+//
+// ES_DISPLAY_REQUIRED is the narrow request that fixes it, and ES_SYSTEM_REQUIRED goes with it so
+// the machine does not suspend under an open microphone. ES_CONTINUOUS makes this a state rather
+// than a one-shot poke, so it is set once per session instead of on every tick — and the state is
+// **per-thread**, which is why both calls are made from the message-loop thread (begin_dictation
+// and finish_dictation are only ever reached from the window procedure). ES_AWAYMODE_REQUIRED is
+// deliberately not requested: nothing here needs to keep running with the screen off, and asking
+// for it would suppress the user's sleep button.
+void App::keep_display_awake(bool on) {
+    if (display_awake_ == on) return;
+    const EXECUTION_STATE want =
+        on ? (ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) : ES_CONTINUOUS;
+    // Returns the previous state, and 0 for failure. Not fatal either way — the worst case is the
+    // behaviour this function was written to fix — but it is not allowed to fail silently, or the
+    // next lost session would be diagnosed from scratch.
+    if (SetThreadExecutionState(want) == 0) {
+        KD_LOG_WARN("SetThreadExecutionState failed; the screen may blank mid-dictation");
+        return;
+    }
+    display_awake_ = on;
+    KD_LOG_DEBUG("display sleep %s", on ? "inhibited for this session" : "released");
+}
+
 void App::end_dictation(kd::LocalEvent why) {
     // Esc while an activation is still waiting for the model cancels the wait. It has to be
     // handled before the guard below, which returns early precisely because none of the things it
@@ -2116,6 +2168,10 @@ void App::finish_dictation(const char* why) {
     // Drop any per-application override, so the next session starts from the user's own settings
     // rather than from whatever the last target happened to need.
     if (injector_ != nullptr) injector_->set_config(settings_.inject);
+    // Released here for the reason note_session_ended() is here: the abort paths skip
+    // end_dictation entirely, and a display request left outstanding would keep the user's
+    // screen awake for the rest of the process's life.
+    keep_display_awake(false);
     if (audio_running_) {
         capture_->stop();
         audio_running_ = false;
