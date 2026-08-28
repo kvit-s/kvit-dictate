@@ -415,8 +415,10 @@ Totals: 494 C++ tests, 475 server tests, 129 bench tests. All green.
   and it needs a person.
 * **The Test button in the dialog.** The function behind it is exercised through `kd_probe`; the
   button itself, its worker thread and its generation counter are not.
-* **The installer.** The `.iss` is written and the build script drives it, but Inno Setup is not
-  installed on the development machine, so it has never been compiled.
+* **The installer, beyond compiling.** `iscc` produces `kvit-dictate-1.0.0-setup.exe` (2.5 MB)
+  and its `[Code]` section verifies, but nobody has run it: not installed, not launched from the
+  Start Menu shortcut, not uninstalled. Compiling proves the script is well-formed and says
+  nothing about whether what it lays down works.
 
 ### Deliberately not done
 

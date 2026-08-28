@@ -144,9 +144,13 @@ if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zip
 Write-Host "[release] wrote $zip"
 
+# All three locations Inno's own installer offers, in the order it offers them. The third is the
+# per-user one — the same %LOCALAPPDATA%\Programs this project's own installer uses — and leaving
+# it out is how a machine that has Inno Setup gets told it does not.
 $iscc = Find-Tool 'iscc.exe' @(
-    'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
-    'C:\Program Files\Inno Setup 6\ISCC.exe'
+    (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+    (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
 )
 if ($iscc) {
     Write-Host "`n[release] === installer ==="

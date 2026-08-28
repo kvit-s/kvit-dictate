@@ -263,7 +263,7 @@ Honest, and specific about what has and has not been run.
 | **Transport** | WebSocket, through WinHTTP, verified end to end against a server written only from the specification. The named-pipe binding survives for the bench. |
 | **Reference server** | Implemented: `ws`, session, stability, VAD, and backends for mock, sherpa-onnx, zipformer, whisper, faster-whisper, openai-http and windows-speech. 475 tests. Two have run against real audio. |
 | **Configuration** | Server address, optional model, a Test button that opens a real connection, and a no-server state with words in it. |
-| **Packaging** | One 1.2 MB executable, static CRT, icon, version block, application manifest. Inno Setup script written; portable ZIP builds. |
+| **Packaging** | One 1.16 MB executable, static CRT, icon, version block, application manifest. Both artefacts build: the portable ZIP and the per-user installer. Neither has been *installed* anywhere yet. |
 | **Signing** | ❌ **Not done, and the largest risk in the release.** No certificate exists. An unsigned binary that hooks the keyboard earns a SmartScreen warning at best. |
 | **Clean-VM test** | ❌ Not done. The gate is a browser download with Mark-of-the-Web intact, Defender and SmartScreen at defaults. |
 | **Phase 0B measurements** | ⚠️ 11 of 162 cells, all against `tools/testtarget`. Until an operator runs the rest, `docs/supported-targets.md` is a template rather than evidence. |
