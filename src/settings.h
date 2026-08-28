@@ -80,6 +80,16 @@
 // No download URLs, no checksums, no "fetch if missing". plan.md §1.9: no model auto-download at
 // runtime; model fetching is an explicit, separate, user-initiated action. A manifest that could
 // trigger a download would make that promise unenforceable.
+//
+// ─── AND: the manifest is no longer user-facing ─────────────────────────────────────────────
+//
+// release-plan.md §2.2. A shipped build has no child process to launch, so a map from a model id
+// to an interpreter and an argv has nothing to map. `ServerSettings` below replaced it: the user
+// types a URL, and which model runs behind that URL is the server operator's business.
+//
+// **The file, the schema and this parser stay** — the bench still spawns interpreters locally and
+// still needs the map — but the installer does not lay `models.json` down beside the executable
+// and the settings dialog does not read it. A source tree keeps both.
 
 #include <cstdint>
 #include <filesystem>
@@ -157,10 +167,45 @@ std::string serialize_model_manifest(const ModelManifest& m);
 
 inline constexpr int kSettingsSchema = 1;
 
+// ─── Where the ASR server is ────────────────────────────────────────────────────────────────
+//
+// release-plan.md §2.1: there was no way for a user to type a server address. The endpoint was a
+// Python module constant, the model was a `models.json` id, and every field in `Settings`
+// assumed the person running the app had also written it.
+//
+// UTF-8 rather than wide, like every other string in this header, so that the file stays pure
+// and testable; ipc_client.h takes the wide form and `endpoint()` converts.
+struct ServerSettings {
+    // docs/protocol.md §2.6.1. `ws://`, `wss://`, and `http://`/`https://` as synonyms because
+    // people type them. **Empty is the normal first-run state, not an error** — docs §10.6 and
+    // release-plan.md §2.3 make "no server configured" a first-class state.
+    std::string url;
+
+    // Optional model request (docs §5.1). Empty means "whatever the server serves by default".
+    // Free text rather than a picker, because a server is not obliged to advertise a catalogue;
+    // when it does, the Test button shows what came back.
+    std::string model;
+
+    uint32_t connect_timeout_ms = 15000;
+
+    // Reconnect policy after a lost connection (docs §10.3 step 5). Exponential from `initial`
+    // to `max`. A server that is switched off must not be hammered, and the tray must say
+    // "reconnecting" rather than pretending to be idle.
+    uint32_t reconnect_initial_ms = 1000;
+    uint32_t reconnect_max_ms = 30000;
+
+    [[nodiscard]] bool configured() const { return !url.empty(); }
+};
+
 struct Settings {
     int schema = kSettingsSchema;
 
-    // Which sidecar to run (an id from models.json).
+    // release-plan.md §2.2. Where the recogniser is.
+    ServerSettings server;
+
+    // Which sidecar to run (an id from models.json). **Bench and source trees only**: a shipped
+    // build spawns nothing, and `server.url` is what it uses instead. Kept because the bench
+    // reads the same settings file.
     std::string model_id;
 
     HotkeySpec hotkey;
@@ -246,6 +291,13 @@ std::filesystem::path executable_directory();
 // The directory diagnostics and (when opted in) transcripts are written to, and the one the tray
 // menu's "Open log folder" opens: %LOCALAPPDATA%\kvit-dictate\logs.
 std::filesystem::path default_log_directory();
+
+// True when the settings file did not exist and these are pure defaults — i.e. a first run.
+// release-plan.md §2.2 requires a shipped build to open the Server page rather than start
+// against `models.json`'s `default_model`, which is `"mock"`: a scripted fixture that types
+// invented sentences. A build that started there would look, to a new user, exactly like a
+// recogniser that hallucinates.
+bool settings_file_exists(const std::filesystem::path& file);
 
 // A missing file is not an error: it yields defaults, which is a first run. A malformed file
 // *is* an error, and the caller must surface it rather than silently reverting to defaults,

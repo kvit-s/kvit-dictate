@@ -307,11 +307,23 @@ private:
     // unstable text for the utterance in progress.
     void render_preview(std::string_view tail);
 
+    // release-plan.md §1: a shipped build connects to a server the user configured; it spawns
+    // nothing. spawn_sidecar() is kept for the bench and for a source tree with a models.json,
+    // and connect_server() is what runs when a server URL is set — which, in a shipped build, is
+    // always, because the installer lays down no models.json.
     bool spawn_sidecar();
+    bool connect_server();
+    bool start_engine();
+    void schedule_reconnect();
     void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
 
     void show_settings();
+    // Balloon + open Settings, at most once per run of the app. release-plan.md §2.3: the
+    // failure must never be silent — but a notification on every hotkey press would be its own
+    // kind of broken.
+    void show_no_server_notice();
+    bool no_server_notice_shown_ = false;
     void apply_settings(kd::Settings next);
 
     void set_tray_state(kd::OverlayState s);
@@ -400,6 +412,24 @@ private:
     bool audio_running_ = false;
     bool display_awake_ = false;    // an ES_DISPLAY_REQUIRED request is outstanding
     unsigned respawn_attempts_ = 0;
+
+    // ── The no-server state (docs/protocol.md §10.6, release-plan.md §2.3) ──────────────────
+    //
+    // Not an error path. It is what every fresh install looks like and what every user sees when
+    // the machine hosting their server is switched off, so it is a state with its own words
+    // rather than a silence.
+    bool no_server_ = false;
+    // Non-empty when the tray should say something more specific than its state's stock text.
+    std::wstring tray_reason_;
+    // Monotonic ms at which to try connecting again; 0 = not scheduled. Exponential between
+    // settings_.server.reconnect_initial_ms and reconnect_max_ms.
+    uint64_t reconnect_at_ms_ = 0;
+    uint32_t reconnect_delay_ms_ = 0;
+
+    // The last transport fault, so the tray can say which of the four network failures it was.
+    // Written on the I/O thread under `ipc_mutex_`, read on the UI thread.
+    std::string last_transport_error_;
+    kd::proto::ErrorCode last_transport_code_ = kd::proto::ErrorCode::internal_error;
     bool sidecar_respawn_ = false;  // this spawn is §10.3's recovery, not the first launch
     bool settings_open_ = false;
     bool finalizing_ = false;       // `stop` is out; the target is held until `stopped`
@@ -651,9 +681,104 @@ bool App::startup() {
 
     SetTimer(hwnd_, kTickTimer, kTickIntervalMs, nullptr);
 
-    spawn_sidecar();
-    set_tray_state(kd::OverlayState::ModelLoading);
+    // release-plan.md §2.2, first run. With no settings file the old default came from
+    // `models.json`'s `default_model`, which is `"mock"` — a scripted fixture that types
+    // invented sentences. A shipped build must never start there, and a new user must not have
+    // to discover the Server page to find out why nothing works.
+    //
+    // Posted rather than called: `create_window()` has not returned, so the tray icon and the
+    // message loop are not yet in a state to own a modal dialog.
+    if (!settings_.server.configured() && manifest_.models.empty()) {
+        PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
+    }
+
+    start_engine();
     return true;
+}
+
+// Which binding to use, decided once from the settings rather than from a build flag.
+//
+// A server URL wins whenever there is one. `models.json` is the fallback and exists only where
+// the file does: the installer does not lay one down (release-plan.md §2.2), so a shipped build
+// with no URL lands in the no-server state, which is exactly where a fresh install belongs.
+bool App::start_engine() {
+    if (settings_.server.configured()) return connect_server();
+    if (!manifest_.models.empty()) return spawn_sidecar();
+
+    no_server_ = true;
+    tray_reason_ = L"kvit-dictate — no server configured. Open Settings and give it an address.";
+    set_tray_state(kd::OverlayState::Error);
+    KD_LOG_INFO("no server is configured and there is no models.json; dictation is off until "
+                "a server URL is set (docs/protocol.md §10.6)");
+    return false;
+}
+
+bool App::connect_server() {
+    no_server_ = false;
+    tray_reason_.clear();
+
+    kd::ServerEndpoint ep;
+    ep.url = widen(settings_.server.url);
+    ep.model = settings_.server.model;
+    ep.connect_timeout_ms = settings_.server.connect_timeout_ms;
+
+    kd::IpcClient::Callbacks cb;
+    // Every one of these runs on the I/O thread. They enqueue and wake; they never decide.
+    cb.on_message = [this](const kd::proto::Message& m) {
+        {
+            std::lock_guard<std::mutex> lock(ipc_mutex_);
+            ipc_queue_.push_back(m);
+        }
+        PostMessageW(hwnd_, kMsgIpcQueue, 0, 0);
+    };
+    cb.on_error = [this](const kd::proto::ProtocolError& e) {
+        KD_LOG_ERROR("protocol error: %s", e.to_string().c_str());
+        {
+            std::lock_guard<std::mutex> lock(ipc_mutex_);
+            last_transport_error_ = e.msg;
+            last_transport_code_ = e.code;
+        }
+        PostMessageW(hwnd_, kMsgIpcState, static_cast<WPARAM>(e.fatal ? 1 : 0), 0);
+    };
+    cb.on_disconnected = [this]() { PostMessageW(hwnd_, kMsgIpcState, 2, 0); };
+    cb.on_state = [this](kd::proto::ConnState s) {
+        PostMessageW(hwnd_, kMsgIpcState, 3, static_cast<LPARAM>(s));
+    };
+
+    set_tray_state(kd::OverlayState::ModelLoading);
+    tray_reason_ = L"kvit-dictate — connecting to " + widen(settings_.server.url);
+    update_tray();
+
+    if (const kd::Status st = ipc_->connect(ep, cb); !st.ok()) {
+        KD_LOG_ERROR("could not connect to %s: %s", settings_.server.url.c_str(),
+                     st.message().c_str());
+        no_server_ = st.code() == kd::StatusCode::InvalidArgument;
+        tray_reason_ = L"kvit-dictate — " + widen(st.message());
+        set_tray_state(kd::OverlayState::Error);
+        update_tray();
+        return false;
+    }
+    return true;
+}
+
+// docs/protocol.md §10.3 step 5: reconnect backoff is a Client policy matter, not protocol, but
+// it MUST exist — a server that is switched off must not be hammered, and the tray must say
+// "reconnecting" rather than pretend to be idle.
+void App::schedule_reconnect() {
+    if (quitting_ || !settings_.server.configured()) return;
+    const kd::ServerSettings& cfg = settings_.server;
+    reconnect_delay_ms_ = reconnect_delay_ms_ == 0
+                              ? cfg.reconnect_initial_ms
+                              : (reconnect_delay_ms_ >= cfg.reconnect_max_ms / 2
+                                     ? cfg.reconnect_max_ms
+                                     : reconnect_delay_ms_ * 2);
+    reconnect_at_ms_ = clock_.now_ms() + reconnect_delay_ms_;
+    tray_reason_ = L"kvit-dictate — the server is not answering; retrying in " +
+                   std::to_wstring(reconnect_delay_ms_ / 1000) + L" s";
+    set_tray_state(kd::OverlayState::Error);
+    update_tray();
+    KD_LOG_INFO("reconnecting to %s in %u ms", settings_.server.url.c_str(),
+                reconnect_delay_ms_);
 }
 
 bool App::spawn_sidecar() {
@@ -852,6 +977,13 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     set_tray_state(kd::OverlayState::Error);
                     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Error);
                 }
+                // The reconnect backoff (docs/protocol.md §10.3 step 5), on the tick that
+                // already exists rather than on a timer of its own.
+                if (reconnect_at_ms_ != 0 && clock_.now_ms() >= reconnect_at_ms_) {
+                    reconnect_at_ms_ = 0;
+                    KD_LOG_INFO("reconnecting to %s", settings_.server.url.c_str());
+                    connect_server();
+                }
                 // docs/editing.md §4.4's hint, expired on the tick that already exists.
                 if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
                     hint_expires_ms_ = 0;
@@ -1048,6 +1180,11 @@ void App::drain_ipc_queue() {
         if (const auto* ready = m.get_if<kd::proto::ReadyMsg>()) {
             loaded_model_ = ready->model;
             respawn_attempts_ = 0;
+            // A connection that reached `ready` is a healthy one, so the next failure starts its
+            // backoff from the bottom again. Without this, one bad afternoon would leave the app
+            // waiting 30 seconds to notice a server that came back an hour ago.
+            reconnect_delay_ms_ = 0;
+            tray_reason_.clear();
             set_tray_state(kd::OverlayState::Idle);
         } else if (m.get_if<kd::proto::LoadingMsg>() != nullptr) {
             set_tray_state(kd::OverlayState::ModelLoading);
@@ -1205,9 +1342,15 @@ void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* 
                 break;
 
             case kd::Effect::RespawnChild:
-                // A new child gets a new random pipe name and a new session_id space, so a late
-                // message from the dead one can never be mistaken for a live one (§10.3).
-                if (respawn_attempts_ < 5) {
+                // §10.3 step 5, re-meant rather than deleted (release-plan.md §1.2): on the
+                // WebSocket binding this is "reconnect with backoff", on the pipe binding it is
+                // still "spawn a new child with a new random pipe name". Either way it is a new
+                // session_id space, so a late message from the dead connection can never be
+                // mistaken for a live one.
+                if (settings_.server.configured()) {
+                    sidecar_respawn_ = true;
+                    schedule_reconnect();
+                } else if (respawn_attempts_ < 5) {
                     ++respawn_attempts_;
                     sidecar_respawn_ = true;
                     spawn_sidecar();
@@ -1720,6 +1863,22 @@ void App::begin_dictation() {
             overlay_->set_state(kd::OverlayState::Idle);
             overlay_->hide();
         }
+        return;
+    }
+
+    // docs/protocol.md §10.6, and the four obligations it names: no microphone, words in the
+    // tray, no pill, never silent. This is the first of them, and it comes before every other
+    // check because it is the one a fresh install hits.
+    if (no_server_ || (!settings_.server.configured() && manifest_.models.empty())) {
+        KD_LOG_WARN("hotkey pressed with no server configured; the microphone was not opened");
+        no_server_ = true;
+        tray_reason_ =
+            L"kvit-dictate — no server configured. Open Settings and give it an address.";
+        set_tray_state(kd::OverlayState::Error);
+        update_tray();
+        // Not the pill: it would claim a session that does not exist. The tray says it instead,
+        // which is where a user goes to find out why a hotkey did nothing.
+        show_no_server_notice();
         return;
     }
 
@@ -2271,6 +2430,27 @@ void App::on_sidecar_lost() {
 
 // ─── Settings ───────────────────────────────────────────────────────────────────────────────
 
+void App::show_no_server_notice() {
+    if (no_server_notice_shown_ || quitting_) return;
+    no_server_notice_shown_ = true;
+
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd_;
+    nid.uID = kTrayId;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    lstrcpynW(nid.szInfoTitle, L"kvit-dictate has no server", ARRAYSIZE(nid.szInfoTitle));
+    lstrcpynW(nid.szInfo,
+              L"Dictation is off until you point it at an ASR server. Opening Settings now.",
+              ARRAYSIZE(nid.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+    // Posted rather than called: this runs inside the hotkey path, and opening a modal dialog
+    // from there would run a nested message loop underneath the hook's own handling.
+    PostMessageW(hwnd_, WM_COMMAND, kMenuSettings, 0);
+}
+
 void App::show_settings() {
     // The dialog runs a nested message loop, so this message can arrive again while it is up —
     // from the tray, or from a second launch of the executable, which posts it here rather than
@@ -2302,6 +2482,8 @@ void App::apply_settings(kd::Settings next) {
     }
 
     const std::string previous_model = settings_.model_id;
+    const std::string previous_url = settings_.server.url;
+    const std::string previous_server_model = settings_.server.model;
     const bool diagnostics_file_changed =
         next.diagnostics_file_enabled != settings_.diagnostics_file_enabled;
     settings_ = std::move(next);
@@ -2366,6 +2548,33 @@ void App::apply_settings(kd::Settings next) {
         }
     }
 
+    // release-plan.md §2.2. Either field is a different conversation with a different peer, so
+    // the connection is torn down and rebuilt rather than adjusted; §6.2 forbids a second
+    // `ready` on one connection, which is the same rule seen from the wire.
+    if (settings_.server.url != previous_url ||
+        settings_.server.model != previous_server_model) {
+        KD_LOG_INFO("server changed: %s -> %s",
+                    previous_url.empty() ? "(none)" : previous_url.c_str(),
+                    settings_.server.url.empty() ? "(none)" : settings_.server.url.c_str());
+        reconnect_at_ms_ = 0;
+        reconnect_delay_ms_ = 0;
+        loaded_model_.clear();
+        tray_reason_.clear();
+        if (ipc_ != nullptr) ipc_->stop();
+        if (settings_.server.configured()) {
+            connect_server();
+        } else {
+            // Emptying the box is how a user switches dictation off, and it must look like the
+            // no-server state rather than like a crash.
+            no_server_ = true;
+            tray_reason_ =
+                L"kvit-dictate — no server configured. Open Settings and give it an address.";
+            set_tray_state(kd::OverlayState::Error);
+            update_tray();
+        }
+        return;
+    }
+
     if (settings_.model_id != previous_model) {
         // plan.md §1.1: a model change is a new child process, never a swap in place. Stopping the
         // connection is enough to cause one — the transport reports the loss, the state machine
@@ -2408,7 +2617,10 @@ void App::update_tray() {
         case kd::OverlayState::Error:        text = L"kvit-dictate — ERROR (see log)"; break;
     }
 
-    std::wstring tip = text;
+    // A specific sentence beats the state's stock one. "no server configured" and "the server
+    // is not answering; retrying in 8 s" are the same OverlayState and completely different
+    // things to know, and the tray tooltip is the only place a user will read either.
+    std::wstring tip = tray_reason_.empty() ? std::wstring(text) : tray_reason_;
     if (!loaded_model_.empty()) tip += L"\n" + widen(loaded_model_);
 
     NOTIFYICONDATAW nid{};

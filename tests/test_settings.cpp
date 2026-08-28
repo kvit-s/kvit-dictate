@@ -459,3 +459,79 @@ KD_TEST(settings, a_file_with_no_normalizer_block_leaves_it_off) {
     KD_REQUIRE(parsed.is_ok());
     KD_CHECK(!parsed->normalizer.enabled);
 }
+
+// ─── The server address (release-plan.md §2.2) ──────────────────────────────────────────────
+
+KD_TEST(settings, a_file_with_no_server_block_has_no_server) {
+    // docs/protocol.md §10.6: this is what a fresh install and every pre-existing settings file
+    // look like, and it is a state rather than an error.
+    kd::Result<kd::Settings> parsed = kd::parse_settings("{}");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(!parsed->server.configured());
+    KD_CHECK(parsed->server.url.empty());
+    KD_CHECK(parsed->validate().is_ok());
+}
+
+KD_TEST(settings, server_round_trips) {
+    kd::Settings s;
+    s.server.url = "ws://strixhalo.lan:10402/kvit-dictate/v1";
+    s.server.model = "parakeet-tdt";
+    s.server.connect_timeout_ms = 9000;
+    s.server.reconnect_initial_ms = 500;
+    s.server.reconnect_max_ms = 60000;
+    s.normalise();
+
+    kd::Result<kd::Settings> back = kd::parse_settings(kd::serialize_settings(s));
+    KD_REQUIRE(back.is_ok());
+    KD_CHECK_EQ(back->server.url, s.server.url);
+    KD_CHECK_EQ(back->server.model, s.server.model);
+    KD_CHECK_EQ(back->server.connect_timeout_ms, uint32_t{9000});
+    KD_CHECK_EQ(back->server.reconnect_initial_ms, uint32_t{500});
+    KD_CHECK_EQ(back->server.reconnect_max_ms, uint32_t{60000});
+    KD_CHECK(back->server.configured());
+}
+
+KD_TEST(settings, an_empty_url_is_written_rather_than_omitted) {
+    // A present-but-blank key says "there is no server yet"; an absent one is indistinguishable
+    // from a file written by an older build, and the first-run path has to tell those apart.
+    const std::string text = kd::serialize_settings(kd::Settings{});
+    KD_CHECK(text.find("\"server\"") != std::string::npos);
+    KD_CHECK(text.find("\"url\"") != std::string::npos);
+}
+
+KD_TEST(settings, a_malformed_url_is_rejected_by_validate_not_at_connect_time) {
+    // The alternative is a dialog that accepts the typo and a tray icon that goes red minutes
+    // later, in a different part of the screen, with no obvious connection to what was typed.
+    kd::Settings s;
+    s.server.url = "strixhalo.lan:10402";  // no scheme
+    KD_CHECK(!s.validate().is_ok());
+    KD_CHECK(s.validate().message().find("server.url") != std::string::npos);
+
+    s.server.url = "ws://box.lan@evil.example.com/";
+    KD_CHECK(!s.validate().is_ok());
+}
+
+KD_TEST(settings, a_settings_file_carrying_a_bad_url_fails_to_load) {
+    // parse_settings() runs validate() before it returns, so a URL that would never connect is
+    // refused at load rather than surviving to the tray. The message names the field, because
+    // the user has to find it in a file they may have edited by hand.
+    kd::Result<kd::Settings> parsed = kd::parse_settings(R"({
+        "server": { "url": "ws://host:0/" }
+    })");
+    KD_REQUIRE(!parsed.is_ok());
+    KD_CHECK(parsed.status().message().find("server.url") != std::string::npos);
+}
+
+KD_TEST(settings, reconnect_bounds_must_be_ordered) {
+    kd::Settings s;
+    s.server.reconnect_initial_ms = 30000;
+    s.server.reconnect_max_ms = 1000;
+    KD_CHECK(!s.validate().is_ok());
+}
+
+KD_TEST(settings, out_of_range_server_numbers_are_a_load_error) {
+    kd::Result<kd::Settings> parsed = kd::parse_settings(R"({
+        "server": { "url": "ws://h:1/", "connect_timeout_ms": 1 }
+    })");
+    KD_CHECK(!parsed.is_ok());
+}

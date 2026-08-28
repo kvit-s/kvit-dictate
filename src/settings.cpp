@@ -59,11 +59,13 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "settings.h"
 
 #include "audio_capture.h"
+#include "ipc_client.h"
 #include "theme.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -963,6 +965,20 @@ Status Settings::validate() const {
                       "cadence.ms must be 50..5000 when cadence.mode is \"periodic\""};
     }
 
+    // An empty URL is legal and is the first-run state (docs/protocol.md §10.6). A URL that is
+    // *present and malformed* is not: it would fail at connect time, in the tray, minutes after
+    // the dialog that accepted it closed.
+    if (!server.url.empty()) {
+        if (const Result<ParsedServerUrl> u = parse_server_url(utf8::to_utf16_or_empty(server.url));
+            !u) {
+            return Status{StatusCode::InvalidArgument, "server.url: " + u.status().message()};
+        }
+    }
+    if (server.reconnect_max_ms < server.reconnect_initial_ms) {
+        return Status{StatusCode::InvalidArgument,
+                      "server.reconnect_max_ms must not be below reconnect_initial_ms"};
+    }
+
     if (inject.chars_per_batch == 0 || inject.chars_per_batch > 4096) {
         return Status{StatusCode::InvalidArgument, "inject.chars_per_batch must be 1..4096"};
     }
@@ -1048,6 +1064,19 @@ std::string serialize_settings(const Settings& s) {
     put_u64(root, "schema", static_cast<uint64_t>(s.schema));
     put_str(root, "model_id", s.model_id);
     put_str(root, "hotkey", s.hotkey.to_display_string());
+
+    {
+        // Always written, even when empty. A key that is present and blank says "there is no
+        // server yet"; an absent key would be indistinguishable from a settings file written by
+        // an older build, and the first-run path needs to tell those apart.
+        json::Value o = json::Value::object();
+        put_str(o, "url", s.server.url);
+        put_str(o, "model", s.server.model);
+        put_u64(o, "connect_timeout_ms", s.server.connect_timeout_ms);
+        put_u64(o, "reconnect_initial_ms", s.server.reconnect_initial_ms);
+        put_u64(o, "reconnect_max_ms", s.server.reconnect_max_ms);
+        root.set("server", std::move(o));
+    }
 
     {
         json::Value o = json::Value::object();
@@ -1210,6 +1239,16 @@ Result<Settings> parse_settings(std::string_view json_text) {
 
     top.str_opt("model_id", s.model_id);
     top.str_opt("audio_device_id", s.audio_device_id);
+
+    if (const json::Value* v = root.find("server")) {
+        Obj o(*v, "settings.server");
+        o.str_opt("url", s.server.url);
+        o.str_opt("model", s.server.model);
+        o.u32_opt("connect_timeout_ms", s.server.connect_timeout_ms, 1000, 120000);
+        o.u32_opt("reconnect_initial_ms", s.server.reconnect_initial_ms, 100, 60000);
+        o.u32_opt("reconnect_max_ms", s.server.reconnect_max_ms, 1000, 600000);
+        if (o.failed()) return Status{StatusCode::Malformed, o.error()};
+    }
     top.bool_opt("start_with_windows", s.start_with_windows);
     if (top.failed()) return Status{StatusCode::Malformed, top.error()};
 
@@ -1507,6 +1546,12 @@ Result<Settings> load_settings(const std::filesystem::path& file) {
     return parsed;
 }
 
+bool settings_file_exists(const std::filesystem::path& file) {
+    if (file.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(file, ec);
+}
+
 Status save_settings(const Settings& s, const std::filesystem::path& file) {
     Status valid = s.validate();
     if (!valid.is_ok()) return valid;  // never persist a file we would refuse to load
@@ -1570,9 +1615,19 @@ enum : int {
     kIdEditingMouse,
     kIdEditingForeign,
     kIdEditingStatus,
+    kIdServerUrl,
+    kIdServerModel,
+    kIdServerTest,
+    kIdServerStatus,
+    kIdServerWarning,
 };
 
-constexpr int kPageCount = 4;
+constexpr int kPageCount = 5;
+
+// Posted by the Test worker when it has an answer. wParam is the generation the request was
+// issued under, so a reply for a URL the user has since edited is discarded instead of
+// overwriting the newer one.
+constexpr UINT kMsgProbeDone = WM_APP + 41;
 
 struct DialogState {
     Settings settings;                       // the working copy; only copied out on OK
@@ -1582,6 +1637,14 @@ struct DialogState {
     std::vector<HWND> page_controls[kPageCount];
     HFONT font = nullptr;
     int dpi = 96;
+
+    // ── The Test button (release-plan.md §2.2) ──────────────────────────────────────────────
+    //
+    // probe_server() blocks for as long as a cold model load takes, which can be minutes, so it
+    // runs on a worker. The worker owns a copy of everything it needs and posts a string back;
+    // it never touches this struct, because the dialog may have been destroyed by then.
+    uint32_t probe_generation = 0;
+    bool probe_running = false;
 
     //: One line of `font`, in *logical* px, measured rather than assumed.
     //:
@@ -1911,6 +1974,98 @@ std::vector<std::string> terms_from_text(const std::wstring& text) {
     return out;
 }
 
+// ─── The Server page (release-plan.md §2.2) ─────────────────────────────────────────────────
+
+// docs/protocol.md §2.8: a sentence, never a block. The user's network is not this program's to
+// adjudicate, and an app that refused to talk to the endpoint its owner named would simply be
+// replaced by one that did. What it is for is the realistic case, not an attack: somebody types
+// a public hostname into a URL box, and dictates a password into it within a week.
+std::wstring server_warning_for(const std::wstring& url) {
+    if (url.empty()) return {};
+    const Result<ParsedServerUrl> u = parse_server_url(url);
+    if (!u) return L"⚠  " + wide(u.status().message());
+    if (!u->secure && !host_is_private(u->host)) {
+        return L"⚠  This is not a loopback or private address, and ws:// is unencrypted. Your "
+               L"audio and every transcript cross the network in the clear, and anyone who can "
+               L"reach that port can send audio to it. Use a network you control.";
+    }
+    return {};
+}
+
+void update_server_warning(HWND dlg) {
+    const std::wstring warning = server_warning_for(get_text(GetDlgItem(dlg, kIdServerUrl)));
+    SetWindowTextW(GetDlgItem(dlg, kIdServerWarning), warning.c_str());
+}
+
+// One line per fact, because this text is what a user will paste into a support conversation.
+std::wstring describe_probe(const ServerProbe& p) {
+    std::wstring out = L"Connected.\r\n";
+    out += L"Server: ";
+    out += p.server_build.empty() ? L"(build id not reported)" : wide(p.server_build);
+    out += L"\r\nModel: " + wide(p.model) + L"  (" + wide(proto::to_string(p.mode)) + L")";
+    if (p.chunk_ms != 0) out += L", " + std::to_wstring(p.chunk_ms) + L" ms chunks";
+    out += p.context_supported ? L"\r\nVocabulary hints: supported"
+                               : L"\r\nVocabulary hints: not supported by this model";
+    out += L"\r\nConnected in " + std::to_wstring(p.connect_ms) + L" ms, ready in " +
+           std::to_wstring(p.ready_ms) + L" ms.";
+    if (p.models.empty()) {
+        out += L"\r\nThis server does not advertise a model list, so the model box is free "
+               L"text. Leave it empty to take whatever it serves.";
+    } else {
+        out += L"\r\nModels offered:";
+        for (const proto::ModelInfo& mi : p.models) {
+            out += L"\r\n    " + wide(mi.id);
+            if (mi.mode.has_value()) {
+                out += L"  (";
+                out += wide(proto::to_string(*mi.mode));
+                out += L")";
+            }
+        }
+    }
+    return out;
+}
+
+void start_server_test(HWND dlg, DialogState& st) {
+    if (st.probe_running) return;
+
+    ServerEndpoint ep;
+    ep.url = get_text(GetDlgItem(dlg, kIdServerUrl));
+    ep.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+    if (ep.url.empty()) {
+        SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
+                       L"Type a server address first, for example ws://127.0.0.1:10402/");
+        return;
+    }
+    if (const Result<ParsedServerUrl> u = parse_server_url(ep.url); !u) {
+        SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(u.status().message()).c_str());
+        return;
+    }
+
+    st.probe_running = true;
+    const uint32_t generation = ++st.probe_generation;
+    SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
+                   L"Connecting… (a server loading a model for the first time can take a "
+                   L"while; this waits up to a minute)");
+    EnableWindow(GetDlgItem(dlg, kIdServerTest), FALSE);
+
+    // The worker owns everything it touches and hands back one heap-allocated string. It must
+    // not read DialogState: by the time it finishes, the dialog may be gone. PostMessage to a
+    // destroyed window fails harmlessly, and the string is freed by whoever wins.
+    std::thread([dlg, generation, ep]() {
+        std::wstring text;
+        if (const Result<ServerProbe> r = probe_server(ep, 60000); r) {
+            text = describe_probe(*r);
+        } else {
+            text = L"Could not use this endpoint.\r\n" + wide(r.status().message());
+        }
+        auto* payload = new std::wstring(std::move(text));
+        if (!PostMessageW(dlg, kMsgProbeDone, static_cast<WPARAM>(generation),
+                          reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
+        }
+    }).detach();
+}
+
 // ─── Populating the controls from a Settings ────────────────────────────────────────────────
 
 void update_model_status(HWND dlg, DialogState& st) {
@@ -2207,6 +2362,16 @@ void load_controls(HWND dlg, DialogState& st) {
                    s.inject.refuse_elevated_targets ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdAppPolicies), policies_to_text(s.app_policies).c_str());
 
+    // Server.
+    SetWindowTextW(GetDlgItem(dlg, kIdServerUrl), wide(s.server.url).c_str());
+    SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
+    SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
+                   s.server.configured()
+                       ? L"Press Test to check that this address answers."
+                       : L"No server is configured yet, so dictation is switched off. Type an "
+                         L"address above and press Test.");
+    update_server_warning(dlg);
+
     // Audio.
     HWND dev = GetDlgItem(dlg, kIdAudioDevice);
     SendMessageW(dev, CB_RESETCONTENT, 0, 0);
@@ -2304,6 +2469,25 @@ void load_controls(HWND dlg, DialogState& st) {
 bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     Settings s = st.settings;  // start from the working copy so unexposed fields survive
     uint64_t n = 0;
+
+    // The server, first, because it is the field most likely to be wrong and the one whose
+    // rejection has to name the mistake rather than the field. An empty box is accepted: it is
+    // how a user switches dictation off, and it is the first-run state (docs/protocol.md §10.6).
+    {
+        std::wstring url = get_text(GetDlgItem(dlg, kIdServerUrl));
+        while (!url.empty() && (url.front() == L' ' || url.front() == L'	')) url.erase(0, 1);
+        while (!url.empty() && (url.back() == L' ' || url.back() == L'	')) url.pop_back();
+        if (!url.empty()) {
+            if (const Result<ParsedServerUrl> u = parse_server_url(url); !u) {
+                MessageBoxW(dlg, (L"Server address: " + wide(u.status().message())).c_str(),
+                            L"kvit-dictate settings", MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, kIdServerUrl));
+                return false;
+            }
+        }
+        s.server.url = narrow(url);
+        s.server.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+    }
 
     const int hk_sel = static_cast<int>(SendMessageW(GetDlgItem(dlg, kIdHotkey), CB_GETCURSEL, 0, 0));
     const std::vector<std::pair<std::string, HotkeySpec>> presets = hotkey_presets();
@@ -2464,9 +2648,59 @@ void build_controls(HWND dlg, DialogState& st) {
     const int col2_x = col1_x + col_w + px(st, kMargin);
     const int top = px(st, kMargin + kTabStrip + kMargin);
 
-    // ── Page 0: the compose buffer (docs/editing.md) ────────────────────────────────────────
+    // ── Page 0: the server (release-plan.md §2.2) ───────────────────────────────────────────
+    //
+    // First, because it is the only page a new install cannot work without. Everything else in
+    // this dialog tunes behaviour; this one decides whether there is any.
     {
         Cursor c{dlg, inst, &st, 0, col1_x, top, col_w};
+        c.section(L"Where the recogniser is");
+        c.note(L"kvit-dictate does not recognise speech itself. It captures your voice, sends it "
+               L"to a server you run, and types back what comes out. Without a server it will "
+               L"not open the microphone at all — and it will say so rather than look broken.",
+               5);
+        c.label_edit(L"Server address", kIdServerUrl);
+        c.note(L"For example ws://127.0.0.1:10402/ for a server on this machine, or "
+               L"ws://mybox.lan:10402/ for one on your network. docs/setup.md has the "
+               L"instructions for standing one up.",
+               4);
+        c.label_edit(L"Model (optional)", kIdServerModel);
+        c.note(L"Leave this empty to take whatever the server offers. If you name a model the "
+               L"server does not have, it says so — it never quietly substitutes another one.",
+               3);
+        c.add(L"BUTTON", L"Test this server", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
+        c.gap(6);
+        c.add(L"STATIC", L"", 0, st.line_h * 9, kIdServerStatus);
+    }
+    {
+        Cursor c{dlg, inst, &st, 0, col2_x, top, col_w};
+        c.section(L"What crosses your network");
+        c.note(L"Your audio goes to the server you name above and nowhere else. There is no "
+               L"cloud service, no telemetry, and nothing is sent anywhere until you press the "
+               L"hotkey.",
+               4);
+        c.note(L"But it is sent unencrypted, and the server does not ask who you are: anyone who "
+               L"can reach that address can send audio to it, and anyone on the path can read "
+               L"yours. Run this on a network you control. wss:// works if you put a proxy with "
+               L"a certificate in front of your server.",
+               6);
+        c.add(L"STATIC", L"", 0, st.line_h * 5, kIdServerWarning);
+        c.gap(6);
+
+        c.section(L"When the server is not there");
+        c.note(L"The hotkey does not open the microphone, the pill does not appear, and the tray "
+               L"says what is wrong. A dictation that silently records into nothing would be "
+               L"worse than one that refuses.",
+               4);
+        c.note(L"If the connection drops mid-sentence, everything already typed into your "
+               L"document stays there. Only the part that had not been committed yet is lost, "
+               L"and the tray says so.",
+               4);
+    }
+
+    // ── Page 1: the compose buffer (docs/editing.md) ────────────────────────────────────────
+    {
+        Cursor c{dlg, inst, &st, 1, col1_x, top, col_w};
         c.section(L"The pill as a compose buffer");
         c.note(L"Nothing reaches your document until you say so. Speech accumulates in the pill; "
                L"Enter types it in and finishes, Esc throws it away, and the hotkey only ever "
@@ -2487,7 +2721,7 @@ void build_controls(HWND dlg, DialogState& st) {
                3);
     }
     {
-        Cursor c{dlg, inst, &st, 0, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 1, col2_x, top, col_w};
         c.section(L"The keyboard belongs to the pill");
         c.note(L"While a session is composing, editing keys — Backspace, Delete, the arrows, "
                L"Home/End, Ctrl+A/C/X/V/Z and ordinary characters — go to the pill instead of to "
@@ -2505,7 +2739,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 1: dictation ───────────────────────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 1, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col1_x, top, col_w};
         c.section(L"Activation");
         c.label_combo(L"Hotkey (toggle: press to start, press again to finalise)", kIdHotkey);
 
@@ -2524,7 +2758,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Never end the session on silence", kIdSessionNever);
     }
     {
-        Cursor c{dlg, inst, &st, 1, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col2_x, top, col_w};
         c.section(L"Stability — what is SAFE to commit");
         c.note(L"Eligibility is decided by stability alone. Committed text is never repaired, so "
                L"nothing below may ever be widened by the cadence setting.",
@@ -2543,7 +2777,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 2: injection, audio, model ─────────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 2, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col1_x, top, col_w};
         c.section(L"Text injection");
         c.label_combo(L"Default method", kIdInjectMethod);
         c.label_edit(L"SendInput: characters per batch (0 = one batch)", kIdCharsBatch, ES_NUMBER);
@@ -2557,7 +2791,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_combo(L"Capture device", kIdAudioDevice);
     }
     {
-        Cursor c{dlg, inst, &st, 2, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col2_x, top, col_w};
         c.section(L"Per-app injection policy");
         c.note(L"One line per application:   process.exe = sendinput | clipboard "
                L"[, ctrl-shift-v] [, unsupported]   # note",
@@ -2574,7 +2808,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 3: overlay, privacy, vocabulary ────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 3, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 4, col1_x, top, col_w};
         c.section(L"Overlay");
         c.label_combo(L"Presentation", kIdOverlayMode);
         c.label_combo(L"When the anchor is not confident enough", kIdFallback);
@@ -2592,7 +2826,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Background, custom scheme only (#AARRGGBB)", kIdColorBackground);
     }
     {
-        Cursor c{dlg, inst, &st, 3, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 4, col2_x, top, col_w};
         c.section(L"Privacy and diagnostics");
         c.note(L"Shipping policy, not preference: nothing you dictate is written to disk, and "
                L"nothing here ever touches the network.",
@@ -2619,8 +2853,8 @@ void build_controls(HWND dlg, DialogState& st) {
                                 nullptr);
     if (tabs) {
         SendMessageW(tabs, WM_SETFONT, reinterpret_cast<WPARAM>(st.font), TRUE);
-        const wchar_t* names[kPageCount] = {L"Compose buffer", L"Dictation", L"Injection && model",
-                                            L"Overlay && privacy"};
+        const wchar_t* names[kPageCount] = {L"Server", L"Compose buffer", L"Dictation",
+                                            L"Injection && model", L"Overlay && privacy"};
         for (int i = 0; i < kPageCount; ++i) {
             TCITEMW item{};
             item.mask = TCIF_TEXT;
@@ -2795,6 +3029,21 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
 
+        case kMsgProbeDone: {
+            auto* text = reinterpret_cast<std::wstring*>(lp);
+            if (st) {
+                st->probe_running = false;
+                EnableWindow(GetDlgItem(hwnd, kIdServerTest), TRUE);
+                // A reply for a URL the user has since edited and re-tested is stale; showing it
+                // would answer a question they have stopped asking.
+                if (static_cast<uint32_t>(wp) == st->probe_generation && text != nullptr) {
+                    SetWindowTextW(GetDlgItem(hwnd, kIdServerStatus), text->c_str());
+                }
+            }
+            delete text;
+            return 0;
+        }
+
         case WM_NOTIFY: {
             auto* hdr = reinterpret_cast<NMHDR*>(lp);
             if (st && hdr && hdr->idFrom == kIdTabs && hdr->code == TCN_SELCHANGE) {
@@ -2829,6 +3078,10 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // Defaults include the privacy defaults; that is the point of the button.
                     Settings fresh;
                     fresh.model_id = st->settings.model_id;  // not a preference — a manifest fact
+                    // Nor is the server address. "Restore defaults" is about behaviour; a user
+                    // who lost the address of their own server to it would have to go and find
+                    // it again, which is not what they asked for.
+                    fresh.server = st->settings.server;
                     fresh.normalise();
                     st->settings = std::move(fresh);
                     load_controls(hwnd, *st);
@@ -2861,6 +3114,16 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case kIdModel:
                     if (code == CBN_SELCHANGE) update_model_status(hwnd, *st);
+                    return 0;
+                case kIdServerTest:
+                    start_server_test(hwnd, *st);
+                    return 0;
+                case kIdServerUrl:
+                    if (code == EN_CHANGE) {
+                        // Live, because the warning is about the address being typed and a
+                        // warning that only appears after OK is a warning nobody reads.
+                        update_server_warning(hwnd);
+                    }
                     return 0;
                 case kIdTheme:
                     if (code == CBN_SELCHANGE) {
