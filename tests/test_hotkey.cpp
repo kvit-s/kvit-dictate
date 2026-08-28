@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `hotkey` — InputFilter, the pure half of src/hotkey.cpp.
 //
 // plan.md §1.8 calls the activation rule "a unit-tested state machine, not an ad-hoc filter", and

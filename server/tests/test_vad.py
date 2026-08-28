@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Tests for :mod:`kvit_asr.vad` — plan.md §1.6 and §3 Phase 2 item 3.
 
 Run with::

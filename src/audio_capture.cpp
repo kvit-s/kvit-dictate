@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // WASAPI capture and the pure conversion chain behind it.
 //
 // Specification: audio_capture.h. Implements plan.md §3 Phase 1 item 1 and docs/protocol.md

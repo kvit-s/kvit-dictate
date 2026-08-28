@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `tray_icon` — the notification-area icon that is drawn rather than shipped.
 //
 // This is a drawing routine, and the parts of drawing that matter to a *user* — is it a

@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 r"""Process entry point: `python -m kvit_asr --pipe <name> --backend <id> [...]`.
 
 Launched by `kvit-dictate.exe`, never by a human in normal operation. The parent creates the

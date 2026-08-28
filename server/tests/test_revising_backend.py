@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """A growing-window batch model revises its own published text, and the session survives it.
 
 This is the failure that ended two real dictations against `qwen-asr-http` (progress.md §3). The

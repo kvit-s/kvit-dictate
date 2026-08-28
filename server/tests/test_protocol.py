@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Properties of `kvit_asr.protocol` that the shared fixtures do not, and cannot, cover.
 
 `test_fixtures.py` drives `tests/fixtures/protocol/` — the cases both endpoints must agree on. This

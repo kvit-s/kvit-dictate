@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `injector` — the parts of src/injector.cpp that can be asserted without a foreign window.
 //
 // plan.md §7 gates on three claims this file is responsible for:

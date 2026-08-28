@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """The backend that makes the whole product testable with nothing installed.
 
 This is infrastructure, not a toy. Every other backend in bench/CANDIDATES.md needs an

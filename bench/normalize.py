@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """bench/normalize.py — the do-no-harm test for the text normalizer.
 
 Implements the measurement `src/normalizer.h`'s term guard was written against. Stdlib only,

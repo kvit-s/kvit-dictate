@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """The adapter contract every ASR model implements.
 
 plan.md §1.1 justifies the whole two-process split with one sentence: *"In Python each new

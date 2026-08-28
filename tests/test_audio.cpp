@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // tests/test_audio.cpp — the pure DSP in AudioConverter.
 //
 // No microphone, no WASAPI, no device. Everything here is a buffer in and a buffer out, because

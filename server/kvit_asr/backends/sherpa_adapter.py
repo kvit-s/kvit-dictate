@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """`sherpa_onnx_streaming` and `zipformer_hotwords`, wearing the `Backend` ABC.
 
 Both of those modules were written standalone, against a plausible lifecycle of their own::

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // kd_testtarget — a controlled application to inject into.
 //
 // Implements: plan.md §3 Phase 0B (the critical gate), plan.md §7 ("tools/testtarget exercising

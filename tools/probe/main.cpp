@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // tools/probe — the Phase 0B measurement instrument.
 //
 // NO ASR. FIXED TEXT ONLY. plan.md calls Phase 0B the critical gate: it decides whether an inline

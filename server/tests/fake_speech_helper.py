@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """A stand-in for `tools/kvit-speech/kvit-speech.exe`, for the tests.
 
 Speaks the frame protocol in `kvit_asr.backends.windows_speech`'s module docstring and nothing

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // The overlay window — layered, click-through, capture-excluded, Direct2D/DirectWrite painted.
 //
 // Specification: overlay.h. Implements plan.md §1.3 (window flags, DPI), §1.5 (what it renders

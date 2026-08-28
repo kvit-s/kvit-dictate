@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Named-pipe transport for the ASR sidecar — ctypes against kernel32, no pywin32.
 
 Implements docs/protocol.md §2 (transport), §9 (backpressure) and §10.3 (peer death) for the

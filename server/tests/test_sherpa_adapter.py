@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """The `sherpa_onnx_streaming` -> `backends.base.Backend` translation.
 
 `kvit_asr.backends.sherpa_adapter`'s docstring names four translations. Each one is a place where

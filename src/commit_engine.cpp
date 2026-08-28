@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // The commit engine. Specification: commit_engine.h, plan.md §1.4, docs/protocol.md §8.
 //
 // The invariant, which nothing in this file may weaken:

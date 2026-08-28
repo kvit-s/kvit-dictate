@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """`--backend windows-speech`: the process seam, not the model.
 
 Every test here runs a real child process — `fake_speech_helper.py` under this interpreter —

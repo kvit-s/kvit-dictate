@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // tests/test_ipc.cpp — pipe naming and the security descriptor.
 //
 // No Python child is spawned here. What IS tested is the part plan.md §1.2 had to correct itself

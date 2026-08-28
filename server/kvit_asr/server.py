@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 r"""Top-level sidecar: transport, handshake, model load, and message routing.
 
 This module owns docs/protocol.md §2 (transport, from the *pipe client* side), §5 (handshake)

@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """The shared cross-language conformance fixtures, driven against `kvit_asr.protocol`.
 
 `tests/fixtures/protocol/` is read by **both** test suites — this one and the C++ one under

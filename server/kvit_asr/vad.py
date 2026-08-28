@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Voice activity detection and **utterance** endpointing for the kvit-dictate sidecar.
 
 Normative sources: plan.md §1.6 (session lifetime and silence) and §3 Phase 2 step 3. Where this

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // UTF-8 validation, code-point and grapheme-cluster navigation, and the UTF-16 boundary.
 //
 // The normative statement of everything here is in util/utf8.h — read that first. This file

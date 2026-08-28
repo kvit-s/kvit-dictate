@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Native-streaming ONNX transducer backend, driven through sherpa-onnx.
 
 Covers `bench/CANDIDATES.md` §4 picks 1 and 2 — the published sherpa-onnx ONNX exports of

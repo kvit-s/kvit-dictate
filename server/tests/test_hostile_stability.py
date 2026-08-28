@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """`Hypothesis.stable_bytes_override`: the path from a hostile backend to a non-conforming wire.
 
 docs/protocol.md §8.3 says what a Client must do when a Server retracts already-published stable

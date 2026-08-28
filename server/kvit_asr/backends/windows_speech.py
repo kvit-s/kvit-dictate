@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """`--backend windows-speech`: the on-device Windows AI speech model, via a helper process.
 
 The model is Whisper Small, quantized to int8, shipped by Microsoft as an optional Windows

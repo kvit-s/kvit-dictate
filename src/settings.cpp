@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Settings persistence, the models.json manifest, and the settings dialog.
 //
 // Specification: settings.h, which also carries the models.json schema (JSON cannot carry

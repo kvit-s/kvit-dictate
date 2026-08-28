@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `utf8` — the text layer the committed-prefix invariant rests on (plan.md §1.4,
 // docs/protocol.md §8.2/§8.4).
 //

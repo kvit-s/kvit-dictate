@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `protocol` — the message codec and the pure validators (src/protocol.cpp).
 //
 // docs/protocol.md §4 (encoding), §6 (catalogue), §7 (identity and ordering), §8 (stable_bytes)

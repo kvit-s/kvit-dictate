@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // tests/test_anchor.cpp — the pure half of anchor estimation, on synthetic bitmaps.
 //
 // No screen capture, no windows, no DWM. Every bitmap here is drawn by the test, which is what

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Global hotkey and stop-on-input — WH_KEYBOARD_LL + WH_MOUSE_LL.
 //
 // Specification: hotkey.h. Implements plan.md §1.8 in full and the source-B half of §1.5.

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Text injection into the focused window, and the guards that decide when not to.
 //
 // Specification: injector.h. Implements plan.md §1.7, and the plan.md §7 gates that read

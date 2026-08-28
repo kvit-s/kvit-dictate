@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Benchmark metrics for kvit-dictate — every number plan.md §4 gates on.
 
 Stdlib only. No numpy, no jiwer, no third-party edit-distance library. This module is imported

@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Whisper through CTranslate2 (`faster-whisper`) — rows E and E′ of the candidate table.
 
 `bench/CANDIDATES.md` §2: `Systran/faster-whisper-large-v3` (row E, a CT2 conversion of

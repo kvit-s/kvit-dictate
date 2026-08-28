@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Suite `framing` — FrameReader and the frame encoders (src/protocol.cpp, docs/protocol.md §3).
 //
 // The fixture runner in test_fixtures.cpp covers the same ground from the shared cross-language

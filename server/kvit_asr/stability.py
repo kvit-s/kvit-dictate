@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Server-side stability computation: cumulative hypotheses in, ``stable_bytes`` out.
 
 Implements plan.md §1.4 (the six-step stability algorithm plus step 7's utterance reset) and

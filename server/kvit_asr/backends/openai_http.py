@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Transcription over an OpenAI-compatible ``/v1/audio/transcriptions`` endpoint.
 
 Written for a specific box: a Qwen3-ASR server on the operator's own LAN

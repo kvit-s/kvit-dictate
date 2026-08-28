@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Normalizer — see normalizer.h for the design and for why this is a client-side module.
 //
 // ─── Windows facts this file depends on, written down because each cost a debugging session ──

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #pragma once
 //
 // UTF-8: validation, code-point iteration, grapheme-cluster boundaries, UTF-16 conversion,

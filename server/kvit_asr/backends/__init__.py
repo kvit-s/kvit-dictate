@@ -1,3 +1,6 @@
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """Backend registry — lazy by construction.
 
 **Importing this package must never import a model runtime.** plan.md §1.1 puts one backend per

@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // The notification-area icon, drawn with Direct2D into a DIB. See tray_icon.h for why it is
 // drawn rather than shipped, and for what the shape and the fill mean.
 //

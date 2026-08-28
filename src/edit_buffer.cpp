@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // EditBuffer — the compose buffer's text, caret and selection.
 //
 // Specification: edit_buffer.h. Implements docs/editing.md §3, §3.4 and the half of §11 that

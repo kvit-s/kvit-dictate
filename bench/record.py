@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Kvit
+# Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
+# https://www.apache.org/licenses/LICENSE-2.0
 """bench/record.py — corpus recorder for the Phase 1 bake-off.
 
 Implements plan.md §3 Phase 1 step 2 (the corpus and its dev/held-out split) and §4's manual
