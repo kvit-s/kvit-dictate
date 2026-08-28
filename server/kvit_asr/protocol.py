@@ -45,7 +45,7 @@ __all__ = [
     "FrameType", "Frame", "FrameReader", "encode_frame", "encode_audio_frame",
     "encode_control_frame", "decode_audio_payload", "pcm_bytes_to_ms",
     # errors
-    "ErrorCode", "ProtocolError", "WIRE_ERROR_CODES", "NON_FATAL_ERROR_CODES",
+    "ErrorCode", "ProtocolError", "WIRE_ERROR_CODES", "NON_FATAL_ERROR_CODES", "ModelInfo",
     # messages
     "Message", "Hello", "Start", "Stop", "Cancel", "Discontinuity", "HelloAck", "Loading",
     "Ready", "Partial", "Final", "Stopped", "ErrorMessage", "StreamingMode",
@@ -134,6 +134,11 @@ class ErrorCode(str, Enum):
     overload_control = "overload_control"
     model_load_failed = "model_load_failed"
     internal_error = "internal_error"
+    # Added with the network binding (§2.7, §5.1). Both are Server -> Client and both are fatal:
+    # the connection cannot proceed, but the endpoint is working and said so, which is a
+    # materially different thing for the user than a socket that never opened.
+    server_busy = "server_busy"
+    model_unavailable = "model_unavailable"
     # Non-fatal, wire-visible. `session_id` is REQUIRED on these (§11.1).
     stability_violation = "stability_violation"
     decode_failed = "decode_failed"
@@ -145,6 +150,12 @@ class ErrorCode(str, Enum):
     model_load_timeout = "model_load_timeout"
     peer_mismatch = "peer_mismatch"
     pipe_squatted = "pipe_squatted"
+    # The network binding's local failures (§11.3, last paragraph). Named on this side too so a
+    # log reader still learns one vocabulary, even though only the Client can raise them.
+    connect_timeout = "connect_timeout"
+    connect_refused = "connect_refused"
+    tls_failed = "tls_failed"
+    no_server_configured = "no_server_configured"
 
 
 #: Codes that may legally appear on the wire (i.e. not the local-only set).
@@ -154,8 +165,9 @@ WIRE_ERROR_CODES = frozenset(
         ErrorCode.truncated_frame, ErrorCode.unknown_frame_type, ErrorCode.bad_utf8,
         ErrorCode.bad_json, ErrorCode.bad_message, ErrorCode.unknown_message,
         ErrorCode.state_violation, ErrorCode.overload_audio, ErrorCode.overload_control,
-        ErrorCode.model_load_failed, ErrorCode.internal_error, ErrorCode.stability_violation,
-        ErrorCode.decode_failed, ErrorCode.audio_underrun,
+        ErrorCode.model_load_failed, ErrorCode.internal_error, ErrorCode.server_busy,
+        ErrorCode.model_unavailable, ErrorCode.stability_violation, ErrorCode.decode_failed,
+        ErrorCode.audio_underrun,
     }
 )
 
@@ -673,11 +685,17 @@ class Hello(Message):
     T = "hello"
     proto: int = PROTO_VERSION
     client: str | None = None
+    #: §5.1. None means "whatever the server serves by default". A server that does not have the
+    #: named model answers `model_unavailable`; substituting another is forbidden, because the
+    #: result is transcripts that are merely worse and nobody notices.
+    model: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"t": self.T, "proto": self.proto}
         if self.client is not None:
             out["client"] = self.client
+        if self.model is not None:
+            out["model"] = self.model
         return out
 
 
@@ -750,15 +768,45 @@ class Discontinuity(Message):
 
 
 @dataclass(slots=True)
+class ModelInfo:
+    """One entry of `hello_ack.models[]` (§5.1).
+
+    Everything but `id` is optional: a server that knows only the ids of its models is still
+    more useful than one that advertises nothing, because the settings page can then offer a
+    list instead of a text box.
+    """
+
+    id: str = ""
+    display_name: str | None = None
+    mode: str | None = None
+    chunk_ms: int | None = None
+    context_supported: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"id": self.id, "context_supported": self.context_supported}
+        if self.display_name is not None:
+            out["display_name"] = self.display_name
+        if self.mode is not None:
+            out["mode"] = self.mode
+        if self.chunk_ms is not None:
+            out["chunk_ms"] = self.chunk_ms
+        return out
+
+
+@dataclass(slots=True)
 class HelloAck(Message):
     T = "hello_ack"
     proto: int = PROTO_VERSION
     server: str | None = None
+    #: §5.1. Empty means "not advertised", never "there is only one".
+    models: list[ModelInfo] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"t": self.T, "proto": self.proto}
         if self.server is not None:
             out["server"] = self.server
+        if self.models:
+            out["models"] = [m.to_json() for m in self.models]
         return out
 
 
@@ -900,6 +948,10 @@ class ErrorMessage(Message):
     msg: str = ""
     session_id: str | None = None
     supported: list[int] = field(default_factory=list)
+    #: §2.7, with `server_busy`. A hint; the Client's own backoff is the real bound.
+    retry_after_ms: int | None = None
+    #: §5.1, with `model_unavailable`. What the server does have.
+    available: list[str] = field(default_factory=list)
 
 
     @property
@@ -920,6 +972,10 @@ class ErrorMessage(Message):
             out["session_id"] = self.session_id
         if self.supported:
             out["supported"] = list(self.supported)
+        if self.retry_after_ms is not None:
+            out["retry_after_ms"] = self.retry_after_ms
+        if self.available:
+            out["available"] = list(self.available)
         return out
 
 
@@ -1003,6 +1059,9 @@ def _decode_hello(o: dict[str, Any]) -> Hello:
     c = _opt(o, "client")
     if c is not None:
         m.client = _as_str(c, t, "client")
+    mo = _opt(o, "model")
+    if mo is not None:
+        m.model = _as_str(mo, t, "model")
     return m
 
 
@@ -1070,6 +1129,33 @@ def _decode_hello_ack(o: dict[str, Any]) -> HelloAck:
     s = _opt(o, "server")
     if s is not None:
         m.server = _as_str(s, t, "server")
+    models = _opt(o, "models")
+    if models is not None:
+        if not isinstance(models, list):
+            raise _bad(f"{t}.models: expected an array of object")
+        # §5.1: the catalogue is advisory, so a malformed *element* is skipped rather than
+        # failing the handshake. Losing a working connection over a mis-typed display name
+        # would be a worse outcome than an incomplete model list. A `models` that is not an
+        # array at all is still bad_message — that is a server which misunderstood the field.
+        for entry in models:
+            if not isinstance(entry, dict):
+                continue
+            ident = entry.get("id")
+            if not isinstance(ident, str) or not ident:
+                continue
+            mode = entry.get("mode")
+            chunk = entry.get("chunk_ms")
+            name = entry.get("display_name")
+            m.models.append(
+                ModelInfo(
+                    id=ident,
+                    display_name=name if isinstance(name, str) else None,
+                    mode=mode if isinstance(mode, str) else None,
+                    chunk_ms=chunk if isinstance(chunk, int) and not isinstance(chunk, bool)
+                    else None,
+                    context_supported=bool(entry.get("context_supported", False)),
+                )
+            )
     return m
 
 
@@ -1176,6 +1262,16 @@ def _decode_error(o: dict[str, Any]) -> ErrorMessage:
         if not isinstance(sup, list):
             raise _bad(f"{t}.supported: expected an array of integer")
         m.supported = [_as_int(v, t, "supported[]", lo=1, hi=65535) for v in sup]
+    retry = _opt(o, "retry_after_ms")
+    if retry is not None:
+        # Clamped rather than rejected: a server that says "wait a week" is misconfigured, not
+        # malicious, and the receiver's own backoff is the real bound anyway.
+        m.retry_after_ms = max(0, min(3_600_000, _as_int(retry, t, "retry_after_ms")))
+    avail = _opt(o, "available")
+    if avail is not None:
+        if not isinstance(avail, list):
+            raise _bad(f"{t}.available: expected an array of string")
+        m.available = [v for v in avail if isinstance(v, str) and v]
     return m
 
 

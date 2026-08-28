@@ -743,7 +743,9 @@ class Server:
         self.log.debug(f"{direction}_{msg.get('t', '?')}", **fields)
 
     def _send_error(self, code: str, fatal: bool, msg: str, session_id: str | None = None,
-                    supported: list[int] | None = None) -> None:
+                    supported: list[int] | None = None,
+                    available: list[str] | None = None,
+                    retry_after_ms: int | None = None) -> None:
         frame: dict[str, Any] = {"t": "error", "code": code, "fatal": fatal, "msg": msg}
         if session_id is not None:
             frame["session_id"] = session_id
@@ -754,6 +756,12 @@ class Server:
             frame["fatal"] = True
         if supported is not None:
             frame["supported"] = supported
+        # §5.1 with model_unavailable, §2.7 with server_busy. Both exist so the refusal names
+        # what the user can do next instead of only what went wrong.
+        if available is not None:
+            frame["available"] = available
+        if retry_after_ms is not None:
+            frame["retry_after_ms"] = retry_after_ms
         try:
             self.send(frame)
         except TransportError as exc:
@@ -851,14 +859,49 @@ class Server:
                 # Not fatal: the command line is advisory, the wire is authoritative (§5). But
                 # a parent whose --proto disagrees with its own hello has a bug worth seeing.
                 self.log.warning("proto_arg_mismatch", arg=self.cfg.proto, hello=offered)
+
+            # §5.1. One backend per process, so the catalogue has exactly one entry and the only
+            # question is whether the client asked for something else. Refusing is the whole
+            # point: loading a different model than the one requested produces transcripts that
+            # are merely *worse*, which is the hardest kind of wrong for a user to notice.
+            served = self._served_model_ids()
+            requested = msg.get("model")
+            if requested is not None and requested not in served:
+                self.log.error("model_unavailable", requested=requested, available=sorted(served))
+                self._send_error(
+                    "model_unavailable",
+                    True,
+                    f"this server serves {sorted(served)[0]!r}, not {requested!r}",
+                    available=sorted(served),
+                )
+                raise _Rejected(EXIT_PROTO_UNSUPPORTED)
+
             self.send({
                 "t": "hello_ack",
                 "proto": supported,
                 "server": kd_config.SERVER_BUILD_ID,
+                # `mode` is deliberately absent: it is not known until the backend has loaded,
+                # and §5.1 makes every field but `id` optional precisely so a server can say
+                # what it knows now rather than guess. `ready.mode` is authoritative anyway.
+                "models": [{"id": sorted(served)[0], "context_supported": False}],
             })
-            self.log.info("handshake_ok", proto=supported, client=msg.get("client"))
+            self.log.info("handshake_ok", proto=supported, client=msg.get("client"),
+                          model=requested)
             return
         raise TransportError("end of stream during handshake")
+
+    def _served_model_ids(self) -> set[str]:
+        """Every id a client may legitimately name in `hello.model` for this process.
+
+        Both spellings are accepted because both are in circulation: `models.json` keys entries
+        by backend id, while `ready.model` reports the model id, and they differ for every
+        backend that takes a `--model`. Refusing one of them would be a distinction the user
+        never agreed to make.
+        """
+        ids = {self.cfg.backend.id}
+        if self.cfg.backend.model:
+            ids.add(self.cfg.backend.model)
+        return ids
 
     # ── loading → ready ─────────────────────────────────────────────────────────────────────
 
@@ -1148,6 +1191,76 @@ def _error_fields(exc: BaseException) -> tuple[str, bool, str, str | None]:
 # ─── Entry point ────────────────────────────────────────────────────────────────────────────
 
 
+def _serve_websocket(cfg: ServerConfig, log: EventLogger) -> int:
+    """docs/protocol.md §2.6: listen, and give each accepted connection its own `Server`.
+
+    Every connection is wholly independent (§2.7) — its own handshake, its own `ready`, its own
+    single session, its own `session_id` space. Nothing is shared and nothing is keyed on
+    `session_id`, which is only unique within one client's process (§7.1) and will collide the
+    first time two people start the app on the same afternoon: both begin at `s1`.
+
+    This function does not return until the process is interrupted. Its exit code is about the
+    *listener*, not about any one connection — a client that fails its handshake is that
+    client's problem, and a server that exited because somebody spoke proto 2 at it would be a
+    denial of service with extra steps.
+    """
+    from . import ws as ws_mod
+
+    host, port = cfg.listen
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        # §2.8, and worth a line in the log every single time rather than once in a README:
+        # there is no authentication, and ws:// is unencrypted.
+        log.warning(
+            "listening_on_a_routable_address",
+            host=host,
+            note="there is no authentication and ws:// is unencrypted (docs/protocol.md §2.8): "
+            "anyone who can reach this port can send audio, and anyone on the path can read it",
+        )
+
+    def refuse(conn: Any) -> None:
+        # §2.7: refuse in words, after reading `hello`, instead of `hello_ack`. Silence and a
+        # connection that never becomes ready both present to the user as "it hangs", which is
+        # the failure this project spends the most effort not producing.
+        message = conn.recv_message()
+        if message is None:
+            return
+        conn.send_binary(
+            proto.encode_control_frame(
+                proto.ErrorMessage(
+                    code=proto.ErrorCode.server_busy.value,
+                    fatal=True,
+                    msg=f"this server accepts {cfg.max_connections} connection(s) at a time",
+                    retry_after_ms=5000,
+                )
+            )
+        )
+
+    def serve(channel: Any, peer: str) -> None:
+        log.info("client_connected", peer=peer)
+        try:
+            code = Server(cfg, channel, log=log).run()
+        except Exception as exc:  # pragma: no cover - a bug here must not kill the listener
+            log.exception("connection_crashed", exc, peer=peer)
+            code = EXIT_INTERNAL
+        log.info("client_disconnected", peer=peer, exit_code=code)
+
+    try:
+        ws_mod.serve_forever(
+            host,
+            port,
+            serve,
+            max_connections=cfg.max_connections,
+            log=log,
+            on_refused=refuse,
+        )
+    except KeyboardInterrupt:
+        log.info("stopping")
+    except OSError as exc:
+        log.error("listen_failed", host=host, port=port, reason=str(exc))
+        return EXIT_TRANSPORT
+    return 0
+
+
 def main(argv: list[str] | None = None, *, channel: Channel | None = None) -> int:
     """Parse, connect, run. Returns the process exit code.
 
@@ -1174,6 +1287,9 @@ def main(argv: list[str] | None = None, *, channel: Channel | None = None) -> in
             note="recognised text will be written to stderr; plan.md §1.9 wants this off "
             "outside a debugging session",
         )
+
+    if channel is None and cfg.listen is not None:
+        return _serve_websocket(cfg, log)
 
     if channel is None:
         try:

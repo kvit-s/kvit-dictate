@@ -110,7 +110,15 @@ class SessionConfig:
 
 @dataclass(frozen=True)
 class ServerConfig:
-    pipe_name: str
+    pipe_name: str = ""
+    #: docs/protocol.md §2.6. `(host, port)` when this process listens for WebSocket clients,
+    #: None when it is a child connecting to the pipe its parent created. Exactly one of the two
+    #: is set; `parse_args` refuses both and refuses neither.
+    listen: "tuple[str, int] | None" = None
+    #: §2.7. 0 means unlimited. The default is 1 because a connection currently costs a model
+    #: load (see kvit_asr/ws.py), so a second client would get a second copy of the weights
+    #: rather than a share of the first.
+    max_connections: int = 1
     proto: int | None = None  # None = "whatever this build supports"; resolved in server.py
     parent_pid: int | None = None
     log_level: str = "info"
@@ -134,13 +142,17 @@ class ServerConfig:
     allow-hostile-backend flag, and MUST log loudly when it does")."""
 
 
-class _RefuseNetworkAction(argparse.Action):
-    """`--port`/`--host` exist only to fail loudly.
+class _RedirectNetworkAction(argparse.Action):
+    """`--port`/`--host` name the right idea with the wrong spelling. Say so, once.
 
-    plan.md §1.2 chose a named pipe specifically so there is no firewall prompt on first run
-    (which reads badly for a privacy tool) and no port collision. If a future launcher grows a
-    `--port`, the failure should name the decision rather than produce an "unrecognised
-    arguments" message that invites someone to add the flag.
+    They used to exist purely to fail: plan.md §1.2 chose a named pipe so that a privacy tool
+    would not produce a firewall prompt on first run, and this action refused the very notion of
+    a port. release-plan.md §1 reversed that decision — the recogniser is no longer a child
+    process, so it has to be reachable over a network — and `--listen` is what replaced them.
+
+    The refusal is kept rather than deleted, and now points at the replacement. Someone reading
+    an old command line, an old README, or an old note in this repository will type `--port`,
+    and "unrecognised arguments" would send them looking for the flag to add.
     """
 
     def __init__(self, option_strings, dest, **kwargs):
@@ -148,10 +160,61 @@ class _RefuseNetworkAction(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         parser.error(
-            f"{option_string}: the sidecar never listens on a network port. Transport is a "
-            "named pipe whose per-launch random name is passed with --pipe (plan.md §1.2, "
-            "docs/protocol.md §2.1)."
+            f"{option_string}: use --listen instead, which takes a host and a port together, "
+            "e.g. --listen ws://127.0.0.1:10402 or --listen 127.0.0.1:10402 "
+            "(docs/protocol.md §2.6)."
         )
+
+
+def parse_listen(value: str) -> "tuple[str, int]":
+    """`ws://host:port`, `host:port` or `:port` into `(host, port)`.
+
+    `ws://` and `http://` are accepted and stripped, because the client's settings page shows a
+    URL and an operator will paste it here. A path is rejected rather than ignored: this server
+    answers on every path, and silently discarding one would let somebody believe they had
+    configured routing.
+    """
+    text = value.strip()
+    for prefix in ("ws://", "wss://", "http://", "https://"):
+        if text.lower().startswith(prefix):
+            if prefix in ("wss://", "https://"):
+                raise ValueError(
+                    "this server does not terminate TLS (docs/protocol.md §2.8). Listen on "
+                    "ws:// and put a reverse proxy in front if you need wss://"
+                )
+            text = text[len(prefix):]
+            break
+    if "/" in text:
+        head, _, tail = text.partition("/")
+        if tail not in ("", ""):
+            raise ValueError(
+                f"--listen takes a host and a port, not a path: drop the '/{tail}'. This "
+                "server answers on every path"
+            )
+        text = head
+    if text.startswith("["):
+        close = text.find("]")
+        if close < 0:
+            raise ValueError("an IPv6 address must be in square brackets, e.g. [::1]:10402")
+        host = text[1:close]
+        rest = text[close + 1:]
+        port_text = rest[1:] if rest.startswith(":") else ""
+    elif text.count(":") == 1:
+        host, _, port_text = text.partition(":")
+    elif ":" in text:
+        raise ValueError("an IPv6 address must be in square brackets, e.g. [::1]:10402")
+    else:
+        raise ValueError("--listen needs a port, e.g. --listen 127.0.0.1:10402")
+    if not port_text:
+        raise ValueError("--listen needs a port, e.g. --listen 127.0.0.1:10402")
+    if not port_text.isdigit():
+        raise ValueError(f"the port is not a number: {port_text!r}")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("the port must be between 1 and 65535")
+    # An empty host means "every interface", which docs §2.8 asks a server not to make the easy
+    # default. It is still allowed — an operator who types it has said what they mean.
+    return (host or "0.0.0.0", port)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -170,13 +233,29 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    t = p.add_argument_group("transport")
+    t = p.add_argument_group("transport — exactly one of --listen or --pipe")
+    t.add_argument(
+        "--listen",
+        default=None,
+        metavar="[host:]port",
+        help="Listen for WebSocket clients (docs/protocol.md §2.6). This is the shipped "
+        "binding. Accepts ws://host:port, host:port, or :port. Bind to 127.0.0.1 unless you "
+        "mean otherwise: there is no authentication and ws:// is unencrypted (§2.8).",
+    )
+    t.add_argument(
+        "--max-connections",
+        type=int,
+        default=1,
+        help="How many WebSocket clients may be connected at once; 0 means unlimited. Beyond "
+        "the limit a client is refused with `server_busy` (§2.7). Default 1, because a "
+        "connection currently costs a model load. (default: 1)",
+    )
     t.add_argument(
         "--pipe",
-        required=True,
+        default=None,
         metavar=r"\\.\pipe\kvit-dictate-<32 hex>",
-        help="Full name of the named pipe created by the parent. Per-launch and unpredictable "
-        "(docs/protocol.md §2.2); never hard-code it.",
+        help="Named-pipe binding (docs/protocol.md §2.2), for the bench, which spawns this "
+        "process locally. Per-launch and unpredictable; never hard-code it.",
     )
     t.add_argument(
         "--proto",
@@ -195,8 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
         "step 5). Best effort — see the note in server.py about that API being an open "
         "question in docs/protocol.md §14.",
     )
-    t.add_argument("--port", action=_RefuseNetworkAction)
-    t.add_argument("--host", action=_RefuseNetworkAction)
+    t.add_argument("--port", action=_RedirectNetworkAction)
+    t.add_argument("--host", action=_RedirectNetworkAction)
 
     b = p.add_argument_group("backend (exactly one per process — see server.py)")
     b.add_argument(
@@ -311,8 +390,24 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
     if ns.proto is not None and not (1 <= ns.proto <= 65535):
         parser.error("--proto must be in 1..65535 (docs/protocol.md §6.1)")
 
+    if (ns.listen is None) == (ns.pipe is None):
+        parser.error(
+            "give exactly one of --listen (the shipped WebSocket binding, docs/protocol.md "
+            "§2.6) or --pipe (the named-pipe binding the bench uses, §2.2)"
+        )
+    listen = None
+    if ns.listen is not None:
+        try:
+            listen = parse_listen(ns.listen)
+        except ValueError as exc:
+            parser.error(f"--listen: {exc}")
+    if ns.max_connections < 0:
+        parser.error("--max-connections must be >= 0 (0 means unlimited)")
+
     return ServerConfig(
-        pipe_name=ns.pipe,
+        pipe_name=ns.pipe or "",
+        listen=listen,
+        max_connections=ns.max_connections,
         proto=ns.proto,
         parent_pid=ns.parent_pid,
         log_level=ns.log_level,
