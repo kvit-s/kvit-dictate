@@ -47,6 +47,10 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <uxtheme.h>
+// BP_CHECKBOX, BP_RADIOBUTTON and the CBS_/RBS_ state constants. uxtheme.h declares the drawing
+// functions and vssym32.h names the parts they take; without it the check-box painter would have
+// to spell the numbers out.
+#include <vssym32.h>
 
 #include <algorithm>
 #include <cctype>
@@ -2384,6 +2388,141 @@ void refresh_editing_page(HWND dlg) {
 // three states Windows reports are honoured, plus hover, which it does not report — see
 // button_hover_subclass.
 
+// ─── Check boxes and radio buttons, drawn by hand, and only in dark mode ────────────────────
+//
+// **The same hole as the push buttons, found the same way and fixed differently.** A BUTTON in
+// the check-box or radio family draws its own label, and once it is themed it does so with
+// DrawThemeText and the *theme's* colour — so the parent's WM_CTLCOLORSTATIC reply, which is
+// what makes every STATIC on this dialog light, is ignored. `DarkMode_Explorer` darkens the
+// glyph and leaves the text at the light theme's near-black, which on our dark face is
+// unreadable. Reported from use as "text is black on dark background"; it was true of every
+// check box on every page, and the two new radios on the Server page merely made it obvious.
+//
+// Why a subclass and not BS_OWNERDRAW, which is what the push buttons use: BS_OWNERDRAW occupies
+// the same style bits as BS_AUTOCHECKBOX and BS_AUTORADIOBUTTON, so turning it on takes the
+// *auto* with it — the control stops toggling itself, stops answering BM_GETCHECK usefully, and
+// every IsDlgButtonChecked call in this file would have to be replaced by state kept by hand.
+// That is a large change to make for a colour. Painting inside a subclass leaves the style, the
+// toggle, the keyboard handling and the group behaviour exactly as they were, and changes only
+// the pixels.
+//
+// The glyph still comes from the theme, opened through the "DarkMode_Explorer::Button" class
+// list so the dark check and the dark radio are Windows' own rather than something drawn here
+// that will not match the next release. DrawFrameControl is the fallback when that class does
+// not exist, which is a build old enough to have no dark mode at all.
+
+void paint_check_or_radio(HWND hwnd, DialogState& st) {
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    if (st.face_brush != nullptr) FillRect(dc, &rc, st.face_brush);
+
+    const theme::DialogPalette& p = theme::dialog_palette(true);
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const LONG_PTR type = style & BS_TYPEMASK;
+    const bool radio = type == BS_RADIOBUTTON || type == BS_AUTORADIOBUTTON;
+    const bool checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const bool disabled = IsWindowEnabled(hwnd) == FALSE;
+
+    // 13 logical px is the size Windows has drawn these at since the beginning; taking it from
+    // the theme would be better and GetThemePartSize needs a theme we may not have.
+    const int box = px(st, 13);
+    const int top = rc.top + ((rc.bottom - rc.top) - box) / 2;
+    RECT glyph{rc.left, top, rc.left + box, top + box};
+
+    HTHEME theme = OpenThemeData(hwnd, L"DarkMode_Explorer::Button");
+    if (theme != nullptr) {
+        const int part = radio ? BP_RADIOBUTTON : BP_CHECKBOX;
+        int state;
+        if (radio) {
+            state = checked ? (disabled ? RBS_CHECKEDDISABLED : RBS_CHECKEDNORMAL)
+                            : (disabled ? RBS_UNCHECKEDDISABLED : RBS_UNCHECKEDNORMAL);
+        } else {
+            state = checked ? (disabled ? CBS_CHECKEDDISABLED : CBS_CHECKEDNORMAL)
+                            : (disabled ? CBS_UNCHECKEDDISABLED : CBS_UNCHECKEDNORMAL);
+        }
+        DrawThemeBackground(theme, dc, part, state, &glyph, nullptr);
+        CloseThemeData(theme);
+    } else {
+        UINT flags = radio ? DFCS_BUTTONRADIO : DFCS_BUTTONCHECK;
+        if (checked) flags |= DFCS_CHECKED;
+        if (disabled) flags |= DFCS_INACTIVE;
+        DrawFrameControl(dc, &glyph, DFC_BUTTON, flags);
+    }
+
+    // The label, in the colour the rest of the dialog uses — which is the whole point of this
+    // function. Disabled takes the palette's own grey rather than COLOR_GRAYTEXT, which is tuned
+    // for a light face and disappears on a dark one.
+    RECT text{glyph.right + px(st, 6), rc.top, rc.right, rc.bottom};
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, disabled ? p.disabled_text : p.text);
+    HGDIOBJ previous_font = SelectObject(dc, st.font);
+    wchar_t label[256]{};
+    GetWindowTextW(hwnd, label, ARRAYSIZE(label));
+    DrawTextW(dc, label, -1, &text,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    // Keyboard focus. Windows draws this for us on an unowned button and cannot here, and a
+    // dialog you can tab through without seeing where you are is worse than one that is light.
+    if ((SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) == 0 &&
+        GetFocus() == hwnd) {
+        RECT focus = text;
+        DrawTextW(dc, label, -1, &focus, DT_LEFT | DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+        focus.top = rc.top;
+        focus.bottom = rc.bottom;
+        InflateRect(&focus, px(st, 1), 0);
+        SetTextColor(dc, p.text);
+        DrawFocusRect(dc, &focus);
+    }
+
+    SelectObject(dc, previous_font);
+    EndPaint(hwnd, &ps);
+}
+
+LRESULT CALLBACK check_radio_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                      DWORD_PTR ref) {
+    auto* st = reinterpret_cast<DialogState*>(ref);
+    switch (msg) {
+        case WM_PAINT:
+            // Inert in light mode, like the tab strip's subclass and the button hover one: the
+            // system's own painting is right there and a hand-drawn imitation of it could only
+            // differ.
+            if (st != nullptr && st->dark) {
+                paint_check_or_radio(hwnd, *st);
+                return 0;
+            }
+            break;
+
+        case WM_ERASEBKGND:
+            // The paint above fills the whole client rect. Letting the default erase run first
+            // is a visible flash on every toggle.
+            if (st != nullptr && st->dark) return 1;
+            break;
+
+        case BM_SETCHECK:
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+        case WM_ENABLE:
+            // A state the paint reads but Windows does not know we are reading. Repainted after
+            // the default handler has actually changed it.
+            if (st != nullptr && st->dark) {
+                const LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return r;
+            }
+            break;
+
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(hwnd, check_radio_subclass, id);
+            break;
+
+        default:
+            break;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 void draw_dialog_button(DialogState& st, const DRAWITEMSTRUCT* di) {
     if (di == nullptr || !st.dark) return;
     const theme::DialogPalette& p = theme::dialog_palette(true);
@@ -2514,6 +2653,30 @@ void apply_dialog_theme(HWND dlg, DialogState& st, bool dark) {
         InvalidateRect(h, nullptr, TRUE);
     }
     st.hot_button = nullptr;
+
+    // Every check box and radio button on every page. Enumerated rather than listed by id: this
+    // dialog has fourteen of them across five pages, a list would go stale the first time one was
+    // added, and "the one nobody updated the list for" is precisely the control that would still
+    // be drawing black text on a dark face.
+    //
+    // Installed once and left in place, like the two subclasses above: it is inert while `dark`
+    // is false, and adding and removing it on every scheme change is one more thing to get wrong
+    // for no gain.
+    EnumChildWindows(
+        dlg,
+        [](HWND child, LPARAM param) -> BOOL {
+            wchar_t cls[32]{};
+            if (GetClassNameW(child, cls, ARRAYSIZE(cls)) == 0) return TRUE;
+            if (_wcsicmp(cls, L"Button") != 0) return TRUE;
+            const LONG_PTR type = GetWindowLongPtrW(child, GWL_STYLE) & BS_TYPEMASK;
+            if (type == BS_AUTOCHECKBOX || type == BS_CHECKBOX || type == BS_AUTORADIOBUTTON ||
+                type == BS_RADIOBUTTON) {
+                SetWindowSubclass(child, check_radio_subclass, 1, static_cast<DWORD_PTR>(param));
+                InvalidateRect(child, nullptr, TRUE);
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&st));
 
     // RDW_ALLCHILDREN and UPDATENOW for the same reason show_page() spells out below: the erase
     // and the children's repaint have to happen in this call, not at the next idle, or the
