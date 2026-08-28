@@ -640,7 +640,52 @@ KD_TEST(hotkey, escape_cancels_only_while_a_session_is_running) {
     o = f.on_event(kdown(kd::vk::kEscape, 200));
     KD_CHECK(o.cancel);
     KD_CHECK(!o.stop_on_input);  // cancel is the specific signal; a generic stop would lose "why"
-    // Not swallowed — a judgement call documented in hotkey.cpp, not something plan.md settles.
+    // **Swallowed**, and this assertion is the reverse of what it used to be. Esc passed through
+    // on the argument that a dialog opened mid-dictation should still close; in practice every
+    // ordinary cancel leaked an Esc into whatever had focus, which interrupts a terminal, leaves
+    // vim's insert mode and dismisses autocompletes. Reported from real use. See hotkey.cpp.
+    KD_CHECK(o.swallow);
+}
+
+KD_TEST(hotkey, the_escape_key_up_is_swallowed_too) {
+    // A target that saw only the key-*up* of an Esc it never saw pressed is worse off than one
+    // that saw neither: an application watching for the release alone still acts on it. Same
+    // `swallowed_down_` bookkeeping the commit key uses, and the same reason.
+    kd::InputFilter f;
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+
+    kd::FilterOutcome down = f.on_event(kdown(kd::vk::kEscape, 200));
+    KD_CHECK(down.cancel);
+    KD_CHECK(down.swallow);
+
+    kd::FilterOutcome up = f.on_event(kup(kd::vk::kEscape, 220));
+    KD_CHECK(up.swallow);
+}
+
+KD_TEST(hotkey, an_idle_escape_still_belongs_entirely_to_the_target) {
+    // The scope of the change, asserted so it cannot widen by accident: with no session running
+    // this filter has no business touching Esc at all, and a build that ate it everywhere would
+    // be a keyboard hook that breaks the Escape key.
+    kd::InputFilter f;
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kEscape, 50));
+    KD_CHECK(!o.cancel);
+    KD_CHECK(!o.swallow);
+    KD_CHECK(!f.on_event(kup(kd::vk::kEscape, 60)).swallow);
+}
+
+KD_TEST(hotkey, escape_is_not_swallowed_after_the_session_has_ended) {
+    // The session ends, and Esc goes back to being the target's. The auto-repeat of a held Esc
+    // is the case that would otherwise keep swallowing forever.
+    kd::InputFilter f;
+    activate_win_y(f, 100);
+    release_win_y(f, 120);
+    KD_CHECK(f.on_event(kdown(kd::vk::kEscape, 200)).swallow);
+    f.on_event(kup(kd::vk::kEscape, 210));
+
+    f.note_session_ended();
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kEscape, 300));
+    KD_CHECK(!o.cancel);
     KD_CHECK(!o.swallow);
 }
 

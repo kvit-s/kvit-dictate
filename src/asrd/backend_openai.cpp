@@ -155,9 +155,29 @@ bool PseudoStreamingDriver::take_window(bool force, std::vector<int16_t>& window
         pending_samples_ = 0;
     }
 
-    slid = buf_.size() > window_samples_;
+    // ── The slide, and the condition that must hold before it is allowed ────────────────────
+    //
+    // Dropping audio out of the window is only survivable because `commit()` freezes its
+    // transcript first, and it can only do that by stitching the pre-slide transcript against
+    // the post-slide one. **With no pre-slide transcript there is nothing to stitch**, so
+    // `scrolled_off_words("", text)` freezes the empty string and the audio is simply gone.
+    //
+    // That is not hypothetical: it is what finalize-only did. With hop >= window no intermediate
+    // hop ever runs, so `prev_window_text_` is always empty — and every utterance longer than
+    // `window_ms` silently lost everything before its last window. openai-translator.md §4.5
+    // asserts "finalize-only makes hop_ms >= window_ms, so the window never slides", and that
+    // is false: it stops *hops* from firing, but the finalize still forces a take.
+    //
+    // Reported from real use as "a chunk of dictation was never captured", which is exactly what
+    // it looks like from the outside and exactly the failure this project says it will not have.
+    //
+    // So the window slides only when there is a transcript to freeze. The buffer is then bounded
+    // by `VadConfig::max_utterance_ms` instead — a cut utterance, logged, rather than a silent
+    // hole in the middle of one.
+    slid = buf_.size() > window_samples_ && !prev_window_text_.empty();
     if (slid) {
-        // Keep the newest window_samples_. Everything older is gone from the model's view.
+        // Keep the newest window_samples_. Everything older is gone from the model's view, and
+        // commit() is about to freeze its words.
         buf_.erase(buf_.begin(),
                    buf_.begin() + static_cast<ptrdiff_t>(buf_.size() - window_samples_));
     }

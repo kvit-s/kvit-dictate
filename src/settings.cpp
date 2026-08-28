@@ -1789,6 +1789,10 @@ struct DialogState {
     //: measured because the whole point of laying labels out above their controls (see `Cursor`)
     //: is to survive a font or DPI this file did not anticipate.
     int line_h = 15;
+
+    // The tallest column, in logical px, filled in by `Cursor::mark()` while the controls are
+    // built. The dialog is then sized from it (`fit_page_height`) instead of from a constant.
+    int content_h = 0;
     bool accepted = false;
     bool running = true;
 
@@ -1897,7 +1901,17 @@ struct Cursor {
     int page = 0;
     int x = 0;
     int y = 0;
+    int top_y = 0;  // where this column started, so `mark()` measures content and not position
     int w = 0;
+
+    // The tallest any column has reached, in logical px below `top`. Recorded rather than
+    // assumed, because the page height used to be a constant tuned against one font size and
+    // every column's real height is a function of `st->line_h`, which is *measured* — so on a
+    // machine whose message font is a point taller, prose that fitted here silently ran into the
+    // button row. See `fit_page_height` for what is done with it.
+    void mark() {
+        if (st != nullptr && y - top_y > st->content_h) st->content_h = y - top_y;
+    }
 
     HWND add(const wchar_t* cls, const wchar_t* text, DWORD style, int logical_height, int id,
              DWORD ex = 0) {
@@ -1915,10 +1929,14 @@ struct Cursor {
             st->page_controls[page].push_back(c);
         }
         y += h;
+        mark();
         return c;
     }
 
-    void gap(int logical = 8) { y += px(*st, logical); }
+    void gap(int logical = 8) {
+        y += px(*st, logical);
+        mark();
+    }
 
     void section(const wchar_t* title) {
         gap(10);
@@ -2895,13 +2913,36 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
 // ─── Construction ───────────────────────────────────────────────────────────────────────────
 
 constexpr int kPageWidth = 700;   // logical px, two columns
-constexpr int kPageHeight = 430;
+
+// The *minimum* page height, and no longer the actual one.
+//
+// It used to be exactly the height, and that was a latent bug in every note on every page: the
+// content's real height is a function of `DialogState::line_h`, which is **measured** from the
+// system message font at run time, while this was a constant tuned against one machine's
+// measurement. A font a point taller — a different DPI, a different Windows language, a user who
+// changed the message font — pushed the bottom of a column into the button row, silently. It was
+// visible on the Overlay page (whose own comment records it as "419 of 430" and which measures
+// 451 at line_h = 17) long before the Server page made it obvious.
+//
+// `fit_page_height` now grows the dialog to whatever the tallest column actually needs.
+constexpr int kPageHeightMin = 430;
 constexpr int kMargin = 12;
 constexpr int kTabStrip = 30;
+
+// The page height this dialog will actually use: the tallest column, never less than the
+// historical minimum so that a sparse page does not produce a stubby window.
+//
+// Deliberately not clamped to the screen here. A column taller than the work area is a content
+// problem, and silently clipping it is exactly the failure this replaces; `create_dialog` warns
+// and lets the window be tall, which at least leaves every control reachable by moving it.
+int page_height(const DialogState& st) {
+    return st.content_h > kPageHeightMin ? st.content_h : kPageHeightMin;
+}
 
 void build_controls(HWND dlg, DialogState& st) {
     HINSTANCE inst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(dlg, GWLP_HINSTANCE));
 
+    st.content_h = 0;
     const int col_w = px(st, (kPageWidth - kMargin * 3) / 2);
     const int col1_x = px(st, kMargin * 2);
     const int col2_x = col1_x + col_w + px(st, kMargin);
@@ -2912,7 +2953,7 @@ void build_controls(HWND dlg, DialogState& st) {
     // First, because it is the only page a new install cannot work without. Everything else in
     // this dialog tunes behaviour; this one decides whether there is any.
     {
-        Cursor c{dlg, inst, &st, 0, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 0, col1_x, top, top, col_w};
         c.section(L"Where your speech service is");
         c.note(L"kvit-dictate does not recognise speech itself. It captures your voice, sends it "
                L"to a service you run, and types back what comes out. Without one it will not "
@@ -2947,7 +2988,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.add(L"STATIC", L"", 0, st.line_h * 9, kIdServerStatus);
     }
     {
-        Cursor c{dlg, inst, &st, 0, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 0, col2_x, top, top, col_w};
         c.section(L"What crosses your network");
         c.note(L"Your audio goes to the server you name above and nowhere else. There is no "
                L"cloud service, no telemetry, and nothing is sent anywhere until you press the "
@@ -2974,7 +3015,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 1: the compose buffer (docs/editing.md) ────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 1, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 1, col1_x, top, top, col_w};
         c.section(L"The pill as a compose buffer");
         c.note(L"Nothing reaches your document until you say so. Speech accumulates in the pill; "
                L"Enter types it in and finishes, Esc throws it away, and the hotkey only ever "
@@ -2995,7 +3036,7 @@ void build_controls(HWND dlg, DialogState& st) {
                3);
     }
     {
-        Cursor c{dlg, inst, &st, 1, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 1, col2_x, top, top, col_w};
         c.section(L"The keyboard belongs to the pill");
         c.note(L"While a session is composing, editing keys — Backspace, Delete, the arrows, "
                L"Home/End, Ctrl+A/C/X/V/Z and ordinary characters — go to the pill instead of to "
@@ -3013,7 +3054,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 1: dictation ───────────────────────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 2, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col1_x, top, top, col_w};
         c.section(L"Activation");
         c.label_combo(L"Hotkey (toggle: press to start, press again to finalise)", kIdHotkey);
 
@@ -3032,7 +3073,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Never end the session on silence", kIdSessionNever);
     }
     {
-        Cursor c{dlg, inst, &st, 2, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 2, col2_x, top, top, col_w};
         c.section(L"Stability — what is SAFE to commit");
         c.note(L"Eligibility is decided by stability alone. Committed text is never repaired, so "
                L"nothing below may ever be widened by the cadence setting.",
@@ -3051,7 +3092,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 2: injection, audio, model ─────────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 3, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col1_x, top, top, col_w};
         c.section(L"Text injection");
         c.label_combo(L"Default method", kIdInjectMethod);
         c.label_edit(L"SendInput: characters per batch (0 = one batch)", kIdCharsBatch, ES_NUMBER);
@@ -3065,7 +3106,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_combo(L"Capture device", kIdAudioDevice);
     }
     {
-        Cursor c{dlg, inst, &st, 3, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 3, col2_x, top, top, col_w};
         c.section(L"Per-app injection policy");
         c.note(L"One line per application:   process.exe = sendinput | clipboard "
                L"[, ctrl-shift-v] [, unsupported]   # note",
@@ -3082,16 +3123,20 @@ void build_controls(HWND dlg, DialogState& st) {
 
     // ── Page 3: overlay, privacy, vocabulary ────────────────────────────────────────────────
     {
-        Cursor c{dlg, inst, &st, 4, col1_x, top, col_w};
+        Cursor c{dlg, inst, &st, 4, col1_x, top, top, col_w};
         c.section(L"Overlay");
         c.label_combo(L"Presentation", kIdOverlayMode);
         c.label_combo(L"When the anchor is not confident enough", kIdFallback);
         c.label_edit(L"Minimum anchor confidence (0.0 - 1.0)", kIdMinConfidence);
         // The scheme sits above the three colours it governs, and the colours name it in their
-        // labels, because a greyed-out field says "not now" and never says "why". No explanatory
-        // note under it: this column is 419 of kPageHeight's 430 logical px as it stands, and one
-        // more line of prose here is a control pushed off the page rather than a page that
-        // scrolls — see the top of this file on what this dialog deliberately does not have.
+        // labels, because a greyed-out field says "not now" and never says "why".
+        //
+        // There used to be a warning here that this column was "419 of kPageHeight's 430" and
+        // that one more line of prose would push a control off the page. It was already false
+        // when it was written — 430 was a constant and this column's height depends on the
+        // measured `line_h`, so at line_h = 17 it is 451 and the last control was already under
+        // the buttons. `fit_page_height` grows the dialog instead, so prose here costs height
+        // rather than correctness.
         c.label_combo(L"Colour scheme (this dialog follows it too)", kIdTheme);
         c.label_edit(L"Font family", kIdFontFamily);
         c.label_edit(L"Font size (DIP)", kIdFontSize);
@@ -3100,7 +3145,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Background, custom scheme only (#AARRGGBB)", kIdColorBackground);
     }
     {
-        Cursor c{dlg, inst, &st, 4, col2_x, top, col_w};
+        Cursor c{dlg, inst, &st, 4, col2_x, top, top, col_w};
         c.section(L"Privacy and diagnostics");
         c.note(L"Shipping policy, not preference: nothing you dictate is written to disk, and "
                L"nothing here ever touches the network.",
@@ -3140,7 +3185,11 @@ void build_controls(HWND dlg, DialogState& st) {
 
     const int button_w = px(st, 96);
     const int button_h = px(st, 26);
-    const int button_y = px(st, kMargin + kTabStrip + kMargin + kPageHeight + kMargin);
+    // From the content, not from a constant: `page_height` is whatever the tallest column
+    // actually needed. Both the buttons and the window below are placed from the same number, so
+    // they cannot disagree.
+    const int button_y = px(st, kMargin + kTabStrip + kMargin) + px(st, kMargin) +
+                         px(st, page_height(st));
     const int right = px(st, kMargin + kPageWidth);
 
     struct ButtonDef {
@@ -3580,7 +3629,7 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
     }
 
     RECT client{0, 0, px(st, kMargin * 2 + kPageWidth),
-                px(st, kMargin * 3 + kTabStrip + kPageHeight + 26 + kMargin)};
+                px(st, kMargin * 3 + kTabStrip + 26 + kMargin) + px(st, page_height(st))};
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRectExForDpi(&client, style, FALSE, 0, static_cast<UINT>(st.dpi));
 
@@ -3592,6 +3641,35 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
         KD_LOG_ERROR("settings dialog creation failed, err=%lu", GetLastError());
         if (st.font) DeleteObject(st.font);
         return false;
+    }
+
+    // ── Grow to what the content turned out to need ──────────────────────────────────────────
+    //
+    // The window has to exist before its controls can be parented to it, and the controls are
+    // what reveal how tall the tallest column is — so the height above is a first guess from the
+    // minimum and this is the correction. WM_CREATE has already run `build_controls`, which
+    // filled `st.content_h` and placed the buttons from the same number, so only the frame is
+    // out of date by the time we get here.
+    if (page_height(st) > kPageHeightMin) {
+        RECT grown{0, 0, px(st, kMargin * 2 + kPageWidth),
+                   px(st, kMargin * 3 + kTabStrip + 26 + kMargin) + px(st, page_height(st))};
+        AdjustWindowRectExForDpi(&grown, style, FALSE, 0, static_cast<UINT>(st.dpi));
+        SetWindowPos(dlg, nullptr, 0, 0, grown.right - grown.left, grown.bottom - grown.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        KD_LOG_DEBUG("settings dialog grown to %d logical px of page (line_h=%d)",
+                     page_height(st), st.line_h);
+
+        // A page taller than the screen is a content problem, not a layout one, and clipping it
+        // silently is the failure this whole mechanism replaces. Say so; the window is still
+        // usable because it can be moved.
+        RECT work{};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) &&
+            (grown.bottom - grown.top) > (work.bottom - work.top)) {
+            KD_LOG_WARN(
+                "the settings dialog needs %d px and the work area is %d px tall; a page has more "
+                "content than fits and some of it will be off screen",
+                grown.bottom - grown.top, work.bottom - work.top);
+        }
     }
 
     // Modal by hand rather than DialogBoxParam, because there is no dialog template: disable the

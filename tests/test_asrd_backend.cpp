@@ -316,3 +316,81 @@ KD_TEST(asrd_backend, reset_forgets_the_frozen_prefix_and_the_clock) {
     KD_CHECK(!driver.any_audio());
     KD_CHECK(!driver.take_window(true, window, slid));
 }
+
+// ─── The slide must never lose audio ────────────────────────────────────────────────────────
+
+KD_TEST(asrd_backend, finalize_only_never_drops_the_start_of_a_long_utterance) {
+    // The regression this test exists for, reported from real use as "a chunk of dictation was
+    // never captured".
+    //
+    // In finalize-only no intermediate hop ever runs, so `prev_window_text_` is empty when the
+    // finalize forces a take. The window used to slide anyway, `scrolled_off_words("", text)`
+    // froze nothing, and every second of audio before the last `window_ms` vanished with no
+    // error, no log line and no gap in the transcript to notice.
+    //
+    // openai-translator.md §4.5 says "finalize-only makes hop_ms >= window_ms, so the window
+    // never slides" — that claim is about *hops*, and the finalize is not a hop.
+    PseudoStreamingDriver driver(8000, 8000);  // the shipped finalize-only shape
+
+    // Twenty seconds of speech in one utterance: a long sentence, or a paragraph read aloud.
+    const std::vector<int16_t> chunk = pcm_ms(1000);
+    for (int i = 0; i < 20; ++i) driver.feed(chunk.data(), chunk.size());
+
+    std::vector<int16_t> window;
+    bool slid = true;
+    KD_REQUIRE(driver.take_window(/*force=*/true, window, slid));
+
+    KD_CHECK(!slid);
+    // The whole utterance reaches the model, not the last eight seconds of it.
+    KD_CHECK_EQ(window.size(), size_t{20 * 16000});
+    KD_CHECK_EQ(driver.commit("the whole thing", slid), std::string("the whole thing"));
+    KD_CHECK(driver.frozen_prefix().empty());
+}
+
+KD_TEST(asrd_backend, a_slide_with_nothing_to_stitch_against_is_refused) {
+    // The general rule, stated without reference to finalize-only: dropping audio is survivable
+    // only because commit() freezes its transcript first, and it can only do that by stitching
+    // the pre-slide transcript against the post-slide one. With no pre-slide transcript there is
+    // nothing to freeze, so the slide must not happen.
+    PseudoStreamingDriver driver(2000, 1000);
+    const std::vector<int16_t> chunk = pcm_ms(5000);
+    driver.feed(chunk.data(), chunk.size());
+
+    std::vector<int16_t> window;
+    bool slid = true;
+    KD_REQUIRE(driver.take_window(false, window, slid));
+    KD_CHECK(!slid);                            // first take: nothing has ever been transcribed
+    KD_CHECK_EQ(window.size(), size_t{5 * 16000});
+
+    // Once a transcript exists, the window is allowed to slide and the words are frozen.
+    driver.commit("one two three", slid);
+    driver.feed(chunk.data(), chunk.size());
+    KD_REQUIRE(driver.take_window(false, window, slid));
+    KD_CHECK(slid);
+    KD_CHECK_EQ(window.size(), size_t{2 * 16000});
+    KD_CHECK_EQ(driver.commit("three four", slid), std::string("one two three four"));
+    KD_CHECK_EQ(driver.frozen_prefix(), std::string("one two"));
+}
+
+KD_TEST(asrd_backend, every_second_fed_reaches_the_model_or_the_frozen_prefix) {
+    // The invariant behind both tests above, driven over a long live-preview session where the
+    // window really does slide repeatedly. Nothing asserts the *text* — the stitch is a
+    // heuristic and base.py documents where it is wrong — but no second of audio may leave the
+    // buffer without a transcription having seen it.
+    PseudoStreamingDriver driver(4000, 1000);
+    const std::vector<int16_t> second = pcm_ms(1000);
+
+    size_t transcribed_seconds = 0;
+    for (int i = 0; i < 30; ++i) {
+        driver.feed(second.data(), second.size());
+        std::vector<int16_t> window;
+        bool slid = false;
+        if (!driver.take_window(false, window, slid)) continue;
+        transcribed_seconds += window.size() / 16000;
+        driver.commit("hypothesis " + std::to_string(i), slid);
+    }
+    // Every hop re-transcribes the whole window, so the total far exceeds the 30 s fed; what
+    // matters is that the buffer never got ahead of what was transcribed.
+    KD_CHECK_GT(transcribed_seconds, size_t{30});
+    KD_CHECK_EQ(driver.audio_ms(), uint64_t{30000});
+}

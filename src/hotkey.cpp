@@ -688,9 +688,9 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
             return out;
         }
 
-        // The same rule, generalised to every key the pill swallowed on its own behalf — Enter,
-        // today. The set is written by the key-down path below and drained here, so a key can
-        // only ever have its release swallowed once, and only if its press actually was.
+        // The same rule, generalised to every key the pill swallowed on its own behalf: Enter,
+        // and now Esc. The set is written by the key-down path below and drained here, so a key
+        // can only ever have its release swallowed once, and only if its press actually was.
         if (bit_test(swallowed_down_, e.vk)) {
             bit_clear(swallowed_down_, e.vk);
             out.swallow = true;
@@ -762,14 +762,30 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
 
     if (!session_active_) return out;
 
-    // ── Esc cancels ──────────────────────────────────────────────────────────────────────────
+    // ── Esc cancels, and is consumed ─────────────────────────────────────────────────────────
     //
-    // Not swallowed, and that is a judgement call rather than something plan.md settles. Esc
-    // means "get me out of this" in the target application too, and eating it would mean a
-    // dialog that refused to close while dictation happened to be running. The cost is that the
-    // target also sees the Esc; the alternative cost is worse and less explicable.
+    // **This used to pass through, and the reversal is deliberate.** The argument for passing it
+    // on was that Esc means "get me out of this" in the target too, so eating it would mean a
+    // dialog that refused to close while dictation happened to be running.
+    //
+    // That traded a common cost for a rare one, and got it backwards. Cancelling is an ordinary
+    // gesture — start dictating, change your mind, press Esc — and every one of those leaked an
+    // Esc into whatever had focus: it interrupts a running agent in a terminal, leaves vim's
+    // insert mode, dismisses an autocomplete, closes a dialog the user was not finished with.
+    // Reported from real use within minutes of the first install. The dialog case costs one
+    // extra keypress (end the session, then Esc) and only when a dialog appears mid-dictation.
+    //
+    // It also makes the two session-ending keys symmetrical. Enter commits and is swallowed, for
+    // the ordering reason docs/editing.md §2 records; Esc discards, and there was never a reason
+    // for it to behave differently.
+    //
+    // Swallowed on the way down *and* on the way up: a target that saw only the key-up of an Esc
+    // it never saw pressed is worse off than one that saw neither, and this is the same
+    // `swallowed_down_` bookkeeping the commit key uses.
     if (e.vk == vk::kEscape) {
-        out.cancel = true;
+        out.swallow = true;
+        bit_set(swallowed_down_, e.vk);
+        if (!was_down) out.cancel = true;
         return out;
     }
 
