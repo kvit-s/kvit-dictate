@@ -1,0 +1,55 @@
+{
+  "id": "014-n3-needs-a-third-opinion",
+  "name": "N=3 publishes nothing until three hypotheses agree",
+  "description": "One of the sweep points plan.md §4 measures. The knob has to mean the same thing on both sides or the sweep compares two different algorithms.",
+  "params": {
+    "hypotheses_n": 3,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "alpha bravo charlie delta echo",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "alpha bravo charlie delta echo",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "alpha bravo charlie delta echo",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 25,
+      "expect_high_water": 25
+    }
+  ],
+  "tags": [
+    "params"
+  ]
+}

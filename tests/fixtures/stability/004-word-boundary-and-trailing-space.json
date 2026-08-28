@@ -1,0 +1,40 @@
+{
+  "id": "004-word-boundary-and-trailing-space",
+  "name": "Step 4 retracts to a word boundary and holds trailing whitespace back",
+  "description": "Never stop inside a word — a revised word ending is the most common revision there is — and hold the space back so a following punctuation revision does not require rewriting across a committed space.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "the quick brown fox jumps ",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "the quick brown fox jumps ",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 19,
+      "expect_high_water": 19
+    }
+  ],
+  "tags": [
+    "step4"
+  ]
+}

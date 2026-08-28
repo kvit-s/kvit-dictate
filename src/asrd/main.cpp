@@ -34,9 +34,8 @@
 #include <vector>
 
 #include "asrd/backend_openai.h"
+#include "asrd/connection.h"
 #include "asrd/http.h"
-#include "asrd/session_server.h"
-#include "asrd/vad.h"
 #include "asrd/ws_server.h"
 #include "protocol.h"
 #include "util/log.h"
@@ -46,22 +45,15 @@ namespace {
 
 // ─── Command line (openai-translator.md §4.7) ───────────────────────────────────────────────
 
+// The process's own settings. Everything one *connection* needs is in `translator`, which is
+// `connection.h`'s type and is what serve_connection() is handed.
 struct Options {
     std::string listen_host = "127.0.0.1";
     uint16_t listen_port = kDefaultPort;
-    std::string service;
-    std::string model = kDefaultModel;
-    std::string language = kDefaultLanguage;
     uint32_t parent_pid = 0;
     uint32_t max_connections = 1;
-    bool finalize_only = true;
-    bool vad_gate = true;
-    uint32_t endpoint_silence_ms = 1500;
-    uint32_t stability_n = 2;
-    uint32_t stability_m = 3;
-    uint32_t stability_hold_ms = 200;
-    bool hostile_stability = false;
     kd::log::Level log_level = kd::log::Level::Info;
+    TranslatorConfig translator;
 };
 
 void print_usage() {
@@ -167,17 +159,17 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
             continue;
         }
         if (a == "--service") {
-            opt.service = next("--service");
+            opt.translator.service = next("--service");
             if (exit_code != 0) return false;
             continue;
         }
         if (a == "--model") {
-            opt.model = next("--model");
+            opt.translator.model = next("--model");
             if (exit_code != 0) return false;
             continue;
         }
         if (a == "--language") {
-            opt.language = next("--language");
+            opt.translator.language = next("--language");
             if (exit_code != 0) return false;
             continue;
         }
@@ -213,7 +205,7 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
                 exit_code = 2;
                 return false;
             }
-            (a == "--finalize-only" ? opt.finalize_only : opt.vad_gate) = value;
+            (a == "--finalize-only" ? opt.translator.finalize_only : opt.translator.vad_gate) = value;
             continue;
         }
         if (a == "--endpoint-silence-ms" || a == "--stability-n" || a == "--stability-m" ||
@@ -227,14 +219,14 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
                 exit_code = 2;
                 return false;
             }
-            if (a == "--endpoint-silence-ms") opt.endpoint_silence_ms = value;
-            else if (a == "--stability-n") opt.stability_n = value;
-            else if (a == "--stability-m") opt.stability_m = value;
-            else opt.stability_hold_ms = value;
+            if (a == "--endpoint-silence-ms") opt.translator.endpoint_silence_ms = value;
+            else if (a == "--stability-n") opt.translator.stability.hypotheses_n = value;
+            else if (a == "--stability-m") opt.translator.stability.retract_clusters_m = value;
+            else opt.translator.stability.hold_ms_t = value;
             continue;
         }
         if (a == "--hostile-stability") {
-            opt.hostile_stability = true;
+            opt.translator.hostile_stability = true;
             continue;
         }
         if (a == "--log-level") {
@@ -256,7 +248,7 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
     // There is deliberately no --api-key, no --silero-model and no --backend. Each is a separate,
     // later, argued addition; openai-translator.md §1.4 records why a silent omission inside the
     // HTTP client would be worse than an absent flag.
-    const std::string why = validate_service_url(opt.service);
+    const std::string why = validate_service_url(opt.translator.service);
     if (!why.empty()) {
         std::fprintf(stderr, "kvit-asrd: %s\n", why.c_str());
         print_usage();
@@ -264,322 +256,6 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
         return false;
     }
     return true;
-}
-
-// ─── The connection ─────────────────────────────────────────────────────────────────────────
-
-// Exit codes, matching `server/kvit_asr`'s so a supervisor learns one set.
-constexpr int kExitOk = 0;
-constexpr int kExitProtocolError = 3;
-constexpr int kExitTransport = 4;
-constexpr int kExitInternal = 5;
-
-class WsSink final : public MessageSink {
-public:
-    explicit WsSink(WsConnection& conn) : conn_(conn) {}
-
-    bool send(const proto::Message& m) override {
-        const std::vector<uint8_t> frame = proto::encode_control_frame(m);
-        if (frame.empty()) {
-            KD_LOG_ERROR("refusing to send a message that would not encode");
-            return false;
-        }
-        KD_LOG_DEBUG("tx %s", proto::to_string(m.type()));
-        return conn_.send_binary(
-            std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()));
-    }
-
-private:
-    WsConnection& conn_;
-};
-
-// One WebSocket message must hold exactly one protocol frame (§2.6.3), and the redundant 4-byte
-// length prefix is checked against the message size. §2.6.3 keeps that field precisely so one
-// decoder serves both bindings, and a decoder that ignores a field it is given will be wrong the
-// first time the field matters — two frames packed into one message would otherwise decode as a
-// legal stream and surface later as garbled text.
-bool length_agrees(const std::string& message) {
-    if (message.size() < proto::kFrameHeaderBytes + 1) return false;
-    const auto* p = reinterpret_cast<const uint8_t*>(message.data());
-    const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-                            (static_cast<uint32_t>(p[2]) << 16) |
-                            (static_cast<uint32_t>(p[3]) << 24);
-    return static_cast<uint64_t>(length) + proto::kFrameHeaderBytes == message.size();
-}
-
-// The whole conversation on one connection. Returns a process exit code, which only matters for
-// the single-connection case; with several, the last one wins and nobody reads it.
-int serve_connection(WsConnection& conn, const Options& opt) {
-    WsSink sink(conn);
-    proto::FrameReader reader;
-
-    const auto send_error = [&](proto::ErrorCode code, bool fatal, const std::string& msg,
-                                const std::string* sid) {
-        proto::ErrorMsg e;
-        e.code = code;
-        e.code_raw = proto::to_string(code);
-        e.fatal = fatal;
-        e.msg = msg;
-        if (sid != nullptr) e.session_id = *sid;
-        if (code == proto::ErrorCode::proto_unsupported) e.supported.push_back(proto::kProtoVersion);
-        sink.send(proto::Message::of(std::move(e)));
-    };
-
-    // ── §5 handshake ────────────────────────────────────────────────────────────────────────
-    //
-    // Read exactly one frame, require it to be `hello`, answer or reject. Anything else here —
-    // audio, `start`, a second `hello` — is a fatal `state_violation`, because the handshake is
-    // what establishes that both peers agree on the message set.
-    bool have_hello = false;
-    std::string hello_model;
-    while (!have_hello) {
-        WsOpcode opcode = WsOpcode::Binary;
-        std::string message;
-        if (!conn.recv_message(opcode, message)) {
-            KD_LOG_INFO("connection closed before hello (%s)", conn.error().c_str());
-            return kExitTransport;
-        }
-        if (opcode == WsOpcode::Text) {
-            // §2.6.3, and fatal even though these bytes would have decoded: a text message means
-            // the peer thinks this is JSON-over-WebSocket, and half its audio frames will arrive
-            // mangled by a UTF-8 round trip.
-            send_error(proto::ErrorCode::unknown_frame_type, true,
-                       "a text message arrived; this protocol is binary only "
-                       "(docs/protocol.md §2.6.3)",
-                       nullptr);
-            return kExitProtocolError;
-        }
-        if (!length_agrees(message)) {
-            send_error(proto::ErrorCode::bad_frame, true,
-                       "one WebSocket message must hold exactly one frame: the length field and "
-                       "the message size disagree (docs/protocol.md §2.6.3)",
-                       nullptr);
-            return kExitProtocolError;
-        }
-        reader.push(message);
-
-        proto::Frame frame;
-        const proto::FrameStatus st = reader.next(frame);
-        if (st == proto::FrameStatus::NeedMore) continue;
-        if (st != proto::FrameStatus::Frame) {
-            send_error(reader.error().code, true, reader.error().msg, nullptr);
-            return kExitProtocolError;
-        }
-        if (frame.type != proto::FrameType::Control) {
-            send_error(proto::ErrorCode::state_violation, true,
-                       "audio frame before hello (docs/protocol.md §5)", nullptr);
-            return kExitProtocolError;
-        }
-
-        proto::Message m;
-        proto::ProtocolError err;
-        if (!proto::decode_control(frame.payload, m, err)) {
-            send_error(err.code, true, err.msg, nullptr);
-            return kExitProtocolError;
-        }
-        const auto* hello = m.get_if<proto::HelloMsg>();
-        if (hello == nullptr) {
-            send_error(proto::ErrorCode::state_violation, true,
-                       std::string("expected hello, got ") + proto::to_string(m.type()), nullptr);
-            return kExitProtocolError;
-        }
-        if (hello->proto != proto::kProtoVersion) {
-            // §5: reply proto_unsupported and close. No silent downgrade, no best-effort
-            // continuation — a version we do not implement is a message set we cannot parse.
-            send_error(proto::ErrorCode::proto_unsupported, true,
-                       "this translator speaks proto " + std::to_string(proto::kProtoVersion) +
-                           ", the client offered " + std::to_string(hello->proto),
-                       nullptr);
-            return kExitProtocolError;
-        }
-        // §5.1. One backend per process, so the catalogue has exactly one entry and the only
-        // question is whether the client asked for something else. Refusing is the point:
-        // serving a different model than the one requested produces transcripts that are merely
-        // *worse*, which is the hardest kind of wrong for a user to notice.
-        if (hello->model.has_value() && !hello->model->empty() && *hello->model != opt.model) {
-            proto::ErrorMsg e;
-            e.code = proto::ErrorCode::model_unavailable;
-            e.code_raw = proto::to_string(e.code);
-            e.fatal = true;
-            e.msg = "this translator serves \"" + opt.model + "\", not \"" + *hello->model + "\"";
-            e.available.push_back(opt.model);
-            sink.send(proto::Message::of(std::move(e)));
-            return kExitProtocolError;
-        }
-        hello_model = hello->model.value_or(opt.model);
-
-        proto::HelloAckMsg ack;
-        ack.proto = proto::kProtoVersion;
-        ack.server = "kvit-asrd";
-        proto::ModelInfo info;
-        info.id = opt.model;
-        // `mode` is stated here as well as in `ready`: unlike the Python server, this process
-        // knows its backend before it loads anything, because there is exactly one and it is
-        // compiled in.
-        info.mode = proto::StreamingMode::PseudoStreaming;
-        info.chunk_ms = static_cast<int32_t>(opt.finalize_only ? 0 : 1000);
-        info.context_supported = false;
-        ack.models.push_back(std::move(info));
-        if (!sink.send(proto::Message::of(std::move(ack)))) return kExitTransport;
-        KD_LOG_INFO("handshake_ok client=%s model=%s",
-                    hello->client.value_or(std::string("?")).c_str(), hello_model.c_str());
-        have_hello = true;
-    }
-
-    // ── Load ────────────────────────────────────────────────────────────────────────────────
-    //
-    // **Ready is earned.** `--service` is resolved and connected — a TCP connect, not a
-    // transcription — before `ready` goes out, so the user is not talking into a dead box.
-    // Failure is a fatal `error` *instead of* `ready`, which is what makes the client's Test
-    // button mean "the translator and the speech host both answered".
-    OpenAiBackendConfig backend_cfg;
-    backend_cfg.base_url = opt.service;
-    backend_cfg.model = opt.model;
-    backend_cfg.language = opt.language;
-    backend_cfg.finalize_only = opt.finalize_only;
-    backend_cfg.vad_gate = opt.vad_gate;
-    OpenAiBackend backend(backend_cfg);
-
-    const ULONGLONG load_started = GetTickCount64();
-    if (const Status st = backend.load(); !st.ok()) {
-        send_error(proto::ErrorCode::connect_refused, true, st.message(), nullptr);
-        KD_LOG_ERROR("load failed: %s", st.to_string().c_str());
-        return kExitProtocolError;
-    }
-
-    proto::ReadyMsg ready;
-    ready.model = opt.model;
-    ready.warm_ms = static_cast<int64_t>(GetTickCount64() - load_started);
-    // The protocol's taxonomy has no other value for a batch model behind a window, and
-    // base.py's rule applies here too: a wrapper that relabelled itself would put uncomparable
-    // latency numbers in the same column as the native-streaming rows.
-    ready.mode = proto::StreamingMode::PseudoStreaming;
-    ready.chunk_ms = static_cast<int32_t>(opt.finalize_only ? 0 : 1000);
-    ready.context_supported = false;
-    if (!sink.send(proto::Message::of(std::move(ready)))) return kExitTransport;
-
-    // ── §6 the conversation ─────────────────────────────────────────────────────────────────
-
-    SessionServerConfig session_cfg;
-    session_cfg.stability.hypotheses_n = opt.stability_n;
-    session_cfg.stability.retract_clusters_m = opt.stability_m;
-    session_cfg.stability.hold_ms_t = opt.stability_hold_ms;
-    session_cfg.vad.endpoint_silence_ms = static_cast<double>(opt.endpoint_silence_ms);
-    // Read off the backend's own declaration rather than a setting. A pseudo-streaming backend
-    // replaces its previous hypothesis instead of extending it; see SessionServerConfig.
-    session_cfg.publish_stable_partials = !opt.finalize_only;
-    session_cfg.hostile_stability = opt.hostile_stability;
-
-    if (const std::string why = session_cfg.vad.validate(); !why.empty()) {
-        KD_LOG_ERROR("VAD configuration is not coherent: %s", why.c_str());
-        send_error(proto::ErrorCode::internal_error, true, why, nullptr);
-        return kExitInternal;
-    }
-
-    SessionServer session(backend, session_cfg, sink);
-    std::vector<int16_t> pcm;
-    int exit_code = kExitOk;
-
-    for (;;) {
-        WsOpcode opcode = WsOpcode::Binary;
-        std::string message;
-        if (!conn.recv_message(opcode, message)) {
-            KD_LOG_INFO("end of stream (%s)", conn.error().c_str());
-            break;
-        }
-        if (opcode == WsOpcode::Text) {
-            send_error(proto::ErrorCode::unknown_frame_type, true,
-                       "a text message arrived; this protocol is binary only", nullptr);
-            exit_code = kExitProtocolError;
-            break;
-        }
-        if (!length_agrees(message)) {
-            send_error(proto::ErrorCode::bad_frame, true,
-                       "one WebSocket message must hold exactly one frame", nullptr);
-            exit_code = kExitProtocolError;
-            break;
-        }
-        reader.push(message);
-
-        // Drain fully. Fixture 002 (three frames in one read) fails any caller that handles one
-        // frame per read, and the rule survives the change of binding.
-        bool fatal = false;
-        for (;;) {
-            proto::Frame frame;
-            const proto::FrameStatus st = reader.next(frame);
-            if (st == proto::FrameStatus::NeedMore) break;
-            if (st == proto::FrameStatus::EndOfStream) { fatal = true; break; }
-            if (st == proto::FrameStatus::Error) {
-                send_error(reader.error().code, true, reader.error().msg, nullptr);
-                exit_code = kExitProtocolError;
-                fatal = true;
-                break;
-            }
-
-            if (frame.type == proto::FrameType::Audio) {
-                proto::ProtocolError err;
-                if (!proto::decode_audio_payload(frame.payload, pcm, err)) {
-                    send_error(err.code, true, err.msg, nullptr);
-                    exit_code = kExitProtocolError;
-                    fatal = true;
-                    break;
-                }
-                if (!session.on_audio(pcm.data(), pcm.size())) { fatal = true; break; }
-                continue;
-            }
-
-            proto::Message m;
-            proto::ProtocolError err;
-            if (!proto::decode_control(frame.payload, m, err)) {
-                const std::string* sid = err.session_id.has_value() ? &*err.session_id : nullptr;
-                send_error(err.code, err.fatal, err.msg, sid);
-                if (err.fatal) {
-                    exit_code = kExitProtocolError;
-                    fatal = true;
-                    break;
-                }
-                continue;
-            }
-
-            bool alive = true;
-            if (m.get_if<proto::HelloMsg>() != nullptr) {
-                send_error(proto::ErrorCode::state_violation, true,
-                           "second hello on one connection", nullptr);
-                exit_code = kExitProtocolError;
-                fatal = true;
-                break;
-            } else if (const auto* start = m.get_if<proto::StartMsg>()) {
-                alive = session.on_start(*start);
-            } else if (const auto* stop = m.get_if<proto::StopMsg>()) {
-                alive = session.on_stop(*stop);
-            } else if (const auto* c = m.get_if<proto::CancelMsg>()) {
-                alive = session.on_cancel(*c);
-            } else if (const auto* d = m.get_if<proto::DiscontinuityMsg>()) {
-                alive = session.on_discontinuity(*d);
-            } else if (const auto* e = m.get_if<proto::ErrorMsg>()) {
-                alive = session.on_peer_error(*e);
-            } else {
-                // A known message type that only the Server may send. Not `unknown_message` —
-                // we know exactly what it is; it is illegal in this direction (§11.3).
-                send_error(proto::ErrorCode::state_violation, true,
-                           std::string(proto::to_string(m.type())) +
-                               " is a Server->Client message",
-                           nullptr);
-                exit_code = kExitProtocolError;
-                fatal = true;
-                break;
-            }
-            if (!alive || session.connection_fatal()) {
-                exit_code = kExitProtocolError;
-                fatal = true;
-                break;
-            }
-        }
-        if (fatal) break;
-    }
-
-    session.close();
-    return exit_code;
 }
 
 // ─── Parent liveness ────────────────────────────────────────────────────────────────────────
@@ -630,10 +306,10 @@ int run(int argc, char** argv) {
     log_cfg.to_debugger = false;
     kd::log::init(log_cfg);
 
-    KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s", opt.service.c_str(),
-                opt.model.c_str(), opt.finalize_only ? "finalize-only" : "live-preview",
-                opt.vad_gate ? "on" : "off");
-    if (opt.hostile_stability) {
+    KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s", opt.translator.service.c_str(),
+                opt.translator.model.c_str(), opt.translator.finalize_only ? "finalize-only" : "live-preview",
+                opt.translator.vad_gate ? "on" : "off");
+    if (opt.translator.hostile_stability) {
         KD_LOG_ERROR(
             "--hostile-stability is on. This build deliberately emits non-conforming "
             "stable_bytes and exists only to exercise docs/protocol.md §8.3. Do not ship it.");
@@ -681,14 +357,16 @@ int run(int argc, char** argv) {
             // and a socket that hangs up both present to the user as "it hangs".
             KD_LOG_WARN("refusing a connection from %s: --max-connections %u is reached",
                         conn->peer().c_str(), opt.max_connections);
-            WsSink sink(*conn);
             proto::ErrorMsg e;
             e.code = proto::ErrorCode::server_busy;
             e.code_raw = proto::to_string(e.code);
             e.fatal = true;
             e.msg = "this translator serves one connection at a time";
             e.retry_after_ms = 1000;
-            sink.send(proto::Message::of(std::move(e)));
+            const std::vector<uint8_t> frame =
+                proto::encode_control_frame(proto::Message::of(std::move(e)));
+            conn->send_binary(std::string_view(reinterpret_cast<const char*>(frame.data()),
+                                               frame.size()));
             conn->close();
             continue;
         }
@@ -698,7 +376,7 @@ int run(int argc, char** argv) {
             // nothing to overlap, and a thread per connection would only make the exit code and
             // the shutdown path harder to follow.
             ++live;
-            last = serve_connection(*conn, opt);
+            last = serve_connection(*conn, opt.translator);
             --live;
             conn->close();
             continue;
@@ -706,7 +384,7 @@ int run(int argc, char** argv) {
 
         ++live;
         connections.emplace_back([&, c = std::move(conn)]() mutable {
-            serve_connection(*c, opt);
+            serve_connection(*c, opt.translator);
             c->close();
             --live;
         });

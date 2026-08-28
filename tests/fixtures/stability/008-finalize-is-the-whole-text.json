@@ -1,0 +1,46 @@
+{
+  "id": "008-finalize-is-the-whole-text",
+  "name": "A final is entirely stable by definition",
+  "description": "docs/protocol.md §6.2. §8.2's last sentence still applies and is checked rather than assumed: utf8(final.text) MUST begin with the highest prefix already published.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "change the llama.cpp config",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "change the llama.cpp config",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 20,
+      "expect_high_water": 20
+    },
+    {
+      "op": "finalize",
+      "text": "change the llama.cpp config file.",
+      "expect_stable_bytes": 33,
+      "expect_high_water": 33
+    }
+  ],
+  "tags": [
+    "final"
+  ]
+}

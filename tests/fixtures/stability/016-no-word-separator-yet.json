@@ -1,0 +1,40 @@
+{
+  "id": "016-no-word-separator-yet",
+  "name": "A single word with no separator is never eligible",
+  "description": "utf8::retract_to_word_boundary returns 0 when nothing below the offset ends a word. The first word of an utterance therefore commits only once a second word has begun, which is deliberate: a word ending is the most commonly revised thing there is.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "hello",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "hello",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    }
+  ],
+  "tags": [
+    "step4"
+  ]
+}

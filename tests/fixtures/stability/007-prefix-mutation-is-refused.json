@@ -1,0 +1,50 @@
+{
+  "id": "007-prefix-mutation-is-refused",
+  "name": "A hypothesis that contradicts the published prefix is refused, not clamped",
+  "description": "docs/protocol.md §8.3 forbids clamping because it hides the defect ICER exists to measure — and in this direction it would additionally mean shipping a message whose bytes below the published mark have changed, which is the failure that corrupts the user's document. This is the signature of a batch model that re-decodes rather than extends: diverge_offset 0 means it revised the first word.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "so i was thinking we should",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "so i was thinking we should",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 20,
+      "expect_high_water": 20
+    },
+    {
+      "op": "observe",
+      "text": "So I was thinking, we should",
+      "expect_violation": "stable_prefix_mutated",
+      "expect_diverge_offset": 0
+    },
+    {
+      "op": "stop_after_violation"
+    }
+  ],
+  "tags": [
+    "violation",
+    "batch-model"
+  ]
+}

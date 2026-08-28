@@ -1,0 +1,40 @@
+{
+  "id": "003-head-cap-is-clusters-behind-the-head",
+  "name": "Step 3 caps the candidate at M clusters behind the decode head",
+  "description": "The reading that had two readings. stability.py:831-836 flags it and takes the cap; subtracting M from the common prefix instead would be strictly more conservative, so the two differ in latency rather than in safety — but they differ, and both implementations must choose the same one. A test that disagrees here is a failed port, not a refinement.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "alpha beta gamma delta",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "alpha beta gamma delta",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 16,
+      "expect_high_water": 16
+    }
+  ],
+  "tags": [
+    "step3"
+  ]
+}

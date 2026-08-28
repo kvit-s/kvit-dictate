@@ -357,6 +357,7 @@ add_custom_command(TARGET kvit-dictate POST_BUILD
 
 set(KD_ASRD_SOURCES
     src/asrd/main.cpp
+    src/asrd/connection.cpp
     src/asrd/ws_server.cpp
     src/asrd/session_server.cpp
     src/asrd/stability.cpp
@@ -366,6 +367,7 @@ set(KD_ASRD_SOURCES
 )
 
 set(KD_ASRD_HEADERS
+    src/asrd/connection.h
     src/asrd/ws_server.h
     src/asrd/session_server.h
     src/asrd/stability.h
@@ -430,10 +432,26 @@ if(KD_BUILD_TESTS)
         tests/test_normalizer.cpp
         tests/test_injector.cpp
         tests/test_fixtures.cpp
+
+        # kvit-asrd. openai-translator.md §4.8 and §5: the translator's code is compiled INTO
+        # the test binary — the same arrangement the overlay tests use — rather than driven only
+        # through CreateProcess. A translator that can only be tested by launching it is one
+        # whose WebSocket layer, stability tracker and window driver are tested by observation
+        # instead of by assertion.
+        tests/test_asrd_ws.cpp
+        tests/test_asrd_fixtures.cpp
+        tests/test_asrd_stability.cpp
+        tests/test_asrd_vad.cpp
+        tests/test_asrd_backend.cpp
+        tests/test_asrd_session.cpp
     )
 
-    add_executable(kd_tests ${KD_TEST_SOURCES} tests/kd_test.h)
-    target_link_libraries(kd_tests PRIVATE kd_core)
+    # Everything under src/asrd/ except main.cpp, which owns the process and its own int main().
+    set(KD_ASRD_TEST_SOURCES ${KD_ASRD_SOURCES})
+    list(REMOVE_ITEM KD_ASRD_TEST_SOURCES src/asrd/main.cpp)
+
+    add_executable(kd_tests ${KD_TEST_SOURCES} ${KD_ASRD_TEST_SOURCES} tests/kd_test.h)
+    target_link_libraries(kd_tests PRIVATE kd_core bcrypt winhttp ws2_32)
     target_include_directories(kd_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
     # Absolute path, so the binary runs identically from ctest, from the debugger, and from a
@@ -481,6 +499,12 @@ if(KD_BUILD_TESTS)
         edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
         normalizer      # src/normalizer.cpp — the term guard and the request/response codecs
+        asrd_ws         # src/asrd/ws_server.cpp — the handshake and RFC 6455 framing
+        asrd_fixtures   # tests/fixtures/protocol/ — the same corpus, from the server's role
+        asrd_stability  # src/asrd/stability.cpp — the producer of stable_bytes
+        asrd_vad        # src/asrd/vad.cpp — the energy endpointer and its chunking invariance
+        asrd_backend    # src/asrd/backend_openai.cpp — the window driver, WAV, multipart
+        asrd_session    # src/asrd/session_server.cpp — in-process loopback and a stub service
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module
     # starts here, disabled and visible, instead of being silently uncovered.

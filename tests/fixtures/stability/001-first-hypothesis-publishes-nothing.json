@@ -1,0 +1,34 @@
+{
+  "id": "001-first-hypothesis-publishes-nothing",
+  "name": "A single hypothesis is never stable",
+  "description": "plan.md §1.4 step 1 keeps the last N hypotheses and N defaults to 2. One hypothesis has not been confirmed by a second opinion, and publishing it is the exact failure the algorithm exists to prevent.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "can you change the",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 1000
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    }
+  ],
+  "tags": [
+    "step1"
+  ]
+}

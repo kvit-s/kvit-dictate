@@ -1,0 +1,42 @@
+{
+  "id": "012-emoji-zwj-sequence-is-one-cluster",
+  "name": "A ZWJ sequence is one grapheme cluster and is never cut",
+  "description": "The family emoji is four code points and eleven bytes joined by ZWJ. A byte-wise or code-point-wise prefix would put half a family in the user's document.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "send the 👨‍👩‍👧 emoji to everyone",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "send the 👨‍👩‍👧 emoji to everyone",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 36,
+      "expect_high_water": 36
+    }
+  ],
+  "tags": [
+    "unicode",
+    "grapheme",
+    "emoji"
+  ]
+}

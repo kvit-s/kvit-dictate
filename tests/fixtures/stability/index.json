@@ -1,0 +1,160 @@
+{
+  "schema": 1,
+  "description": "Recorded behaviour of kvit_asr.stability.StabilityTracker, the oracle for src/asrd/stability.cpp. Regenerate with server/tools/gen_stability_fixtures.py; never edit an expect value by hand. openai-translator.md section 5 makes byte-for-byte agreement between the two trackers the T2 gate.",
+  "generated_by": "server/tools/gen_stability_fixtures.py",
+  "step_grammar": {
+    "reset": "{op, utterance_id} - clear the tracker for a new utterance",
+    "advance": "{op, ms} - move the manual clock forward",
+    "observe": "{op, text, expect_stable_bytes|expect_violation} - one hypothesis",
+    "poll": "{op, expect_stable_bytes|expect_violation} - re-evaluate the dwell",
+    "finalize": "{op, text, expect_stable_bytes|expect_violation} - close the utterance",
+    "stop_after_violation": "{op} - the program ends here; a refused utterance has no conforming successor"
+  },
+  "cases": [
+    {
+      "id": "001-first-hypothesis-publishes-nothing",
+      "file": "001-first-hypothesis-publishes-nothing.json",
+      "name": "A single hypothesis is never stable",
+      "tags": [
+        "step1"
+      ]
+    },
+    {
+      "id": "002-dwell-must-mature",
+      "file": "002-dwell-must-mature.json",
+      "name": "Two agreeing hypotheses still wait T milliseconds",
+      "tags": [
+        "step5",
+        "dwell"
+      ]
+    },
+    {
+      "id": "003-head-cap-is-clusters-behind-the-head",
+      "file": "003-head-cap-is-clusters-behind-the-head.json",
+      "name": "Step 3 caps the candidate at M clusters behind the decode head",
+      "tags": [
+        "step3"
+      ]
+    },
+    {
+      "id": "004-word-boundary-and-trailing-space",
+      "file": "004-word-boundary-and-trailing-space.json",
+      "name": "Step 4 retracts to a word boundary and holds trailing whitespace back",
+      "tags": [
+        "step4"
+      ]
+    },
+    {
+      "id": "005-common-prefix-over-diverging-hypotheses",
+      "file": "005-common-prefix-over-diverging-hypotheses.json",
+      "name": "Only the prefix the last N hypotheses agree on is a candidate",
+      "tags": [
+        "step2"
+      ]
+    },
+    {
+      "id": "006-mark-never-decreases",
+      "file": "006-mark-never-decreases.json",
+      "name": "A shrinking candidate does not shrink the published mark",
+      "tags": [
+        "step6",
+        "monotonic"
+      ]
+    },
+    {
+      "id": "007-prefix-mutation-is-refused",
+      "file": "007-prefix-mutation-is-refused.json",
+      "name": "A hypothesis that contradicts the published prefix is refused, not clamped",
+      "tags": [
+        "violation",
+        "batch-model"
+      ]
+    },
+    {
+      "id": "008-finalize-is-the-whole-text",
+      "file": "008-finalize-is-the-whole-text.json",
+      "name": "A final is entirely stable by definition",
+      "tags": [
+        "final"
+      ]
+    },
+    {
+      "id": "009-finalize-contradicting-the-mark-is-refused",
+      "file": "009-finalize-contradicting-the-mark-is-refused.json",
+      "name": "A final that does not extend the published prefix is refused",
+      "tags": [
+        "violation",
+        "final"
+      ]
+    },
+    {
+      "id": "010-reset-forgets-everything",
+      "file": "010-reset-forgets-everything.json",
+      "name": "An utterance boundary resets the mark, the window and the dwell",
+      "tags": [
+        "step7",
+        "reset"
+      ]
+    },
+    {
+      "id": "011-combining-marks-are-not-split",
+      "file": "011-combining-marks-are-not-split.json",
+      "name": "The candidate lands on a grapheme-cluster boundary, not a byte one",
+      "tags": [
+        "unicode",
+        "grapheme"
+      ]
+    },
+    {
+      "id": "012-emoji-zwj-sequence-is-one-cluster",
+      "file": "012-emoji-zwj-sequence-is-one-cluster.json",
+      "name": "A ZWJ sequence is one grapheme cluster and is never cut",
+      "tags": [
+        "unicode",
+        "grapheme",
+        "emoji"
+      ]
+    },
+    {
+      "id": "013-growing-hypothesis-restarts-the-dwell",
+      "file": "013-growing-hypothesis-restarts-the-dwell.json",
+      "name": "A candidate that advances on every hypothesis never matures",
+      "tags": [
+        "step5",
+        "dwell"
+      ]
+    },
+    {
+      "id": "014-n3-needs-a-third-opinion",
+      "file": "014-n3-needs-a-third-opinion.json",
+      "name": "N=3 publishes nothing until three hypotheses agree",
+      "tags": [
+        "params"
+      ]
+    },
+    {
+      "id": "015-m0-and-t0-publish-immediately",
+      "file": "015-m0-and-t0-publish-immediately.json",
+      "name": "M=0, T=0 is the fastest legal setting and is still conforming",
+      "tags": [
+        "params"
+      ]
+    },
+    {
+      "id": "016-no-word-separator-yet",
+      "file": "016-no-word-separator-yet.json",
+      "name": "A single word with no separator is never eligible",
+      "tags": [
+        "step4"
+      ]
+    },
+    {
+      "id": "017-empty-hypothesis",
+      "file": "017-empty-hypothesis.json",
+      "name": "An empty hypothesis is legal and publishes nothing",
+      "tags": [
+        "edge"
+      ]
+    }
+  ]
+}

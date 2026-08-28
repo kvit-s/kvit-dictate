@@ -1,0 +1,50 @@
+{
+  "id": "009-finalize-contradicting-the-mark-is-refused",
+  "name": "A final that does not extend the published prefix is refused",
+  "description": "The last line of defence, on the message type where a violation is least recoverable: a `final` is what the Client commits.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "hello there friend",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "hello there friend",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 11,
+      "expect_high_water": 11
+    },
+    {
+      "op": "finalize",
+      "text": "goodbye there friend",
+      "expect_violation": "stable_prefix_mutated",
+      "expect_diverge_offset": 0
+    },
+    {
+      "op": "stop_after_violation"
+    }
+  ],
+  "tags": [
+    "violation",
+    "final"
+  ]
+}

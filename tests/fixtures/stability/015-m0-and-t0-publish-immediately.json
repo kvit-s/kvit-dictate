@@ -1,0 +1,36 @@
+{
+  "id": "015-m0-and-t0-publish-immediately",
+  "name": "M=0, T=0 is the fastest legal setting and is still conforming",
+  "description": "The corner of the sweep with no retraction and no hold. It must still land on a word boundary and still never decrease — the two rules that are not tunable.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 0,
+    "hold_ms_t": 0
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "one two three",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "one two three",
+      "expect_stable_bytes": 7,
+      "expect_high_water": 7
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 7,
+      "expect_high_water": 7
+    }
+  ],
+  "tags": [
+    "params"
+  ]
+}

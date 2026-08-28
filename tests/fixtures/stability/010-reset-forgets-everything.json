@@ -1,0 +1,66 @@
+{
+  "id": "010-reset-forgets-everything",
+  "name": "An utterance boundary resets the mark, the window and the dwell",
+  "description": "plan.md §1.4 step 7. Entirely means entirely: carrying any of it across a boundary would let a mark established for utterance n constrain utterance n+1, which §8.2 does not do. The second utterance here would be a violation if anything survived.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "first utterance text here",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "first utterance text here",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 20,
+      "expect_high_water": 20
+    },
+    {
+      "op": "reset",
+      "utterance_id": 2
+    },
+    {
+      "op": "observe",
+      "text": "completely different words now",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "completely different words now",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 26,
+      "expect_high_water": 26
+    }
+  ],
+  "tags": [
+    "step7",
+    "reset"
+  ]
+}

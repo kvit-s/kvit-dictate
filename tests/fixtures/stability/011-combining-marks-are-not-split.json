@@ -1,0 +1,41 @@
+{
+  "id": "011-combining-marks-are-not-split",
+  "name": "The candidate lands on a grapheme-cluster boundary, not a byte one",
+  "description": "Two hypotheses that differ only in a combining mark share a byte prefix that ends *inside* a cluster. Committing it would type a base letter whose accent the model is still revising, and the Client would then have to repair a document it is forbidden to repair.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "café au lait please now",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "café au lait please now",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 21,
+      "expect_high_water": 21
+    }
+  ],
+  "tags": [
+    "unicode",
+    "grapheme"
+  ]
+}

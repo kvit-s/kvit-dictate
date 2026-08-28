@@ -1,0 +1,46 @@
+{
+  "id": "017-empty-hypothesis",
+  "name": "An empty hypothesis is legal and publishes nothing",
+  "description": "A VAD-gated window that the model returned nothing for. Not an error: the utterance simply has no text yet.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "finalize",
+      "text": "",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    }
+  ],
+  "tags": [
+    "edge"
+  ]
+}

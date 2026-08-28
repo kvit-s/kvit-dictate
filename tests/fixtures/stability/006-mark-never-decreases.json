@@ -1,0 +1,56 @@
+{
+  "id": "006-mark-never-decreases",
+  "name": "A shrinking candidate does not shrink the published mark",
+  "description": "Step 6. The high-water mark is monotonic even when the hypothesis stops supporting it, because the Client may already have typed those bytes into the user's document.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "one two three four five",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "one two three four five",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 18,
+      "expect_high_water": 18
+    },
+    {
+      "op": "observe",
+      "text": "one two three four",
+      "expect_stable_bytes": 18,
+      "expect_high_water": 18
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 18,
+      "expect_high_water": 18
+    }
+  ],
+  "tags": [
+    "step6",
+    "monotonic"
+  ]
+}

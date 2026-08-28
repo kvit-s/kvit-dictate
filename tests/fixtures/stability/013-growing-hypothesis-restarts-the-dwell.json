@@ -1,0 +1,66 @@
+{
+  "id": "013-growing-hypothesis-restarts-the-dwell",
+  "name": "A candidate that advances on every hypothesis never matures",
+  "description": "The silent failure StabilityTracker.poll's docstring warns about, recorded as a fixture: while somebody is still talking the candidate moves on almost every hypothesis, each move restarts the hold, and a loop that publishes only on observe() emits stable_bytes = 0 for ever. Every message is well formed and the invariant is trivially satisfied by never committing anything.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "the first",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "observe",
+      "text": "the first part",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "observe",
+      "text": "the first part of",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "observe",
+      "text": "the first part of the",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "observe",
+      "text": "the first part of the sentence",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    }
+  ],
+  "tags": [
+    "step5",
+    "dwell"
+  ]
+}

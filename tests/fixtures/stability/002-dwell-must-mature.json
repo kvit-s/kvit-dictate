@@ -1,0 +1,59 @@
+{
+  "id": "002-dwell-must-mature",
+  "name": "Two agreeing hypotheses still wait T milliseconds",
+  "description": "Step 5. With N=2 the first real candidate comes into existence at the moment the second hypothesis lands, having then been unchanged for 0 ms — so observe(a); observe(b) publishes nothing however much time passed between a and b. The time passed before there was a candidate to hold. A poll T ms later is what matures it.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "hello world and more",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 5000
+    },
+    {
+      "op": "observe",
+      "text": "hello world and more",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 199
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 1
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 15,
+      "expect_high_water": 15
+    }
+  ],
+  "tags": [
+    "step5",
+    "dwell"
+  ]
+}

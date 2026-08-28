@@ -1,0 +1,55 @@
+{
+  "id": "005-common-prefix-over-diverging-hypotheses",
+  "name": "Only the prefix the last N hypotheses agree on is a candidate",
+  "description": "Step 2, on grapheme clusters rather than bytes. The divergence at the tail is where revision concentrates and is exactly what N exists to notice.",
+  "params": {
+    "hypotheses_n": 2,
+    "retract_clusters_m": 3,
+    "hold_ms_t": 200
+  },
+  "steps": [
+    {
+      "op": "reset",
+      "utterance_id": 1
+    },
+    {
+      "op": "observe",
+      "text": "the meeting is on tuesday afternoon",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "observe",
+      "text": "the meeting is on thursday afternoon",
+      "expect_stable_bytes": 0,
+      "expect_high_water": 0
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 17,
+      "expect_high_water": 17
+    },
+    {
+      "op": "observe",
+      "text": "the meeting is on thursday afternoon",
+      "expect_stable_bytes": 17,
+      "expect_high_water": 17
+    },
+    {
+      "op": "advance",
+      "ms": 300
+    },
+    {
+      "op": "poll",
+      "expect_stable_bytes": 26,
+      "expect_high_water": 26
+    }
+  ],
+  "tags": [
+    "step2"
+  ]
+}
