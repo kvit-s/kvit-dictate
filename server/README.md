@@ -1,7 +1,12 @@
 # `server/` — the ASR sidecar
 
-The Python half of kvit-dictate. It receives 16 kHz mono s16le audio over a named pipe, runs one
-ASR backend, and sends `partial` / `final` messages back. It has no window, no tray icon, no
+The Python half of kvit-dictate: the **reference server**. It receives 16 kHz mono s16le audio
+over a WebSocket, runs one ASR backend, and sends `partial` / `final` messages back.
+
+**`--listen` is the shipped binding; `--pipe` is the bench's.** release-plan.md §1 made the
+recogniser something the user configures rather than a child process the client spawns, so this
+program now listens on a port instead of connecting to a pipe its parent created. The pipe
+binding stays for `bench/`, which genuinely does launch its subject locally. It has no window, no tray icon, no
 settings, and no opinion about what happens to the text: plan.md §1.1 splits the product in two so
 that each new model candidate is a ~50-line adapter here instead of weeks of C++ per runtime.
 
@@ -19,7 +24,8 @@ server/
 │  ├─ server.py             transport, handshake, model load, message routing
 │  ├─ config.py             command line, model-directory resolution, offline policy
 │  ├─ protocol.py           frame codec + message catalogue (shares fixtures with the C++ side)
-│  ├─ transport.py          the named-pipe client, via ctypes against kernel32
+│  ├─ ws.py                 the WebSocket binding (docs/protocol.md §2.6) — SHIPPED
+│  ├─ transport.py          the named-pipe client, via ctypes against kernel32 — bench only
 │  ├─ session.py            one session's decode loop: audio buffer, VAD, utterance/seq numbering
 │  ├─ stability.py          `stable_bytes` (plan.md §1.4) — the same algorithm as the C++ engine
 │  ├─ vad.py                Silero ONNX with a stdlib energy fallback; utterance endpointing only
@@ -66,13 +72,20 @@ in the one environment where it matters most.
    the command line;
 4. validates the connected peer with `GetNamedPipeClientProcessId` before speaking protocol.
 
-The sidecar is the pipe **client**. It connects to a name it was given; it never creates a pipe,
-never listens, and never opens a socket. `--port` and `--host` exist in the parser only so that
-passing one fails with the sentence explaining why there will never be a port.
+Exactly one transport is chosen per process, and giving neither or both is a usage error.
+
+With `--listen` this is a server: it binds, accepts WebSocket clients, and gives each one its own
+handshake, its own `ready` and its own session (docs/protocol.md §2.7). With `--pipe` it is the
+pipe *client*, connecting to a name its parent gave it. `--port` and `--host` are still in the
+parser, but they now point at `--listen` rather than refusing the idea of a port — the decision
+they used to cite is the one release-plan.md §1 reversed, and an error message that cites a
+superseded rule sends the reader somewhere useless.
 
 ```
 <interpreter> -m kvit_asr
-    --pipe        \\.\pipe\kvit-dictate-<32 hex>   (required; from the parent, never hard-coded)
+    --listen      [host:]port                                 (the shipped binding)
+    --max-connections <int>                                   (0 = unlimited; default 1)
+    --pipe        \\.\pipe\kvit-dictate-<32 hex>   (the bench binding; from the parent)
     --backend     mock | sherpa-onnx | transformers-whisper | faster-whisper
     --model       <id or path as spelled in models.json>
     --model-dir   <directory of unpacked model files>        (optional)
@@ -113,12 +126,29 @@ contract with the launcher even though they are not part of the wire protocol (`
 
 ---
 
-## 3. Running it by hand, for debugging
+## 3. Running it by hand
 
-The sidecar is the pipe client, so something must create the server end first. Normally that is
-`kvit-dictate.exe`. When the thing being debugged *is* the sidecar, this PowerShell harness creates
-a pipe, launches the child against it, and does the `hello` exchange — no C++ build required. Use
-`--backend mock`, which needs no model and no GPU.
+### 3.1 As a server (what you actually want)
+
+One command, and nothing has to create anything first:
+
+```
+py -3.12 -m kvit_asr --listen 127.0.0.1:10402 --backend mock
+```
+
+Point the client's **Settings → Server** at `ws://127.0.0.1:10402/` and press Test, or check it
+from a shell with `kd_probe --server ws://127.0.0.1:10402/`. `docs/setup.md` covers the real
+backends, and §5 of it covers why you should bind loopback rather than `:10402`.
+
+`--max-connections 1` is the default and a second client is refused with `server_busy` rather
+than quietly given a second copy of the model. Raise it if your backend can share.
+
+### 3.2 Against the pipe binding, for debugging the bench path
+
+The sidecar is the pipe client there, so something must create the server end first. Normally
+that is `kvit-dictate.exe`. When the thing being debugged *is* the sidecar, this PowerShell
+harness creates a pipe, launches the child against it, and does the `hello` exchange — no C++
+build required. Use `--backend mock`, which needs no model and no GPU.
 
 ```powershell
 $name = "kvit-dictate-debug-$([guid]::NewGuid().ToString('N'))"

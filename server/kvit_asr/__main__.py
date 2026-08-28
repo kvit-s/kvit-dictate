@@ -1,17 +1,22 @@
 # Copyright 2026 Kvit
 # Licensed under the Apache License, Version 2.0. See LICENSE-APACHE, or
 # https://www.apache.org/licenses/LICENSE-2.0
-r"""Process entry point: `python -m kvit_asr --pipe <name> --backend <id> [...]`.
+r"""Process entry point: `python -m kvit_asr --listen [host:]port --backend <id> [...]`.
 
-Launched by `kvit-dictate.exe`, never by a human in normal operation. The parent creates the
-named pipe first, generates its per-launch unpredictable name, applies the DACL, and only then
-spawns this process with that name on the command line (docs/protocol.md §2.4). The by-hand
-form exists for debugging and is documented in server/README.md.
+Two shapes, and the first is the one that ships:
 
-**There is no port and never will be.** plan.md §1.2 chose a named pipe precisely so that the
-first run of a privacy tool does not produce a Windows Firewall prompt, and so that there is no
-port collision and no discovery dance. `--port` and `--host` are accepted by the parser only so
-that passing them fails with that sentence instead of "unrecognised arguments".
+* **`--listen`** — a WebSocket server (docs/protocol.md §2.6). Started by a person, or by
+  whatever supervises it, and reachable by any conforming client. `server/README.md` §3.1.
+* **`--pipe`** — the named-pipe binding, launched by `kvit-dictate.exe` or by the bench, which
+  creates the pipe first, generates its per-launch unpredictable name, applies the DACL, and only
+  then spawns this process with that name on the command line (§2.4).
+
+**There used to be no port, and this docstring used to say there never would be.** plan.md §1.2
+chose a named pipe so that the first run of a privacy tool would not produce a Windows Firewall
+prompt, and so that there would be no port collision and no discovery dance. That reasoning was
+sound for a child process on the same machine, and release-plan.md §1 reversed it for exactly one
+reason: the recogniser stopped being a child process. `--port` and `--host` are still accepted by
+the parser, and now point at `--listen` rather than at a decision that no longer holds.
 
 **One backend per process.** `--backend` is read once. Changing model means the parent starts a
 new process under that model's interpreter, because the model→interpreter mapping lives in the
