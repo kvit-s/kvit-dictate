@@ -311,9 +311,23 @@ private:
     // nothing. spawn_sidecar() is kept for the bench and for a source tree with a models.json,
     // and connect_server() is what runs when a server URL is set — which, in a shipped build, is
     // always, because the installer lays down no models.json.
+#ifdef KD_ENABLE_SIDECAR_SPAWN
     bool spawn_sidecar();
+#endif
     bool connect_server();
     bool start_engine();
+    // True when *something* could serve this build: a configured URL, or — in a development
+    // build that still has the pipe binding and a models.json — a local sidecar. False is the
+    // no-server state of docs/protocol.md §10.6, and in a shipped build it is exactly
+    // "the user has not typed an address yet".
+    [[nodiscard]] bool has_local_sidecar_option() const {
+        if (settings_.server.configured()) return true;
+#ifdef KD_ENABLE_SIDECAR_SPAWN
+        return !manifest_.models.empty();
+#else
+        return false;
+#endif
+    }
     void schedule_reconnect();
     void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
@@ -688,7 +702,7 @@ bool App::startup() {
     //
     // Posted rather than called: `create_window()` has not returned, so the tray icon and the
     // message loop are not yet in a state to own a modal dialog.
-    if (!settings_.server.configured() && manifest_.models.empty()) {
+    if (!has_local_sidecar_option()) {
         PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
     }
 
@@ -696,14 +710,17 @@ bool App::startup() {
     return true;
 }
 
-// Which binding to use, decided once from the settings rather than from a build flag.
+// Which binding to use, decided from the settings, and — for the pipe — from the build.
 //
-// A server URL wins whenever there is one. `models.json` is the fallback and exists only where
-// the file does: the installer does not lay one down (release-plan.md §2.2), so a shipped build
-// with no URL lands in the no-server state, which is exactly where a fresh install belongs.
+// A server URL wins whenever there is one. The `models.json` fallback exists only in a build
+// that can spawn a child at all, and only where the file is present: the installer lays down
+// neither the capability nor the file (release-plan.md §1.2, §2.2), so a shipped build with no
+// URL lands in the no-server state, which is exactly where a fresh install belongs.
 bool App::start_engine() {
     if (settings_.server.configured()) return connect_server();
+#ifdef KD_ENABLE_SIDECAR_SPAWN
     if (!manifest_.models.empty()) return spawn_sidecar();
+#endif
 
     no_server_ = true;
     tray_reason_ = L"kvit-dictate — no server configured. Open Settings and give it an address.";
@@ -781,6 +798,7 @@ void App::schedule_reconnect() {
                 reconnect_delay_ms_);
 }
 
+#ifdef KD_ENABLE_SIDECAR_SPAWN
 bool App::spawn_sidecar() {
     // Everything that must be true before CreateProcess is worth attempting — the id resolves,
     // the entry is enabled, the interpreter is on disk — checked here so the failure names the
@@ -860,6 +878,8 @@ bool App::spawn_sidecar() {
     }
     return true;
 }
+
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
 // ─── The message loop ───────────────────────────────────────────────────────────────────────
 
@@ -1350,12 +1370,15 @@ void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* 
                 if (settings_.server.configured()) {
                     sidecar_respawn_ = true;
                     schedule_reconnect();
+#ifdef KD_ENABLE_SIDECAR_SPAWN
                 } else if (respawn_attempts_ < 5) {
                     ++respawn_attempts_;
                     sidecar_respawn_ = true;
                     spawn_sidecar();
+#endif
                 } else {
-                    KD_LOG_ERROR("sidecar failed %u times; not restarting again", respawn_attempts_);
+                    KD_LOG_ERROR("the engine failed %u times; not restarting again",
+                                 respawn_attempts_);
                     set_tray_state(kd::OverlayState::Error);
                 }
                 break;
@@ -1869,7 +1892,7 @@ void App::begin_dictation() {
     // docs/protocol.md §10.6, and the four obligations it names: no microphone, words in the
     // tray, no pill, never silent. This is the first of them, and it comes before every other
     // check because it is the one a fresh install hits.
-    if (no_server_ || (!settings_.server.configured() && manifest_.models.empty())) {
+    if (no_server_ || !has_local_sidecar_option()) {
         KD_LOG_WARN("hotkey pressed with no server configured; the microphone was not opened");
         no_server_ = true;
         tray_reason_ =

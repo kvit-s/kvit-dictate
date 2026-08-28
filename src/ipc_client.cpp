@@ -176,6 +176,11 @@ Status os_failure(StatusCode code, const char* what, DWORD err) {
     return Status{code, std::string(buf), static_cast<uint32_t>(err)};
 }
 
+// Compiled out when KD_ENABLE_SIDECAR_SPAWN is off (ipc_client.h): with no child there is no
+// argv to quote and no environment block to build, and /W4 would rightly complain about three
+// unused static functions.
+#ifdef KD_ENABLE_SIDECAR_SPAWN
+
 // ─── Command line and environment ────────────────────────────────────────────────────────────
 
 // CommandLineToArgvW's quoting rules, which are not the shell's. A backslash is literal except
@@ -260,6 +265,8 @@ std::wstring build_environment(const std::vector<std::pair<std::wstring, std::ws
     out.push_back(L'\0');
     return out;
 }
+
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
 }  // namespace
 
@@ -1135,7 +1142,9 @@ struct IpcClient::Impl {
     DWORD next_timeout() const;
     void check_deadlines();
     void enqueue_internal(std::vector<uint8_t> bytes);
-    void log_main();
+#ifdef KD_ENABLE_SIDECAR_SPAWN
+    void log_main();  // drains the child's stdout/stderr; without a child there is nothing to drain
+#endif
     void teardown_pipe();
 
     void ws_main();
@@ -1661,6 +1670,7 @@ void IpcClient::Impl::teardown_pipe() {
     pipe.close();
 }
 
+#ifdef KD_ENABLE_SIDECAR_SPAWN
 void IpcClient::Impl::log_main() {
     // The child's stdout and stderr, both redirected here. docs §2.1: the sidecar's runtime,
     // logging and C extensions all write to those streams unpredictably, which is precisely why
@@ -1698,6 +1708,8 @@ void IpcClient::Impl::log_main() {
         KD_LOG_WARN("child: %s", acc.c_str());
     }
 }
+
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
 // ─── The WebSocket I/O threads ───────────────────────────────────────────────────────────────
 //
@@ -2046,6 +2058,7 @@ IpcClient::~IpcClient() {
     delete impl_;
 }
 
+#ifdef KD_ENABLE_SIDECAR_SPAWN
 Status IpcClient::start(const ChildSpec& child, Callbacks cb) {
     Impl& im = *impl_;
     {
@@ -2244,6 +2257,8 @@ Status IpcClient::start(const ChildSpec& child, Callbacks cb) {
     im.io_native = im.io_thread.native_handle();
     return Status::success();
 }
+
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
 Status IpcClient::connect(const ServerEndpoint& endpoint, Callbacks cb) {
     Impl& im = *impl_;

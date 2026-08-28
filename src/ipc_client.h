@@ -272,7 +272,22 @@ struct ServerProbe {
 // into one button, which is the whole argument for it (release-plan.md §2.2).
 Result<ServerProbe> probe_server(const ServerEndpoint& endpoint, uint32_t timeout_ms);
 
-// ─── Child process description — pipe binding only ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The named-pipe binding — compiled only when KD_ENABLE_SIDECAR_SPAWN is defined
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// release-plan.md §1.2: "Deleted from shipped builds. There is no child to spawn, kill or
+// outlive." `-DKD_ENABLE_SIDECAR_SPAWN=OFF` is what makes that literally true rather than merely
+// unreached — a shipped `kvit-dictate.exe` contains no `CreateProcessW`, no job object, no
+// command-line quoting and no environment-block construction, and its `models.json` parser is
+// never called. Attack surface a binary does not contain is the only kind that cannot be
+// reached by a bug elsewhere.
+//
+// It is ON by default, because a development tree and the bench both spawn interpreters locally
+// and are the reason the binding survives at all. `packaging/windows/build-release.ps1` turns it
+// off, and that is the only place that does.
+
+#ifdef KD_ENABLE_SIDECAR_SPAWN
 
 struct ChildSpec {
     // Absolute path to the interpreter, straight from models.json (settings.h). The C++ side
@@ -292,6 +307,8 @@ struct ChildSpec {
     // Model identifier, for `loading`/`ready` correlation and for log lines.
     std::string model_id;
 };
+
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
 // ─── Connection ─────────────────────────────────────────────────────────────────────────────
 
@@ -318,6 +335,7 @@ public:
     IpcClient(const IpcClient&) = delete;
     IpcClient& operator=(const IpcClient&) = delete;
 
+#ifdef KD_ENABLE_SIDECAR_SPAWN
     // Creates the pipe, spawns the child into a job object with
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (so a crashed Client can never orphan a sidecar
     // holding VRAM), waits for the connection, validates the peer, and enters HANDSHAKE.
@@ -331,6 +349,7 @@ public:
     // completes asynchronously and is reported through on_state/on_error. Blocking here would
     // freeze the UI thread for the model's whole cold load, which can be minutes.
     Status start(const ChildSpec& child, Callbacks cb);
+#endif  // KD_ENABLE_SIDECAR_SPAWN
 
     // The WebSocket binding (docs/protocol.md §2.6). Resolves, connects, upgrades, and enters
     // HANDSHAKE. Returns as soon as the I/O thread is running — the connection completes

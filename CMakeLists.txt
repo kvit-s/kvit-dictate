@@ -64,6 +64,19 @@ endif()
 # two cases with ordinary escapes instead; the bytes are the same.
 option(KD_WERROR "Treat compiler warnings as errors" ON)
 
+# The named-pipe binding, with everything it implies: CreateProcessW, a job object, command-line
+# quoting, environment-block construction, and reading a child's stdout.
+#
+# release-plan.md §1.2 says of the spawn machinery: "Deleted from shipped builds. There is no
+# child to spawn, kill or outlive." This option is what makes that literally true rather than
+# merely unreached — with it off, a `kvit-dictate.exe` contains no CreateProcessW at all, and
+# attack surface a binary does not contain cannot be reached by a bug elsewhere in it.
+#
+# **ON by default**, because a development tree and bench/ both launch interpreters locally and
+# are the reason the binding survives. packaging/windows/build-release.ps1 turns it off, and is
+# the only place that does.
+option(KD_ENABLE_SIDECAR_SPAWN "Compile the child-spawning named-pipe transport (dev/bench)" ON)
+
 option(KD_BUILD_TOOLS "Build tools/probe and tools/testtarget" ON)
 option(KD_BUILD_TESTS "Build the kd_tests binary" ON)
 
@@ -99,6 +112,10 @@ target_compile_options(kd_common_flags INTERFACE
 
 if(KD_WERROR)
     target_compile_options(kd_common_flags INTERFACE /WX)
+endif()
+
+if(KD_ENABLE_SIDECAR_SPAWN)
+    target_compile_definitions(kd_common_flags INTERFACE KD_ENABLE_SIDECAR_SPAWN)
 endif()
 
 # ─── The C runtime: static (/MT), and this is the moment it changed ──────────────────────────

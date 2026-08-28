@@ -23,6 +23,12 @@
     redistribute. models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and
     shipping it would put a "mock" model in front of a new user, which types invented sentences.
 
+    The release configuration is its own build directory with KD_ENABLE_SIDECAR_SPAWN=OFF, so
+    the shipped executable contains no CreateProcessW, no job object and no command-line quoting
+    at all (release-plan.md §1.2: "Deleted from shipped builds"). That is checked below rather
+    than assumed — attack surface a binary does not contain is the only kind a bug elsewhere in
+    it cannot reach, and a build flag that silently flipped back would give that away quietly.
+
 .PARAMETER SkipTests
     Package without running ctest. For iterating on the packaging itself only; the release build
     is never made this way.
@@ -36,7 +42,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$buildDir = Join-Path $repo 'build-windows-msvc-release'
+# Its own directory, not the developer preset's: the two differ in KD_ENABLE_SIDECAR_SPAWN and
+# sharing a CMake cache between them is how a release ends up built with development options.
+$buildDir = Join-Path $repo 'build-release'
 $stageDir = Join-Path $repo 'build-stage'
 $distDir = Join-Path $repo 'dist'
 
@@ -66,7 +74,8 @@ Write-Host "[release] repo      : $repo"
 # ─── Build ───────────────────────────────────────────────────────────────────────────────────
 
 Write-Host "`n[release] === configure ==="
-& $cmake --preset windows-msvc-release
+& $cmake -S $repo -B $buildDir -G 'Visual Studio 17 2022' -A x64 `
+    -DKD_ENABLE_SIDECAR_SPAWN=OFF -DKD_BUILD_TOOLS=OFF -DKD_BUILD_TESTS=ON
 if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
 
 Write-Host "`n[release] === build ==="
@@ -112,6 +121,16 @@ foreach ($dll in @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt-runtime')) {
     }
 }
 Write-Host "[release] static CRT confirmed (no VCRUNTIME/MSVCP/UCRT imports)"
+
+# release-plan.md §1.2. A shipped build has no child to spawn, kill or outlive, and this is the
+# check that the compiler was actually told so. CreateProcessW appears in the import table by
+# name, so its absence is checkable without a PE parser.
+foreach ($api in @('CreateProcessW', 'AssignProcessToJobObject')) {
+    if ($ascii.Contains($api)) {
+        throw "the executable imports $api — KD_ENABLE_SIDECAR_SPAWN was not off, and this build can still launch a child process"
+    }
+}
+Write-Host "[release] no child-spawning machinery (no CreateProcessW / AssignProcessToJobObject)"
 
 $staged = Get-ChildItem -Recurse -File $stageDir
 Write-Host "[release] staged $($staged.Count) files, $([math]::Round(($staged | Measure-Object Length -Sum).Sum / 1MB, 2)) MB"
