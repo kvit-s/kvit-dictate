@@ -9,7 +9,11 @@
 # in their own headers.
 
 cmake_minimum_required(VERSION 3.24)
-project(kvit-dictate VERSION 0.1.0 LANGUAGES CXX)
+
+# RC is a language here because the executable now carries an icon, a version block and an
+# application manifest (release-plan.md §3.2). It is enabled at the top rather than added later
+# so that a generator which caches the language set does not need a fresh configure.
+project(kvit-dictate VERSION 1.0.0 LANGUAGES CXX RC)
 
 # ─── Toolchain preconditions ─────────────────────────────────────────────────────────────────
 #
@@ -97,9 +101,22 @@ if(KD_WERROR)
     target_compile_options(kd_common_flags INTERFACE /WX)
 endif()
 
-# The C runtime is left at CMake's default (dynamic, /MD and /MDd). Static linking is not
-# required: this is not a redistributable yet, and /MT would have to be revisited when the
-# binary is signed for the Defender work in plan.md §6 anyway.
+# ─── The C runtime: static (/MT), and this is the moment it changed ──────────────────────────
+#
+# It was dynamic (/MD) for the whole experimental phase, and the comment here said why: "this is
+# not a redistributable yet, and /MT would have to be revisited when the binary is signed".
+# release-plan.md §3.2 is that moment. The payload is one executable, and /MT removes the
+# redistributable step from the installer entirely — no vc_redist bootstrapper, no "the program
+# can't start because VCRUNTIME140.dll is missing" on a machine that has never had Visual Studio.
+#
+# The costs, stated because they are real: the binary is roughly 200 KB larger, and a CRT
+# security fix reaches it only through a rebuild rather than through Windows Update. For a
+# single-executable tool with no plugins and no DLLs of its own, that is the right side of the
+# trade — there is no second module to share a heap with, which is the failure mode /MT is
+# usually warned about.
+#
+# MSVC_RUNTIME_LIBRARY needs CMP0091 NEW, which cmake_minimum_required(3.24) sets.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # ─── kd_core: every module except main.cpp ───────────────────────────────────────────────────
 
@@ -238,19 +255,44 @@ target_link_libraries(kd_core PUBLIC
 
 # ─── kvit-dictate.exe ────────────────────────────────────────────────────────────────────────
 
-add_executable(kvit-dictate WIN32 src/main.cpp)
+# ─── Resources: icon, version block, manifest (release-plan.md §3.2) ─────────────────────────
+#
+# This closes the TODO(phase-3) that stood here for the whole experimental phase. The manifest
+# half of it was never cosmetic: anchor.cpp works in physical screen pixels and warns at run time
+# (anchor.cpp:801) when PerMonitorV2 is missing, so every scaled monitor was a live correctness
+# bug. See packaging/windows/kvit-dictate.manifest for the rest of the argument.
+#
+add_executable(kvit-dictate WIN32 src/main.cpp packaging/windows/kvit-dictate.rc)
 target_link_libraries(kvit-dictate PRIVATE kd_core)
 
-# TODO(phase-3): add an application manifest declaring
-#   <dpiAwareness>PerMonitorV2</dpiAwareness> and <dpiAware>true/pm</dpiAware>,
-#   plus requestedExecutionLevel asInvoker (never requireAdministrator — plan.md §1.7 makes
-#   elevated targets an explicit unsupported state rather than something to elevate past).
-# The manifest is preferred over SetProcessDpiAwarenessContext because it applies before any
-# window is created, and plan.md §1.3 requires per-monitor v2 for captured physical pixels.
+# The version numbers come from project(), so the .rc and the binary cannot drift. Passed as
+# bare tokens and stringified inside the .rc rather than quoted here: a quoted define has to
+# survive CMake, the generator and rc.exe's own command line, and each of the three escapes
+# backslashes differently.
+target_compile_definitions(kvit-dictate PRIVATE
+    KVIT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    KVIT_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    KVIT_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    KVIT_VERSION_RAW=${PROJECT_VERSION}
+)
+
+# The .rc references kvit-dictate.ico and kvit-dictate.manifest by bare name, so rc.exe has to
+# be able to find them; its include path is where it looks.
+target_include_directories(kvit-dictate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows")
+
+# MSVC would otherwise synthesise a default manifest and embed it *as well*, which produces two
+# RT_MANIFEST resources and an executable Windows refuses to start.
+set_target_properties(kvit-dictate PROPERTIES LINK_FLAGS "/MANIFEST:NO")
 
 # models.json sits beside the executable (see the schema block in src/settings.h). Copied rather
 # than embedded so a user can point an entry at a different interpreter without a rebuild —
 # which is the whole reason plan.md §1.1 puts the model→interpreter map in a data file.
+#
+# **The installer does not ship it** (release-plan.md §2.2). A shipped build spawns nothing, so
+# there is no interpreter to map; the presence of this file next to the executable is what makes
+# a *development* tree still able to launch a local sidecar. Deleting this copy step would break
+# the bench; shipping the file would put a "mock" model in front of a new user, and the mock
+# types invented sentences.
 add_custom_command(TARGET kvit-dictate POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/models.json"

@@ -1,6 +1,9 @@
 # ── Build output ────────────────────────────────────────────────────────────────────────────
 build/
 build-*/
+# Release artefacts from packaging/windows/build-release.ps1. Reproducible from a tag, so there
+# is nothing here worth versioning, and a 1 MB binary per build would dominate the history.
+dist/
 out/
 .vs/
 *.user

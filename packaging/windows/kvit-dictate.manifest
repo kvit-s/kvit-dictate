@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  The application manifest. CMakeLists.txt carried this as TODO(phase-3) for the whole
+  experimental phase; release-plan.md §3.2 is where it stopped being deferrable.
+
+  Two of the three blocks below are correctness, not packaging:
+
+  * PerMonitorV2 DPI awareness. anchor.cpp works in physical screen pixels — it BitBlts the
+    desktop and compares caret rectangles — and a DPI-virtualised process is handed coordinates
+    that are wrong by the scale factor. That is a live bug on any scaled monitor, and
+    anchor.cpp:801 already warns at run time when this manifest is missing. It has to be a
+    manifest rather than SetProcessDpiAwarenessContext because it must apply before any window
+    exists, and the first window this process creates is created during startup.
+
+  * requestedExecutionLevel asInvoker, spelled out rather than left to the default. plan.md §1.7
+    makes an elevated target an explicitly *unsupported* state: the app refuses to type into one
+    and says why. An app that could elevate itself would turn that considered refusal into a
+    prompt, and the whole point is that this program never asks for more privilege than the
+    window it is typing into.
+
+  * The common-controls v6 dependency. The settings dialog is built programmatically against
+    comctl32 and assumes visual styles; without this it renders in the Windows 95 theme.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="Kvit.Dictate" version="1.0.0.0"
+                    processorArchitecture="amd64"/>
+  <description>kvit-dictate — push-to-talk dictation</description>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- The modern spelling. Windows 10 1703 and later read this one. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- The legacy spelling, for Windows 10 1607-1703, which reads only this one.
+           "true/pm" is per-monitor v1 there; v2 comes from the line above where it is
+           understood. Both are present because the supported floor is 1809 (release-plan.md
+           §0) and neither tag alone covers every build in that range. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- GDI scaling for the few bitmaps that are not DPI-aware. Harmless where unsupported. -->
+      <gdiScaling xmlns="http://schemas.microsoft.com/SMI/2017/WindowsSettings">true</gdiScaling>
+      <!-- UTF-8 as the process code page (Windows 10 1903+). plan.md §1.2 makes UTF-8
+           end-to-end the project's central text invariant; this closes the one gap where an
+           -A API or a CRT narrow path could still see the system code page. Every Win32 call
+           in src/ already resolves to its -W form, so this is defence in depth. -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11. Without these GUIDs, GetVersionEx and the shell's compatibility
+           shims treat the process as pre-8.1. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/><!-- 10 / 11 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/><!-- 8.1 -->
+    </application>
+  </compatibility>
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>

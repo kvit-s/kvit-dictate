@@ -1,0 +1,80 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// The executable's resources: the icon, the version block and the application manifest.
+//
+// CMakeLists.txt used to say, correctly, that the project "links no resource script and adding
+// one is a build change, not a settings change". This is that build change, and release-plan.md
+// §3.2 is the reason: a downloaded executable with no icon, no publisher and no version is one
+// SmartScreen has nothing to say about and a user has no way to identify in Task Manager.
+//
+// KVIT_VERSION_* are defined on the resource compiler's command line by CMakeLists.txt from the
+// project() version, so this file and the binary cannot disagree. KVIT_VERSION_RAW arrives as a
+// bare token (1.0.0) and is stringified here: a define that is already quoted has to survive
+// CMake, the generator and rc.exe's command line, each of which escapes backslashes its own way.
+
+#include <windows.h>
+
+#ifndef KVIT_VERSION_MAJOR
+#define KVIT_VERSION_MAJOR 0
+#define KVIT_VERSION_MINOR 0
+#define KVIT_VERSION_PATCH 0
+#define KVIT_VERSION_RAW 0.0.0
+#endif
+
+#define KVIT_STRINGIFY_(x) #x
+#define KVIT_STRINGIFY(x) KVIT_STRINGIFY_(x)
+#define KVIT_VERSION_STRING KVIT_STRINGIFY(KVIT_VERSION_RAW)
+
+// The first icon in the file, by resource-id order, is the one Explorer and the taskbar use.
+// IDI_ICON1 is 101 by convention; nothing in src/ loads it by name, so the number is free.
+1 ICON "kvit-dictate.ico"
+
+// CREATEPROCESS_MANIFEST_RESOURCE_ID (1) is the id Windows looks for. Embedding the manifest
+// rather than shipping kvit-dictate.exe.manifest beside the binary matters for two reasons: an
+// external manifest is ignored when the executable is launched from some shells, and a file the
+// installer could fail to lay down would take DPI awareness with it.
+1 RT_MANIFEST "kvit-dictate.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    KVIT_VERSION_MAJOR,KVIT_VERSION_MINOR,KVIT_VERSION_PATCH,0
+ PRODUCTVERSION KVIT_VERSION_MAJOR,KVIT_VERSION_MINOR,KVIT_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = US English, 04B0 = 1200 = Unicode. The pair must match the Translation value
+        // below or the shell's Details tab shows nothing at all.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Kvit"
+            VALUE "FileDescription",  "kvit-dictate — push-to-talk dictation"
+            VALUE "FileVersion",      KVIT_VERSION_STRING
+            VALUE "InternalName",     "kvit-dictate"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Kvit. MPL-2.0."
+            VALUE "OriginalFilename", "kvit-dictate.exe"
+            VALUE "ProductName",      "kvit-dictate"
+            VALUE "ProductVersion",   KVIT_VERSION_STRING
+            // Not a standard key, and deliberately present: this program installs a global
+            // keyboard hook and synthesises keystrokes into other applications. Anyone who goes
+            // looking at the file's properties because their antivirus flagged it should find
+            // the project saying so itself (release-plan.md §4 item 5).
+            VALUE "Comments",         "Reads every keystroke to find its hotkey and types into "
+                                      "other applications. Sends audio only to the ASR server "
+                                      "you configure. https://github.com/kvit-s/kvit-dictate"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

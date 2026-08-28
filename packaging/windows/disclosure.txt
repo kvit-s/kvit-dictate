@@ -1,0 +1,56 @@
+What kvit-dictate does to your machine
+======================================
+
+Read this before installing. It is shown here rather than buried, because two of the things
+below look, to an antivirus product, exactly like the things malware does — and you should hear
+it from the program first.
+
+1. It reads every keystroke.
+
+   kvit-dictate installs a global low-level keyboard hook so that its hotkey works in whatever
+   application you are typing into. That hook sees every key you press, everywhere. It uses them
+   to recognise one chord and, while you are dictating, to let you edit the text in the pill
+   before it is typed in. Keystrokes are never recorded, never stored, and never sent anywhere.
+
+2. It types into other applications.
+
+   That is the whole product: it synthesises keystrokes into whatever window has focus. It
+   refuses to do so into password fields, into windows running with higher privileges than it
+   has, and into applications you have told it to leave alone.
+
+   Heuristic antivirus scanners recognise (1) and (2) together as the signature of a keylogger.
+   That is a fair description of the mechanism and an unfair one of the purpose, and the honest
+   answer is that you should decide whether to trust it — the source is public, and this build
+   is not code-signed.
+
+3. It sends your audio to a server you configure.
+
+   kvit-dictate does not recognise speech itself. You point it at an ASR server, and it streams
+   16 kHz audio there while you hold the hotkey. There is no cloud service, no telemetry, and no
+   account. Nothing is sent until you press the hotkey, and nothing is sent anywhere except the
+   address you typed.
+
+   That audio is sent unencrypted, and the server is not asked who you are. Run it on a network
+   you control. docs/setup.md explains how to stand one up.
+
+4. It does not work until you give it a server.
+
+   There is no bundled recogniser. Until you configure an address in Settings, the hotkey will
+   not open your microphone and the tray will say so.
+
+What it does not do
+-------------------
+
+No cloud service. No telemetry. No account. No automatic updates, and nothing downloaded at run
+time. Recognised text is never written to a log unless you switch that on yourself, and that
+switch is compiled out of release builds entirely.
+
+Where it puts things
+--------------------
+
+The program:  %LOCALAPPDATA%\Programs\kvit-dictate
+Settings:     %LOCALAPPDATA%\kvit-dictate\settings.json
+Logs:         %LOCALAPPDATA%\kvit-dictate\logs
+
+Nothing is written outside your own user profile, and the installer never asks for
+administrator rights.
