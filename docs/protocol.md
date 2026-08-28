@@ -4,10 +4,16 @@
 this file are edits to a draft and do not require a version bump. After the freeze, every
 change to the normative content requires a new `proto` number and a row in §13.
 
+**Licence: Apache-2.0** (`LICENSE-APACHE`), unlike the client, which is MPL-2.0. The split is
+deliberate and release-plan.md §5 argues it: copyleft where the value is, permissive where the
+adoption is. This document exists to be implemented by people who have never spoken to its
+author, and a spec nobody can read without first reading a licence does not spread.
+
 This document is the authority both endpoints are implemented against. It is written to be
 sufficient on its own: an implementer with this file, and no access to the other endpoint's
 source or author, should be able to build a conforming peer. Where it is not sufficient, that
-is a defect in this file — record it in §14 rather than deciding locally.
+is a defect in this file — record it in §14 rather than deciding locally. §15 is a complete
+worked example of a conforming server, for exactly the reader who has only this file.
 
 Normative keywords MUST / MUST NOT / SHOULD / MAY are used in the RFC 2119 sense.
 
@@ -15,18 +21,30 @@ Normative keywords MUST / MUST NOT / SHOULD / MAY are used in the RFC 2119 sense
 
 ## 1. Scope, roles, and layering
 
-Two processes, one duplex pipe (plan.md §1.1):
+Two endpoints, one duplex byte channel:
 
-| Term used here | Process | Role on the pipe | Role in the protocol |
-|---|---|---|---|
-| **Client** | `kvit-dictate.exe` (C++) | pipe **server** — creates the instance | protocol **client** — drives sessions |
-| **Server** | `asr-server` (Python) | pipe **client** — connects by name | protocol **server** — answers with transcripts |
+| Term used here | Process | Role in the protocol |
+|---|---|---|
+| **Client** | `kvit-dictate.exe` (C++) | drives sessions: opens the connection, sends `start`, streams audio, sends `stop` |
+| **Server** | any conforming ASR endpoint | answers with `partial` / `final` transcripts |
 
-**The inversion is deliberate and is the single most confusing thing in this document.** The
-process that creates the pipe is the one that spawns the other, because only the parent can
-generate a per-launch name, apply a DACL before anyone can connect, and know the child's PID
-for peer validation. Everywhere below, "Client" and "Server" mean the protocol roles in the
-table; the pipe roles are named explicitly as "pipe server" / "pipe client" when they matter.
+Everywhere below, "Client" and "Server" mean these protocol roles and nothing else. **They are
+independent of who opens the connection**, which differs between the two transport bindings in
+§2 and is a live source of confusion:
+
+| Binding | Who listens / creates | Who connects |
+|---|---|---|
+| WebSocket (§2.6) — shipped | the **Server** | the **Client** |
+| Named pipe (§2.2–§2.5) — bench only | the **Client** (it is the pipe *server*) | the **Server** (it is the pipe *client*) |
+
+The pipe binding's inversion is deliberate — only the parent can generate a per-launch name,
+apply a DACL before anyone can connect, and know the child's PID for peer validation — and it is
+why transport roles are always spelled out as "pipe server" / "pipe client" rather than being
+inferred from "Client" and "Server".
+
+**Neither binding is visible above L0.** §3 onwards is identical on both, which is the property
+that made publishing this document cheap: the network binding reuses one decoder, one fixture
+corpus and one message catalogue.
 
 Four layers, each of which can fail independently and is tested independently:
 
@@ -55,7 +73,7 @@ malformed control payload — see §4.1).
 | `AUDIO_QUEUE_MAX_MS` | `3000` | §9 |
 | `CONTROL_QUEUE_MAX` | `256` messages | §9 |
 | `WRITE_DEADLINE_MS` | `5000` | §9 |
-| `CONNECT_TIMEOUT_MS` | `15000` | §2.4 |
+| `CONNECT_TIMEOUT_MS` | `15000` | §2.4 (pipe), §2.6.2 (WebSocket) |
 | `HELLO_TIMEOUT_MS` | `5000` | §5 |
 | `LOADING_HEARTBEAT_MS` | `5000` | §6.6 |
 | `READY_TIMEOUT_MS` | `180000`, reset by each `loading` | §6.6 |
@@ -64,14 +82,57 @@ malformed control payload — see §4.1).
 
 ## 2. Transport
 
-### 2.1 Why a named pipe
+### 2.1 Two bindings, and which one to read
 
-Not a TCP socket: no Windows Firewall prompt on first run (which reads badly for a privacy
-tool), no port collision, no discovery dance. Not stdin/stdout: the sidecar's Python runtime,
-its logging, and any C extension it loads all write to stdout/stderr unpredictably, and one
-stray `print` would corrupt a binary frame stream.
+The framing layer (§3) needs only a duplex, reliable, ordered byte channel. Two bindings supply
+one:
 
-### 2.2 Pipe creation (Client, the pipe server)
+| §  | Binding | Status | Who uses it |
+|---|---|---|---|
+| §2.6 | **WebSocket**, `ws://` or `wss://` | **Normative for v1. This is the binding a shipped client speaks and the one a server implementer wants.** | Everybody |
+| §2.2–§2.5 | **Named pipe**, Windows, with a spawned child process | Retained, not shipped | The bench harness in `bench/`, which measures backends by launching them locally |
+
+**If you are implementing a server, read §2.1, skip to §2.6, then go to §3.** §2.2–§2.5 describe
+a local IPC channel between a parent process and a child it spawned; none of it — not the DACL,
+not the peer PID check, not the job object — has any meaning over a network, and a server
+implementer needs none of it.
+
+#### Why the pipe was first, and why it is not the shipped binding
+
+The original argument was sound for what it was solving: a named pipe raises no Windows Firewall
+prompt on first run (which reads badly for a privacy tool), collides with no port, and needs no
+discovery dance. stdio was rejected because the sidecar's Python runtime, its logging, and any C
+extension it loads all write to stdout/stderr unpredictably, and one stray `print` corrupts a
+binary frame stream. That reasoning still holds — for a child process on the same machine.
+
+It stopped being the right default when the recogniser stopped being a child process.
+release-plan.md §1 ships the client alone and makes the ASR endpoint something the user
+configures, which the pipe binding cannot express: it can only reach a process this one spawned.
+
+**The pipe binding is kept rather than deleted**, for two reasons that are not sentiment. The
+bench harness genuinely does spawn its subject locally and is better served by a channel with no
+port and no listener. And keeping both bindings alive keeps the layering claim honest — a
+framing layer that has only ever run over one transport has not been shown to be
+transport-agnostic, it has only been asserted to be.
+
+#### Why WebSocket and not raw TCP
+
+Raw TCP is genuinely smaller: the framing already reassembles a stream, so the whole binding
+would be a socket plus the existing decoder. It was rejected anyway.
+
+* **TLS and proxies come free.** `wss://` is the same API call with a different scheme. A raw
+  TCP binding that later wanted transport security would have to grow one.
+* **Every ASR server already has a WebSocket story.** A bespoke TCP protocol needs one written
+  for it, once per server, by somebody who has read this document.
+* **The client needs no new dependency.** WinHTTP has spoken WebSocket since Windows 8
+  (`WinHttpWebSocketCompleteUpgrade` and friends), and the client already links WinHTTP. The
+  alternative — hand-rolling RFC 6455 masking and fragmentation — is several hundred lines
+  nobody should write again.
+
+The cost is a few hundred lines on the server side for implementers who have no WebSocket
+library. §15 is that code, in full, so the cost is paid once here rather than once per server.
+
+### 2.2 Pipe creation (Client, the pipe server) — pipe binding only
 
 Name: `\\.\pipe\kvit-dictate-<32 lowercase hex digits>`, where the 32 hex digits are 16 bytes
 from `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`. A new name is generated for
@@ -171,7 +232,7 @@ The child is created suspended-and-assigned or immediately assigned to a **job o
 VRAM (plan.md §3, Phase 3). This is process supervision, not protocol, but it is the reason
 the protocol never needs a keepalive: a dead peer becomes a broken pipe, promptly.
 
-### 2.5 Teardown
+### 2.5 Teardown — pipe binding
 
 Orderly: Client sends `stop` (or `cancel`), waits for `stopped`, closes its write side by
 calling `FlushFileBuffers` then `DisconnectNamedPipe`, then closes the handle. The Server sees
@@ -179,6 +240,150 @@ end of stream on a frame boundary (fixture 010) and exits 0.
 
 Disorderly: any read returning `ERROR_BROKEN_PIPE` / `ERROR_PIPE_NOT_CONNECTED`, or end of
 stream mid-frame (fixture 011), is a dead connection. See §10.3 for the required behaviour.
+
+### 2.6 The WebSocket binding
+
+**This is the binding a shipped client speaks.** Everything in §2.2–§2.5 is replaced by this
+subsection; nothing in §3 onwards changes.
+
+#### 2.6.1 URL, scheme and path
+
+The Client is configured with a single URL. There is no discovery, no default port, and no
+well-known path: an endpoint is something a person types in, and inventing a search order would
+mean an app that connects to something the user did not name.
+
+| Scheme | Meaning |
+|---|---|
+| `ws://` | Plaintext. What a LAN or loopback deployment uses. |
+| `wss://` | TLS. Accepted, and the Client MUST validate the certificate chain by the platform's ordinary rules. |
+| `http://`, `https://` | Accepted as synonyms for `ws://` / `wss://`, because users type them. The Client MUST NOT reject a URL for this reason alone. |
+
+The path is whatever the URL carries; a Server MAY listen on `/`, and a Server that hosts other
+things alongside SHOULD use a distinguishing path such as `/kvit-dictate/v1`. Query strings are
+passed through unchanged — a Server MAY use them for its own routing, and the protocol assigns
+them no meaning. A Client MUST NOT append a path of its own to a configured URL.
+
+#### 2.6.2 The opening handshake
+
+An ordinary RFC 6455 handshake. Two protocol-specific requirements:
+
+1. The Client MUST offer the subprotocol token **`kvit-dictate.v1`** in
+   `Sec-WebSocket-Protocol`.
+2. A Server that understands this protocol SHOULD echo that token. A Server that responds with a
+   *different* token has selected a protocol the Client did not offer; the Client MUST treat
+   that as fatal `proto_unsupported` and close. A Server that omits the header entirely is
+   accepted — many general-purpose WebSocket frameworks do not echo subprotocols, and refusing
+   them would exclude servers that are otherwise perfectly conforming.
+
+The token is a courtesy, not the version negotiation. **The authoritative version check is
+`hello`/`hello_ack` (§5)**, which runs identically on both bindings and cannot be skipped.
+
+`CONNECT_TIMEOUT_MS` bounds the whole opening handshake — DNS, TCP, TLS and the HTTP upgrade.
+On expiry the Client reports `connect_timeout` locally and does not retry inside the same
+activation.
+
+#### 2.6.3 One frame per message
+
+**One protocol frame (§3) per binary WebSocket message.** Both endpoints MUST use binary
+messages (opcode `0x2`); a text message (opcode `0x1`) is `unknown_frame_type` and is fatal,
+even when its bytes happen to be a valid control frame. The distinction is worth being strict
+about: a text message means the peer has decided this is a JSON-over-WebSocket protocol, and
+half its audio frames will arrive mangled by a UTF-8 round trip.
+
+A message MUST contain exactly one frame — not part of one, and not two. Fragmentation across
+WebSocket *continuation frames* is permitted and is the transport's business; a receiver
+reassembles the message before decoding. The 65541-byte ceiling of §3.3 is unchanged and applies
+to the reassembled message.
+
+**The 4-byte length prefix stays, and it is redundant.** A WebSocket message already carries its
+own boundary. Keeping the prefix costs five bytes per frame and buys one decoder, one fixture
+corpus and one specification section serving both bindings. A receiver MUST still validate it —
+a message whose length field disagrees with the message size is `bad_frame`, fatal — because a
+decoder that ignores a field it is given is a decoder that will be wrong the first time the
+field matters.
+
+Ping/pong is the transport's own business and is invisible above L0. Neither endpoint may
+encode protocol meaning in a ping payload. **There is no application-level keepalive and there
+must not be one**: the framing layer has no idle message, a dead peer surfaces as a dead socket,
+and §10.3 is the behaviour.
+
+#### 2.6.4 Teardown
+
+Orderly: the Client sends `stop` (or `cancel`), waits for `stopped`, then sends a WebSocket
+Close frame with status `1000` and waits up to `WRITE_DEADLINE_MS` for the Server's Close before
+closing the socket.
+
+Disorderly: a Close frame with any other status, a TCP reset, or end of stream mid-message is a
+dead connection, and §10.3 applies unchanged. The Server MUST tolerate a Client that vanishes
+without a Close frame — the Client's teardown runs on crash paths too — and MUST NOT hold
+resources for a session whose socket has closed.
+
+A Server MUST NOT use Close status codes to convey protocol errors. Errors are `error` messages
+(§11); an implementation that reports `bad_message` as a Close reason string has put the
+diagnostic somewhere the message catalogue cannot reach.
+
+### 2.7 Concurrency
+
+**A Server MAY accept concurrent connections. Each connection is wholly independent**: its own
+`hello`/`hello_ack`, its own `ready`, its own single open session (§7.2), its own `session_id`
+space. `session_id` uniqueness (§7.1) is per connection and per Client, never global; a Server
+MUST NOT assume ids from different connections differ, and MUST NOT route by `session_id` alone.
+
+This question did not exist on the pipe binding, where the Server was the child of exactly one
+Client. On a LAN it is the ordinary case: one server box, three people.
+
+A Server that cannot serve another connection — a single-GPU box already decoding, a configured
+connection limit — MUST refuse it **in words**:
+
+```
+Client                                        Server
+  |  0x01 {"t":"hello","proto":1}  ---------->  |
+  |  <-- 0x01 {"t":"error","fatal":true,"code":"server_busy",
+  |            "msg":"one session at a time; another client is connected",
+  |            "retry_after_ms":5000}
+  |  <-- WebSocket Close 1000
+```
+
+- The refusal MUST be a fatal `error` with code `server_busy`, sent **after** reading `hello`
+  and **instead of** `hello_ack`, followed by an orderly close.
+- `retry_after_ms` (integer, optional) is a hint. A Client that receives it SHOULD wait at least
+  that long before reconnecting; a Client that does not MUST still apply a backoff of its own.
+- **Silence is not an acceptable refusal**, and neither is accepting the connection and then
+  never sending `ready`. Both present to the user as "it hangs", which is the failure this
+  project spends the most effort not producing. A Server that must drop a connection without
+  explanation SHOULD at minimum close it promptly rather than leave it open.
+
+A Client MUST NOT treat `server_busy` as a reason to fall back to any other endpoint, and MUST
+NOT reconnect in a tight loop. The tray says the server is busy; the user decides.
+
+### 2.8 Security posture over a network, stated on purpose
+
+**This binding has no authentication and no confidentiality in v1.** Said plainly rather than
+left to be discovered:
+
+* Anyone who can reach the port can open a session and send audio.
+* Over `ws://`, the audio and every transcript are readable by anyone on the path.
+* There is no token, no client certificate, and no per-user identity of any kind.
+
+This is a smaller change than it looks. The pipe binding's DACL only ever protected the local
+hop between two processes on one machine; the audio it carried was already being forwarded to an
+HTTP endpoint on another host in plaintext. Moving the control channel onto the network puts it
+where the audio already was.
+
+Consequently:
+
+* **The supported deployment is loopback and a network you control** (release-plan.md §2.4). A
+  Client SHOULD warn — visibly, in words, in the settings UI — when a configured host is neither
+  loopback nor a private address and the scheme is unencrypted. A warning, not a block: the
+  user's network is not the Client's to adjudicate.
+* **A Server SHOULD bind to loopback by default** and require an explicit act to listen on a
+  routable interface. A default of `0.0.0.0` makes the least careful deployment the easiest one.
+* `wss://` MUST work if the operator supplies a certificate, so that a deployment that needs
+  confidentiality is a configuration change rather than a protocol change.
+
+A future proto MAY add authentication. It is deliberately absent from proto 1 rather than
+half-present: a token field nobody validates is worse than no field, because it looks like a
+boundary.
 
 ---
 
@@ -311,6 +516,19 @@ Client                                   Server
   |  <----  0x01 {"t":"hello_ack","proto":1,"server":"kvit-asr/0.1"}
 ```
 
+With model selection and discovery, both optional (§5.1):
+
+```
+Client                                             Server
+  |  0x01 {"t":"hello","proto":1,"model":"parakeet"}  -->  |
+  |  <-- 0x01 {"t":"hello_ack","proto":1,"server":"kvit-asr/0.2",
+  |            "models":[{"id":"parakeet","mode":"native-streaming",
+  |                       "context_supported":true},
+  |                      {"id":"whisper-lv3","mode":"pseudo-streaming"}]}
+  |  <-- 0x01 {"t":"ready","model":"parakeet","warm_ms":31,
+  |            "mode":"native-streaming","context_supported":true}
+```
+
 - The Client MUST send `hello` as the **first frame** on the connection, before any other
   frame, and MUST NOT send audio before `ready`.
 - The Server MUST answer with `hello_ack` or with a fatal `error` carrying code
@@ -321,8 +539,9 @@ Client                                   Server
 - If the Client receives `hello_ack` with `proto` != the version it offered, that is fatal
   `proto_unsupported` on the Client side: version selection is the Client's, and a Server that
   answers with a different number has changed the contract unilaterally.
-- If no `hello_ack` (or `error`) arrives within `HELLO_TIMEOUT_MS`, the Client kills the child
-  and reports `handshake_timeout` locally.
+- If no `hello_ack` (or `error`) arrives within `HELLO_TIMEOUT_MS`, the Client ends the
+  connection — closing the socket, or killing the child on the pipe binding — and reports
+  `handshake_timeout` locally.
 
 **`hello_ack` is not in plan.md §1.2, and is added deliberately.** The plan's sketch has the
 Client send `hello` and the Server reply `loading`/`ready`, but those describe the *model*, not
@@ -333,6 +552,39 @@ handshake.
 
 proto 1 supports exactly one version. `supported` in the rejection is an array of integers so
 that a future Server can tell an old Client what to fall back to.
+
+### 5.1 Model selection and discovery
+
+Both fields below are optional, and a Server that implements neither is fully conforming. They
+exist because §2.6 changed one assumption the original design leaned on everywhere: the Server
+is no longer a child process launched for one model, so "a model change means a new process"
+stopped being a thing the Client can arrange.
+
+**`hello.model` — the Client asks for a model.**
+
+- Absent means "whatever you serve by default". A Server with exactly one model ignores the
+  field entirely and reports what it loaded in `ready.model`.
+- Present names a model id. A Server that does not have it MUST answer with fatal `error` code
+  `model_unavailable`, listing what it does have in `available` — **not** silently load a
+  different one. Loading a different model than the one asked for is the failure mode this
+  field exists to prevent: it produces transcripts that are merely worse, which is the hardest
+  kind of wrong to notice.
+- `ready.model` is authoritative for what is actually loaded, and a Client SHOULD compare it
+  with what it asked for and say so if they differ.
+
+**`hello_ack.models[]` — the Server advertises what it has.**
+
+- Absent means "not advertised", never "there is only one". A Client MUST NOT infer a catalogue
+  from its absence; it offers the user a free-text model field instead.
+- Present, it lets the settings UI offer a list rather than a text box, which is the difference
+  between a configuration screen a stranger can use and one they have to be told about.
+- The list is advisory and a snapshot. A Server MAY load models lazily, and a model that appears
+  in `models[]` MAY still fail to load — that is `model_load_failed` (§11.3), not a
+  contradiction.
+
+Selecting a different model means **a new connection**, not a second `ready` on this one (§6.2).
+The Client already tears down and reconnects when the model setting changes; the Server does not
+have to support mid-connection reconfiguration, and MUST NOT accept a second `hello`.
 
 ---
 
@@ -350,6 +602,7 @@ schema. Field tables below use: **R** required, **O** optional.
 | `t` | string | R | `"hello"` |
 | `proto` | integer | R | `1` in this version. Range 1..65535. |
 | `client` | string | O | Client build id, e.g. `"kvit-dictate/0.1"`. Diagnostics only; never parsed for behaviour. |
+| `model` | string | O | Requested model id, §5.1. Absent means the Server's default. An id the Server does not have is fatal `model_unavailable`, never a silent substitution. `[A-Za-z0-9_.-]{1,64}`. |
 
 #### `start`
 
@@ -436,6 +689,7 @@ Client's `READY_TIMEOUT_MS` restarts on each `loading`.
 | `t` | string | R | `"hello_ack"` |
 | `proto` | integer | R | The accepted version; MUST equal the offered `proto`. |
 | `server` | string | O | Server build id. Diagnostics only. |
+| `models` | array | O | Catalogue, §5.1. Each element is an object: `id` (string, R), `display_name` (string, O), `mode` (string, O — the §6.2 `ready.mode` taxonomy), `chunk_ms` (integer, O), `context_supported` (boolean, O, default `false`). A receiver MUST ignore unknown members of an element, and MUST ignore an element with no `id` rather than failing the handshake — a malformed catalogue entry is not worth losing a working connection over. |
 
 #### `ready`
 
@@ -449,7 +703,11 @@ Client's `READY_TIMEOUT_MS` restarts on each `loading`.
 | `context_supported` | boolean | O | Default `false`. Whether `start.context` is honoured. |
 
 `ready` MUST be sent exactly once per connection, after `hello_ack`. There is no
-`ready`-again: a model change means a new child process (plan.md §1.1).
+`ready`-again: **one connection serves one model for its whole life**, and changing model means
+opening a new connection (§5.1). On the pipe binding that fell out of the architecture — a model
+change was a new child process (plan.md §1.1). On the network binding it is a rule, and it is
+kept because the alternative is a Server that can change what it is halfway through a
+conversation, which every state machine on the Client side would have to be rewritten to expect.
 
 #### `partial`
 
@@ -520,9 +778,9 @@ header, no padding, no interleaving. Payload length MUST be even; an odd length 
 
 **Session attribution of audio frames — the one real design compromise, stated openly.** Audio
 frames carry no `session_id`. They belong to whichever session is open on the connection at the
-point in the stream where they appear. This is sound only because a named pipe delivers bytes
-reliably and in order, so "between `start` and `stop`" is unambiguous, and because of two
-obligations:
+point in the stream where they appear. This is sound only because the transport delivers bytes
+reliably and in order — true of a named pipe, and equally true of a WebSocket over TCP — so
+"between `start` and `stop`" is unambiguous, and because of two obligations:
 
 - **Client obligation:** before writing `stop` or `cancel` for a session, the Client MUST have
   written, or dropped, every audio frame belonging to it. No audio for session *n* may follow
@@ -534,10 +792,15 @@ obligations:
 
 The alternative — an 8-byte binary header per audio frame carrying a session tag and sequence
 number — was considered and rejected. On a reliable ordered transport it would detect nothing
-that the framing layer does not already detect: a pipe does not drop a frame in transit, and a
-*locally* dropped frame is something the sender already knows about and must report as
-`overload_audio` (§9) rather than silently skip. The header would add per-chunk parsing cost
-and a second identity space to keep consistent, for no detection the protocol lacks.
+that the framing layer does not already detect: neither a pipe nor a TCP stream drops a frame in
+transit, and a *locally* dropped frame is something the sender already knows about and must
+report as `overload_audio` (§9) rather than silently skip. The header would add per-chunk parsing
+cost and a second identity space to keep consistent, for no detection the protocol lacks.
+
+**The network binding was the moment to revisit this, and it does not change the answer.** A
+WebSocket is TCP: it does not reorder, does not duplicate, and does not deliver half a message.
+What it can do that a pipe cannot is *die between the audio and the `stop`* — and that is
+§10.3's problem, in which the whole session is abandoned and no attribution question survives.
 
 ---
 
@@ -565,10 +828,16 @@ the Client MUST NOT apply any text or state from them, but MUST record them for 
 `accept_bookkeeping_only`. Without it, the Client would have no way to observe the orderly end
 of a session it has already moved on from.
 
-### 7.2 One session at a time
+### 7.2 One session at a time, per connection
 
-Exactly one session may be open per connection. `start` while open is `state_violation`
-(fatal). The Client serialises hotkey activations; the pipe is not a multiplexer.
+Exactly one session may be open **per connection**. `start` while one is open is
+`state_violation` (fatal). The Client serialises hotkey activations; the connection is not a
+multiplexer.
+
+"Per connection" is load-bearing now that a Server may hold several (§2.7). A Server MUST keep
+session state per connection and MUST NOT key it on `session_id`, which is only unique within
+one Client's process (§7.1) and will collide across connections the first time two people start
+the app on the same afternoon — both Clients begin at `s1`.
 
 ### 7.3 `utterance_id`
 
@@ -725,37 +994,51 @@ drops" — is tested against these numbers.
 
 ### 10.1 States
 
-Connection-scoped states, both endpoints (the Client also has `SPAWNING`/`VALIDATING`, which
-exist before any frame is exchanged):
+Connection-scoped states, both endpoints (the Client also has `CONNECTING`, and on the pipe
+binding `SPAWNING`/`VALIDATING`, which exist before any frame is exchanged):
 
 | State | Meaning |
 |---|---|
-| `SPAWNING` | Client only. Pipe created, child launched, awaiting `ConnectNamedPipe`. |
-| `VALIDATING` | Client only. Connected; checking `GetNamedPipeClientProcessId`. |
+| `CONNECTING` | Client only, WebSocket binding. Resolving, connecting, upgrading (§2.6.2). |
+| `SPAWNING` | Client only, pipe binding. Pipe created, child launched, awaiting `ConnectNamedPipe`. |
+| `VALIDATING` | Client only, pipe binding. Connected; checking `GetNamedPipeClientProcessId`. |
 | `HANDSHAKE` | `hello` sent / awaited; nothing else may cross. |
 | `LOADING` | `hello_ack` exchanged; model loading; `loading` messages permitted. |
 | `IDLE` | `ready` exchanged; no session open. |
 | `RUNNING` | Session open; audio flowing; `partial`/`final` flowing. |
 | `FINALIZING` | `stop` sent/received; awaiting `stopped`. |
 | `CANCELLING` | `cancel` sent/received; awaiting `stopped`; all text discarded. |
-| `DEAD` | Connection finished. Terminal. Recovery is a new child and a new pipe. |
+| `DEAD` | Connection finished. Terminal. Recovery is a new connection — a reconnect, or a new child and a new pipe. |
+| `NO_SERVER` | Client only, WebSocket binding. No URL is configured. **Not an error state**: it is what every fresh install looks like, and §10.6 says what the Client does in it. |
 
 ### 10.2 Client transitions
 
+Rows naming a pipe-binding state apply only to that binding; a WebSocket client starts in
+`CONNECTING` (or `NO_SERVER`) and joins the table at `HANDSHAKE`.
+
 | State | Event | Next | Action |
 |---|---|---|---|
+| `NO_SERVER` | hotkey pressed | `NO_SERVER` | **do not open the microphone.** Say so: tray text, and the settings page (§10.6) |
+| `NO_SERVER` | a URL is configured | `CONNECTING` | connect |
+| `CONNECTING` | upgrade completes (§2.6.2) | `HANDSHAKE` | send `hello` |
+| `CONNECTING` | `CONNECT_TIMEOUT_MS` elapsed | `DEAD` | report `connect_timeout`; reconnect with backoff |
+| `CONNECTING` | connection refused / DNS failure | `DEAD` | report `connect_refused`; reconnect with backoff |
+| `CONNECTING` | TLS validation fails | `DEAD` | report `tls_failed`; **do not** retry without validation, and do not offer to |
+| `CONNECTING` | server selects a subprotocol not offered | `DEAD` | report `proto_unsupported` |
+| `HANDSHAKE` | `error server_busy` | `DEAD` | surface "the server is busy"; wait `retry_after_ms` (or the local backoff, whichever is longer) |
+| `HANDSHAKE` | `error model_unavailable` | `DEAD` | surface the requested id and the server's `available` list; **do not** retry with a different model |
 | `SPAWNING` | client connects | `VALIDATING` | — |
 | `SPAWNING` | `CONNECT_TIMEOUT_MS` elapsed | `DEAD` | kill child, report `spawn_timeout` |
 | `VALIDATING` | PID matches | `HANDSHAKE` | send `hello` |
 | `VALIDATING` | PID mismatch | `DEAD` | disconnect, kill child, report `peer_mismatch` |
 | `HANDSHAKE` | `hello_ack` with matching `proto` | `LOADING` | — |
-| `HANDSHAKE` | `hello_ack` with other `proto`, or `error proto_unsupported` | `DEAD` | surface "sidecar protocol mismatch" |
-| `HANDSHAKE` | `HELLO_TIMEOUT_MS` elapsed | `DEAD` | kill child, report `handshake_timeout` |
+| `HANDSHAKE` | `hello_ack` with other `proto`, or `error proto_unsupported` | `DEAD` | surface "server protocol mismatch" |
+| `HANDSHAKE` | `HELLO_TIMEOUT_MS` elapsed | `DEAD` | end the connection, report `handshake_timeout` |
 | `HANDSHAKE` | any other message | `DEAD` | `state_violation` |
 | `LOADING` | `loading` | `LOADING` | restart `READY_TIMEOUT_MS`, update tray |
 | `LOADING` | `ready` | `IDLE` | tray → idle-ready |
 | `LOADING` | hotkey pressed | `LOADING` | **do not send `start`.** Show "model loading". Buffer locally or refuse — a Client choice, but the wire rule is that `start` may only be sent from `IDLE`. |
-| `LOADING` | `READY_TIMEOUT_MS` elapsed | `DEAD` | kill child, report `model_load_timeout` |
+| `LOADING` | `READY_TIMEOUT_MS` elapsed | `DEAD` | end the connection, report `model_load_timeout` |
 | `IDLE` | hotkey pressed | `RUNNING` | new `session_id`, send `start` |
 | `IDLE` | `partial`/`final` for any session | `IDLE` | drop (stale, §7.1) |
 | `RUNNING` | mic buffer ready | `RUNNING` | send `0x02` audio frame |
@@ -771,28 +1054,34 @@ exist before any frame is exchanged):
 | `FINALIZING` | `stopped` | `IDLE` | commit engine reset |
 | `CANCELLING` | `partial`/`final` for the cancelled session | `CANCELLING` | **drop** (fixture 019) |
 | `CANCELLING` | `stopped` | `IDLE` | commit engine reset; no injection performed after `cancel` |
-| any | `error` `fatal:true` | `DEAD` | tear down, surface, restart child |
-| any | broken pipe / EOF | `DEAD` | §10.3 |
+| any | `error` `fatal:true` | `DEAD` | tear down, surface, re-establish the connection |
+| any | broken pipe / socket close / EOF | `DEAD` | §10.3 |
 | any | L1/L2 error (§3, §4) | `DEAD` | §11.2 |
 
-### 10.3 Child crash
+### 10.3 Connection loss
 
-`ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED`, EOF mid-frame, or child process exit. The
-Client MUST:
+On the pipe binding: `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED`, EOF mid-frame, or child
+process exit. On the WebSocket binding: a Close frame with a status other than `1000`, a socket
+error, a TCP reset, or end of stream mid-message. The two are the same event and get the same
+treatment. The Client MUST:
 
 1. Move to `DEAD`. Never attempt to reuse the handle or the pipe name.
 2. Abort any open session **without injecting anything further**. Text already committed stays
    in the document (that is the invariant); the unstable tail is lost, which is the honest
    outcome — the hypothesis that would have finalised it no longer exists.
 3. Reset the commit engine and anchor state.
-4. Surface "sidecar stopped" in the tray. Do not silently restart mid-session and pretend
-   nothing happened.
-5. Reap the child, then respawn with a **new random pipe name** and a **new `session_id`
-   space** (fixture 020). Restart backoff is a Client policy matter, not protocol.
+4. Surface it in the tray, in words — "the server stopped", not a colour change. Do not
+   silently reconnect mid-session and pretend nothing happened.
+5. Re-establish the connection with a **new `session_id` space** (fixture 020) — on the pipe
+   binding by reaping the child and respawning against a new random pipe name; on the WebSocket
+   binding by reconnecting to the same URL. Reconnect backoff is a Client policy matter, not
+   protocol, but it MUST exist: a server that is switched off must not be hammered, and the tray
+   must say "reconnecting", not pretend to be idle.
 
-A message bearing a pre-crash `session_id` arriving on the new connection is dropped by §7.1.
-With a fresh random pipe name this should be impossible; the rule is defence in depth, and the
-fixture exists because the cost of getting it wrong is text injected into an unrelated window.
+A message bearing a pre-loss `session_id` arriving on the new connection is dropped by §7.1.
+The rule is defence in depth — on the pipe binding a fresh random name made it nearly
+impossible, and over a network it is merely unlikely — and the fixture exists because the cost
+of getting it wrong is text injected into an unrelated window.
 
 ### 10.4 Cancel during final
 
@@ -817,6 +1106,24 @@ handled by the idempotent rule in §6.1: the Server answers `stopped` with
 `reason:"unknown_session"`. A Server MUST NOT treat this as an error, because the Client's
 teardown path runs on crash and shutdown paths where its own state may be uncertain.
 
+### 10.6 No server configured
+
+Not an error path. It is what every fresh install looks like, and what every user sees when the
+machine hosting their server is switched off, so it is specified rather than left to each
+Client's discretion. A Client in `NO_SERVER`:
+
+- MUST NOT open the microphone. The hotkey does not begin capture, because there is nowhere for
+  the audio to go and a recording indicator with no recogniser behind it is a privacy surprise.
+- MUST say what is wrong in words, in a place the user is already looking — the tray tooltip and
+  the tray icon's state, not only a log file.
+- MUST NOT show the dictation UI (the pill), which would claim a session that does not exist.
+- MUST NOT fail silently. A hotkey press that produces nothing at all is indistinguishable from
+  a broken hotkey, and the user will go looking in the wrong place.
+
+This is a Client obligation with no wire component — there is no peer to tell — and it is
+written into this document rather than into a UI note because it is the first thing every
+implementer of a second client (§0 of release-plan.md contemplates one) will otherwise skip.
+
 ---
 
 ## 11. Error codes
@@ -826,8 +1133,9 @@ teardown path runs on crash and shutdown paths where its own state may be uncert
 Exactly two levels, no third:
 
 - `fatal: true` — **the connection is finished.** The sender will write nothing more. The
-  receiver tears down; the Client additionally kills and respawns the child. `session_id` is
-  optional (some fatal errors precede any session).
+  receiver tears down; the Client additionally re-establishes the connection (respawning the
+  child, on the pipe binding). `session_id` is optional (some fatal errors precede any
+  session).
 - `fatal: false` — **the named session is aborted; the connection remains usable.** A new
   session may be started afterwards. `session_id` is **required**.
 
@@ -845,7 +1153,9 @@ MUST NOT wait for a reply.
 
 | `code` | `fatal` | Sent by | Meaning | Required receiver behaviour |
 |---|---|---|---|---|
-| `proto_unsupported` | true | Server | Offered `proto` not supported | Client: tear down, surface "sidecar protocol mismatch", do not auto-restart in a loop |
+| `proto_unsupported` | true | Server | Offered `proto` not supported. Also raised locally by the Client when a WebSocket handshake selects a subprotocol it did not offer (§2.6.2). | Client: tear down, surface "server protocol mismatch", do not auto-restart in a loop |
+| `server_busy` | true | Server | The Server cannot serve another connection (§2.7). MAY carry `retry_after_ms` (integer). | Client: tear down, surface "the server is busy", back off. Never retry in a tight loop, never fall back to another endpoint. |
+| `model_unavailable` | true | Server | `hello.model` names a model the Server does not have (§5.1). SHOULD carry `available` (array of string). | Client: tear down, surface the requested id and the `available` list, do not retry with a different model automatically |
 | `bad_frame` | true | either | `length` below `MIN_LENGTH_FIELD`, or otherwise unparseable header | Tear down. Never resynchronise. |
 | `frame_too_large` | true | either | `length` above `MAX_LENGTH_FIELD` | Tear down without reading the payload |
 | `truncated_frame` | true | either | End of stream inside a frame | Tear down; usually detected locally, rarely sendable |
@@ -864,9 +1174,18 @@ MUST NOT wait for a reply.
 | `audio_underrun` | false | Server | Not enough audio arrived to decode the session meaningfully | Client: abort the session, surface, allow a new session |
 
 Locally-detected conditions that are **never** wire messages, because there is no peer to tell:
-`spawn_timeout`, `handshake_timeout`, `model_load_timeout`, `peer_mismatch`, `pipe_squatted`
+`spawn_timeout`, `connect_timeout`, `connect_refused`, `tls_failed`, `no_server_configured`,
+`handshake_timeout`, `model_load_timeout`, `peer_mismatch`, `pipe_squatted`
 (`FILE_FLAG_FIRST_PIPE_INSTANCE` failure). They use the same string identifiers in logs so that
 a log reader does not have to learn two vocabularies.
+
+The four network ones are worth distinguishing rather than collapsing into "cannot connect",
+because each has a different next action for the user and the tray text is the only place they
+will ever see it: `connect_timeout` means the host did not answer (wrong address, machine off,
+firewall dropping); `connect_refused` means it answered and said no (server not running, wrong
+port); `tls_failed` means `wss://` and a certificate the machine does not trust;
+`no_server_configured` means the settings are empty, which is what every fresh install looks
+like and is not an error at all.
 
 ---
 
@@ -1014,6 +1333,16 @@ across two languages whose internals differ.
 | proto | Date | Status | Changes |
 |---|---|---|---|
 | 1 | 2026-08-16 | v1 draft — frozen in Phase 2 | Initial specification. Length covers the type byte. Frame types `0x01` control / `0x02` audio, `MAX_PAYLOAD` 64 KiB. `hello`/`hello_ack` handshake. `session_id`/`utterance_id`/`seq` identity. Cumulative `partial.text` with `stable_bytes` in UTF-8 bytes on grapheme boundaries. Bounded queues with explicit overload errors. `discontinuity` added to the Client→Server set; `hello_ack` added to the Server→Client set. |
+| 1 | 2026-08-28 | v1 draft — network binding | **No `proto` bump; see below.** Added the WebSocket binding (§2.6) and made it normative for shipped builds, demoting the named pipe (§2.2–§2.5) to the bench. Answered the two questions the network binding creates: concurrency (§2.7) and model discovery (§5.1). New optional fields `hello.model` and `hello_ack.models[]`; new error codes `server_busy` and `model_unavailable`; new locally-detected conditions `connect_timeout`, `connect_refused`, `tls_failed`, `no_server_configured`. §2.8 states the network security posture. §15 adds a complete worked example of a conforming server. |
+
+**The WebSocket binding did not bump `proto`, and that is not an oversight.** A transport
+binding is L0; `proto` versions L1 through L3, none of which changed. The same decoder, the same
+fixture corpus and the same message catalogue serve both bindings, which is the property §2.1
+claims and the reason adding a binding was cheap. What did change under proto 1 is entirely
+additive and is listed in the row above: two optional fields and two error codes, both of which
+§13 already permits without a bump. A receiver written against the original proto 1 and given a
+`hello_ack` carrying `models[]` ignores a field it does not know, which is exactly the forward
+tolerance the rule was written for.
 
 A new `proto` number is required to change any of: the framing header layout or the meaning of
 `length`; the set or meaning of frame type bytes; the size limits; the audio format or its
@@ -1034,6 +1363,21 @@ error about a fatal error — loses the diagnostic that was being delivered.
 ## 14. Open questions
 
 Recorded rather than guessed. Each must be resolved before the Phase 2 freeze.
+
+**Closed since revision 1**, recorded here rather than deleted so that a reader who remembers
+them can see where they went:
+
+* *Concurrency* — release-plan.md §1.4 item 1. **Answered in §2.7**: a Server MAY accept
+  concurrent connections, each wholly independent, and one that cannot MUST refuse with
+  `server_busy` rather than by hanging.
+* *Model discovery* — release-plan.md §1.4 item 2. **Answered in §5.1**, taking the first of the
+  two options that section offered: optional `hello.model` and optional `hello_ack.models[]`.
+  The free-text fallback survives as the behaviour when a Server advertises nothing, so a Server
+  that implements neither field is still fully conforming.
+* *Whether the length prefix survives inside a WebSocket message.* **It does** (§2.6.3), and it
+  is redundant on purpose: five bytes a frame buys one decoder and one fixture corpus.
+
+Still open:
 
 1. **`GetNamedPipeServerProcessId`.** §2.4 step 5 has the child validate the parent. The
    mirror-image API is believed to exist and to be available from `kernel32` on Windows Vista
@@ -1057,4 +1401,80 @@ Recorded rather than guessed. Each must be resolved before the Phase 2 freeze.
    freeze, not after.
 5. **Overload thresholds.** `AUDIO_QUEUE_MAX_MS = 3000` and `CONTROL_QUEUE_MAX = 256` are
    reasoned guesses, not measurements. Phase 2 runs streaming backends at real-time cadence and
-   should confirm that a healthy system stays an order of magnitude below both.
+   should confirm that a healthy system stays an order of magnitude below both. The network
+   binding makes this more urgent, not less: on a pipe the queues drained at memcpy speed, and
+   over Wi-Fi they will not.
+6. **Whether `AUDIO_QUEUE_MAX_MS` is still the right shape over a network.** It bounds a local
+   send queue, which is the correct thing to bound when the peer is a child process. Over a
+   network a client can also be *fast* and the server slow, with the backlog sitting in kernel
+   socket buffers where neither endpoint's queue depth sees it. Nothing here is wrong, but §9's
+   guarantee is weaker over a network than the text implies, and the text should say so once
+   somebody has measured it.
+7. **Authentication.** Absent from proto 1 on purpose (§2.8) and the right answer for a
+   loopback-and-LAN tool. A remote tier needs one, and adding it later is a proto bump if it
+   touches `hello`. Deciding the *shape* now — a bearer token in the upgrade request, most
+   likely, since that is what the WebSocket binding makes free — would cost nothing and would
+   keep the option from becoming a redesign.
+
+---
+
+## 15. A minimal conforming server
+
+`docs/examples/minimal_server.py` is a complete, working, standard-library-only server. It is
+about 400 lines including its commentary, it has no dependency on anything else in this
+repository, and it is written against this document alone — no import from `kvit_asr`, no shared
+helper.
+
+```
+python docs/examples/minimal_server.py
+listening on ws://127.0.0.1:10402/
+```
+
+**It does not recognise speech.** It accepts a session, counts the audio, and answers with a
+`final` reading `heard 2.4 s of audio (38400 samples)`. That is the point: what a server author
+needs proved is the upgrade, the frame layout, the handshake, the ordering rules and the
+stability invariant. Replacing `transcribe()` with a decoder is the part that does not need a
+specification.
+
+`server/tests/test_minimal_server.py` drives it through a full session — and through every
+fault path in §11 — using a WebSocket *client* written the same way, from this document, in the
+same file. **The example is executed on every test run, not asserted.** A worked example that
+has drifted from its specification is worse than no example, because it teaches the drift.
+
+### 15.1 The shape of it
+
+| Part | Section here | What it is |
+|---|---|---|
+| `websocket_handshake` | §2.6.2 | The RFC 6455 upgrade: `Sec-WebSocket-Accept` is base64(SHA-1(key + GUID)), and the `kvit-dictate.v1` subprotocol is echoed when offered |
+| `ws_recv_message` / `ws_send` | §2.6.3 | Frames in and out, unmasking what the client sends, reassembling continuations, answering pings |
+| `decode_frame` / `encode_frame` | §3 | `u32` little-endian length covering the type byte, then the type byte, then the payload |
+| `decode_control` | §4 | UTF-8, then JSON, with each failure reported at its own layer |
+| `Connection.handshake` | §5, §5.1 | `hello` → `hello_ack` → `ready`, refusing an unsupported `proto` and an unavailable `model` rather than substituting |
+| `Connection.on_*` | §6, §7, §10 | Session routing, one session per connection, idempotent `stop`/`cancel` |
+| `_Handler` | §2.7 | One thread per connection, with an optional limit that refuses in words |
+
+### 15.2 The five things implementers get wrong
+
+Each of these is a test in `test_minimal_server.py`, and each is a real defect somebody will
+otherwise ship:
+
+1. **Sending control messages as WebSocket *text* frames.** Natural, since they are JSON, and
+   fatal: half the audio frames then arrive mangled by a UTF-8 round trip. §2.6.3 — binary only.
+2. **Trusting the WebSocket message boundary and ignoring the length prefix.** It works until
+   something coalesces, and then it fails as garbled text rather than as an error. Validate the
+   field; a disagreement is `bad_frame`.
+3. **Substituting U+FFFD for invalid UTF-8 in a control payload.** A decoder that repairs its
+   input hides the bug that produced it. §4.1 — `bad_utf8`, fatal.
+4. **Loading a different model than the one `hello.model` asked for.** It produces transcripts
+   that are merely *worse*, which is the hardest kind of wrong to notice. §5.1 —
+   `model_unavailable`.
+5. **Refusing a connection by hanging.** Accepting the socket and never sending `ready` reads to
+   the user as "it hangs", and the author of the client cannot tell it from a crash. §2.7 —
+   `server_busy`, in words, then close.
+
+And the sixth, which no example can test for you: **`stable_bytes` must never go backwards, and
+bytes below it must never change.** §8 is the whole of it. A backend that re-punctuates earlier
+words as later context arrives — which is what a batch model does by default — violates this
+structurally, not occasionally. If yours does, emit one `final` at the endpoint and no
+`partial`s at all. `ready.mode: "pseudo-streaming"` is how you say so, and a client that is told
+will adapt its UI instead of showing text that rewrites itself.

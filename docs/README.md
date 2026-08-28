@@ -1,11 +1,16 @@
 # docs/
 
 Specifications and published matrices for kvit-dictate. The authoritative design document is
-`../plan.md`; everything here is subordinate to it and cites the section it implements.
+`../plan.md`; everything here is subordinate to it and cites the section it implements —
+**except `protocol.md`**, which is now a public API specification, is licensed Apache-2.0 rather
+than MPL-2.0, and is written to be sufficient without any other file in this repository.
 
 | File | What it is | Status |
 |---|---|---|
-| `protocol.md` | Versioned wire spec for the C++ ↔ Python named-pipe transport: framing, message types, identity fields (`session_id` / `utterance_id` / `seq`), UTF-8 byte-offset semantics, backpressure and error handling. Implements `plan.md` §1.2. | **Not yet written.** `plan.md` §1.2 requires it to exist *before either endpoint is implemented*; it freezes in Phase 2 along with the cross-language fixtures. |
+| `protocol.md` | **The public wire specification.** Two transport bindings — WebSocket (shipped) and a named pipe (retained for the bench) — over one framing layer: message types, identity fields (`session_id` / `utterance_id` / `seq`), UTF-8 byte-offset semantics, backpressure and error handling. Implements `plan.md` §1.2 and `release-plan.md` §1. | **Written and implemented on both sides.** Licensed Apache-2.0 (`../LICENSE-APACHE`). §15 is a worked example of a conforming server. |
+| `examples/minimal_server.py` | A complete conforming server in the standard library and nothing else: WebSocket upgrade, framing, handshake, one session, an audio counter where a recogniser would go. `protocol.md` §15 walks through it. | **Executed, not asserted.** `../server/tests/test_minimal_server.py` drives it through a full session and every fault path on every test run. |
+| `setup.md` | How to stand up an ASR endpoint for the app to talk to: which existing servers can sit behind the protocol, a worked example, and the honest statement that this is the part the project does not do for you yet. | Written for the v1 release. |
+| `cla.md` | The contributor agreement `../CONTRIBUTING.md` refers to, and §4's plain statement of why it asks for more than the outbound licence does. | Draft; `release-plan.md` §5 wants a lawyer's eye on it before the first binary ships. |
 | `editing.md` | The pill as an editable compose buffer: nothing reaches the document until the user presses Enter. Two disjoint session states — dictating with the microphone open, editing with it closed — plus keyboard capture, the settled/unstable split the caret may occupy, mouse hit-testing against a non-focusable window, and the fail-open rule that keeps a wedged UI thread from eating the keyboard. Amends `plan.md` §1.8 and §1.6; strengthens §1.4. | **Proposal, not implemented.** Nothing in `src/` does any of it. §15 holds the questions that must be measured rather than guessed — the resume latency is the one that could still change the design. |
 | `supported-targets.md` | Per-application support matrix: which applications kvit-dictate types into, which get the degraded floating-pill experience, and which are refused with a reason. Also the Phase 0B methodology that produces it. Implements `plan.md` §0B/§1.7/§4. | **v1 template, no measurements.** Cells read `—` until the Phase 0B probe fills them in. Do not cite it as evidence of support yet. |
 
