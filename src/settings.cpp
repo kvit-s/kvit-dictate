@@ -2956,9 +2956,8 @@ void build_controls(HWND dlg, DialogState& st) {
         Cursor c{dlg, inst, &st, 0, col1_x, top, top, col_w};
         c.section(L"Where your speech service is");
         c.note(L"kvit-dictate does not recognise speech itself. It captures your voice, sends it "
-               L"to a service you run, and types back what comes out. Without one it will not "
-               L"open the microphone at all — and it will say so rather than look broken.",
-               5);
+               L"to a service you run, and types back what comes out.",
+               3);
         // The address box comes FIRST and the radios after it, because for most people the only
         // thing to do on this page is type one address and press Test. The second radio is the
         // escape hatch for somebody who already runs a protocol server, not a choice everyone
@@ -2977,39 +2976,40 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Model (optional)", kIdServerModel);
         c.note(L"Leave this empty to take whatever the service offers. If you name a model it "
                L"does not have, it says so — it never quietly substitutes another one.",
-               3);
-        c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
-        c.note(L"Off by default. A batch model rewrites earlier words as it hears more, so a "
-               L"live preview against one either flickers or stops committing. With it off, "
-               L"each phrase lands when you pause.",
-               4);
+               2);
         c.add(L"BUTTON", L"Test this service", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
         c.gap(6);
-        c.add(L"STATIC", L"", 0, st.line_h * 9, kIdServerStatus);
+        // Seven lines, not nine. `describe_probe` writes six on a good answer and the box scrolls
+        // nothing, so the last two were dead space paid for on *every* page — the dialog is one
+        // size for all five, so the tallest column anywhere sets the height everywhere.
+        c.add(L"STATIC", L"", 0, st.line_h * 7, kIdServerStatus);
     }
     {
         Cursor c{dlg, inst, &st, 0, col2_x, top, top, col_w};
-        c.section(L"What crosses your network");
-        c.note(L"Your audio goes to the server you name above and nowhere else. There is no "
-               L"cloud service, no telemetry, and nothing is sent anywhere until you press the "
-               L"hotkey.",
+        // The live-preview switch lives in this column rather than under the address, because it
+        // is not part of "point this at a service": it is a thing to read about and then decide,
+        // and it belongs with the other two paragraphs that explain consequences.
+        c.section(L"While you are speaking");
+        c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
+        c.note(L"Off by default. A batch model rewrites earlier words as it hears more, so a "
+               L"live preview against one either flickers or stops committing. With it off, each "
+               L"phrase lands when you pause.",
                4);
-        c.note(L"But it is sent unencrypted, and the server does not ask who you are: anyone who "
-               L"can reach that address can send audio to it, and anyone on the path can read "
-               L"yours. Run this on a network you control. wss:// works if you put a proxy with "
-               L"a certificate in front of your server.",
-               6);
-        c.add(L"STATIC", L"", 0, st.line_h * 5, kIdServerWarning);
+
+        c.section(L"What crosses your network");
+        c.note(L"Your audio goes to the service you name and nowhere else. No cloud service, no "
+               L"telemetry, and nothing is sent until you press the hotkey.",
+               3);
+        c.note(L"It is sent unencrypted and the service is not asked who you are, so run this on "
+               L"a network you control. wss:// works behind a proxy with a certificate.",
+               3);
+        c.add(L"STATIC", L"", 0, st.line_h * 4, kIdServerWarning);
         c.gap(6);
 
-        c.section(L"When the server is not there");
-        c.note(L"The hotkey does not open the microphone, the pill does not appear, and the tray "
-               L"says what is wrong. A dictation that silently records into nothing would be "
-               L"worse than one that refuses.",
-               4);
-        c.note(L"If the connection drops mid-sentence, everything already typed into your "
-               L"document stays there. Only the part that had not been committed yet is lost, "
-               L"and the tray says so.",
+        c.section(L"When it is not there");
+        c.note(L"The hotkey does not open the microphone and the tray says why. If the connection "
+               L"drops mid-sentence, everything already typed stays in your document and only the "
+               L"uncommitted tail is lost.",
                4);
     }
 
