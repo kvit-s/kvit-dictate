@@ -1,6 +1,8 @@
 # kvit-dictate — Release Plan (v1.0, first build for other people)
 
-Status: **draft, nothing here is built yet.** Revision 2, 2026-08-27, against commit `59b0a57`.
+Status: **mostly built.** Revision 2, 2026-08-27, against commit `59b0a57`; implemented
+2026-08-28. §10 is the honest account of what was built, what was not, and what cannot be
+verified from a keyboard.
 
 `plan.md` is the design document for the experimental phase and it still wins on every question
 of architecture *inside* the client. This document is narrower and later: it covers only what has
@@ -378,3 +380,71 @@ until R3.
    meant to be broader, the reference server moves from §1.5 into the release and R1 grows.
 4. **Does `tools/kvit-speech` get archived or maintained?** It is the seed of an offline story and
    it is currently in nobody's phase.
+
+---
+
+## 10. What was built, 2026-08-28
+
+Written after the fact, against the plan above, and specific about the difference between "done"
+and "done and observed". Every claim below is either verified by a test that runs or is marked as
+unverified; there is no third category.
+
+### Built and verified
+
+| § | Work | How it was verified |
+|---|---|---|
+| §1.3 | The WebSocket binding, client side (`IpcClient::connect`, WinHTTP) | `kd_probe --server` completes the upgrade, handshake and `ready` against two independent servers |
+| §1.3 | The WebSocket binding, server side (`kvit_asr/ws.py`, `--listen`) | 29 new tests drive it over a real socket with a client written from the spec |
+| §1.4 | Concurrency (§2.7) and model discovery (§5.1) answered in the spec and implemented on both sides | `server_busy` and `model_unavailable` are asserted end to end, in both suites |
+| §2.2 | `ServerSettings`, the Server settings page, the Test button | 7 new settings tests; the Test button's call (`probe_server`) is the same one `kd_probe --server` makes and that is exercised |
+| §2.4 | The non-private-host warning | Unit-tested against loopback, all three RFC 1918 ranges, CGNAT, link-local, IPv6 unique-local, and the public addresses that must *not* be excused |
+| §3.2 | `/MT`, the application manifest, the icon, the version resource | The release script greps the binary for CRT imports and refuses to package if it finds any |
+| §1.2 | Spawn machinery out of shipped builds (`KD_ENABLE_SIDECAR_SPAWN=OFF`) | The release script greps for `CreateProcessW` and `AssignProcessToJobObject` and refuses to package if either is present |
+| §5 | MPL-2.0 / Apache-2.0 split, headers, CLA | `tools/apply-license-headers.sh --check` runs clean |
+| §6 | README rewrite, `docs/setup.md`, the corrected privacy statement | — |
+| §1.5 | Not the reference server, but `docs/examples/minimal_server.py`: a complete conforming server in 400 lines of standard library | Executed by 27 tests on every run, including the RFC 6455 vector that caught a wrong magic GUID |
+
+Totals: 494 C++ tests, 475 server tests, 129 bench tests. All green.
+
+### Built but not observed
+
+* **A full dictation session over the WebSocket binding.** Every layer under it is exercised —
+  the upgrade, the framing, the handshake, `start`, audio, `stop`, `final`, `stopped` — and the
+  server side is driven through exactly that sequence by the test suite. What has not happened is
+  a person pressing the hotkey and watching words appear from a network server. That is R2's gate
+  and it needs a person.
+* **The Test button in the dialog.** The function behind it is exercised through `kd_probe`; the
+  button itself, its worker thread and its generation counter are not.
+* **The installer.** The `.iss` is written and the build script drives it, but Inno Setup is not
+  installed on the development machine, so it has never been compiled.
+
+### Deliberately not done
+
+* **Signing (§4).** No certificate exists. This is the largest risk in the release and it is
+  carried, not solved. Nothing in the build pretends otherwise: there is no `SignTool` directive
+  and the release script says so in its closing output.
+* **The clean-VM test (§3, R3's gate).** Requires a VM, a browser download with Mark-of-the-Web
+  intact, and Defender at its defaults. The development machine has exclusions that hide exactly
+  the failure the test exists to find.
+* **Defender pre-submission (§4 item 3).** Follows the certificate.
+* **R4's outside testers.** Three to five people who already run a server. That is a recruitment
+  problem, not a code one.
+* **A version-check endpoint and a download page (R5).** Both need infrastructure that does not
+  exist.
+* **The reference server (§1.5).** Still a separate deliverable on its own timeline. What exists
+  instead is `docs/examples/minimal_server.py`, which proves the protocol without transcribing
+  anything, and `server/` with `--listen`, which is a real server for anyone who already has a
+  model.
+
+### Two things this work changed about the plan itself
+
+1. **§1.2 said `docs/protocol.md` §2 would be "replaced" by a network binding.** It was extended
+   instead: §2.1 now routes the reader, §2.6–§2.8 are the network binding, and §2.2–§2.5 remain
+   as the pipe binding the bench uses. Replacing them would have invalidated about sixty
+   `§2.x` references in source comments across both languages, for no gain — and keeping one
+   binding alive is what keeps "the framing layer is transport-agnostic" a demonstrated claim
+   rather than an asserted one.
+2. **§1.4 offered two options for model discovery and called the second "v1-acceptable".** The
+   first was taken (`hello_ack.models[]`), because it turned out to cost about forty lines per
+   side, and the free-text fallback survives as what a client does when a server advertises
+   nothing. A server that implements neither field is still fully conforming.
