@@ -381,7 +381,20 @@ set(KD_ASRD_HEADERS
     src/asrd/http.h
 )
 
-add_executable(kvit-asrd ${KD_ASRD_SOURCES} ${KD_ASRD_HEADERS})
+# The .rc carries a version block and nothing else — no icon, no manifest. A headless child with
+# no version block shows up as a bare "kvit-asrd.exe" in the installer's in-use-files dialog and
+# in Task Manager, which for a process the user did not start is the wrong impression to give.
+add_executable(kvit-asrd ${KD_ASRD_SOURCES} ${KD_ASRD_HEADERS} packaging/windows/kvit-asrd.rc)
+
+# rc.exe finds kvit-asrd.rc's includes here, the same way the client's target does.
+target_include_directories(kvit-asrd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows")
+
+# **No /MANIFEST:NO here**, unlike kvit-dictate. That flag exists on the client because its .rc
+# embeds packaging/windows/kvit-dictate.manifest by hand, and a second linker-generated one would
+# give the executable two RT_MANIFEST resources and make Windows refuse to start it. This .rc
+# embeds no manifest, so the linker's default is the only one — and that default is exactly what
+# openai-translator.md §4.8 asks for: asInvoker, and nothing else. Suppressing it would leave the
+# translator with no declared execution level at all.
 
 #   bcrypt   ws_server — BCryptCreateHash(BCRYPT_SHA1_ALGORITHM) for Sec-WebSocket-Accept.
 #            Already a project dependency (BCryptGenRandom in ipc_client), so this adds no new

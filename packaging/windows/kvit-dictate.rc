@@ -16,6 +16,16 @@
 
 #include <windows.h>
 
+// This file is UTF-8, and rc.exe has to be told so.
+//
+// Without this it reads the source in the system ANSI code page, so the em-dash in
+// FileDescription below — three UTF-8 bytes — became three CP1252 characters and Windows showed
+// "kvit-dictate a€" push-to-talk dictation" in the installer's "these applications are using
+// files" dialog and in Task Manager. A BOM would work too; the pragma is preferred because it
+// states the fact in the file rather than hiding it in three invisible bytes that an editor is
+// free to strip.
+#pragma code_page(65001)
+
 #ifndef KVIT_VERSION_MAJOR
 #define KVIT_VERSION_MAJOR 0
 #define KVIT_VERSION_MINOR 0

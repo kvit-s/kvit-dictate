@@ -1,0 +1,85 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// The translator's version block. No icon and no manifest: it has no window to put an icon on
+// and nothing to be DPI-aware about, and `openai-translator.md` §4.8 says so.
+//
+// ─── Why a headless child needs a version block at all ──────────────────────────────────────
+//
+// Because it is the process nobody asked for. The installer's "these applications are using
+// files that need to be updated" dialog listed it as a bare `kvit-asrd.exe`, with the client
+// beside it fully described — and an unexplained executable in that list, or in Task Manager,
+// beside a program that reads every keystroke, is exactly the thing a cautious user should
+// distrust. `disclosure.txt` now says this process exists; this is the half of that promise that
+// holds when the user meets it somewhere else.
+//
+// The description is written to answer the question actually being asked, which is not "what is
+// this program" but "why is it running": hence "speech translator for kvit-dictate" rather than
+// the product name repeated.
+//
+// KVIT_VERSION_* come from CMakeLists.txt, from the same project() version as the client's, so
+// the two binaries in one installer can never disagree about which build they are.
+
+#include <windows.h>
+
+// UTF-8, stated rather than assumed. Without it rc.exe reads this in the system ANSI code page,
+// which is how the client's em-dash became "a€"" in that same installer dialog. This file is
+// ASCII-only as well, so the pragma is belt and braces rather than load-bearing.
+#pragma code_page(65001)
+
+#ifndef KVIT_VERSION_MAJOR
+#define KVIT_VERSION_MAJOR 0
+#define KVIT_VERSION_MINOR 0
+#define KVIT_VERSION_PATCH 0
+#define KVIT_VERSION_RAW 0.0.0
+#endif
+
+#define KVIT_STRINGIFY_(x) #x
+#define KVIT_STRINGIFY(x) KVIT_STRINGIFY_(x)
+#define KVIT_VERSION_STRING KVIT_STRINGIFY(KVIT_VERSION_RAW)
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    KVIT_VERSION_MAJOR,KVIT_VERSION_MINOR,KVIT_VERSION_PATCH,0
+ PRODUCTVERSION KVIT_VERSION_MAJOR,KVIT_VERSION_MINOR,KVIT_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = US English, 04B0 = 1200 = Unicode. The pair must match the Translation value
+        // at the bottom or the block is invisible to every tool that reads it.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Kvit"
+            VALUE "FileDescription",  "Speech translator for kvit-dictate"
+            VALUE "FileVersion",      KVIT_VERSION_STRING
+            VALUE "InternalName",     "kvit-asrd"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Kvit. MPL-2.0."
+            VALUE "OriginalFilename", "kvit-asrd.exe"
+            VALUE "ProductName",      "kvit-dictate"
+            VALUE "ProductVersion",   KVIT_VERSION_STRING
+
+            // Same reason the client carries one: a user who finds this in Task Manager and
+            // right-clicks Properties deserves a sentence rather than a version number, and the
+            // sentence they need is what it talks to and whether it is listening on anything.
+            VALUE "Comments",         "Started and supervised by kvit-dictate.exe. Accepts audio "
+                                      "on a loopback port chosen by it, forwards the audio to the "
+                                      "speech service you configured, and exits when it does. "
+                                      "Listens on 127.0.0.1 only and reaches no network address "
+                                      "but the one you typed."
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
