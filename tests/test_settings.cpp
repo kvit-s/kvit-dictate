@@ -535,3 +535,142 @@ KD_TEST(settings, out_of_range_server_numbers_are_a_load_error) {
     })");
     KD_CHECK(!parsed.is_ok());
 }
+
+// ─── server.mode (openai-translator.md §4.6) ────────────────────────────────────────────────
+//
+// The field exists because the two things a user might type into one box are indistinguishable
+// by inspection and catastrophically different in effect: `parse_server_url` treats `http://`
+// as a **WebSocket synonym** (docs §2.6.1), so a speech-service address stored without a mode
+// would be handed to `IpcClient::connect` and upgraded. Everything below is about keeping that
+// from happening to a settings file written before the translator existed.
+
+KD_TEST(settings, a_file_without_a_mode_keeps_its_websocket_server) {
+    // The migration that must not surprise anybody: a user who already pointed the app at a
+    // Python server keeps that, with no dialog and nothing spawned.
+    kd::Result<kd::Settings> s =
+        kd::parse_settings(R"({"schema":1,"server":{"url":"ws://mybox.lan:10402/"}})");
+    KD_REQUIRE(s.is_ok());
+    KD_CHECK(s->server.mode == kd::ServerMode::Protocol);
+    KD_CHECK_EQ(s->server.url, std::string("ws://mybox.lan:10402/"));
+
+    kd::Result<kd::Settings> secure =
+        kd::parse_settings(R"({"schema":1,"server":{"url":"wss://mybox.lan/asr"}})");
+    KD_REQUIRE(secure.is_ok());
+    KD_CHECK(secure->server.mode == kd::ServerMode::Protocol);
+}
+
+KD_TEST(settings, a_file_without_a_mode_and_without_a_url_is_a_first_run) {
+    kd::Result<kd::Settings> s = kd::parse_settings(R"({"schema":1,"server":{"url":""}})");
+    KD_REQUIRE(s.is_ok());
+    KD_CHECK(s->server.mode == kd::ServerMode::Local);
+    KD_CHECK(!s->server.configured());
+}
+
+KD_TEST(settings, an_http_url_without_a_mode_becomes_local_rather_than_being_upgraded) {
+    // The ambiguous case, and the one this enum exists for. An older build would have treated
+    // this as a WebSocket synonym; there is now somewhere better for it to go, and feeding it to
+    // IpcClient::connect is the exact failure openai-translator.md was written about.
+    kd::Result<kd::Settings> s =
+        kd::parse_settings(R"({"schema":1,"server":{"url":"http://strixhalo.lan:10301"}})");
+    KD_REQUIRE(s.is_ok());
+    KD_CHECK(s->server.mode == kd::ServerMode::Local);
+    KD_CHECK(s->validate().ok());
+}
+
+KD_TEST(settings, an_explicit_mode_is_never_second_guessed) {
+    // Somebody who genuinely runs a protocol server behind an http:// URL — the synonym docs
+    // §2.6.1 permits — must be able to say so and be believed.
+    kd::Result<kd::Settings> s = kd::parse_settings(
+        R"({"schema":1,"server":{"mode":"protocol","url":"http://mybox.lan:10402/"}})");
+    KD_REQUIRE(s.is_ok());
+    KD_CHECK(s->server.mode == kd::ServerMode::Protocol);
+    KD_CHECK(s->validate().ok());
+}
+
+KD_TEST(settings, an_unknown_mode_is_named_rather_than_ignored) {
+    kd::Result<kd::Settings> s =
+        kd::parse_settings(R"({"schema":1,"server":{"mode":"cloud","url":""}})");
+    KD_REQUIRE(!s.is_ok());
+    KD_CHECK(s.status().message().find("mode") != std::string::npos);
+    KD_CHECK(s.status().message().find("cloud") != std::string::npos);
+}
+
+KD_TEST(settings, the_mode_survives_a_round_trip_and_the_schema_did_not_move) {
+    kd::Settings in;
+    in.server.mode = kd::ServerMode::Local;
+    in.server.url = "https://asr.internal:8443";
+    in.server.live_preview = true;
+
+    kd::Result<kd::Settings> back = kd::parse_settings(kd::serialize_settings(in));
+    KD_REQUIRE(back.is_ok());
+    KD_CHECK(back->server.mode == kd::ServerMode::Local);
+    KD_CHECK_EQ(back->server.url, in.server.url);
+    KD_CHECK(back->server.live_preview);
+    // Deliberately not bumped: every file written without `mode` can be interpreted correctly
+    // from the URL it already holds, and a bump would make those files unreadable for a field
+    // that needs no migration dialog.
+    KD_CHECK_EQ(back->schema, 1);
+}
+
+KD_TEST(settings, validation_uses_the_parser_the_mode_names) {
+    // The heart of it. The same URL is valid in one mode and rejected in the other, and it must
+    // be rejected *here*, in the dialog, rather than at connect time in the tray.
+    kd::Settings local;
+    local.server.mode = kd::ServerMode::Local;
+    local.server.url = "ws://127.0.0.1:10402/";
+    KD_CHECK(!local.validate().ok());
+
+    kd::Settings protocol;
+    protocol.server.mode = kd::ServerMode::Protocol;
+    protocol.server.url = "ws://127.0.0.1:10402/";
+    KD_CHECK(protocol.validate().ok());
+
+    kd::Settings speech;
+    speech.server.mode = kd::ServerMode::Local;
+    speech.server.url = "http://strixhalo.lan:10301";
+    KD_CHECK(speech.validate().ok());
+}
+
+KD_TEST(settings, the_speech_service_guard_says_what_is_wrong) {
+    KD_CHECK(kd::validate_speech_service_url("http://strixhalo.lan:10301").empty());
+    KD_CHECK(kd::validate_speech_service_url("https://asr.example.com/v1").empty());
+    KD_CHECK(kd::validate_speech_service_url("").empty());  // the first-run state
+
+    // The most likely mistake gets a sentence naming the other radio, not a syntax complaint.
+    const std::string ws = kd::validate_speech_service_url("ws://127.0.0.1:10402/");
+    KD_CHECK(!ws.empty());
+    KD_CHECK(ws.find("I run my own kvit-dictate server") != std::string::npos);
+
+    KD_CHECK(!kd::validate_speech_service_url("strixhalo.lan:10301").empty());
+    // The characters that would have to be quoted onto `kvit-asrd --service`. Rejected in the
+    // dialog rather than at spawn time, because the user is looking at the field now.
+    KD_CHECK(!kd::validate_speech_service_url("http://host x").empty());
+    KD_CHECK(!kd::validate_speech_service_url("http://host\"x").empty());
+    KD_CHECK(!kd::validate_speech_service_url("http://host\nx").empty());
+}
+
+KD_TEST(settings, a_websocket_url_in_local_mode_is_reconciled_rather_than_refused) {
+    // A settings object built programmatically — by the bench, or by a caller that set a URL and
+    // forgot the mode — must still round-trip. `kvit-asrd` speaks HTTP and nothing else, so a
+    // `ws://` address in Local mode is never meaningful and the URL is the half to believe.
+    kd::Settings s;
+    s.server.url = "ws://mybox.lan:10402/";  // mode left at its default, Local
+    s.normalise();
+    KD_CHECK(s.server.mode == kd::ServerMode::Protocol);
+    KD_CHECK(s.validate().ok());
+
+    kd::Result<kd::Settings> back = kd::parse_settings(kd::serialize_settings(s));
+    KD_REQUIRE(back.is_ok());
+    KD_CHECK(back->server.mode == kd::ServerMode::Protocol);
+}
+
+KD_TEST(settings, an_http_url_in_protocol_mode_is_left_alone) {
+    // The reverse is not reconciled: docs §2.6.1 makes `http://` a legal WebSocket synonym, and
+    // somebody who ticked "I run my own server" and typed one meant it.
+    kd::Settings s;
+    s.server.mode = kd::ServerMode::Protocol;
+    s.server.url = "http://mybox.lan:10402/";
+    s.normalise();
+    KD_CHECK(s.server.mode == kd::ServerMode::Protocol);
+    KD_CHECK(s.validate().ok());
+}

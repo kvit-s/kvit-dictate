@@ -72,13 +72,23 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
 ## First run
 
 1. It starts in the tray and opens **Settings → Server**, because it cannot do anything without
-   one.
-2. Type your server's address — `ws://127.0.0.1:10402/` if it is on this machine — and press
-   **Test**. It connects for real and tells you what answered: the server, the model, the mode
-   and the round-trip time.
+   an address.
+2. Type the address of your speech service — anything that serves
+   `POST /v1/audio/transcriptions`, for example `http://strixhalo.lan:10301` — and press
+   **Test**. It connects for real and tells you what answered: the model, the mode and the
+   round-trip time.
 3. Press OK.
 
-Do not have a server? [`docs/setup.md`](docs/setup.md) §1 gets you a working endpoint in five
+That is the whole setup. **There is nothing else to start and no Python to install.**
+kvit-dictate ships with `kvit-asrd.exe`, a translator that speaks its own protocol on one side
+and `/v1/audio/transcriptions` on the other; the app launches it, supervises it, and stops it
+when you quit. Test starts a private copy and completes the real handshake with it, so a green
+Test means the whole path answered — the app, the translator and your service.
+
+Already run a **kvit-dictate protocol server**? Pick "I run my own kvit-dictate server" and give
+it the `ws://` address. Nothing is launched for you in that mode.
+
+Do not have either? [`docs/setup.md`](docs/setup.md) §1 gets you a working endpoint in five
 minutes that proves the plumbing without needing a model, and §2 gets you a real one.
 
 Until a server is configured **the hotkey does not open your microphone**, the pill does not
@@ -146,6 +156,26 @@ wins.
 └─────────────────────────────┘            └──────────────────────────────┘
 ```
 
+Almost nobody runs one of those, and everybody's GPU box already speaks
+`/v1/audio/transcriptions`. So the installer ships the right-hand box too:
+
+```
+┌──────────────────────┐         ┌──────────────────────┐        ┌────────────────────┐
+│  kvit-dictate.exe    │   ws    │   kvit-asrd.exe      │  HTTP  │  your ASR service  │
+│                      │ ──────► │                      │ ─────► │                    │
+│  hotkey, capture,    │127.0.0.1│  protocol server     │        │  /v1/audio/        │
+│  session, commit,    │ ◄────── │  endpointing (VAD)   │ ◄───── │    transcriptions  │
+│  injection, overlay  │  frames │  stability, WAV      │  JSON  │                    │
+└──────────────────────┘         └──────────────────────┘        └────────────────────┘
+      ~1.2 MB                       headless, no Python                yours
+```
+
+`kvit-asrd.exe` is built from this repository, needs no Python and no runtime, and is launched
+and supervised by the client on a loopback port it chooses. It is a *translator*, not a
+recogniser: it still owns no ASR. The protocol between the two halves is unchanged — the
+translator is a conforming server like any other, which is the test of whether the boundary was
+drawn in the right place, and it passes.
+
 [`docs/protocol.md`](docs/protocol.md) is the contract, it is licensed Apache-2.0, and it is
 written to be implementable by someone who has never spoken to its author. §15 is a complete
 worked example of a conforming server in about 400 lines of Python standard library, and that
@@ -175,6 +205,8 @@ live behind the endpoint you configure.
 ```
 src/
   main.cpp            tray, message loop, lifecycle          (the single-threaded serialisation point)
+  translator.{h,cpp}  launching and supervising kvit-asrd    ← job object, fixed image path
+  asrd/               kvit-asrd.exe: the translator          ← RFC 6455 server, VAD, stability, HTTP
   protocol.{h,cpp}    framing + message codec                ← pure, unit-tested, no Windows
   session.{h,cpp}     session/utterance state machine        ← pure, unit-tested
   commit_engine.{h,cpp} stability → injection ops            ← pure, unit-tested

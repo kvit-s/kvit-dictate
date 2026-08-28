@@ -42,6 +42,7 @@
 #include "normalizer.h"
 #include "injector.h"
 #include "ipc_client.h"
+#include "translator.h"
 #include "overlay.h"
 #include "protocol.h"
 #include "session.h"
@@ -328,6 +329,7 @@ private:
         return false;
 #endif
     }
+    kd::Result<std::wstring> resolve_server_url();
     void schedule_reconnect();
     void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
@@ -359,6 +361,11 @@ private:
     std::unique_ptr<kd::CommitEngine> commit_;
     std::unique_ptr<kd::Injector> injector_;
     std::unique_ptr<kd::IpcClient> ipc_;
+
+    // The other half of the application, when `server.mode` is Local. Owns a job object, so the
+    // child dies with this process however this process ends — including a crash, where no
+    // cleanup code of ours runs at all (translator.h).
+    kd::Translator translator_;
     std::unique_ptr<kd::audio::AudioCapture> capture_;
     std::unique_ptr<kd::HotkeyManager> hotkey_;
     std::unique_ptr<kd::Overlay> overlay_;
@@ -706,6 +713,15 @@ bool App::startup() {
         PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
     }
 
+    // A broken installation, reported once and early rather than at the first hotkey press.
+    // In Local mode the translator is not optional: it is half the application.
+    if (settings_.server.mode == kd::ServerMode::Local &&
+        settings_.server.configured()) {
+        if (const kd::Result<std::filesystem::path> image = kd::Translator::image_path(); !image) {
+            KD_LOG_ERROR("%s", image.status().message().c_str());
+        }
+    }
+
     start_engine();
     return true;
 }
@@ -730,12 +746,62 @@ bool App::start_engine() {
     return false;
 }
 
+// The address the client actually connects to.
+//
+// In Protocol mode that is `server.url` verbatim, unchanged from before the translator existed.
+// In Local mode `server.url` is a *speech service*, which speaks nothing this program
+// understands — so the translator is launched first and the client connects to **it**, on the
+// loopback port the client chose (openai-translator.md §4.6).
+//
+// This is the one place the two meanings of that field are resolved, which is why the mode is a
+// stored setting rather than something inferred from the scheme: `http://` is a legal WebSocket
+// synonym (docs §2.6.1) and there is no way to tell them apart by looking.
+kd::Result<std::wstring> App::resolve_server_url() {
+    if (settings_.server.mode == kd::ServerMode::Protocol) {
+        return widen(settings_.server.url);
+    }
+
+    // Already running — a reconnect, not a fresh start. Reuse the child rather than launching a
+    // second one: the translator serves one connection at a time and a second would be refused
+    // with `server_busy`, which the user would read as "it is broken".
+    if (translator_.running() && !translator_.url().empty()) {
+        return widen(translator_.url());
+    }
+
+    kd::TranslatorSpec spec;
+    spec.service_url = settings_.server.url;
+    spec.model = settings_.server.model;
+    spec.live_preview = settings_.server.live_preview;
+    spec.endpoint_silence_ms = settings_.session.endpoint_silence_ms;
+
+    const kd::Result<std::string> url = translator_.start(spec);
+    if (!url) return url.status();
+    // A translator that dies on its own is the same event as a lost engine: committed text
+    // stays in the document and only the uncommitted tail is lost. Reconnect handling then
+    // relaunches it, which is why this is wired to the existing path rather than a new one.
+    translator_.set_on_exit([this](uint32_t code) {
+        KD_LOG_ERROR("the translator exited with code %u; dictation is off until it restarts",
+                     code);
+        PostMessageW(hwnd_, kMsgIpcState, 2, 0);
+    });
+    return widen(*url);
+}
+
 bool App::connect_server() {
     no_server_ = false;
     tray_reason_.clear();
 
+    const kd::Result<std::wstring> url = resolve_server_url();
+    if (!url) {
+        KD_LOG_ERROR("could not start the translator: %s", url.status().message().c_str());
+        tray_reason_ = L"kvit-dictate — " + widen(url.status().message());
+        set_tray_state(kd::OverlayState::Error);
+        update_tray();
+        return false;
+    }
+
     kd::ServerEndpoint ep;
-    ep.url = widen(settings_.server.url);
+    ep.url = *url;
     ep.model = settings_.server.model;
     ep.connect_timeout_ms = settings_.server.connect_timeout_ms;
 
@@ -764,6 +830,8 @@ bool App::connect_server() {
 
     set_tray_state(kd::OverlayState::ModelLoading);
     tray_reason_ = L"kvit-dictate — connecting to " + widen(settings_.server.url);
+    // Deliberately the *user's* address rather than `ep.url`: in Local mode `ep.url` is a
+    // loopback port this program chose a second ago, which tells the user nothing.
     update_tray();
 
     if (const kd::Status st = ipc_->connect(ep, cb); !st.ok()) {
@@ -2740,6 +2808,10 @@ void App::shutdown() {
     if (audio_running_ && capture_ != nullptr) capture_->stop();
     if (anchor_ != nullptr) anchor_->stop();
     if (ipc_ != nullptr) ipc_->stop();  // the job object kills the child even if it ignores us
+    // The socket first, then the child: a translator killed mid-write would look like a crash in
+    // the log rather than the orderly teardown it is. Closing its job is what actually ends it,
+    // and that happens anyway if this process dies without reaching here.
+    translator_.stop();
     if (overlay_ != nullptr) overlay_->destroy();
 
     if (tray_added_) {

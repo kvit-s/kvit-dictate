@@ -66,6 +66,7 @@
 
 #include "audio_capture.h"
 #include "ipc_client.h"
+#include "translator.h"
 #include "theme.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -836,6 +837,22 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 // undoing.
 
 void Settings::normalise() {
+    // `server.mode` and `server.url` must agree, and where they cannot, the URL wins.
+    //
+    // A `ws://` or `wss://` address in Local mode is never meaningful: `kvit-asrd` speaks
+    // `/v1/audio/transcriptions` over HTTP and nothing else, so no configuration of it can talk
+    // to a WebSocket. Reconciling here rather than letting validate() reject it keeps
+    // serialize→parse a total function — a settings file this program wrote must always load —
+    // and it is the same rule migrate_server_mode() applies to a file that has no mode at all.
+    //
+    // The reverse (an `http://` URL in Protocol mode) is deliberately left alone: docs §2.6.1
+    // makes that a legal WebSocket synonym, and somebody who ticked "I run my own server" and
+    // typed one meant it.
+    if (server.mode == ServerMode::Local && !server.url.empty() &&
+        migrate_server_mode(server.url) == ServerMode::Protocol) {
+        server.mode = ServerMode::Protocol;
+    }
+
     // The settings file is the single source; SessionConfig::context is derived. One place to
     // edit, one place to read.
     session.context = context_terms;
@@ -895,6 +912,84 @@ void Settings::normalise() {
     // still round-trips, but a file that names *no* key would silently disable the one gesture
     // that ends a composing session.
     if (editing.commit_vk == 0) editing.commit_vk = vk::kReturn;
+}
+
+// ─── ServerMode (openai-translator.md §4.6) ─────────────────────────────────────────────────
+
+const char* to_string(ServerMode m) noexcept {
+    switch (m) {
+        case ServerMode::Local:    return "local";
+        case ServerMode::Protocol: return "protocol";
+    }
+    return "local";
+}
+
+bool server_mode_from_string(std::string_view s, ServerMode& out) noexcept {
+    if (s == "local") {
+        out = ServerMode::Local;
+        return true;
+    }
+    if (s == "protocol") {
+        out = ServerMode::Protocol;
+        return true;
+    }
+    return false;
+}
+
+std::string validate_speech_service_url(std::string_view url) {
+    if (url.empty()) return {};  // the first-run state, not an error
+
+    // Case-insensitive on the scheme only. A locale-aware fold is deliberately not used, for the
+    // reason normalizer.cpp gives: the Turkish dotless i in a comparison whose job is to be
+    // predictable.
+    std::string lower;
+    lower.reserve(url.size());
+    for (const char c : url) {
+        const auto u = static_cast<unsigned char>(c);
+        lower.push_back(u < 0x80 ? static_cast<char>(std::tolower(u)) : c);
+    }
+    if (lower.rfind("ws://", 0) == 0 || lower.rfind("wss://", 0) == 0) {
+        // The most likely mistake by far, so it gets a sentence rather than a syntax complaint.
+        return "that is a kvit-dictate protocol server address. If you run your own server, "
+               "choose \"I run my own kvit-dictate server\"; otherwise give the address of your "
+               "speech service, which starts with http:// or https://";
+    }
+    if (lower.rfind("http://", 0) != 0 && lower.rfind("https://", 0) != 0) {
+        return "a speech service address starts with http:// or https:// "
+               "(for example http://strixhalo.lan:10301)";
+    }
+
+    // The characters that would have to be quoted onto `kvit-asrd --service`. Rejected here, in
+    // the dialog, rather than at spawn time: the user is looking at the field now.
+    for (const char c : url) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7F) return "the address contains a control character";
+        if (c == ' ' || c == '\t') return "the address contains a space";
+        if (c == '"' || c == '\'' || c == '`') return "the address contains a quote character";
+    }
+
+    // Structure, borrowed from the same WinHTTP parser the translator uses, so the dialog and
+    // the child agree about what is well formed.
+    const Result<ParsedServerUrl> parsed = parse_server_url(utf8::to_utf16_or_empty(std::string(url)));
+    if (!parsed) return parsed.status().message();
+    return {};
+}
+
+ServerMode migrate_server_mode(std::string_view url) noexcept {
+    std::string lower;
+    lower.reserve(url.size());
+    for (const char c : url) {
+        const auto u = static_cast<unsigned char>(c);
+        lower.push_back(u < 0x80 ? static_cast<char>(std::tolower(u)) : c);
+    }
+    if (lower.rfind("ws://", 0) == 0 || lower.rfind("wss://", 0) == 0) {
+        return ServerMode::Protocol;
+    }
+    // Empty, or anything else. Empty is the first-run Server page; "anything else" is an
+    // `http://` URL that an older build would have treated as a WebSocket synonym, and which is
+    // far more likely to be a speech service now that there is somewhere to put one. It is
+    // re-validated on the next save rather than silently connected to.
+    return ServerMode::Local;
 }
 
 Status Settings::validate() const {
@@ -968,9 +1063,18 @@ Status Settings::validate() const {
     // An empty URL is legal and is the first-run state (docs/protocol.md §10.6). A URL that is
     // *present and malformed* is not: it would fail at connect time, in the tray, minutes after
     // the dialog that accepted it closed.
+    //
+    // Which parser applies depends on `mode`, and that is the whole point of the field: in Local
+    // mode the URL is a speech service and `parse_server_url` would happily accept it as a
+    // WebSocket synonym, which is the mistake openai-translator.md exists to end.
     if (!server.url.empty()) {
-        if (const Result<ParsedServerUrl> u = parse_server_url(utf8::to_utf16_or_empty(server.url));
-            !u) {
+        if (server.mode == ServerMode::Local) {
+            if (const std::string why = validate_speech_service_url(server.url); !why.empty()) {
+                return Status{StatusCode::InvalidArgument, "server.url: " + why};
+            }
+        } else if (const Result<ParsedServerUrl> u =
+                       parse_server_url(utf8::to_utf16_or_empty(server.url));
+                   !u) {
             return Status{StatusCode::InvalidArgument, "server.url: " + u.status().message()};
         }
     }
@@ -1070,8 +1174,14 @@ std::string serialize_settings(const Settings& s) {
         // server yet"; an absent key would be indistinguishable from a settings file written by
         // an older build, and the first-run path needs to tell those apart.
         json::Value o = json::Value::object();
+        // `mode` is new and `kSettingsSchema` is deliberately NOT bumped for it: every settings
+        // file written without it can be interpreted correctly from the URL it already holds
+        // (see migrate_server_mode), and a bump would make those files unreadable for a field
+        // that needs no migration dialog.
+        put_str(o, "mode", to_string(s.server.mode));
         put_str(o, "url", s.server.url);
         put_str(o, "model", s.server.model);
+        put_bool(o, "live_preview", s.server.live_preview);
         put_u64(o, "connect_timeout_ms", s.server.connect_timeout_ms);
         put_u64(o, "reconnect_initial_ms", s.server.reconnect_initial_ms);
         put_u64(o, "reconnect_max_ms", s.server.reconnect_max_ms);
@@ -1244,6 +1354,22 @@ Result<Settings> parse_settings(std::string_view json_text) {
         Obj o(*v, "settings.server");
         o.str_opt("url", s.server.url);
         o.str_opt("model", s.server.model);
+        // Absent `mode` means a settings file written before the translator existed. Infer it
+        // from the URL rather than defaulting: defaulting to Local would hand a `ws://` address
+        // to the speech-service validator, and defaulting to Protocol would hand an `http://`
+        // one to `IpcClient::connect`. Both are wrong for somebody.
+        std::string mode_text;
+        o.str_opt("mode", mode_text);
+        if (!mode_text.empty()) {
+            if (!server_mode_from_string(mode_text, s.server.mode)) {
+                return Status{StatusCode::Malformed,
+                              "settings.server.mode: expected \"local\" or \"protocol\", got \"" +
+                                  mode_text + "\""};
+            }
+        } else {
+            s.server.mode = migrate_server_mode(s.server.url);
+        }
+        o.bool_opt("live_preview", s.server.live_preview);
         o.u32_opt("connect_timeout_ms", s.server.connect_timeout_ms, 1000, 120000);
         o.u32_opt("reconnect_initial_ms", s.server.reconnect_initial_ms, 100, 60000);
         o.u32_opt("reconnect_max_ms", s.server.reconnect_max_ms, 1000, 600000);
@@ -1620,6 +1746,14 @@ enum : int {
     kIdServerTest,
     kIdServerStatus,
     kIdServerWarning,
+    // openai-translator.md §4.6. Two radios rather than a scheme sniffer, because `http://` is a
+    // legal WebSocket synonym (docs §2.6.1) and there is no way to tell the two meanings apart
+    // by looking at the URL — which is the whole reason `ServerMode` exists.
+    kIdServerModeLocal,
+    kIdServerModeProtocol,
+    kIdServerUrlLabel,
+    kIdServerUrlNote,
+    kIdServerLivePreview,
 };
 
 constexpr int kPageCount = 5;
@@ -1821,6 +1955,16 @@ struct Cursor {
         return h;
     }
 
+    // BS_AUTORADIOBUTTON groups by tab order: the first of a run carries WS_GROUP, and Windows
+    // then unchecks its siblings for us. Getting the group wrong is how two radios end up both
+    // checked, so the caller says which one starts the run.
+    HWND radio(const wchar_t* label, int id, bool first_in_group) {
+        HWND h = add(L"BUTTON", label,
+                     WS_TABSTOP | BS_AUTORADIOBUTTON | (first_in_group ? WS_GROUP : 0u), 19, id);
+        gap(3);
+        return h;
+    }
+
     HWND check(const wchar_t* label, int id) {
         HWND h = add(L"BUTTON", label, WS_TABSTOP | BS_AUTOCHECKBOX, 19, id);
         gap(3);
@@ -1980,8 +2124,42 @@ std::vector<std::string> terms_from_text(const std::wstring& text) {
 // adjudicate, and an app that refused to talk to the endpoint its owner named would simply be
 // replaced by one that did. What it is for is the realistic case, not an attack: somebody types
 // a public hostname into a URL box, and dictates a password into it within a week.
-std::wstring server_warning_for(const std::wstring& url) {
+// Which of the two things the URL box currently means. Read from the controls rather than from
+// the working copy, because the user may have just clicked the other radio.
+ServerMode mode_of(HWND dlg) {
+    return IsDlgButtonChecked(dlg, kIdServerModeProtocol) == BST_CHECKED ? ServerMode::Protocol
+                                                                        : ServerMode::Local;
+}
+
+// The label and the example change with the mode, because "Server address" over a box that
+// wants `http://strixhalo.lan:10301` is how the two get confused in the first place.
+void update_server_mode_ui(HWND dlg) {
+    const bool local = mode_of(dlg) == ServerMode::Local;
+    SetWindowTextW(GetDlgItem(dlg, kIdServerUrlLabel),
+                   local ? L"Speech service" : L"Server address");
+    SetWindowTextW(
+        GetDlgItem(dlg, kIdServerUrlNote),
+        local ? L"For example http://strixhalo.lan:10301 — the address of an OpenAI-compatible "
+                L"/v1/audio/transcriptions service. kvit-dictate starts and supervises the "
+                L"translator that talks to it; there is nothing else to run."
+              : L"For example ws://127.0.0.1:10402/ for a docs/protocol.md server on this "
+                L"machine, or ws://mybox.lan:10402/ for one on your network. Nothing is "
+                L"launched for you in this mode.");
+    // Live preview is a translator setting, so it means nothing when the translator is not the
+    // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
+    // the user cannot find again.
+    EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
+    SetWindowTextW(GetDlgItem(dlg, kIdServerTest),
+                   local ? L"Test this service" : L"Test this server");
+}
+
+std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
     if (url.empty()) return {};
+    if (mode_of(dlg) == ServerMode::Local) {
+        if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
+            return L"⚠  " + wide(why);
+        }
+    }
     const Result<ParsedServerUrl> u = parse_server_url(url);
     if (!u) return L"⚠  " + wide(u.status().message());
     if (!u->secure && !host_is_private(u->host)) {
@@ -1993,7 +2171,7 @@ std::wstring server_warning_for(const std::wstring& url) {
 }
 
 void update_server_warning(HWND dlg) {
-    const std::wstring warning = server_warning_for(get_text(GetDlgItem(dlg, kIdServerUrl)));
+    const std::wstring warning = server_warning_for(dlg, get_text(GetDlgItem(dlg, kIdServerUrl)));
     SetWindowTextW(GetDlgItem(dlg, kIdServerWarning), warning.c_str());
 }
 
@@ -2028,15 +2206,25 @@ std::wstring describe_probe(const ServerProbe& p) {
 void start_server_test(HWND dlg, DialogState& st) {
     if (st.probe_running) return;
 
-    ServerEndpoint ep;
-    ep.url = get_text(GetDlgItem(dlg, kIdServerUrl));
-    ep.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
-    if (ep.url.empty()) {
+    const ServerMode mode = mode_of(dlg);
+    const std::wstring url = get_text(GetDlgItem(dlg, kIdServerUrl));
+    const std::string model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+    const bool live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
+
+    if (url.empty()) {
         SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
-                       L"Type a server address first, for example ws://127.0.0.1:10402/");
+                       mode == ServerMode::Local
+                           ? L"Type your speech service's address first, for example "
+                             L"http://strixhalo.lan:10301"
+                           : L"Type a server address first, for example ws://127.0.0.1:10402/");
         return;
     }
-    if (const Result<ParsedServerUrl> u = parse_server_url(ep.url); !u) {
+    if (mode == ServerMode::Local) {
+        if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
+            SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(why).c_str());
+            return;
+        }
+    } else if (const Result<ParsedServerUrl> u = parse_server_url(url); !u) {
         SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(u.status().message()).c_str());
         return;
     }
@@ -2044,20 +2232,70 @@ void start_server_test(HWND dlg, DialogState& st) {
     st.probe_running = true;
     const uint32_t generation = ++st.probe_generation;
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
-                   L"Connecting… (a server loading a model for the first time can take a "
+                   L"Connecting… (a service loading a model for the first time can take a "
                    L"while; this waits up to a minute)");
     EnableWindow(GetDlgItem(dlg, kIdServerTest), FALSE);
 
+    // ── What Test actually does, which is the point of it ───────────────────────────────────
+    //
+    // **It always speaks the protocol to whatever this process will really connect to.** In
+    // Local mode that means launching a *private* `kvit-asrd.exe` on its own port, completing
+    // the handshake with it, and waiting for `ready` — not POSTing to
+    // /v1/audio/transcriptions directly, which would pass while the translator was broken.
+    //
+    // And because asrd does not emit `ready` unless its own TCP connect to the speech host
+    // succeeded (openai-translator.md §4.2), a green Test means the whole path answered: this
+    // client, the translator, and the speech service. That is the property the button is worth
+    // having for.
+    //
     // The worker owns everything it touches and hands back one heap-allocated string. It must
     // not read DialogState: by the time it finishes, the dialog may be gone. PostMessage to a
     // destroyed window fails harmlessly, and the string is freed by whoever wins.
-    std::thread([dlg, generation, ep]() {
+    std::thread([dlg, generation, mode, url, model, live_preview]() {
         std::wstring text;
-        if (const Result<ServerProbe> r = probe_server(ep, 60000); r) {
-            text = describe_probe(*r);
+        // Declared here so the child outlives the probe and dies with this scope: its destructor
+        // closes the job, which kills it. A Test that left a translator running would collide
+        // with the real one the next time dictation started.
+        Translator probe_child;
+
+        ServerEndpoint ep;
+        ep.model = model;
+        bool launched = true;
+        if (mode == ServerMode::Local) {
+            TranslatorSpec spec;
+            spec.service_url = narrow(url);
+            spec.model = model;
+            spec.live_preview = live_preview;
+            if (const Result<std::string> started = probe_child.start(spec); started) {
+                ep.url = wide(*started);
+                text = L"Started the translator on " + ep.url + L"\r\n";
+            } else {
+                launched = false;
+                text = L"Could not start the translator.\r\n" + wide(started.status().message());
+            }
         } else {
-            text = L"Could not use this endpoint.\r\n" + wide(r.status().message());
+            ep.url = url;
         }
+
+        if (launched) {
+            if (const Result<ServerProbe> r = probe_server(ep, 60000); r) {
+                text += describe_probe(*r);
+                if (mode == ServerMode::Local) {
+                    text += L"\r\nThe translator and your speech service both answered. "
+                            L"kvit-dictate starts this for you when you dictate; there is "
+                            L"nothing else to run.";
+                }
+            } else {
+                text += L"Could not use this endpoint.\r\n" + wide(r.status().message());
+                if (mode == ServerMode::Local) {
+                    text += L"\r\nThe translator started but did not become ready, which "
+                            L"usually means it could not reach the speech service at that "
+                            L"address. Its own diagnostics are in this app's log, prefixed "
+                            L"\"asrd:\".";
+                }
+            }
+        }
+
         auto* payload = new std::wstring(std::move(text));
         if (!PostMessageW(dlg, kMsgProbeDone, static_cast<WPARAM>(generation),
                           reinterpret_cast<LPARAM>(payload))) {
@@ -2363,8 +2601,14 @@ void load_controls(HWND dlg, DialogState& st) {
     SetWindowTextW(GetDlgItem(dlg, kIdAppPolicies), policies_to_text(s.app_policies).c_str());
 
     // Server.
+    CheckDlgButton(dlg, kIdServerModeLocal,
+                   s.server.mode == ServerMode::Local ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdServerModeProtocol,
+                   s.server.mode == ServerMode::Protocol ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdServerLivePreview, s.server.live_preview ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdServerUrl), wide(s.server.url).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
+    update_server_mode_ui(dlg);
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
                    s.server.configured()
                        ? L"Press Test to check that this address answers."
@@ -2477,16 +2721,31 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         std::wstring url = get_text(GetDlgItem(dlg, kIdServerUrl));
         while (!url.empty() && (url.front() == L' ' || url.front() == L'	')) url.erase(0, 1);
         while (!url.empty() && (url.back() == L' ' || url.back() == L'	')) url.pop_back();
+        const ServerMode mode = mode_of(dlg);
         if (!url.empty()) {
-            if (const Result<ParsedServerUrl> u = parse_server_url(url); !u) {
-                MessageBoxW(dlg, (L"Server address: " + wide(u.status().message())).c_str(),
+            // Which parser applies is the mode's whole job. In Local mode `parse_server_url`
+            // would accept `http://` as a WebSocket synonym and the dialog would cheerfully
+            // save an address the client then tries to upgrade.
+            std::string why;
+            if (mode == ServerMode::Local) {
+                why = validate_speech_service_url(narrow(url));
+            } else if (const Result<ParsedServerUrl> u = parse_server_url(url); !u) {
+                why = u.status().message();
+            }
+            if (!why.empty()) {
+                MessageBoxW(dlg,
+                            ((mode == ServerMode::Local ? L"Speech service: " : L"Server address: ") +
+                             wide(why))
+                                .c_str(),
                             L"kvit-dictate settings", MB_OK | MB_ICONWARNING);
                 SetFocus(GetDlgItem(dlg, kIdServerUrl));
                 return false;
             }
         }
+        s.server.mode = mode;
         s.server.url = narrow(url);
         s.server.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+        s.server.live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
     }
 
     const int hk_sel = static_cast<int>(SendMessageW(GetDlgItem(dlg, kIdHotkey), CB_GETCURSEL, 0, 0));
@@ -2654,21 +2913,36 @@ void build_controls(HWND dlg, DialogState& st) {
     // this dialog tunes behaviour; this one decides whether there is any.
     {
         Cursor c{dlg, inst, &st, 0, col1_x, top, col_w};
-        c.section(L"Where the recogniser is");
+        c.section(L"Where your speech service is");
         c.note(L"kvit-dictate does not recognise speech itself. It captures your voice, sends it "
-               L"to a server you run, and types back what comes out. Without a server it will "
-               L"not open the microphone at all — and it will say so rather than look broken.",
+               L"to a service you run, and types back what comes out. Without one it will not "
+               L"open the microphone at all — and it will say so rather than look broken.",
                5);
-        c.label_edit(L"Server address", kIdServerUrl);
-        c.note(L"For example ws://127.0.0.1:10402/ for a server on this machine, or "
-               L"ws://mybox.lan:10402/ for one on your network. docs/setup.md has the "
-               L"instructions for standing one up.",
-               4);
+        // The address box comes FIRST and the radios after it, because for most people the only
+        // thing to do on this page is type one address and press Test. The second radio is the
+        // escape hatch for somebody who already runs a protocol server, not a choice everyone
+        // has to make.
+        c.add(L"STATIC", L"Speech service", SS_LEFTNOWORDWRAP, 15, kIdServerUrlLabel);
+        c.add(L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 21, kIdServerUrl,
+              WS_EX_CLIENTEDGE);
+        c.gap(6);
+        c.add(L"STATIC", L"", 0, st.line_h * 3, kIdServerUrlNote);
+        c.gap(2);
+
+        c.radio(L"That address is an OpenAI-compatible speech service", kIdServerModeLocal, true);
+        c.radio(L"I run my own kvit-dictate server (ws://…)", kIdServerModeProtocol, false);
+        c.gap(4);
+
         c.label_edit(L"Model (optional)", kIdServerModel);
-        c.note(L"Leave this empty to take whatever the server offers. If you name a model the "
-               L"server does not have, it says so — it never quietly substitutes another one.",
+        c.note(L"Leave this empty to take whatever the service offers. If you name a model it "
+               L"does not have, it says so — it never quietly substitutes another one.",
                3);
-        c.add(L"BUTTON", L"Test this server", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
+        c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
+        c.note(L"Off by default. A batch model rewrites earlier words as it hears more, so a "
+               L"live preview against one either flickers or stops committing. With it off, "
+               L"each phrase lands when you pause.",
+               4);
+        c.add(L"BUTTON", L"Test this service", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
         c.gap(6);
         c.add(L"STATIC", L"", 0, st.line_h * 9, kIdServerStatus);
     }
@@ -3124,6 +3398,14 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // warning that only appears after OK is a warning nobody reads.
                         update_server_warning(hwnd);
                     }
+                    return 0;
+                case kIdServerModeLocal:
+                case kIdServerModeProtocol:
+                    // The label, the example and the warning all change meaning with the mode,
+                    // and the warning in particular is about a *different* validation — so it is
+                    // recomputed here rather than only on the next keystroke.
+                    update_server_mode_ui(hwnd);
+                    update_server_warning(hwnd);
                     return 0;
                 case kIdTheme:
                     if (code == CBN_SELCHANGE) {

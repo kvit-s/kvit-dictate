@@ -400,10 +400,25 @@ bool run_session(TranslatorHarness& harness, Observed& seen, const std::vector<i
     // 20 ms frames, the low end of §6.3's recommended band, because that is what the client's
     // own capture path produces and a translator that only works at one frame size is broken in
     // the way a real microphone will find.
-    constexpr size_t kFrame = 320;
+    //
+    // **Drained every half second, and that is not an optimisation.** `IpcClient::send_audio`
+    // bounds its queue at AUDIO_QUEUE_MAX_MS (3000 ms of PCM) and answers `Overloaded` past it,
+    // because §9 forbids absorbing a backlog by dropping frames. A microphone cannot outrun that
+    // bound — it produces audio at wall-clock speed — but a test that pushes three seconds of
+    // PCM in a few microseconds can, and in a Release build it does. Pacing here keeps the test
+    // honest about what a capture thread actually does without making every case take as long as
+    // the audio it feeds.
+    constexpr size_t kFrame = 320;              // 20 ms
+    constexpr size_t kDrainEvery = 25 * kFrame;  // 500 ms
+    size_t since_drain = 0;
     for (size_t at = 0; at < pcm.size(); at += kFrame) {
         const size_t n = (std::min)(kFrame, pcm.size() - at);
         if (!client.send_audio(pcm.data() + at, n).ok()) return false;
+        since_drain += n;
+        if (since_drain >= kDrainEvery) {
+            since_drain = 0;
+            if (!client.flush_audio(5000).ok()) return false;
+        }
     }
 
     if (cancel_instead_of_stop) {

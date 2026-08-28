@@ -1,15 +1,66 @@
-# Standing up a server
+# Pointing kvit-dictate at a speech service
 
-kvit-dictate does not recognise speech. It captures your voice, sends it to a server you run, and
-types back what comes out. **This is the part the project does not do for you yet**, and this page
-is how you do it.
+kvit-dictate does not recognise speech. It captures your voice, sends it somewhere, and types
+back what comes out. This page is about the "somewhere".
 
-That is a real cost and worth stating plainly before you spend an evening on it: `release-plan.md`
-§8 calls the first-run cliff — "install this, then go set up a server" — the single biggest
-adoption risk in the project, and it is a deliberate choice rather than an oversight. A reference
-server that makes this one download and one `run.bat` is a separate deliverable on its own
-timeline (`release-plan.md` §1.5). Until it exists, the audience for kvit-dictate is people who
-already run, or are willing to run, an ASR server.
+There are **two** things it can talk to, and which one you have decides how much of this page
+applies to you:
+
+| You have | Settings → Server | What you run |
+|---|---|---|
+| An **OpenAI-compatible speech service** — anything serving `/v1/audio/transcriptions` | Type its address. Leave the first radio selected. | Nothing. kvit-dictate starts and supervises `kvit-asrd.exe` for you. |
+| A **kvit-dictate protocol server** — `server/` from this repository, or your own | Type its `ws://` address and pick "I run my own kvit-dictate server". | That server. |
+
+**If you have the first, you are two minutes from working and the rest of this page is
+background.** Sections 1-3 are about standing up a protocol server, which you do not need.
+
+---
+
+## 0. The short version: one address
+
+If something on your network already serves `/v1/audio/transcriptions` — a llama.cpp-style ASR
+server, a Qwen3-ASR box, a vLLM deployment, anything OpenAI-compatible — then:
+
+1. Open **Settings → Server**.
+2. Type its address into **Speech service**: for example `http://strixhalo.lan:10301`.
+3. Press **Test**.
+
+Test does not merely ping that address. It starts `kvit-asrd.exe` — the translator that ships
+beside `kvit-dictate.exe` — hands it your address, and completes the full protocol handshake with
+it, exactly as dictation will. `kvit-asrd` does not report itself ready until it has connected to
+your speech service, so a green Test means the whole path answered: this client, the translator,
+and your service. A test that POSTed to your service directly would pass while the translator was
+broken, which is not a test worth having.
+
+Then dictate. There is nothing else to run, no window to keep open, and no Python.
+
+### What the translator is
+
+`kvit-asrd.exe` is the second half of the application, installed beside the client. It speaks
+`docs/protocol.md` on one side and HTTP on the other:
+
+```
+kvit-dictate.exe  ──ws──▶  kvit-asrd.exe  ──HTTP──▶  your speech service
+   hotkey, capture,        endpointing,               /v1/audio/transcriptions
+   injection, overlay      stability, WAV
+```
+
+The client launches it on a loopback port it chooses, supervises it, and kills it when the client
+exits — including when the client crashes, because the child is in a job object. You never start
+it yourself unless you want to (§5).
+
+**What it does not do yet:** no API key. If your service wants an `Authorization: Bearer` header,
+this is not yet the way to reach it — that is a settings field and a header, and it is a separate
+argued change rather than a silent omission inside the HTTP client
+(`openai-translator.md` §1.4, §10 item 4).
+
+---
+
+## 0.1 If you do not have a speech service
+
+Then you are standing one up, and the rest of this page is for you. Be warned that it is a real
+evening's work: `release-plan.md` §8 calls the first-run cliff the single biggest adoption risk in
+the project, and it is a deliberate choice rather than an oversight.
 
 Everything below assumes you have the repository, or at least `server/`. If you only have the
 installer, start at [§4](#4-putting-a-server-you-already-run-behind-the-protocol).
@@ -27,8 +78,10 @@ python docs/examples/minimal_server.py
 listening on ws://127.0.0.1:10402/
 ```
 
-Put `ws://127.0.0.1:10402/` into kvit-dictate's **Settings → Server** and press **Test**. You
-should see the server's build id, a model called `counter`, and a round-trip time in
+Put `ws://127.0.0.1:10402/` into kvit-dictate's **Settings → Server**, pick **"I run my own
+kvit-dictate server"**, and press **Test**. (The radio matters: with the first one selected, that
+box means a speech service and kvit-dictate will refuse a `ws://` address with a sentence saying
+so.) You should see the server's build id, a model called `counter`, and a round-trip time in
 milliseconds. Dictate into Notepad and it will type
 
 ```
@@ -62,7 +115,12 @@ The mock types scripted fixture sentences. It is for testing the client, not for
 
 ### 2.2 Against an OpenAI-compatible transcription endpoint
 
-This is the shortest path from "the plumbing works" to "a real model wrote that". The
+**You almost certainly want [§0](#0-the-short-version-one-address) instead.** `kvit-asrd.exe`
+does exactly this, ships with the app, needs no Python at all, and is what the first radio in
+Settings configures. What follows is the Python equivalent, which is still here because the bench
+runs it and because it is the reference implementation of everything `kvit-asrd` was ported from.
+
+The
 `openai-http` backend posts audio to any endpoint that implements
 `POST /v1/audio/transcriptions` — which is what vLLM, llama.cpp's server, faster-whisper-server,
 Speaches and several others already expose. **It needs nothing installed**: the backend module is
@@ -113,7 +171,9 @@ Once an environment exists, the shape is the same:
 
 | Field | What to put in it |
 |---|---|
-| Server address | `ws://127.0.0.1:10402/` for this machine, `ws://box.lan:10402/` for another. `wss://` and `https://` work too. |
+| Which radio | **"…OpenAI-compatible speech service"** for §0's case, **"I run my own kvit-dictate server"** for everything else on this page. It is a stored setting, not a guess from the scheme: `http://` is a legal WebSocket synonym (`docs/protocol.md` §2.6.1), so there is no way to tell the two apart by looking at the address. |
+| Speech service (first radio) | `http://strixhalo.lan:10301` — an OpenAI-compatible service. `http://` or `https://` only. |
+| Server address (second radio) | `ws://127.0.0.1:10402/` for this machine, `ws://box.lan:10402/` for another. `wss://` and `https://` work too. |
 | Model | Leave empty unless your server hosts several. If you name one it does not have, it says so — it never quietly substitutes another. |
 
 Then press **Test**. It opens a real connection, completes the handshake, waits for the server to
@@ -128,7 +188,20 @@ The same check from a command line, which is the useful thing to paste into a bu
 kd_probe --server ws://127.0.0.1:10402/
 ```
 
-### If Test fails
+### If Test fails in speech-service mode
+
+Two things can fail, and the message says which:
+
+| Message | What it means |
+|---|---|
+| `Could not start the translator.` | `kvit-asrd.exe` is not beside `kvit-dictate.exe`. The message names the absolute path it looked at. Reinstall, or use the second radio and run your own server. |
+| `The translator started but did not become ready` | The translator is fine and your speech service is not: it could not open a TCP connection to the address you gave. Wrong host, wrong port, machine off, or a firewall. The translator's own diagnostics are in this app's log, on lines prefixed `asrd:`. |
+
+The port the translator is listening on is in the log too, on the `kvit-asrd pid … listening on
+ws://127.0.0.1:…` line. It is a fresh port each run — the client picks one so that two clients, or
+a leftover Python server on 10402, cannot collide.
+
+### If Test fails against your own protocol server
 
 The message names which of four things happened, because each has a different fix:
 
@@ -137,7 +210,7 @@ The message names which of four things happened, because each has a different fi
 | `connect_timeout` | Nothing answered. Wrong address, machine off, or a firewall dropping the packets. |
 | `connect_refused` | Something answered and said no. The server is not running, or not on that port. |
 | `tls_failed` | `wss://`, and this machine does not trust the certificate. |
-| `answered HTTP 200 instead of upgrading` | The URL points at an HTTP API rather than at the WebSocket endpoint. Check the path. |
+| `answered HTTP 200 instead of upgrading` | The URL points at an HTTP API rather than at the WebSocket endpoint. If that HTTP API is your speech service, you want the **first** radio, not this one. |
 | `server_busy` | The server is already serving someone. `--max-connections` on the server side, or wait. |
 | `model_unavailable` | You named a model it does not have. The message lists what it does have. |
 
@@ -183,6 +256,44 @@ So:
 A firewall rule is worth adding either way: the server is a Python process listening on a port,
 and Windows will offer to allow it through on first run. Say no if it is only ever going to serve
 this machine.
+
+---
+
+## 5.1 Running the translator by hand
+
+You never have to, but it is the same program and it takes a command line:
+
+```
+kvit-asrd.exe --listen 127.0.0.1:10402 --service http://strixhalo.lan:10301
+```
+
+That is also how you run it on **another machine** — put it next to your speech service and point
+kvit-dictate at it with the second radio, as a protocol server. `--listen` on a non-loopback
+address is an explicit act; the default is loopback, and there is still no authentication and no
+TLS on the listening side (§5 applies unchanged).
+
+`kvit-asrd --help` lists the rest. The ones worth knowing:
+
+| Flag | Default | What it is for |
+|---|---|---|
+| `--model NAME` | `Qwen/Qwen3-ASR-1.7B` | The model your service should use. |
+| `--language LANG` | `en` | Passed through. Empty means the service's default. |
+| `--finalize-only on\|off` | `on` | Off is live preview. See below. |
+| `--vad-gate on\|off` | `on` | Ask the service's `/v1/audio/vad` route before transcribing. Fails open. |
+| `--endpoint-silence-ms MS` | `1500` | How long a pause ends a phrase. |
+| `--log-level LEVEL` | `info` | Diagnostics go to stderr. |
+
+### Why live preview is off by default
+
+A batch model does not extend its previous guess, it replaces it. Once it can hear where the
+sentence ended it re-cases the first word and inserts the punctuation it was not sure of, so
+`so I was thinking we` becomes `So I was thinking, we`. That revises byte 0 — and the protocol
+binds each new hypothesis against the mark already published (`docs/protocol.md` §8.2), so once
+anything has been committed, no honest answer exists for the next message.
+
+With finalize-only, each phrase is transcribed once when you pause and lands whole. With live
+preview on, you watch the words arrive but nothing commits until the phrase ends anyway. It is
+available, it is labelled experimental in Settings, and it is off.
 
 ---
 

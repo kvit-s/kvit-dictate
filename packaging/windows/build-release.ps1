@@ -18,16 +18,38 @@
     release and no certificate exists yet; a script that quietly produced unsigned output while
     looking like it signed would be worse than one that says so. It says so, at the end.
 
-    The staged payload is deliberately one executable plus documents. No sidecar, no models.json,
-    no Python, no CRT redistributable — the build is /MT (CMakeLists.txt), so there is nothing to
-    redistribute. models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and
-    shipping it would put a "mock" model in front of a new user, which types invented sentences.
+    The staged payload is **two** executables plus documents. No models.json, no Python, no CRT
+    redistributable — the build is /MT (CMakeLists.txt), so there is nothing to redistribute.
+    models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and shipping it would
+    put a "mock" model in front of a new user, which types invented sentences.
 
-    The release configuration is its own build directory with KD_ENABLE_SIDECAR_SPAWN=OFF, so
-    the shipped executable contains no CreateProcessW, no job object and no command-line quoting
-    at all (release-plan.md §1.2: "Deleted from shipped builds"). That is checked below rather
-    than assumed — attack surface a binary does not contain is the only kind a bug elsewhere in
-    it cannot reach, and a build flag that silently flipped back would give that away quietly.
+        kvit-dictate.exe   the client: hotkey, capture, session, injection, overlay
+        kvit-asrd.exe      the translator: docs/protocol.md on one side, an OpenAI-compatible
+                           /v1/audio/transcriptions service on the other
+
+    ── The spawn check changed, and it is worth reading before "fixing" it ────────────────────
+
+    This script used to assert that the shipped `kvit-dictate.exe` contained **no**
+    `CreateProcessW` and no `AssignProcessToJobObject`, on release-plan.md §1.2's argument that
+    attack surface a binary does not contain cannot be reached by a bug elsewhere in it.
+
+    openai-translator.md §4.6 reverses that, deliberately and with a reason: the client now
+    launches and supervises `kvit-asrd.exe`, because the alternative is the user keeping a
+    Python window open. So those two imports are now **expected**, and asserting their absence
+    would only stop the release.
+
+    What replaced it is narrower and still has teeth:
+
+      1. `KD_ENABLE_SIDECAR_SPAWN=OFF` is still passed to CMake. The named-pipe / models.json /
+         arbitrary-interpreter path — a configuration file that can execute anything — stays
+         compiled out. That is the surface §1.2 was actually about.
+      2. `kvit-asrd.exe` is present in the stage directory, because a client that cannot find
+         its translator is a broken install.
+      3. The staged client does **not** contain the string `spawned sidecar pid`, which is the
+         unique log line of the old path. Its presence would mean §1.2's spawn came back.
+
+    The security property that remains is in `src/translator.h`: the image path is
+    `GetModuleFileName(nullptr)`'s directory plus `kvit-asrd.exe`, and nothing else.
 
 .PARAMETER SkipTests
     Package without running ctest. For iterating on the packaging itself only; the release build
@@ -99,6 +121,14 @@ $exe = Join-Path $buildDir 'bin\Release\kvit-dictate.exe'
 if (-not (Test-Path $exe)) { throw "built executable not found at $exe" }
 Copy-Item $exe $stageDir
 
+# Both halves, same build, same version. openai-translator.md §4.8: the Inno script already
+# copies {#StageDir}\* with recursesubdirs, so staging is the whole change on the packaging side.
+$asrd = Join-Path $buildDir 'bin\Release\kvit-asrd.exe'
+if (-not (Test-Path $asrd)) {
+    throw "kvit-asrd.exe not found at $asrd — the translator is half the application and an installer without it produces a client that cannot dictate"
+}
+Copy-Item $asrd $stageDir
+
 # The whole payload, and the list is short on purpose (release-plan.md §3.2).
 foreach ($f in @('LICENSE', 'LICENSE-APACHE', 'README.md')) {
     Copy-Item (Join-Path $repo $f) $stageDir
@@ -113,24 +143,39 @@ Copy-Item (Join-Path $PSScriptRoot 'disclosure.txt') (Join-Path $stageDir 'docs\
 # installer, and a build that silently reverted to /MD would produce an installer that works on
 # this machine and fails on a clean one — the exact failure a clean-VM test is meant to catch and
 # the exact one that is easiest to skip.
-$strings = [System.IO.File]::ReadAllBytes((Join-Path $stageDir 'kvit-dictate.exe'))
-$ascii = [System.Text.Encoding]::ASCII.GetString($strings)
-foreach ($dll in @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt-runtime')) {
-    if ($ascii.Contains($dll)) {
-        throw "the executable imports $dll — the build is not /MT and the installer would need a redistributable"
+# Both binaries: a /MD kvit-asrd.exe would fail on a clean machine exactly as a /MD client would,
+# and it is the one nobody would think to test.
+foreach ($name in @('kvit-dictate.exe', 'kvit-asrd.exe')) {
+    $bytes = [System.IO.File]::ReadAllBytes((Join-Path $stageDir $name))
+    $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+    foreach ($dll in @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt-runtime')) {
+        if ($text.Contains($dll)) {
+            throw "$name imports $dll — the build is not /MT and the installer would need a redistributable"
+        }
     }
 }
-Write-Host "[release] static CRT confirmed (no VCRUNTIME/MSVCP/UCRT imports)"
+Write-Host "[release] static CRT confirmed in both binaries (no VCRUNTIME/MSVCP/UCRT imports)"
 
-# release-plan.md §1.2. A shipped build has no child to spawn, kill or outlive, and this is the
-# check that the compiler was actually told so. CreateProcessW appears in the import table by
-# name, so its absence is checkable without a PE parser.
-foreach ($api in @('CreateProcessW', 'AssignProcessToJobObject')) {
-    if ($ascii.Contains($api)) {
-        throw "the executable imports $api — KD_ENABLE_SIDECAR_SPAWN was not off, and this build can still launch a child process"
-    }
+# The replacement for the old CreateProcessW grep. See the .DESCRIPTION block above for why the
+# import-table check had to go and what this checks instead.
+#
+# `spawned sidecar pid` is `ipc_client.cpp`'s log line for the named-pipe interpreter spawn, and
+# it exists in the binary only when KD_ENABLE_SIDECAR_SPAWN was on. Unlike an import, a string
+# literal is compiled out with the code that uses it, so its absence is a real statement about
+# what this build can do — and it is checkable without a PE parser.
+$clientBytes = [System.IO.File]::ReadAllBytes((Join-Path $stageDir 'kvit-dictate.exe'))
+$clientText = [System.Text.Encoding]::ASCII.GetString($clientBytes)
+if ($clientText.Contains('spawned sidecar pid')) {
+    throw "kvit-dictate.exe contains the old sidecar spawn path — KD_ENABLE_SIDECAR_SPAWN was not off, and this build can launch an interpreter named in models.json"
 }
-Write-Host "[release] no child-spawning machinery (no CreateProcessW / AssignProcessToJobObject)"
+Write-Host "[release] the models.json interpreter spawn is compiled out (no 'spawned sidecar pid')"
+
+# And the translator is actually there. A client that cannot find kvit-asrd.exe reports a broken
+# installation rather than dictating, which is correct behaviour and a terrible release.
+if (-not (Test-Path (Join-Path $stageDir 'kvit-asrd.exe'))) {
+    throw 'kvit-asrd.exe is missing from the stage directory'
+}
+Write-Host "[release] both halves staged (kvit-dictate.exe + kvit-asrd.exe)"
 
 $staged = Get-ChildItem -Recurse -File $stageDir
 Write-Host "[release] staged $($staged.Count) files, $([math]::Round(($staged | Measure-Object Length -Sum).Sum / 1MB, 2)) MB"

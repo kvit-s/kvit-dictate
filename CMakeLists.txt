@@ -177,6 +177,10 @@ set(KD_CORE_SOURCES
     src/settings.cpp
     src/edit_buffer.cpp
 
+    # Windows-facing, but with no UI: launching and supervising kvit-asrd.exe.
+    # openai-translator.md §4.6 — always compiled, never behind KD_ENABLE_SIDECAR_SPAWN.
+    src/translator.cpp
+
     # Windows-facing.
     src/normalizer.cpp
     src/hotkey.cpp
@@ -203,6 +207,7 @@ set(KD_CORE_HEADERS
     src/theme.h
     src/tray_icon.h
     src/edit_buffer.h
+    src/translator.h
 )
 
 add_library(kd_core STATIC ${KD_CORE_SOURCES} ${KD_CORE_HEADERS})
@@ -431,6 +436,7 @@ if(KD_BUILD_TESTS)
         tests/test_edit_buffer.cpp
         tests/test_normalizer.cpp
         tests/test_injector.cpp
+        tests/test_translator.cpp
         tests/test_fixtures.cpp
 
         # kvit-asrd. openai-translator.md §4.8 and §5: the translator's code is compiled INTO
@@ -499,6 +505,7 @@ if(KD_BUILD_TESTS)
         edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
         normalizer      # src/normalizer.cpp — the term guard and the request/response codecs
+        translator      # src/translator.cpp — the client's half of the spawn contract
         asrd_ws         # src/asrd/ws_server.cpp — the handshake and RFC 6455 framing
         asrd_fixtures   # tests/fixtures/protocol/ — the same corpus, from the server's role
         asrd_stability  # src/asrd/stability.cpp — the producer of stable_bytes

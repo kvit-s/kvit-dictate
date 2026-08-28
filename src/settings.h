@@ -175,16 +175,51 @@ inline constexpr int kSettingsSchema = 1;
 //
 // UTF-8 rather than wide, like every other string in this header, so that the file stays pure
 // and testable; ipc_client.h takes the wide form and `endpoint()` converts.
+// How to read `ServerSettings::url` (openai-translator.md §4.6).
+//
+// This exists because the two things a user might type into one box are indistinguishable by
+// inspection and catastrophically different in effect. `parse_server_url` treats `http://` and
+// `https://` as **WebSocket synonyms** (docs §2.6.1, because people type them), so storing
+// `http://strixhalo.lan:10301` in a Local-mode field and connecting to it as a protocol server
+// would make the client attempt a WinHTTP upgrade against an OpenAI HTTP API — which is
+// precisely the failure openai-translator.md exists to end.
+enum class ServerMode : uint8_t {
+    // `url` is an OpenAI-compatible speech service. The client launches `kvit-asrd.exe` beside
+    // itself and points it at that address. **The default**, and what most people configure.
+    Local,
+    // `url` is a docs/protocol.md server the user runs themselves. Unchanged behaviour: the
+    // client speaks the protocol to it directly and spawns nothing.
+    Protocol,
+};
+
+const char* to_string(ServerMode m) noexcept;
+bool server_mode_from_string(std::string_view s, ServerMode& out) noexcept;
+
 struct ServerSettings {
-    // docs/protocol.md §2.6.1. `ws://`, `wss://`, and `http://`/`https://` as synonyms because
-    // people type them. **Empty is the normal first-run state, not an error** — docs §10.6 and
-    // release-plan.md §2.3 make "no server configured" a first-class state.
+    // What `url` means. Written as `server.mode` and **absent in every settings file written by
+    // an older build**, which is why `migrate_server_mode()` below exists rather than a schema
+    // bump: bumping `kSettingsSchema` would make those files unreadable, and every one of them
+    // can be interpreted correctly from the URL it already holds.
+    ServerMode mode = ServerMode::Local;
+
+    // In Protocol mode: docs/protocol.md §2.6.1 — `ws://`, `wss://`, and `http://`/`https://`
+    // as synonyms because people type them. In Local mode: `http://` or `https://` only, and
+    // validated by a separate helper, never by `parse_server_url`.
+    //
+    // **Empty is the normal first-run state, not an error** — docs §10.6 and release-plan.md
+    // §2.3 make "no server configured" a first-class state.
     std::string url;
 
     // Optional model request (docs §5.1). Empty means "whatever the server serves by default".
     // Free text rather than a picker, because a server is not obliged to advertise a catalogue;
     // when it does, the Test button shows what came back.
     std::string model;
+
+    // Live preview in Local mode: `partial`s with a computed `stable_bytes` against a batch
+    // model that structurally violates monotonicity. Off by default and labelled in the dialog
+    // (openai-translator.md §4.3's batch-model caveat). Meaningless in Protocol mode, where the
+    // server decides for itself what it publishes.
+    bool live_preview = false;
 
     uint32_t connect_timeout_ms = 15000;
 
@@ -196,6 +231,27 @@ struct ServerSettings {
 
     [[nodiscard]] bool configured() const { return !url.empty(); }
 };
+
+// Validate `url` as a **speech-service** address: `http://` or `https://` only, well formed, and
+// free of the characters that would need quoting on the command line the client builds for
+// `kvit-asrd --service`.
+//
+// Deliberately not `parse_server_url`. That function's job is the opposite — it *accepts*
+// `http://` as a WebSocket synonym — and reusing it here is exactly how a speech-service address
+// ends up being upgraded. Returns an empty string when the URL is usable, and a sentence the
+// user can act on otherwise.
+std::string validate_speech_service_url(std::string_view url);
+
+// Choose a `mode` for a settings file that has none (openai-translator.md §4.6):
+//
+//   * empty url                -> Local, and the first-run Server page. Unchanged behaviour.
+//   * `ws://` or `wss://`      -> Protocol. A user who already pointed the app at a Python
+//                                 server keeps that, with no dialog and no surprise.
+//   * anything else            -> Local, and the URL is re-validated as a speech-service
+//                                 address on the next save. It is NOT silently fed to
+//                                 `IpcClient::connect`, because an `http://` URL there is the
+//                                 ambiguous case this whole enum exists to disambiguate.
+ServerMode migrate_server_mode(std::string_view url) noexcept;
 
 struct Settings {
     int schema = kSettingsSchema;
