@@ -83,9 +83,27 @@ The only thing that is local-only is the *transport*.
 | `docs/protocol.md` §3–§10 (framing, encoding, handshake, message catalogue, ordering, text semantics, errors) | **None.** These are transport-agnostic already: a 4-byte length, a type byte, a payload, ≤ 65541 bytes on the wire, with a reference decoder (§3.4) that already handles partial reads. |
 | `docs/protocol.md` §2 (Transport) and §2.4 (child launch and peer validation) | **Replaced** by a network binding (§1.3). This is the only part of the spec that is about a pipe and a child process. |
 | `src/ipc_client.cpp` transport layer | **Replaced.** `CreateFile`/`ReadFile`/`WriteFile` on a pipe → Winsock or WinHTTP. The framing code and its fixtures are untouched. |
-| `src/ipc_client.cpp` lifecycle — `CreateProcessW` (:1291), the job object, `--parent-pid` liveness | **Deleted from shipped builds.** There is no child to spawn, kill or outlive. |
+| `src/ipc_client.cpp` lifecycle — `CreateProcessW` (:1291), the job object, `--parent-pid` liveness | **Deleted from shipped builds**, and that is still true of *this* path. **But see the note below §1.2's table: a shipped build spawns a child again, a different one.** |
 | `session.cpp` — `Effect::KillChild`, `Effect::RespawnChild` | **Re-meaning, not deletion.** "Kill the child" becomes "close the connection", "respawn" becomes "reconnect with backoff". The states and their tests survive; `App::on_sidecar_lost` (`main.cpp:2195`) already does the right thing when the engine vanishes. |
 | `models.json` and its whole spawn machinery | **Gone from shipped builds**, kept for the bench. Its job was mapping a model id to an interpreter and argv; with no child process there is nothing to map. Server URL replaces it (§2). |
+
+> **Superseded in part, 2026-08-28 — `openai-translator.md`.** The two rows above said "there is
+> no child to spawn". There is one again, and the reason is that revision 2 of §1 assumed the
+> user's endpoint speaks this protocol, and the endpoint on the author's own network does not: it
+> is an OpenAI-compatible `/v1/audio/transcriptions` service. Under revision 2 a translator still
+> existed, still ran on the user's machine, and was started by hand from a `.bat` file — the
+> moving parts did not go away, only the supervision of them did.
+>
+> So `kvit-dictate.exe` now launches `kvit-asrd.exe`, a second native executable built from this
+> repository and installed beside it. **What stays deleted is what §1.2 was actually about:** the
+> named-pipe path that spawns an arbitrary interpreter named in a user-editable `models.json`,
+> with a user-supplied argv and environment. `KD_ENABLE_SIDECAR_SPAWN` is still OFF in shipped
+> builds and the `#ifdef` around `ChildSpec` and `IpcClient::start` has not moved.
+>
+> What is added back launches **one fixed executable, by absolute path, from the installation
+> directory** — `GetModuleFileName(nullptr)`'s directory plus `kvit-asrd.exe`, with no setting,
+> environment variable or manifest able to redirect it (`src/translator.h`). The release gate
+> changed with it; see the note on §1.2's row in the summary table below.
 | `server/kvit_asr/transport.py` (800 lines of ctypes against kernel32) | **Replaced by a socket**, which is stdlib and about a tenth of the size — and which makes the reference server cross-platform for free. |
 | Everything else in `server/` — `vad.py`, `stability.py`, `session.py`, the backends | **Unchanged, and out of scope for this release.** |
 
@@ -405,10 +423,10 @@ unverified; there is no third category.
 | §1.3 | The WebSocket binding, client side (`IpcClient::connect`, WinHTTP) | `kd_probe --server` completes the upgrade, handshake and `ready` against two independent servers |
 | §1.3 | The WebSocket binding, server side (`kvit_asr/ws.py`, `--listen`) | 29 new tests drive it over a real socket with a client written from the spec |
 | §1.4 | Concurrency (§2.7) and model discovery (§5.1) answered in the spec and implemented on both sides | `server_busy` and `model_unavailable` are asserted end to end, in both suites |
-| §2.2 | `ServerSettings`, the Server settings page, the Test button | 7 new settings tests; the Test button's call (`probe_server`) is the same one `kd_probe --server` makes and that is exercised |
+| §2.2 | `ServerSettings`, the Server settings page, the Test button | 7 new settings tests; the Test button's call (`probe_server`) is the same one `kd_probe --server` makes and that is exercised. **Extended 2026-08-28**: `server.mode` distinguishes a speech service from a protocol server — necessary because `parse_server_url` treats `http://` as a WebSocket synonym and the two cannot be told apart by looking — and in speech-service mode Test launches a private `kvit-asrd.exe` and handshakes *it*, so a green Test covers the whole path. 11 further settings tests, including every migration case for a file written before the field existed. |
 | §2.4 | The non-private-host warning | Unit-tested against loopback, all three RFC 1918 ranges, CGNAT, link-local, IPv6 unique-local, and the public addresses that must *not* be excused |
 | §3.2 | `/MT`, the application manifest, the icon, the version resource | The release script greps the binary for CRT imports and refuses to package if it finds any |
-| §1.2 | Spawn machinery out of shipped builds (`KD_ENABLE_SIDECAR_SPAWN=OFF`) | The release script greps for `CreateProcessW` and `AssignProcessToJobObject` and refuses to package if either is present |
+| §1.2 | Spawn machinery out of shipped builds (`KD_ENABLE_SIDECAR_SPAWN=OFF`) | ~~The release script greps for `CreateProcessW` and `AssignProcessToJobObject`~~ — **superseded 2026-08-28.** A shipped client now contains both, because it launches `kvit-asrd.exe` (`openai-translator.md` §4.6). The script instead checks that the flag is still OFF, that `kvit-asrd.exe` is staged, and that the client does **not** contain the string `spawned sidecar pid` — the unique marker of the `models.json` interpreter path, which is what §1.2 was about. A string literal is compiled out with the code that uses it, so its absence is a statement about what the build can do rather than about which APIs it imports. |
 | §3 | The per-user installer | Installed silently, inspected, launched, uninstalled: program directory, Start Menu group, Run key and uninstall entry all created and all removed, and `settings.json` correctly kept |
 | §5 | MPL-2.0 / Apache-2.0 split, headers, CLA | `tools/apply-license-headers.sh --check` runs clean |
 | §6 | README rewrite, `docs/setup.md`, the corrected privacy statement | — |

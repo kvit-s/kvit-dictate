@@ -109,6 +109,17 @@ public:
     void set_transcribe(Reply r) {
         std::lock_guard<std::mutex> lock(m_);
         transcribe_ = std::move(r);
+        script_.clear();
+    }
+
+    // One reply per request, in order; the last one repeats once the script runs out. This is
+    // how a *revising* model is simulated — a batch model does not extend its previous
+    // hypothesis, it replaces it, and a stub that always answers the same string cannot provoke
+    // the failure §8.2 exists to prevent.
+    void set_transcribe_script(std::vector<Reply> replies) {
+        std::lock_guard<std::mutex> lock(m_);
+        script_ = std::move(replies);
+        if (!script_.empty()) transcribe_ = script_.front();
     }
     void set_vad(Reply r) {
         std::lock_guard<std::mutex> lock(m_);
@@ -178,7 +189,14 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_);
             last_body_bytes_ = content_length;
-            reply = is_vad ? vad_ : transcribe_;
+            if (is_vad) {
+                reply = vad_;
+            } else if (!script_.empty()) {
+                const size_t at = static_cast<size_t>(transcribe_requests_.load());
+                reply = script_[(std::min)(at, script_.size() - 1)];
+            } else {
+                reply = transcribe_;
+            }
             if (is_vad && !vad_configured_) {
                 // The honest default: a server without pysilero-vad answers 503 naming the
                 // package, which is what the fail-open path has to survive.
@@ -213,6 +231,7 @@ private:
 
     mutable std::mutex m_;
     Reply transcribe_;
+    std::vector<Reply> script_;
     Reply vad_;
     bool vad_configured_ = false;
     size_t last_body_bytes_ = 0;
@@ -346,6 +365,7 @@ TranslatorConfig config_for(const StubSpeechService& stub) {
     cfg.vad_gate = false;  // on only in the tests that are about the gate
     // Shorter than the shipped 1500 ms, so a case is two seconds of audio rather than four.
     cfg.endpoint_silence_ms = 400;
+    cfg.stability.hold_ms_t = 0;  // the dwell is a wall clock; a test must not wait on it
     cfg.http_timeout_ms = 5000;
     return cfg;
 }
@@ -882,4 +902,150 @@ KD_TEST(asrd_session, against_a_real_speech_service_when_one_is_named) {
         if (f.stable_bytes.has_value()) KD_CHECK_EQ(*f.stable_bytes, f.text.size());
         KD_CHECK(kd::proto::is_valid_stable_offset(f.text, f.text.size()));
     }
+}
+
+// ─── --hostile-stability, and the T2 live-preview gate ──────────────────────────────────────
+
+KD_TEST(asrd_session, hostile_stability_puts_a_non_conforming_mark_on_the_wire) {
+    // openai-translator.md §4.7 and §5. `server/tests/test_hostile_stability.py` exists because
+    // docs/protocol.md §8.3's Client handling had never been reachable from a *running* server:
+    // stability is the server's computation, so no correct pipeline produces §8.3's input. The
+    // C++ translator needs the same deliberate hole, with the same name and the same loud
+    // logging — otherwise the client's §8.3 path stays covered only by frozen fixtures.
+    //
+    // Four things have to hold, and each has a way of failing that leaves the suite looking
+    // healthy. The first two are asserted here; the second two are structural in this port and
+    // are noted where they live.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+
+    // A backend that revises byte 0 on its second hypothesis — the signature of a batch model
+    // that re-decodes rather than extends, and exactly what a hostile mark cannot survive.
+    stub.set_transcribe({200, R"({"text":"so i was thinking we should"})"});
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.finalize_only = false;  // partials are where §8.2's monotonicity lives
+    cfg.hostile_stability = true;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(2500, 1200)));
+
+    const auto partials = seen.of<kd::proto::PartialMsg>();
+    KD_REQUIRE_GT(partials.size(), size_t{0});
+    // The whole hypothesis published as stable, bypassing the tracker. A conforming computation
+    // would have published 0 here — with N=2 the first candidate is 0 ms old — so a non-zero
+    // mark on the first partial is proof the switch is what produced it.
+    KD_CHECK_EQ(partials[0].stable_bytes, partials[0].text.size());
+    KD_INFO("hostile partial published stable_bytes=" +
+            std::to_string(partials[0].stable_bytes) + " of " +
+            std::to_string(partials[0].text.size()) + " bytes");
+
+    // Point 3 from the Python file, and the subtle one: the server's own tracker must stand
+    // down. Left running it would raise on the contradiction the switch exists to create, abort
+    // the utterance with `decode_failed`, and keep §8.3 untested while the test appeared to
+    // pass. In this port that is structural — `SessionServer::worker` takes the hostile branch
+    // *instead of* `stability_.observe`, never as well as — and this is what notices if that
+    // ever becomes an `if` with two arms that both run.
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+}
+
+KD_TEST(asrd_session, live_preview_against_a_revising_model_never_reaches_the_client_broken) {
+    // openai-translator.md §7's T2 gate, second half: "Live preview against a batch model
+    // produces either a conforming stream or a refused emission — never a `stability_violation`
+    // on the client."
+    //
+    // Both outcomes are acceptable and the test asserts the disjunction rather than picking one,
+    // because which one happens depends on how much the model revises — and pinning that would
+    // make this test about the stub's script instead of about the invariant.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    // A batch model, behaving as measured: as it hears more it re-cases the opening word and
+    // inserts the punctuation it was not sure of. `so i was thinking we` becomes `So I was
+    // thinking, we` — a revision at byte 0, which no value of stable_bytes can make conforming
+    // once anything has been published.
+    //
+    // The recasing is the *second* reply on purpose. A hop that fires while a POST is running
+    // replaces the pending work rather than queueing a second call (openai-translator.md §2.1),
+    // so a fast test coalesces most hops and sees only a couple of transcriptions — putting the
+    // byte-0 revision late in the script would mean it never arrived and the gate would pass
+    // without ever meeting the case it exists for.
+    stub.set_transcribe_script({
+        {200, R"({"text":"so i was thinking we"})"},
+        {200, R"({"text":"So I was thinking, we should"})"},
+        {200, R"({"text":"So I was thinking, we should probably ship it."})"},
+    });
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.finalize_only = false;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(2500, 1200)));
+
+    // Whatever was published must be a conforming sequence: non-decreasing within an utterance,
+    // on a grapheme boundary, and with each hypothesis extending the last published prefix.
+    // These are §8.2's three requirements, checked from the receiving side.
+    uint64_t high_water = 0;
+    std::string published;
+    uint64_t utterance = 0;
+    for (const kd::proto::PartialMsg& p : seen.of<kd::proto::PartialMsg>()) {
+        if (p.utterance_id != utterance) {
+            utterance = p.utterance_id;
+            high_water = 0;
+            published.clear();
+        }
+        KD_CHECK(kd::proto::is_valid_stable_offset(p.text, p.stable_bytes));
+        KD_CHECK(p.stable_bytes >= high_water);
+        KD_CHECK(p.text.compare(0, published.size(), published) == 0);
+        high_water = p.stable_bytes;
+        published = p.text.substr(0, static_cast<size_t>(p.stable_bytes));
+    }
+
+    // A refusal is the other legal outcome, and it is `decode_failed` rather than
+    // `stability_violation`: §11.3 has no code for "the Server detected that its own next
+    // message would violate §8.2", and sending the inadmissible message so the Client can raise
+    // one would put the offending bytes in the user's document first.
+    for (const kd::proto::ErrorMsg& e : seen.of<kd::proto::ErrorMsg>()) {
+        KD_CHECK(e.code == kd::proto::ErrorCode::decode_failed);
+        KD_CHECK(!e.fatal);
+        KD_INFO("refused rather than published: " + e.msg);
+    }
+
+    // Reported rather than inferred, because a run that produced no partials at all would
+    // satisfy every assertion above and prove nothing.
+    //
+    // **What this normally finds, and it is worth understanding before "improving" it:** the
+    // published marks are all 0. That is not the tracker being timid — it is step 2 working.
+    // With N = 2 the candidate is the common grapheme prefix of the last two hypotheses, and a
+    // model that recases the first word makes that prefix empty. So a revising model in live
+    // preview publishes nothing and everything commits at the `final`, which is exactly what
+    // `SessionConfig::publish_stable_partials` predicts and why finalize-only is the default.
+    // The conforming-stream arm of the gate is satisfied trivially, and trivially is fine: the
+    // gate is that the Client never receives a violation, not that a mark advances.
+    std::string marks;
+    for (const kd::proto::PartialMsg& p : seen.of<kd::proto::PartialMsg>()) {
+        marks += std::to_string(p.stable_bytes) + "/" + std::to_string(p.text.size()) + " ";
+    }
+    KD_INFO("live preview: " + std::to_string(seen.of<kd::proto::PartialMsg>().size()) +
+            " partial(s) [" + marks + "], " +
+            std::to_string(seen.of<kd::proto::FinalMsg>().size()) + " final(s), " +
+            std::to_string(seen.of<kd::proto::ErrorMsg>().size()) + " error(s), " +
+            std::to_string(stub.transcribe_requests()) + " transcriptions");
+    // The script's byte-0 revision must actually have been delivered, or the case that matters
+    // never happened. Asserted on *content* rather than on a message count: how many partials
+    // arrive depends on how many hops coalesced while a POST was in flight, which is correct
+    // behaviour (§2.1) and varies with machine load — a count assertion here passes alone and
+    // fails in a full suite run, which is the worst kind of test.
+    KD_CHECK_GT(stub.transcribe_requests(), 1);
+    bool saw_revision = false;
+    for (const kd::proto::PartialMsg& p : seen.of<kd::proto::PartialMsg>()) {
+        if (p.text.rfind("So I was thinking,", 0) == 0) saw_revision = true;
+    }
+    for (const kd::proto::FinalMsg& f : seen.of<kd::proto::FinalMsg>()) {
+        if (f.text.rfind("So I was thinking,", 0) == 0) saw_revision = true;
+    }
+    KD_CHECK(saw_revision);
 }

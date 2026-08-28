@@ -1,8 +1,25 @@
 # `kvit-asrd` — the translator
 
-Status: **plan, nothing built.** 2026-08-28, against commit `25d036d`. Updated the same day
-to close the gaps a review of this file found: spawn vs the release grep, port bootstrap,
-settings schema, the CMake split, and the overstated `commit_engine` reuse.
+Status: **built.** 2026-08-28. T0–T4 are implemented and committed; the sections below are kept
+as written, because a plan that is quietly edited to match what was built stops being a record of
+what was decided.
+
+What changed against the plan while building it, all of it small:
+
+* **`serve_connection` lives in `src/asrd/connection.{h,cpp}`, not in `main.cpp`.** §5 asks for an
+  in-process loopback test, and a serve loop inside `main.cpp` is reachable only through
+  `CreateProcess`.
+* **`kd::log` grew a stderr sink**, and its first `init()` now reaches the sinks before the first
+  line is emitted. §4.8 says asrd logs to stderr; there was no stderr sink, and the opening lines
+  of *every* process were going to the pre-init defaults.
+* **There is no `overload_audio` in asrd**, and `session_server.h` says why: the connection thread
+  never waits on the network, so §9's inbound queue does not exist to overflow. The buffer that
+  does grow is bounded by `VadConfig::max_utterance_ms`, which is a different mechanism.
+* **`Settings::normalise()` reconciles `server.mode` with `server.url`** when they cannot both be
+  right, so `serialize`→`parse` stays total. §4.6 specified the migration for a file with no mode
+  and not the impossible combination.
+* **A second fixture corpus**, `tests/fixtures/stability/`, generated from the Python tracker.
+  §5 asks for property tests against it; the protocol corpus cannot express them.
 
 This document restores a decision that was made, reversed, and then missed. It is effectively
 **revision 3 of `release-plan.md` §1**, and it exists because revision 2 produced a working
@@ -583,13 +600,13 @@ replaced by the narrower checks in §4.6.
 
 ## 7. Phases
 
-| Phase | Work | Gate |
-|---|---|---|
-| **T0** | CMake: `kd_wire` + `kvit-asrd`. `ws_server` + the fixture corpus in the server role; a translator that completes a handshake and answers `ready` with a stub backend | `kd_probe --server ws://127.0.0.1:10402/` against a standalone `kvit-asrd.exe`, and the 21 fixtures green in both roles |
-| **T1** | Session loop, endpointing, the OpenAI backend in finalize-only mode, load-time connect, one-in-flight HTTP, cancel-aborts-POST | A full dictation into Notepad, through `kvit-asrd.exe` started by hand, against strixhalo, with no Python running anywhere. Observed, not asserted. |
-| **T2** | Stability tracker + pseudo-streaming window; live preview available and off by default | Property tests green (C++ tracker == Python tracker on `stable_bytes`). Live preview against a batch model produces either a conforming stream or a refused emission — never a `stability_violation` on the client |
-| **T3** | Translator spawn (always compiled); `build-release.ps1` grep rewrite; Settings → Server becomes one address (`server.mode`, Test talks to asrd); `docs/setup.md` and README teach the speech-service URL | Install from the installer on a machine with no Python, type `http://…:10301`, press Test, dictate. Existing `ws://` settings still open a protocol connection and do not spawn asrd |
-| **T4** | Retire `run-server.bat`; delete the instructions that told the user to keep a Python window open | The file is gone, the docs do not mention it, and nothing in the shipped tree needs it |
+| Phase | Work | Gate | Status |
+|---|---|---|---|
+| **T0** | CMake: `kd_wire` + `kvit-asrd`. `ws_server` + the fixture corpus in the server role; a translator that completes a handshake and answers `ready` with a stub backend | `kd_probe --server ws://127.0.0.1:10402/` against a standalone `kvit-asrd.exe`, and the 21 fixtures green in both roles | **Done.** `kd_probe` against a standalone `kvit-asrd.exe` pointed at `http://strixhalo.lan:10301`: handshake 11 ms, ready 35 ms. Fixtures green in both roles — see `tests/test_asrd_fixtures.cpp`, which is explicit about what "the other role" can honestly mean for each kind. |
+| **T1** | Session loop, endpointing, the OpenAI backend in finalize-only mode, load-time connect, one-in-flight HTTP, cancel-aborts-POST | A full dictation into Notepad, through `kvit-asrd.exe` started by hand, against strixhalo, with no Python running anywhere. Observed, not asserted. | **Done, with the gate half-met by construction.** The dictating half needs a human at a microphone. The rest is `tests/test_asrd_session.cpp`: the real `IpcClient` against the real translator over a loopback socket, plus an opt-in case (`KD_ASRD_SERVICE`) that completes the whole path against strixhalo and gets a conforming `final` back. |
+| **T2** | Stability tracker + pseudo-streaming window; live preview available and off by default | Property tests green (C++ tracker == Python tracker on `stable_bytes`). Live preview against a batch model produces either a conforming stream or a refused emission — never a `stability_violation` on the client | **Done.** 17 recorded cases in `tests/fixtures/stability/`, agreeing byte for byte, step 3's disputed reading included. The live-preview gate is `asrd_session.live_preview_against_a_revising_model_never_reaches_the_client_broken`, and what it finds is worth knowing: with N=2 a model that recases the first word collapses the common prefix to zero, so nothing is ever published and everything commits at the `final`. Exactly what `publish_stable_partials` predicts. |
+| **T3** | Translator spawn (always compiled); `build-release.ps1` grep rewrite; Settings → Server becomes one address (`server.mode`, Test talks to asrd); `docs/setup.md` and README teach the speech-service URL | Install from the installer on a machine with no Python, type `http://…:10301`, press Test, dictate. Existing `ws://` settings still open a protocol connection and do not spawn asrd | **Done, less the clean-machine install.** The release script produces an installer with both halves and its new gates pass. The spawn is verified against strixhalo by an opt-in test that launches a real child, gets `ready` in 46 ms, and confirms the job object killed it. The migration is unit-tested for every case; the author's own `settings.json`, which has a `ws://` URL and no mode, reads as `protocol` and spawns nothing. **A clean-VM install is still owed** — `release-plan.md` §3's gate, unchanged by this work. |
+| **T4** | Retire `run-server.bat`; delete the instructions that told the user to keep a Python window open | The file is gone, the docs do not mention it, and nothing in the shipped tree needs it | **Done.** |
 
 T0 does not include spawn. T3 does not start until §4.6's spawn contract and settings schema are
 the code, not just this file.
