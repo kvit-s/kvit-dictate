@@ -1,8 +1,17 @@
 # kvit-dictate — Release Plan (v1.0, first build for other people)
 
-Status: **mostly built.** Revision 2, 2026-08-27, against commit `59b0a57`; implemented
-2026-08-28. §10 is the honest account of what was built, what was not, and what cannot be
-verified from a keyboard.
+Status: **mostly built, and §1 is superseded.** Revision 2, 2026-08-27, against commit
+`59b0a57`; implemented 2026-08-28. §10 is the honest account of what was built, what was not,
+and what cannot be verified from a keyboard.
+
+**Read `openai-translator.md` before acting on §1 or §2.2 of this file.** Revision 2's central
+move — ship the client, treat the server as configuration the user supplies — was implemented
+faithfully and turns out to be wrong for the endpoint this project actually talks to. The user's
+service speaks OpenAI-compatible HTTP, not this protocol, so a translator has to exist
+somewhere; deleting the shipped one did not remove it, it removed the *supervision* of it and
+left a Python window the user has to keep open. Revision 1's `kvit-asrd.exe` was right and
+`openai-translator.md` is revision 3 of that decision. The protocol boundary itself stands
+unchanged.
 
 `plan.md` is the design document for the experimental phase and it still wins on every question
 of architecture *inside* the client. This document is narrower and later: it covers only what has
