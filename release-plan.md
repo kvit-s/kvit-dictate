@@ -400,6 +400,7 @@ unverified; there is no third category.
 | §2.4 | The non-private-host warning | Unit-tested against loopback, all three RFC 1918 ranges, CGNAT, link-local, IPv6 unique-local, and the public addresses that must *not* be excused |
 | §3.2 | `/MT`, the application manifest, the icon, the version resource | The release script greps the binary for CRT imports and refuses to package if it finds any |
 | §1.2 | Spawn machinery out of shipped builds (`KD_ENABLE_SIDECAR_SPAWN=OFF`) | The release script greps for `CreateProcessW` and `AssignProcessToJobObject` and refuses to package if either is present |
+| §3 | The per-user installer | Installed silently, inspected, launched, uninstalled: program directory, Start Menu group, Run key and uninstall entry all created and all removed, and `settings.json` correctly kept |
 | §5 | MPL-2.0 / Apache-2.0 split, headers, CLA | `tools/apply-license-headers.sh --check` runs clean |
 | §6 | README rewrite, `docs/setup.md`, the corrected privacy statement | — |
 | §1.5 | Not the reference server, but `docs/examples/minimal_server.py`: a complete conforming server in 400 lines of standard library | Executed by 27 tests on every run, including the RFC 6455 vector that caught a wrong magic GUID |
@@ -415,10 +416,10 @@ Totals: 494 C++ tests, 475 server tests, 129 bench tests. All green.
   and it needs a person.
 * **The Test button in the dialog.** The function behind it is exercised through `kd_probe`; the
   button itself, its worker thread and its generation counter are not.
-* **The installer, beyond compiling.** `iscc` produces `kvit-dictate-1.0.0-setup.exe` (2.5 MB)
-  and its `[Code]` section verifies, but nobody has run it: not installed, not launched from the
-  Start Menu shortcut, not uninstalled. Compiling proves the script is well-formed and says
-  nothing about whether what it lays down works.
+* **The installer on a *clean* machine.** It has been installed, launched and uninstalled here
+  (see the table above), which proves the script and the payload. It has not been through R3's
+  actual gate: a browser download with Mark-of-the-Web intact, on a machine with no Visual Studio,
+  no exclusions and Defender at its defaults.
 
 ### Deliberately not done
 

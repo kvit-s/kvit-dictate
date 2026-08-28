@@ -76,10 +76,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-; Wired to Settings::start_with_windows rather than to a Run key here, so that the checkbox in
-; the settings dialog and this one cannot disagree about what is true. This task only sets the
-; initial value; the app owns it from then on.
-Name: "startup"; Description: "Start kvit-dictate when I sign in"; GroupDescription: "Startup:"
+; Unchecked, like the desktop icon, and for the reason the [Registry] section gives: a dictation
+; tool that added itself to startup uninvited would be making exactly the assumption this project
+; is careful not to make. It was pre-ticked in the first draft, which a silent install then
+; applied by default — verified by installing this and finding the Run key written without anyone
+; having agreed to it.
+Name: "startup"; Description: "Start kvit-dictate when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
