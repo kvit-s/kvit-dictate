@@ -2410,7 +2410,19 @@ void App::on_conn_state(kd::proto::ConnState s) {
                 // ChildRespawned is the event that takes it back to HANDSHAKE — collapsing
                 // SPAWNING/VALIDATING, clearing the dead session, and keeping the session_id
                 // counter, which is the whole point of fixture 020.
-                apply(session_->on_transport(sidecar_respawn_
+                //
+                // **On the WebSocket binding every connection takes that path, including the
+                // first.** There is no SPAWNING and no VALIDATING over a network: nothing is
+                // spawned and there is no peer PID to check, so the transport goes CONNECTING →
+                // HANDSHAKE and `PeerValidated` would arrive while the machine is still in its
+                // initial SPAWNING state — which it correctly rejects as a fatal
+                // `internal_error` ("peer validated outside VALIDATING"). Observed: every launch
+                // logged that error and burned two reconnects before working. The event's name
+                // is about a child because the pipe binding was the only one when it was named;
+                // release-plan.md §1.2 re-means it rather than renaming it, and this is the
+                // second half of that re-meaning.
+                const bool network = ipc_ != nullptr && !ipc_->server_url().empty();
+                apply(session_->on_transport(sidecar_respawn_ || network
                                                  ? kd::TransportEvent::ChildRespawned
                                                  : kd::TransportEvent::PeerValidated));
                 sidecar_respawn_ = false;

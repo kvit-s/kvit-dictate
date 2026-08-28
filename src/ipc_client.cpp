@@ -695,14 +695,22 @@ Status WsConn::open(const ParsedServerUrl& u, uint32_t connect_timeout_ms,
     sock.store(ws);
     req.reset();  // must outlive every header query above, and nothing beyond
 
-    // Infinite receive. A server is legitimately silent for the whole of a cold model load and
-    // for as long as the user is not dictating; anything finite here turns quiet into a fault.
-    DWORD infinite = 0;
-    if (!WinHttpSetOption(ws, WINHTTP_OPTION_RECEIVE_TIMEOUT, &infinite, sizeof(infinite))) {
-        KD_LOG_ERROR("could not clear the WebSocket receive timeout (err %lu); a long silence "
-                     "may now be reported as a lost connection",
-                     GetLastError());
-    }
+    // Measured, not assumed, because the first version of this got it wrong in both directions.
+    //
+    // WinHttpSetTimeouts' receive value bounds the *response*, i.e. the upgrade — it does not
+    // bound WinHttpWebSocketReceive, which blocks indefinitely by design. Trying to set
+    // WINHTTP_OPTION_RECEIVE_TIMEOUT on the WebSocket handle fails with 12018
+    // (ERROR_WINHTTP_INCORRECT_HANDLE_TYPE): it is not a request handle and does not carry that
+    // option. The original code did exactly that and logged an ERROR on every single connection,
+    // warning about a hazard that does not exist.
+    //
+    // Verified on this machine: a connection left idle for 75 seconds — five times the 15 000 ms
+    // receive timeout set above — was not dropped. That is the behaviour this binding needs,
+    // since a server is legitimately silent for the whole of a cold model load and for as long
+    // as the user is not dictating. Nothing has to be configured to get it.
+    //
+    // A dead peer still surfaces promptly: the socket closes, and the receive fails rather than
+    // hanging. §10.3 is what happens next. That is why the protocol needs no keepalive (§2.6.3).
 
     if (upgrade_ms != nullptr) *upgrade_ms = static_cast<uint32_t>(now_ms() - started);
     return Status::success();

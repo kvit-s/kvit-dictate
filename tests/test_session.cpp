@@ -1232,3 +1232,34 @@ KD_TEST(session, id_generator_never_reuses_and_verdict_spellings_are_stable) {
     KD_CHECK_EQ(kd::to_string(Effect::LogGap), "log_gap");
     KD_CHECK_EQ(kd::to_string(Effect::ResetAnchorConfidence), "reset_anchor_confidence");
 }
+
+// ─── The WebSocket binding has no SPAWNING and no VALIDATING ─────────────────────────────────
+//
+// release-plan.md §1.2 re-means `ChildRespawned` rather than renaming it, and main.cpp leans on
+// the property asserted here: over a network there is nothing to spawn and no peer PID to check,
+// so the transport goes CONNECTING → HANDSHAKE and the *first* connection has to be driven by
+// the same event a reconnection is. These two tests pin both halves of that, because the bug
+// they describe was found by running the app rather than by any test.
+
+KD_TEST(session, peer_validated_from_the_initial_state_is_fatal) {
+    // Not a defect — this is the pipe binding's contract, and it is what made the mis-wiring
+    // loud instead of silent. Every launch logged "peer validated outside VALIDATING" and burned
+    // two reconnects before working.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    const auto out = m.on_transport(TransportEvent::PeerValidated);
+    KD_CHECK_EQ(out.verdict, Verdict::ProtocolError);
+    KD_CHECK(out.to_send.empty());
+}
+
+KD_TEST(session, child_respawned_drives_a_first_connection_too) {
+    // What the network path uses instead, from the machine's initial state rather than from
+    // DEAD: it must reach HANDSHAKE and emit exactly one `hello`.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    const auto out = m.on_transport(TransportEvent::ChildRespawned);
+    KD_CHECK_EQ(out.verdict, Verdict::Reconnected);
+    KD_CHECK_EQ(m.state(), proto::ConnState::Handshake);
+    KD_REQUIRE_EQ(out.to_send.size(), size_t{1});
+    KD_CHECK(sends(out, proto::MessageType::Hello));
+}
