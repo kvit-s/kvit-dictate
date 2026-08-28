@@ -94,6 +94,10 @@ struct State {
 
     Config pending;
     bool has_pending = false;
+    // True once a configuration has actually reached the sinks. Distinguishes the first init()
+    // — which must take effect before a single line is emitted — from a reconfiguration, which
+    // must not disturb records already queued. See writer_main().
+    bool configured = false;
 
     std::atomic<uint64_t> dropped{0};
 
@@ -240,6 +244,15 @@ void roll_file_if_needed(State& s, size_t incoming) {
 void emit(State& s, std::string_view line) {
     if (s.active.to_debugger) emit_to_debugger(line);
 
+    if (s.active.to_stderr) {
+        // One fwrite for the line and one for the terminator would let two threads interleave,
+        // but only the writer thread reaches here, so the pair is atomic enough. stderr is
+        // unbuffered by default on Windows, which is what a supervised child wants: the parent
+        // reads the pipe as the lines are produced rather than in 4 KB gulps at exit.
+        std::fwrite(line.data(), 1, line.size(), stderr);
+        std::fputc('\n', stderr);
+    }
+
     if (s.file.is_open()) {
         roll_file_if_needed(s, line.size() + 2);
         s.file.write(line.data(), static_cast<std::streamsize>(line.size()));
@@ -281,12 +294,25 @@ void writer_main() {
         bool finished = false;
         Config to_apply;
         bool apply = false;
+        bool apply_first = false;
 
         {
             std::unique_lock<std::mutex> lk(s.mu);
             s.cv.wait_for(lk, std::chrono::milliseconds(200), [&s] {
                 return s.stopping || s.count > 0 || s.has_pending;
             });
+
+            // The *first* configuration is applied before anything is emitted. Deferring it
+            // like a reconfiguration would put the process's opening lines on the default sinks
+            // — which for kvit-asrd, whose only sink is stderr, meant its "starting" line going
+            // nowhere while every later line arrived. The promise below is about a *re*-init and
+            // is not weakened by this.
+            if (s.has_pending && !s.configured) {
+                to_apply = s.pending;
+                apply_first = true;
+                s.has_pending = false;
+                s.configured = true;
+            }
 
             n = (std::min)(s.count, kBatchMax);
             const size_t cap = s.ring.size();
@@ -308,6 +334,9 @@ void writer_main() {
             }
             finished = s.stopping && s.count == 0;
         }
+
+        // Outside the lock, like every other sink touch: apply_config() can open a file.
+        if (apply_first) apply_config(s, to_apply);
 
         for (size_t i = 0; i < n; ++i) {
             emit(s, std::string_view(batch[i].text, batch[i].len));

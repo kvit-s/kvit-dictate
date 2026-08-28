@@ -84,6 +84,13 @@ struct Config {
     // Mirror diagnostics to OutputDebugStringW. Cheap, persists nothing.
     bool to_debugger = true;
 
+    // Mirror diagnostics to stderr. Off for the GUI client, which has no console to write to;
+    // ON for `kvit-asrd`, whose whole diagnostic channel is its standard error — supervised, the
+    // parent redirects it into the client's log, and standalone it is the terminal the operator
+    // started it in (openai-translator.md §4.8). A separate asrd.log would split the first
+    // support question across two files, which is why there is not one.
+    bool to_stderr = false;
+
     // Diagnostics file. Empty means "no file", which is the release default: plan.md §1.9's
     // "persisted by default" prohibition is about transcripts, but a diagnostics file that
     // records window titles and process names is close enough to the line that it is opt-in too.

@@ -135,16 +135,45 @@ endif()
 # MSVC_RUNTIME_LIBRARY needs CMP0091 NEW, which cmake_minimum_required(3.24) sets.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# ─── kd_wire: the protocol and the text primitives, shared by both executables ───────────────
+#
+# Split out of kd_core when kvit-asrd arrived (openai-translator.md §4.8). The translator needs
+# the codec, the grapheme layer, the JSON parser and the logger; it must NOT need Direct2D,
+# DirectWrite, WASAPI or the settings dialog, all of which kd_core drags in. Linking kd_core
+# into a headless translator would pull Direct2D into it and make the size claim a lie.
+#
+# The rule for this list: a file belongs in kd_wire if it has no UI, no audio device and no
+# window — the same test that decides whether a module is unit-testable without a message loop.
+# `src/session.cpp` and `src/commit_engine.cpp` deliberately stay in kd_core: they are the
+# *client's* halves of the conversation, and openai-translator.md §4.3 is explicit that the
+# translator ports the producer of `stable_bytes` rather than calling the consumer of it.
+
+set(KD_WIRE_SOURCES
+    src/protocol.cpp
+    src/util/utf8.cpp
+    src/util/json.cpp
+    src/util/log.cpp
+)
+
+set(KD_WIRE_HEADERS
+    src/protocol.h
+    src/util/clock.h
+    src/util/json.h
+    src/util/log.h
+    src/util/result.h
+    src/util/utf8.h
+)
+
+add_library(kd_wire STATIC ${KD_WIRE_SOURCES} ${KD_WIRE_HEADERS})
+target_include_directories(kd_wire PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(kd_wire PUBLIC kd_common_flags)
+
 # ─── kd_core: every module except main.cpp ───────────────────────────────────────────────────
 
 set(KD_CORE_SOURCES
     # Pure logic — no <windows.h>, unit-tested without a UI (see the header of each).
-    src/protocol.cpp
     src/session.cpp
     src/commit_engine.cpp
-    src/util/utf8.cpp
-    src/util/json.cpp
-    src/util/log.cpp
     src/settings.cpp
     src/edit_buffer.cpp
 
@@ -161,7 +190,6 @@ set(KD_CORE_SOURCES
 )
 
 set(KD_CORE_HEADERS
-    src/protocol.h
     src/normalizer.h
     src/session.h
     src/commit_engine.h
@@ -175,17 +203,12 @@ set(KD_CORE_HEADERS
     src/theme.h
     src/tray_icon.h
     src/edit_buffer.h
-    src/util/clock.h
-    src/util/json.h
-    src/util/log.h
-    src/util/result.h
-    src/util/utf8.h
 )
 
 add_library(kd_core STATIC ${KD_CORE_SOURCES} ${KD_CORE_HEADERS})
 
 target_include_directories(kd_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(kd_core PUBLIC kd_common_flags)
+target_link_libraries(kd_core PUBLIC kd_common_flags kd_wire)
 
 # ─── Windows libraries ───────────────────────────────────────────────────────────────────────
 #
@@ -316,6 +339,58 @@ add_custom_command(TARGET kvit-dictate POST_BUILD
             "$<TARGET_FILE_DIR:kvit-dictate>/models.json"
     COMMENT "Copying models.json next to kvit-dictate.exe"
     VERBATIM
+)
+
+# ─── kvit-asrd.exe — the translator (openai-translator.md §4.8) ──────────────────────────────
+#
+# The second half of the shipped application: it speaks docs/protocol.md on a loopback
+# WebSocket and an OpenAI-compatible /v1/audio/transcriptions service over HTTP, so that a user
+# who owns a speech box configures **one address** instead of keeping a Python window open.
+#
+# **It does not link kd_core.** That is the whole reason kd_wire exists: kd_core carries the
+# overlay, the tray, the injector, WASAPI and the settings dialog, and linking it here would
+# pull Direct2D into a headless translator and make the size claim a lie.
+#
+# Console subsystem on purpose: standalone use is a terminal, and when the client spawns it,
+# CREATE_NO_WINDOW hides the console. No icon and no application manifest beyond asInvoker —
+# there is no window to be DPI-aware about.
+
+set(KD_ASRD_SOURCES
+    src/asrd/main.cpp
+    src/asrd/ws_server.cpp
+    src/asrd/session_server.cpp
+    src/asrd/stability.cpp
+    src/asrd/vad.cpp
+    src/asrd/backend_openai.cpp
+    src/asrd/http.cpp
+)
+
+set(KD_ASRD_HEADERS
+    src/asrd/ws_server.h
+    src/asrd/session_server.h
+    src/asrd/stability.h
+    src/asrd/vad.h
+    src/asrd/backend_openai.h
+    src/asrd/http.h
+)
+
+add_executable(kvit-asrd ${KD_ASRD_SOURCES} ${KD_ASRD_HEADERS})
+
+#   bcrypt   ws_server — BCryptCreateHash(BCRYPT_SHA1_ALGORITHM) for Sec-WebSocket-Accept.
+#            Already a project dependency (BCryptGenRandom in ipc_client), so this adds no new
+#            DLL; crypt32 is deliberately NOT added for one base64 call, which is twenty lines.
+#   winhttp  backend_openai/http — the POST to /v1/audio/transcriptions and /v1/audio/vad.
+#   ws2_32   ws_server — the listening socket. WinHTTP is a client API and has no server-side
+#            counterpart short of http.sys, which wants a namespace reservation and elevation.
+target_link_libraries(kvit-asrd PRIVATE kd_wire bcrypt winhttp ws2_32)
+
+# Same version numbers as the client, from project(), so the two binaries in one installer can
+# never disagree about which build they are.
+target_compile_definitions(kvit-asrd PRIVATE
+    KVIT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    KVIT_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    KVIT_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    KVIT_VERSION_RAW=${PROJECT_VERSION}
 )
 
 # ─── tools/ ──────────────────────────────────────────────────────────────────────────────────
