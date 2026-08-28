@@ -3,22 +3,47 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #pragma once
 //
-// The named-pipe transport: pipe creation with an explicit DACL, child spawn under a job
-// object, peer validation, overlapped framed I/O, bounded queues.
+// The transport. **Two bindings, one set of queues, one framing layer.**
+//
+//   * **WebSocket** (docs/protocol.md §2.6) — what a shipped build speaks. `connect()`. WinHTTP,
+//     which the project already links for normalizer.cpp, so this adds no dependency; the
+//     endpoint is a URL the user configures and there is no child process anywhere in it.
+//   * **Named pipe** (docs/protocol.md §2.2–§2.5) — `start()`. Pipe creation with an explicit
+//     DACL, child spawn under a job object, peer validation, overlapped framed I/O. Retained
+//     for the bench, which genuinely does launch its subject locally.
+//
+// The two share everything above L0: the bounded queues, the FrameReader, the message
+// callbacks, the handshake deadlines, the backpressure rules. That sharing is the point —
+// release-plan.md §1.2 could claim the framing layer was transport-agnostic only because it
+// already was, and keeping both bindings alive is what keeps the claim honest.
 //
 // Implements: docs/protocol.md §2 (transport) and §9 (backpressure), plan.md §1.2 (security).
 // The framing and message codec live in protocol.h and are pure; this file is the Windows half
-// and is deliberately the only place in the project that opens a pipe or spawns a process.
+// and is deliberately the only place in the project that opens a socket, opens a pipe, or
+// spawns a process.
 //
 // ─── Role naming ────────────────────────────────────────────────────────────────────────────
 //
-// This class is the **pipe server** (it creates the instance) and the **protocol client** (it
-// drives sessions). The inversion is deliberate: only the parent can generate a per-launch
-// name, apply a DACL before anyone can connect, and know the child's PID for peer validation.
-// The class is named for its protocol role, which is the one the rest of the program cares
-// about. See docs/protocol.md §1.
+// This class is always the **protocol client** — it drives sessions — and the class is named
+// for that role, which is the one the rest of the program cares about. Who opens the connection
+// differs per binding and is the single most confusing thing in docs/protocol.md §1:
 //
-// ─── The security requirements, none of which are optional ──────────────────────────────────
+//   * WebSocket: the server listens, this connects. The ordinary arrangement.
+//   * Named pipe: this is the **pipe server** and creates the instance; the child connects to
+//     it. Deliberate — only the parent can generate a per-launch name, apply a DACL before
+//     anyone can connect, and know the child's PID for peer validation.
+//
+// ─── Security: what each binding does and does not defend ───────────────────────────────────
+//
+// **The WebSocket binding has neither authentication nor confidentiality in v1** (docs §2.8).
+// Anyone who can reach the port can send audio; over `ws://` anyone on the path can read it.
+// This is not a regression from the pipe binding, and saying so is the honest framing: the DACL
+// below only ever protected the local hop between two processes on one machine, while the audio
+// it carried was already being forwarded to another host in plaintext. The supported deployment
+// is loopback and a network the user controls, `host_is_private()` below is what the settings
+// page uses to warn when it is neither, and the warning is a sentence rather than a block.
+//
+// The pipe binding's requirements, none of which are optional:
 //
 // Revision 1 of the plan claimed a named pipe's default ACL restricts it to the current user.
 // **That is false** — Microsoft documents that the default descriptor grants full control to
@@ -177,7 +202,77 @@ private:
 Result<uintptr_t> create_pipe_instance(const std::wstring& pipe_name,
                                        const SecurityDescriptorBuilder& sec);
 
-// ─── Child process description ──────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The WebSocket binding (docs/protocol.md §2.6)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+// Where the app is pointed. Persisted as part of Settings; see settings.h.
+struct ServerEndpoint {
+    // The URL exactly as the user typed it. `ws://`, `wss://`, and — because people type them —
+    // `http://` and `https://` as synonyms (docs §2.6.1). Empty means no server is configured,
+    // which is ConnState::NoServer and docs §10.6, and is not an error.
+    std::wstring url;
+
+    // Optional model request (docs §5.1). Empty means "whatever the server serves by default".
+    // A server that does not have the named model answers `model_unavailable`; it must never
+    // quietly load a different one, because that produces transcripts that are merely worse.
+    std::string model;
+
+    uint32_t connect_timeout_ms = proto::kConnectTimeoutMs;
+};
+
+// The pieces of a URL the transport needs. Split out as a pure function because URL parsing is
+// where a "close enough" implementation silently connects to the wrong host — `ws://a.com@b.com/`
+// resolves to b.com, and a parser that stops at the first `/` gets it wrong.
+struct ParsedServerUrl {
+    bool secure = false;        // wss:// or https://
+    std::wstring host;          // no brackets, even for a literal IPv6 address
+    uint16_t port = 0;          // explicit, or 80/443 by scheme
+    std::wstring path;          // path plus query, "/" when the URL had none
+    bool literal_ipv6 = false;  // the host was written as [::1]
+};
+
+// Parses, or fails with a message naming what is wrong in words a user can act on. Rejects:
+// an unknown scheme, a missing host, a port outside 1..65535, and a URL with a fragment (a
+// fragment is never sent to a server, so a URL carrying one means the user pasted the wrong
+// thing). A trailing path is preserved verbatim; the Client never appends one of its own.
+Result<ParsedServerUrl> parse_server_url(std::wstring_view url);
+
+// True for loopback, RFC 1918, RFC 6598 carrier-grade NAT, link-local, unique-local IPv6, and
+// unqualified or `.local` names. docs §2.8: the settings page warns when a host is neither this
+// nor encrypted.
+//
+// **It is a warning, not a boundary, and it must not be mistaken for one.** A private-looking
+// name can resolve anywhere — `internal.example.com` is unqualified-looking and is not, a
+// hostname is whatever DNS says it is — and this function never resolves anything. It exists so
+// that the person who types a public hostname into a URL box gets a sentence about it before
+// they dictate a password into it, which is the realistic failure and not an attack.
+bool host_is_private(std::wstring_view host);
+
+// What a settings page's Test button reports back. docs/protocol.md §5, §5.1: the handshake
+// carries everything needed to describe the endpoint, so proving it works is one connection.
+struct ServerProbe {
+    std::string server_build;   // hello_ack.server, if any
+    std::string model;          // ready.model
+    proto::StreamingMode mode = proto::StreamingMode::NativeStreaming;
+    bool context_supported = false;
+    uint32_t chunk_ms = 0;
+    std::vector<proto::ModelInfo> models;  // hello_ack.models[], empty when not advertised
+    uint32_t connect_ms = 0;    // to the completed upgrade
+    uint32_t handshake_ms = 0;  // upgrade to hello_ack
+    uint32_t ready_ms = 0;      // upgrade to ready; a cold model load lands here, not in a bug report
+};
+
+// Opens a real connection, completes the handshake, waits for `ready`, and closes. Synchronous
+// and self-contained: it starts no I/O thread and touches no IpcClient state, so it is safe to
+// call from a modal dialog. **Blocks the calling thread** for up to `timeout_ms` — the caller is
+// the settings dialog, which runs it on a worker.
+//
+// A settings page that can prove the endpoint works converts most of the future support burden
+// into one button, which is the whole argument for it (release-plan.md §2.2).
+Result<ServerProbe> probe_server(const ServerEndpoint& endpoint, uint32_t timeout_ms);
+
+// ─── Child process description — pipe binding only ──────────────────────────────────────────
 
 struct ChildSpec {
     // Absolute path to the interpreter, straight from models.json (settings.h). The C++ side
@@ -237,6 +332,19 @@ public:
     // freeze the UI thread for the model's whole cold load, which can be minutes.
     Status start(const ChildSpec& child, Callbacks cb);
 
+    // The WebSocket binding (docs/protocol.md §2.6). Resolves, connects, upgrades, and enters
+    // HANDSHAKE. Returns as soon as the I/O thread is running — the connection completes
+    // asynchronously and is reported through on_state/on_error, because blocking here would
+    // freeze the UI thread for a DNS lookup against a machine that is switched off.
+    //
+    // **It does not send `hello`**, for exactly the reason start() does not: SessionMachine owns
+    // that frame and fixture 020 asserts it. Entering HANDSHAKE arms HELLO_TIMEOUT_MS here.
+    //
+    // An empty `endpoint.url` is StatusCode::InvalidArgument with `no_server_configured`. That
+    // is docs §10.6 and it is not a fault: it is what every fresh install looks like. The caller
+    // shows ConnState::NoServer in the tray and does not open the microphone.
+    Status connect(const ServerEndpoint& endpoint, Callbacks cb);
+
     // Runs the framed I/O loop over an **already connected, already peer-validated** pipe-server
     // handle, taking ownership of it. It enters HANDSHAKE without writing `hello`, exactly as
     // start() does; see the note there for why that frame belongs to SessionMachine.
@@ -295,6 +403,10 @@ public:
 
     [[nodiscard]] std::wstring pipe_name() const;
     [[nodiscard]] uint32_t child_pid() const noexcept;
+
+    // The URL this connection was opened against, empty on the pipe binding. For log lines and
+    // for the tray's "reconnecting to …" text.
+    [[nodiscard]] std::wstring server_url() const;
 
 private:
     struct Impl;

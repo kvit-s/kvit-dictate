@@ -275,3 +275,135 @@ KD_TEST(ipc, a_pipe_created_with_the_descriptor_accepts_a_local_client) {
     CloseHandle(client);
     CloseHandle(server_handle);
 }
+
+// ─── The WebSocket binding's pure halves (docs/protocol.md §2.6.1, §2.8) ─────────────────────
+//
+// Both are pure functions on a string, and both are places where a "close enough"
+// implementation is silently wrong rather than loudly broken: a URL parser that guesses the
+// host connects to the wrong machine, and a private-address test that is too generous
+// suppresses the one warning the user was going to get before dictating a password into a
+// public endpoint.
+
+namespace {
+
+kd::ParsedServerUrl parse_ok(const wchar_t* url) {
+    const kd::Result<kd::ParsedServerUrl> r = kd::parse_server_url(url);
+    if (!r) {
+        KD_FAIL(std::string("expected this URL to parse: ") + narrow(url) + " — " +
+                r.status().message());
+        return {};
+    }
+    return *r;
+}
+
+void parse_fails(const wchar_t* url) {
+    const kd::Result<kd::ParsedServerUrl> r = kd::parse_server_url(url);
+    if (r) {
+        KD_FAIL(std::string("expected this URL to be rejected: ") + narrow(url));
+        return;
+    }
+    // A rejection with no sentence in it is barely better than a silent one: this string is
+    // what the settings dialog shows the user, and "InvalidArgument" is not an instruction.
+    KD_CHECK(!r.status().message().empty());
+}
+
+}  // namespace
+
+KD_TEST(ipc, url_schemes) {
+    KD_CHECK_EQ(parse_ok(L"ws://127.0.0.1:10402/").secure, false);
+    KD_CHECK_EQ(parse_ok(L"wss://asr.example.com/").secure, true);
+    // docs §2.6.1: http/https are accepted as synonyms because people type them, and refusing
+    // them would be a support question rather than a lesson.
+    KD_CHECK_EQ(parse_ok(L"http://box.lan:10402/").secure, false);
+    KD_CHECK_EQ(parse_ok(L"https://box.lan/").secure, true);
+    parse_fails(L"ftp://box.lan/");
+    // No scheme is rejected rather than guessed: defaulting to ws:// would silently pick the
+    // unencrypted one on the user's behalf.
+    parse_fails(L"127.0.0.1:10402");
+    parse_fails(L"");
+    parse_fails(L"   ");
+}
+
+KD_TEST(ipc, url_default_ports) {
+    KD_CHECK_EQ(parse_ok(L"ws://host/").port, 80);
+    KD_CHECK_EQ(parse_ok(L"wss://host/").port, 443);
+    KD_CHECK_EQ(parse_ok(L"ws://host:10402/").port, 10402);
+    KD_CHECK_EQ(parse_ok(L"ws://host:65535/").port, 65535);
+    parse_fails(L"ws://host:0/");
+    parse_fails(L"ws://host:65536/");
+    parse_fails(L"ws://host:asr/");
+}
+
+KD_TEST(ipc, url_path_is_preserved_verbatim) {
+    // §2.6.1: the path is whatever the URL carries, and the Client never appends one of its own.
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:9/").path), std::string("/"));
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:9").path), std::string("/"));
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:9/kvit-dictate/v1").path),
+                std::string("/kvit-dictate/v1"));
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:9/v1?model=parakeet").path),
+                std::string("/v1?model=parakeet"));
+    // A query with no path still has to reach the server as a path plus a query.
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:9?k=v").path), std::string("/?k=v"));
+}
+
+KD_TEST(ipc, url_ipv6_needs_brackets) {
+    const kd::ParsedServerUrl u = parse_ok(L"ws://[::1]:10402/");
+    KD_CHECK_EQ(narrow(u.host), std::string("::1"));
+    KD_CHECK_EQ(u.port, 10402);
+    KD_CHECK_EQ(u.literal_ipv6, true);
+    KD_CHECK_EQ(parse_ok(L"ws://[fe80::1]/").port, 80);
+    // Unbracketed IPv6 is a real mistake people make; the rejection says how to fix it.
+    parse_fails(L"ws://::1:10402/");
+    parse_fails(L"ws://[::1:10402/");
+}
+
+KD_TEST(ipc, url_refuses_userinfo_and_fragments) {
+    // ws://a@b connects to *b*, which is exactly the trick a phishing link uses. This protocol
+    // carries no credentials at all (docs §2.8), so userinfo here is a mistake or a deception.
+    parse_fails(L"ws://trusted.lan@evil.example.com/");
+    parse_fails(L"ws://user:pass@host/");
+    // A fragment is never sent to a server: a URL carrying one is a page address, pasted wrong.
+    parse_fails(L"ws://host/path#section");
+}
+
+KD_TEST(ipc, url_whitespace_is_trimmed_not_rejected) {
+    // Pasted out of a chat window often enough that rejecting it would teach nothing.
+    KD_CHECK_EQ(narrow(parse_ok(L"  ws://host:10402/  ").host), std::string("host"));
+    KD_CHECK_EQ(narrow(parse_ok(L"ws://host:10402/\r\n").host), std::string("host"));
+}
+
+KD_TEST(ipc, private_hosts) {
+    KD_CHECK(kd::host_is_private(L"127.0.0.1"));
+    KD_CHECK(kd::host_is_private(L"127.10.20.30"));
+    KD_CHECK(kd::host_is_private(L"10.0.0.5"));
+    KD_CHECK(kd::host_is_private(L"172.16.0.1"));
+    KD_CHECK(kd::host_is_private(L"172.31.255.254"));
+    KD_CHECK(kd::host_is_private(L"192.168.1.7"));
+    KD_CHECK(kd::host_is_private(L"169.254.10.1"));   // link-local
+    KD_CHECK(kd::host_is_private(L"100.64.0.1"));     // carrier-grade NAT
+    KD_CHECK(kd::host_is_private(L"::1"));
+    KD_CHECK(kd::host_is_private(L"fd00::1"));        // unique-local
+    KD_CHECK(kd::host_is_private(L"fe80::abcd"));     // link-local
+    KD_CHECK(kd::host_is_private(L"localhost"));
+    KD_CHECK(kd::host_is_private(L"LocalHost"));
+    KD_CHECK(kd::host_is_private(L"strixhalo"));      // unqualified: a machine on this network
+    KD_CHECK(kd::host_is_private(L"strixhalo.lan"));
+    KD_CHECK(kd::host_is_private(L"nas.local"));
+}
+
+KD_TEST(ipc, public_hosts_get_the_warning) {
+    KD_CHECK(!kd::host_is_private(L"asr.example.com"));
+    KD_CHECK(!kd::host_is_private(L"8.8.8.8"));
+    KD_CHECK(!kd::host_is_private(L"172.32.0.1"));    // just outside RFC 1918
+    KD_CHECK(!kd::host_is_private(L"172.15.255.255"));
+    KD_CHECK(!kd::host_is_private(L"192.169.1.1"));
+    KD_CHECK(!kd::host_is_private(L"11.0.0.1"));
+    KD_CHECK(!kd::host_is_private(L"2001:4860:4860::8888"));
+    // Deliberately public: a name that merely *ends* in something private-looking is not one.
+    KD_CHECK(!kd::host_is_private(L"notlocalhost.example.com"));
+    // The honest limit of this function, asserted so nobody mistakes it for a boundary: it never
+    // resolves anything, so a name that looks private and points anywhere is answered by its
+    // shape. `internal.example.com` is public-shaped and may be internal; the reverse is also
+    // possible. It is a warning, not a control.
+    KD_CHECK(!kd::host_is_private(L"internal.example.com"));
+}

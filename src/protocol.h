@@ -113,6 +113,11 @@ enum class ErrorCode : uint8_t {
     overload_control,
     model_load_failed,
     internal_error,
+    // Added with the network binding (docs/protocol.md §2.7, §5.1). Both are Server -> Client
+    // and both are fatal: the connection cannot proceed, but the endpoint is working and said
+    // so, which is a materially different thing for the user than a socket that did not open.
+    server_busy,
+    model_unavailable,
     // Non-fatal, wire-visible. `session_id` is REQUIRED on these (§11.1).
     stability_violation,
     decode_failed,
@@ -124,6 +129,13 @@ enum class ErrorCode : uint8_t {
     model_load_timeout,
     peer_mismatch,
     pipe_squatted,
+    // The network binding's local failures (docs/protocol.md §11.3, final paragraph). Kept
+    // apart rather than collapsed into one "cannot connect", because each one has a different
+    // next action for the user and the tray text is the only place they will ever see it.
+    connect_timeout,     // the host did not answer: wrong address, machine off, firewall
+    connect_refused,     // it answered and said no: server not running, wrong port
+    tls_failed,          // wss:// and a certificate this machine does not trust
+    no_server_configured,  // the settings are empty. Not an error — see ConnState::NoServer.
     // Forward tolerance (§13): a code this build does not know. `ErrorMsg::code_raw` keeps the
     // original string; the receiver acts on `fatal`. This is the only place in the protocol
     // where an unknown value is tolerated, and the reason is that the alternative — a fatal
@@ -334,6 +346,10 @@ StopReason stop_reason_from_string(std::string_view s) noexcept;
 struct HelloMsg {
     int32_t proto = kProtoVersion;         // R, range 1..65535
     std::optional<std::string> client;     // O, diagnostics only; never parsed for behaviour
+    // O, §5.1. Absent means "whatever the server serves by default". A server that does not
+    // have the named model answers `model_unavailable`; substituting another is forbidden,
+    // because the result is transcripts that are merely worse and nobody notices.
+    std::optional<std::string> model;
 };
 
 struct StartMsg {
@@ -365,9 +381,23 @@ struct DiscontinuityMsg {
 
 // ── Server -> Client ────────────────────────────────────────────────────────────────────────
 
+// One entry of `hello_ack.models[]` (§5.1). Everything but `id` is optional, because a server
+// that knows only the ids of its models is still more useful than one that advertises nothing.
+struct ModelInfo {
+    std::string id;                              // R
+    std::optional<std::string> display_name;     // O
+    std::optional<StreamingMode> mode;           // O, the ready.mode taxonomy
+    std::optional<int32_t> chunk_ms;             // O
+    bool context_supported = false;              // O, default false
+};
+
 struct HelloAckMsg {
     int32_t proto = kProtoVersion;      // R, MUST equal the offered proto
     std::optional<std::string> server;  // O
+    // O, §5.1. Empty means "not advertised", never "there is only one" — a receiver that
+    // inferred a one-model server from an absent catalogue would hide every other model the
+    // server has. The settings page falls back to a free-text field instead.
+    std::vector<ModelInfo> models;
 };
 
 struct LoadingMsg {
@@ -415,6 +445,8 @@ struct ErrorMsg {
     std::string msg;                             // R, prose, never parsed
     std::optional<std::string> session_id;       // REQUIRED when fatal == false (§11.1)
     std::vector<int32_t> supported;              // O, only with proto_unsupported
+    std::optional<int32_t> retry_after_ms;       // O, only with server_busy (§2.7)
+    std::vector<std::string> available;          // O, only with model_unavailable (§5.1)
 };
 
 // One decoded control message.
@@ -531,8 +563,13 @@ StabilityCheck check_stability(std::string_view prev_text, uint64_t prev_stable,
 // the fixture files (§12.5 `initial.state`) spell them exactly this way.
 
 enum class ConnState : uint8_t {
-    Spawning,    // Client only: pipe created, child launched, awaiting ConnectNamedPipe
-    Validating,  // Client only: connected, checking GetNamedPipeClientProcessId
+    // docs/protocol.md §10.6. Not an error state: it is what every fresh install looks like and
+    // what every user sees when the machine hosting their server is off. The obligations it
+    // carries are real ones — no microphone, words in the tray, no pill, never silent.
+    NoServer,    // Client only, WebSocket binding: no URL is configured
+    Connecting,  // Client only, WebSocket binding: resolving, connecting, upgrading (§2.6.2)
+    Spawning,    // Client only, pipe binding: pipe created, child launched, awaiting connect
+    Validating,  // Client only, pipe binding: connected, checking the peer PID
     Handshake,   // hello sent/awaited; nothing else may cross
     Loading,     // hello_ack exchanged; model loading
     Idle,        // ready exchanged; no session open

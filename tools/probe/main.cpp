@@ -45,6 +45,7 @@
 
 #include "anchor.h"
 #include "injector.h"
+#include "ipc_client.h"
 #include "util/json.h"
 #include "util/utf8.h"
 
@@ -520,6 +521,62 @@ void print_matrix_status() {
 
 }  // namespace
 
+// ─── --server: prove an ASR endpoint works, from the command line ────────────────────────────
+//
+// The same kd::probe_server() the settings dialog's Test button calls, so a support answer can
+// be "run this and paste the output" and the two cannot disagree. docs/setup.md documents it.
+int probe_server_main(const std::string& url, const std::string& model, uint32_t timeout_ms) {
+    kd::ServerEndpoint ep;
+    ep.url = kd::utf8::to_utf16_or_empty(url);
+    ep.model = model;
+
+    const kd::Result<kd::ParsedServerUrl> parsed = kd::parse_server_url(ep.url);
+    if (!parsed) {
+        std::printf("FAIL  %s\n", parsed.status().message().c_str());
+        return 2;
+    }
+    std::printf("host      %s\nport      %u\npath      %s\nscheme    %s\n",
+                kd::utf8::from_utf16_or_empty(parsed->host).c_str(),
+                static_cast<unsigned>(parsed->port),
+                kd::utf8::from_utf16_or_empty(parsed->path).c_str(),
+                parsed->secure ? "encrypted (wss)" : "plaintext (ws)");
+    if (!parsed->secure && !kd::host_is_private(parsed->host)) {
+        // docs/protocol.md §2.8. A sentence, not a refusal.
+        std::printf("WARNING   this host is neither loopback nor a private address, and ws:// is\n"
+                    "          unencrypted: the audio and every transcript cross the network in\n"
+                    "          the clear, and anyone who can reach the port can send audio.\n");
+    }
+
+    const kd::Result<kd::ServerProbe> r = kd::probe_server(ep, timeout_ms);
+    if (!r) {
+        std::printf("FAIL      %s\n", r.status().message().c_str());
+        return 1;
+    }
+    const kd::ServerProbe& pr = *r;
+    std::printf("\nOK\n"
+                "server    %s\n"
+                "model     %s\n"
+                "mode      %s\n"
+                "context   %s\n",
+                pr.server_build.empty() ? "(not reported)" : pr.server_build.c_str(),
+                pr.model.c_str(), kd::proto::to_string(pr.mode),
+                pr.context_supported ? "supported" : "not supported");
+    if (pr.chunk_ms != 0) std::printf("chunk_ms  %u\n", pr.chunk_ms);
+    std::printf("connect   %u ms\nhandshake %u ms\nready     %u ms\n", pr.connect_ms,
+                pr.handshake_ms, pr.ready_ms);
+    if (pr.models.empty()) {
+        std::printf("models    (not advertised — the model field is free text for this server)\n");
+    } else {
+        std::printf("models    %zu advertised:\n", pr.models.size());
+        for (const kd::proto::ModelInfo& mi : pr.models) {
+            std::printf("          %-24s %s%s\n", mi.id.c_str(),
+                        mi.mode.has_value() ? kd::proto::to_string(*mi.mode) : "(mode unstated)",
+                        mi.context_supported ? ", context" : "");
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     // Physical pixels, per-monitor. The whole measurement is in screen coordinates and a
     // virtualised process would report positions that are wrong by the scale factor — which
@@ -555,6 +612,9 @@ int main(int argc, char** argv) {
     bool dump_state = false;
     std::string side_channel_cmd;
     std::string notes;
+    std::string server_url;
+    std::string server_model;
+    uint32_t server_timeout_ms = 30000;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -576,9 +636,22 @@ int main(int argc, char** argv) {
         else if (a == "--dump-state") dump_state = true;
         else if (a == "--no-side-channel") no_side_channel = true;
         else if (a == "--send") { side_channel_cmd = next(); dump_state = true; }
+        else if (a == "--server") server_url = next();
+        else if (a == "--model") server_model = next();
+        else if (a == "--timeout-ms") {
+            server_timeout_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        }
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "kd_probe — Phase 0B measurement harness (fixed text, no ASR)\n\n"
+                "  --server <url>           connect to an ASR endpoint, complete the handshake,\n"
+                "                           print what it reports, and exit. The same check the\n"
+                "                           settings dialog's Test button runs. Nothing else in\n"
+                "                           this tool is touched. Example:\n"
+                "                             kd_probe --server ws://127.0.0.1:10402/\n"
+                "  --model <id>             ask that endpoint for a specific model (--server)\n"
+                "  --timeout-ms N           budget for --server, default 30000. A cold model\n"
+                "                           load legitimately takes longer than a connect does.\n"
                 "  --status                 print the resumable coverage matrix and exit\n"
                 "  --dump-state             print tools/testtarget's state JSON and exit.\n"
                 "                           Injects nothing and does not touch the foreground.\n"
@@ -618,6 +691,10 @@ int main(int argc, char** argv) {
                 "before/after frames, scores the diff, and writes one JSON record per repetition.\n");
             return 0;
         }
+    }
+
+    if (!server_url.empty()) {
+        return probe_server_main(server_url, server_model, server_timeout_ms);
     }
 
     if (status_only) {

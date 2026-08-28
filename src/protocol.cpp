@@ -95,7 +95,7 @@ struct ErrorCodeRow {
 };
 
 // One table, so a spelling and its two flags cannot drift apart. Order matches the enum for
-// readability only; lookup is linear over 22 entries and is not on any hot path.
+// readability only; lookup is linear over the table and is not on any hot path.
 constexpr ErrorCodeRow kErrorCodes[] = {
     {ErrorCode::proto_unsupported, "proto_unsupported", true, true},
     {ErrorCode::bad_frame, "bad_frame", true, true},
@@ -111,6 +111,8 @@ constexpr ErrorCodeRow kErrorCodes[] = {
     {ErrorCode::overload_control, "overload_control", true, true},
     {ErrorCode::model_load_failed, "model_load_failed", true, true},
     {ErrorCode::internal_error, "internal_error", true, true},
+    {ErrorCode::server_busy, "server_busy", true, true},
+    {ErrorCode::model_unavailable, "model_unavailable", true, true},
     // The three non-fatal codes. §11.1 REQUIRES session_id on each of them.
     {ErrorCode::stability_violation, "stability_violation", true, false},
     {ErrorCode::decode_failed, "decode_failed", true, false},
@@ -122,6 +124,12 @@ constexpr ErrorCodeRow kErrorCodes[] = {
     {ErrorCode::model_load_timeout, "model_load_timeout", false, true},
     {ErrorCode::peer_mismatch, "peer_mismatch", false, true},
     {ErrorCode::pipe_squatted, "pipe_squatted", false, true},
+    {ErrorCode::connect_timeout, "connect_timeout", false, true},
+    {ErrorCode::connect_refused, "connect_refused", false, true},
+    {ErrorCode::tls_failed, "tls_failed", false, true},
+    // Fatal in the sense that no session can start, and *not* a fault. The tray says so in
+    // words and the settings page opens; nothing is logged at error level for it.
+    {ErrorCode::no_server_configured, "no_server_configured", false, true},
     // §13's single point of forward tolerance. `wire` is true because a value carrying this
     // enumerator *did* arrive on the wire — it is just not a spelling this build knows, which is
     // why ErrorMsg::code_raw keeps the original. `fatal` defaults to true only for the case of
@@ -706,6 +714,7 @@ bool decode_hello(const json::Value& o, Message& out, ProtocolError& err) {
     if (!require_range(proto, 1, 65535, "proto", err)) return false;
     m.proto = static_cast<int32_t>(proto);
     if (!get_opt_string(o, "client", m.client, err)) return false;
+    if (!get_opt_string(o, "model", m.model, err)) return false;
     out = Message::of(std::move(m));
     return true;
 }
@@ -814,6 +823,46 @@ bool decode_hello_ack(const json::Value& o, Message& out, ProtocolError& err) {
     if (!require_range(proto, 1, 65535, "proto", err)) return false;
     m.proto = static_cast<int32_t>(proto);
     if (!get_opt_string(o, "server", m.server, err)) return false;
+
+    // §5.1: the catalogue is advisory. A malformed *element* is skipped rather than failing the
+    // handshake — the spec says so explicitly, and it is the right trade: losing a working
+    // connection over a mis-typed display name would be a worse outcome than an incomplete
+    // model list. A `models` that is not an array at all is still bad_message, because that is
+    // a server that has misunderstood the field rather than one with a bad row.
+    if (const json::Value* arr = o.find("models"); arr != nullptr && !arr->is_null()) {
+        if (!arr->is_array()) {
+            return fail(err, ErrorCode::bad_message, "field 'models' is not an array");
+        }
+        m.models.reserve(arr->size());
+        for (size_t i = 0; i < arr->size(); ++i) {
+            const json::Value* item = arr->at(i);
+            if (item == nullptr || !item->is_object()) continue;
+            ModelInfo info;
+            const json::Value* id = item->find("id");
+            std::string_view id_sv;
+            if (id == nullptr || !id->get_string(id_sv) || id_sv.empty()) continue;
+            info.id.assign(id_sv);
+            std::string_view sv;
+            if (const json::Value* v = item->find("display_name");
+                v != nullptr && v->get_string(sv)) {
+                info.display_name = std::string(sv);
+            }
+            if (const json::Value* v = item->find("mode"); v != nullptr && v->get_string(sv)) {
+                StreamingMode sm{};
+                if (streaming_mode_from_string(sv, sm)) info.mode = sm;
+            }
+            if (const json::Value* v = item->find("chunk_ms"); v != nullptr) {
+                int64_t n = 0;
+                if (v->get_int(n) && n >= 0 && n <= 3600000) info.chunk_ms = static_cast<int32_t>(n);
+            }
+            if (const json::Value* v = item->find("context_supported"); v != nullptr) {
+                bool b = false;
+                if (v->get_bool(b)) info.context_supported = b;
+            }
+            m.models.push_back(std::move(info));
+        }
+    }
+
     // NOTE: "proto must equal the offered version" is deliberately NOT checked here. This
     // function does not know what was offered; §5 makes that the Client's check, and its failure
     // is proto_unsupported (a session-layer decision), not bad_message.
@@ -1004,6 +1053,36 @@ bool decode_error(const json::Value& o, Message& out, ProtocolError& err) {
         }
     }
 
+    // §2.7: a hint that accompanies `server_busy`. Accepted on any error rather than only that
+    // one, because §13's forward tolerance means a future code may carry it too, and rejecting
+    // a field for appearing on the wrong message would be the kind of strictness that buys
+    // nothing and breaks a working connection.
+    std::optional<int64_t> retry;
+    if (!get_opt_int(o, "retry_after_ms", retry, err)) return false;
+    if (retry.has_value()) {
+        // Clamped rather than rejected: a server that says "wait a week" is misconfigured, not
+        // malicious, and the client's own backoff is the real bound anyway.
+        const int64_t v = *retry < 0 ? 0 : (*retry > 3600000 ? 3600000 : *retry);
+        m.retry_after_ms = static_cast<int32_t>(v);
+    }
+
+    // §5.1: what the server does have, when it has refused what was asked for. Elements that
+    // are not strings are skipped, on the same reasoning as `hello_ack.models[]` — the list is
+    // there to be shown to a person, and a bad row is not worth failing a diagnostic over.
+    if (const json::Value* av = o.find("available"); av != nullptr && !av->is_null()) {
+        if (!av->is_array()) {
+            return fail(err, ErrorCode::bad_message, "field 'available' is not an array");
+        }
+        m.available.reserve(av->size());
+        for (size_t i = 0; i < av->size(); ++i) {
+            const json::Value* item = av->at(i);
+            std::string_view sv;
+            if (item != nullptr && item->get_string(sv) && !sv.empty()) {
+                m.available.emplace_back(sv);
+            }
+        }
+    }
+
     out = Message::of(std::move(m));
     return true;
 }
@@ -1113,6 +1192,7 @@ std::string encode_control(const Message& m) {
             if constexpr (std::is_same_v<T, HelloMsg>) {
                 o.set("proto", json::Value::number(static_cast<int64_t>(b.proto)));
                 set_opt(o, "client", b.client);
+                set_opt(o, "model", b.model);
             } else if constexpr (std::is_same_v<T, StartMsg>) {
                 o.set("session_id", json::Value::string(b.session_id));
                 o.set("sample_rate", json::Value::number(static_cast<int64_t>(b.sample_rate)));
@@ -1130,6 +1210,21 @@ std::string encode_control(const Message& m) {
             } else if constexpr (std::is_same_v<T, HelloAckMsg>) {
                 o.set("proto", json::Value::number(static_cast<int64_t>(b.proto)));
                 set_opt(o, "server", b.server);
+                if (!b.models.empty()) {
+                    json::Value a = json::Value::array();
+                    for (const ModelInfo& mi : b.models) {
+                        json::Value e = json::Value::object();
+                        e.set("id", json::Value::string(mi.id));
+                        set_opt(e, "display_name", mi.display_name);
+                        if (mi.mode.has_value()) {
+                            e.set("mode", json::Value::string(to_string(*mi.mode)));
+                        }
+                        set_opt_int(e, "chunk_ms", mi.chunk_ms);
+                        e.set("context_supported", json::Value::boolean(mi.context_supported));
+                        a.push_back(std::move(e));
+                    }
+                    o.set("models", std::move(a));
+                }
             } else if constexpr (std::is_same_v<T, LoadingMsg>) {
                 o.set("model", json::Value::string(b.model));
                 set_opt(o, "stage", b.stage);
@@ -1178,6 +1273,12 @@ std::string encode_control(const Message& m) {
                         a.push_back(json::Value::number(static_cast<int64_t>(v)));
                     }
                     o.set("supported", std::move(a));
+                }
+                set_opt_int(o, "retry_after_ms", b.retry_after_ms);
+                if (!b.available.empty()) {
+                    json::Value a = json::Value::array();
+                    for (const std::string& v : b.available) a.push_back(json::Value::string(v));
+                    o.set("available", std::move(a));
                 }
             }
         },
@@ -1270,6 +1371,7 @@ struct ConnStateRow {
 // Uppercase, exactly as docs/protocol.md §10.1 and the fixture `initial.state` field spell them.
 // The Python runner compares these as strings; changing one changes a cross-language contract.
 constexpr ConnStateRow kConnStates[] = {
+    {ConnState::NoServer, "NO_SERVER"},  {ConnState::Connecting, "CONNECTING"},
     {ConnState::Spawning, "SPAWNING"},   {ConnState::Validating, "VALIDATING"},
     {ConnState::Handshake, "HANDSHAKE"}, {ConnState::Loading, "LOADING"},
     {ConnState::Idle, "IDLE"},           {ConnState::Running, "RUNNING"},

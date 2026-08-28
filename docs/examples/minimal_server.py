@@ -55,7 +55,11 @@ TYPE_CONTROL = 0x01
 TYPE_AUDIO = 0x02
 
 SUBPROTOCOL = "kvit-dictate.v1"
-WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11D"  # RFC 6455 §1.3
+# RFC 6455 §1.3. Verified against the RFC's own test vector in
+# server/tests/test_minimal_server.py rather than trusted from memory: a wrong GUID here
+# produces a handshake that looks perfect on both sides and that a real WebSocket client
+# rejects with "invalid server response", which is a genuinely miserable thing to debug.
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 SERVER_ID = "minimal-example/1"
 MODEL_ID = "counter"

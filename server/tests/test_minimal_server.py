@@ -15,6 +15,7 @@ docs/protocol.md alone, which is the only way it can catch the document being wr
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -43,6 +44,11 @@ example = _load_example()
 
 TYPE_CONTROL = 0x01
 TYPE_AUDIO = 0x02
+
+CRLF = "\r\n"
+# RFC 6455 §1.3, spelled out here rather than read from the example, so that the
+# test would still fail if the example's constant were changed to match a bug.
+RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 # ─── The client half of §2.6, written from the document ───────────────────────────────────────
@@ -169,7 +175,48 @@ class ExampleServer:
 # ─── Tests ────────────────────────────────────────────────────────────────────────────────────
 
 
+class Rfc6455(unittest.TestCase):
+    """The magic GUID, checked against the RFC's own vector rather than trusted.
+
+    A wrong GUID produces a handshake both endpoints think succeeded and that every real
+    WebSocket client rejects with "invalid server response" — which is exactly what WinHTTP did
+    when this file first shipped one. The test that would have caught it in a second is this.
+    """
+
+    def test_accept_matches_the_rfc_test_vector(self):
+        # RFC 6455 §1.3: key "dGhlIHNhbXBsZSBub25jZQ==" must produce this accept value.
+        digest = hashlib.sha1(("dGhlIHNhbXBsZSBub25jZQ==" + example.WS_GUID).encode("ascii"))
+        self.assertEqual(base64.b64encode(digest.digest()).decode(), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+
 class Handshake(unittest.TestCase):
+    def test_accept_header_is_correct_for_our_own_key(self):
+        """The end-to-end version: our key, the server's answer, computed independently here."""
+        with ExampleServer() as srv:
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            sock = socket.create_connection((srv.host, srv.port), timeout=10)
+            self.addCleanup(sock.close)
+            request = CRLF.join(
+                [
+                    "GET / HTTP/1.1",
+                    f"Host: {srv.host}:{srv.port}",
+                    "Upgrade: websocket",
+                    "Connection: Upgrade",
+                    f"Sec-WebSocket-Key: {key}",
+                    "Sec-WebSocket-Version: 13",
+                    "",
+                    "",
+                ]
+            )
+            sock.sendall(request.encode("ascii"))
+            raw = b""
+            while (CRLF + CRLF).encode("ascii") not in raw:
+                raw += sock.recv(4096)
+            expect = base64.b64encode(
+                hashlib.sha1((key + RFC6455_GUID).encode("ascii")).digest()
+            ).decode()
+            self.assertIn(f"Sec-WebSocket-Accept: {expect}", raw.decode("latin-1"))
+
     def test_subprotocol_is_echoed_when_offered(self):
         with ExampleServer() as srv:
             c = srv.client()

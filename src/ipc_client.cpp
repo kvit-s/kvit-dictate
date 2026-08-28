@@ -36,10 +36,11 @@
 #include "ipc_client.h"
 
 #include <windows.h>
-// The three below must follow windows.h.
+// The four below must follow windows.h.
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <atomic>
@@ -47,7 +48,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -56,6 +59,7 @@
 
 #include "util/clock.h"
 #include "util/log.h"
+#include "util/utf8.h"
 
 namespace kd {
 namespace {
@@ -463,6 +467,549 @@ Result<uintptr_t> create_pipe_instance(const std::wstring& pipe_name,
     return static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(h));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The WebSocket binding (docs/protocol.md §2.6)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Facts checked against the SDK rather than assumed, for the same reason the pipe notes at the
+// top of this file exist:
+//
+//   * WinHTTP has spoken WebSocket since Windows 8. `WinHttpWebSocketCompleteUpgrade` takes the
+//     request handle after a 101 and returns a *new* handle; the request handle must then be
+//     closed separately, and every header query — including the negotiated subprotocol — has to
+//     happen before that close.
+//   * One send and one receive may be outstanding concurrently on a WebSocket handle. That is
+//     what lets the reader live on its own thread while the I/O thread writes, which is the
+//     shape the rest of this file already assumes.
+//   * `WinHttpSetTimeouts` treats 0 as *infinite*. The receive timeout must be infinite once the
+//     upgrade is done: a server is legitimately silent for minutes during a cold model load and
+//     indefinitely while idle, and a finite receive timeout turns quiet into a disconnect.
+//   * `WinHttpCloseHandle` on a handle with a blocked receive is how that receive is unblocked.
+//     There is no cancel call for WebSocket receives.
+
+namespace {
+
+// docs §2.6.2. Offered on every connection; a server that echoes something else has selected a
+// protocol we did not offer, which is fatal. A server that echoes nothing is accepted.
+constexpr wchar_t kSubprotocol[] = L"kvit-dictate.v1";
+constexpr wchar_t kSubprotocolHeader[] = L"Sec-WebSocket-Protocol: kvit-dictate.v1\r\n";
+
+// A ceiling on one reassembled message before the framing layer ever sees it (docs §2.6.3 and
+// §3.3). Deliberately checked in the reader thread: a peer that announces a gigabyte must not be
+// able to make us allocate it while we work out that the frame is illegal.
+constexpr size_t kMaxMessageBytes = proto::kMaxFrameOnWire;
+
+constexpr size_t kWsReadChunk = 16384;
+
+// One RAII WinHTTP handle. Same shape as normalizer.cpp's; duplicated rather than shared
+// because a header that both include would have to name HINTERNET, and no header under src/
+// includes <windows.h> — that constraint is what keeps the pure modules testable.
+class WinHttpHandle {
+public:
+    WinHttpHandle() = default;
+    explicit WinHttpHandle(HINTERNET h) : h_(h) {}
+    ~WinHttpHandle() { reset(); }
+
+    WinHttpHandle(const WinHttpHandle&) = delete;
+    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+
+    void reset(HINTERNET h = nullptr) {
+        if (h_ != nullptr) WinHttpCloseHandle(h_);
+        h_ = h;
+    }
+    [[nodiscard]] HINTERNET get() const noexcept { return h_; }
+    explicit operator bool() const noexcept { return h_ != nullptr; }
+
+private:
+    HINTERNET h_ = nullptr;
+};
+
+// WinHTTP's failure codes, turned into the four the user actually needs told apart
+// (docs §11.3, final paragraph). Collapsing these into "cannot connect" would be the single
+// most common support question this project could have avoided and did not.
+proto::ErrorCode classify_winhttp_error(DWORD err) {
+    switch (err) {
+        case ERROR_WINHTTP_TIMEOUT:
+            return proto::ErrorCode::connect_timeout;
+        case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+        case ERROR_WINHTTP_CANNOT_CONNECT:
+        case ERROR_WINHTTP_CONNECTION_ERROR:
+            return proto::ErrorCode::connect_refused;
+        case ERROR_WINHTTP_SECURE_FAILURE:
+        case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED:
+            return proto::ErrorCode::tls_failed;
+        default:
+            return proto::ErrorCode::internal_error;
+    }
+}
+
+const char* winhttp_error_hint(DWORD err) {
+    switch (err) {
+        case ERROR_WINHTTP_TIMEOUT:
+            return "the host did not answer: check the address, and that the machine is on and "
+                   "not behind a firewall";
+        case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+            return "the host name did not resolve";
+        case ERROR_WINHTTP_CANNOT_CONNECT:
+        case ERROR_WINHTTP_CONNECTION_ERROR:
+            return "the host answered and refused the connection: is the server running, on "
+                   "that port?";
+        case ERROR_WINHTTP_SECURE_FAILURE:
+            return "the TLS certificate was not trusted by this machine";
+        case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED:
+            return "the server asked for a client certificate, which this build does not send";
+        default:
+            return "the WebSocket upgrade failed";
+    }
+}
+
+// One connection, from the upgrade to the close. Shared by the live transport and by
+// probe_server(), so that the Test button in the settings dialog proves the same code path the
+// app will use rather than a parallel one that can drift.
+struct WsConn {
+    WinHttpHandle session;
+    WinHttpHandle connect;
+
+    // Raw and atomic, unlike the two above, because it is the one handle a *second* thread has
+    // to be able to close. A reader parked in WinHttpWebSocketReceive cannot be woken any other
+    // way — WinHTTP has no cancel for a WebSocket receive — and the receive timeout is
+    // deliberately infinite, so waiting it out is not an option either. The exchange means
+    // exactly one thread ever closes it; a send that loses the race sees ERROR_INVALID_HANDLE,
+    // which is reported as a lost connection, which is what it is.
+    std::atomic<void*> sock{nullptr};
+    std::atomic<bool> closing{false};
+
+    ~WsConn() { shutdown(); }
+    WsConn() = default;
+    WsConn(const WsConn&) = delete;
+    WsConn& operator=(const WsConn&) = delete;
+
+    Status open(const ParsedServerUrl& u, uint32_t connect_timeout_ms, uint32_t send_timeout_ms,
+                uint32_t* upgrade_ms);
+    Status send_binary(const uint8_t* data, size_t n);
+
+    // One complete, reassembled binary message. StatusCode::Unavailable means the peer closed —
+    // an orderly end of stream, which §10.3 treats the same as any other loss of the connection.
+    Status recv_message(std::vector<uint8_t>& out);
+
+    // Idempotent, callable from any thread. `closing` is what tells a reader that the failure
+    // it is about to see was ours rather than the server's.
+    void shutdown() {
+        closing.store(true);
+        HINTERNET h = static_cast<HINTERNET>(sock.exchange(nullptr));
+        if (h == nullptr) return;
+        // Shutdown, not Close: docs §2.6.4 wants a Close frame with status 1000 on an orderly
+        // teardown, and WinHttpWebSocketShutdown sends one *without* waiting for the peer's
+        // reply. WinHttpWebSocketClose waits — and with the receive timeout set to infinite
+        // above, a server that never answers would wedge whichever thread called it, which on
+        // this path is the UI thread inside stop().
+        WinHttpWebSocketShutdown(h, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
+        WinHttpCloseHandle(h);
+    }
+};
+
+Status WsConn::open(const ParsedServerUrl& u, uint32_t connect_timeout_ms,
+                    uint32_t send_timeout_ms, uint32_t* upgrade_ms) {
+    const Millis started = now_ms();
+
+    session.reset(WinHttpOpen(L"kvit-dictate/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return os_failure(StatusCode::OsError, "WinHttpOpen", GetLastError());
+
+    // Per-operation, not per-request (the note at the top of normalizer.cpp records measuring
+    // this). Resolve/connect/send/receive each get the configured budget; the receive one is
+    // replaced with "infinite" the moment the upgrade completes, below.
+    const auto t = static_cast<int>(connect_timeout_ms);
+    WinHttpSetTimeouts(session.get(), t, t, static_cast<int>(send_timeout_ms), t);
+
+    connect.reset(WinHttpConnect(session.get(), u.host.c_str(), u.port, 0));
+    if (!connect) return os_failure(StatusCode::OsError, "WinHttpConnect", GetLastError());
+
+    WinHttpHandle req(WinHttpOpenRequest(connect.get(), L"GET", u.path.c_str(), nullptr,
+                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         u.secure ? WINHTTP_FLAG_SECURE : 0u));
+    if (!req) return os_failure(StatusCode::OsError, "WinHttpOpenRequest", GetLastError());
+
+    if (!WinHttpSetOption(req.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) {
+        return os_failure(StatusCode::OsError, "WinHttpSetOption(UPGRADE_TO_WEB_SOCKET)",
+                          GetLastError());
+    }
+    WinHttpAddRequestHeaders(req.get(), kSubprotocolHeader, static_cast<DWORD>(-1),
+                             WINHTTP_ADDREQ_FLAG_ADD);
+
+    if (!WinHttpSendRequest(req.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req.get(), nullptr)) {
+        const DWORD err = GetLastError();
+        const proto::ErrorCode code = classify_winhttp_error(err);
+        return Status{code == proto::ErrorCode::connect_timeout ? StatusCode::Timeout
+                                                                : StatusCode::Unavailable,
+                      std::string(proto::to_string(code)) + ": " + winhttp_error_hint(err), err};
+    }
+
+    DWORD status_code = 0;
+    DWORD len = sizeof(status_code);
+    if (!WinHttpQueryHeaders(req.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &len,
+                             WINHTTP_NO_HEADER_INDEX)) {
+        return os_failure(StatusCode::OsError, "WinHttpQueryHeaders(STATUS_CODE)",
+                          GetLastError());
+    }
+    if (status_code != 101) {
+        // A 200 here is the commonest misconfiguration by a wide margin: the URL points at the
+        // server's ordinary HTTP API rather than at its WebSocket endpoint. Say that, rather
+        // than "upgrade failed", because the fix is a path the user can type.
+        return Status{StatusCode::Unavailable,
+                      "the endpoint answered HTTP " + std::to_string(status_code) +
+                          " instead of upgrading to a WebSocket" +
+                          (status_code == 200 || status_code == 404
+                               ? " — is this the WebSocket path, or the HTTP API's?"
+                               : "")};
+    }
+
+    // docs §2.6.2: a *different* token is fatal; no token at all is accepted, because plenty of
+    // otherwise conforming servers do not echo subprotocols. Queried before the request handle
+    // is closed, which is the only time it can be.
+    wchar_t negotiated[128] = {};
+    DWORD nlen = sizeof(negotiated);
+    if (WinHttpQueryHeaders(req.get(), WINHTTP_QUERY_CUSTOM, L"Sec-WebSocket-Protocol",
+                            negotiated, &nlen, WINHTTP_NO_HEADER_INDEX)) {
+        if (negotiated[0] != L'\0' && std::wcscmp(negotiated, kSubprotocol) != 0) {
+            return Status{StatusCode::Unsupported,
+                          "proto_unsupported: the server selected the subprotocol '" +
+                              utf8::from_utf16_or_empty(negotiated) +
+                              "', which this client did not offer"};
+        }
+    }
+
+    HINTERNET ws = WinHttpWebSocketCompleteUpgrade(req.get(), 0);
+    if (ws == nullptr) {
+        return os_failure(StatusCode::OsError, "WinHttpWebSocketCompleteUpgrade", GetLastError());
+    }
+    sock.store(ws);
+    req.reset();  // must outlive every header query above, and nothing beyond
+
+    // Infinite receive. A server is legitimately silent for the whole of a cold model load and
+    // for as long as the user is not dictating; anything finite here turns quiet into a fault.
+    DWORD infinite = 0;
+    if (!WinHttpSetOption(ws, WINHTTP_OPTION_RECEIVE_TIMEOUT, &infinite, sizeof(infinite))) {
+        KD_LOG_ERROR("could not clear the WebSocket receive timeout (err %lu); a long silence "
+                     "may now be reported as a lost connection",
+                     GetLastError());
+    }
+
+    if (upgrade_ms != nullptr) *upgrade_ms = static_cast<uint32_t>(now_ms() - started);
+    return Status::success();
+}
+
+Status WsConn::send_binary(const uint8_t* data, size_t n) {
+    HINTERNET h = static_cast<HINTERNET>(sock.load());
+    if (h == nullptr) return Status{StatusCode::Unavailable, "the WebSocket is closed"};
+    // docs §2.6.3: one protocol frame per binary message, never split and never coalesced.
+    const DWORD rc = WinHttpWebSocketSend(h, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                                          const_cast<uint8_t*>(data), static_cast<DWORD>(n));
+    if (rc == NO_ERROR) return Status::success();
+    if (rc == ERROR_WINHTTP_TIMEOUT) {
+        // §9: a write that has not completed within WRITE_DEADLINE_MS is overload of its queue.
+        // The send timeout set in open() is that deadline, so WinHTTP reports it for us.
+        return Status{StatusCode::Overloaded,
+                      "a single WebSocket send exceeded WRITE_DEADLINE_MS; the server has "
+                      "stopped reading"};
+    }
+    return Status{StatusCode::Unavailable, "WinHttpWebSocketSend failed", rc};
+}
+
+Status WsConn::recv_message(std::vector<uint8_t>& out) {
+    out.clear();
+    uint8_t chunk[kWsReadChunk];
+    for (;;) {
+        HINTERNET h = static_cast<HINTERNET>(sock.load());
+        if (h == nullptr) return Status{StatusCode::Unavailable, "the WebSocket is closed"};
+        DWORD read = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type{};
+        const DWORD rc =
+            WinHttpWebSocketReceive(h, chunk, static_cast<DWORD>(sizeof(chunk)), &read, &type);
+        if (rc != NO_ERROR) {
+            if (closing.load()) return Status{StatusCode::Unavailable, "closed locally"};
+            return Status{StatusCode::Unavailable, "WinHttpWebSocketReceive failed", rc};
+        }
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+            return Status{StatusCode::Unavailable, "the server closed the connection"};
+        }
+        if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
+            type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) {
+            // docs §2.6.3, and it is fatal even when the bytes would have decoded: a text
+            // message means the peer thinks this is JSON-over-WebSocket, and half its audio
+            // frames will arrive mangled by a UTF-8 round trip.
+            return Status{StatusCode::Malformed,
+                          "unknown_frame_type: the server sent a text message; this protocol is "
+                          "binary only"};
+        }
+        if (out.size() + read > kMaxMessageBytes) {
+            return Status{StatusCode::Malformed,
+                          "frame_too_large: a message exceeded MAX_FRAME_ON_WIRE"};
+        }
+        out.insert(out.end(), chunk, chunk + read);
+        if (type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) return Status::success();
+        // BINARY_FRAGMENT: continuation frames are the transport's business (§2.6.3); keep
+        // reading until the message is whole.
+    }
+}
+
+// One thing the reader thread hands the I/O thread. Exactly one of the three shapes: bytes, an
+// end of stream, or a fault the reader was the first to see.
+struct InboundMessage {
+    std::vector<uint8_t> bytes;
+    bool eof = false;
+    bool fault = false;
+    proto::ProtocolError err;
+};
+
+// §2.6.3: the length prefix is redundant inside a WebSocket message and is validated anyway. A
+// decoder that ignores a field it is given is a decoder that will be wrong the first time the
+// field matters.
+bool message_length_agrees(const std::vector<uint8_t>& msg, std::string& why) {
+    if (msg.size() < 5) {
+        why = "a message of " + std::to_string(msg.size()) + " bytes cannot hold a frame header";
+        return false;
+    }
+    const uint32_t length = static_cast<uint32_t>(msg[0]) | (static_cast<uint32_t>(msg[1]) << 8) |
+                            (static_cast<uint32_t>(msg[2]) << 16) |
+                            (static_cast<uint32_t>(msg[3]) << 24);
+    if (static_cast<uint64_t>(length) + 4u != msg.size()) {
+        why = "the length field says " + std::to_string(static_cast<uint64_t>(length) + 4u) +
+              " bytes, the message is " + std::to_string(msg.size());
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+// ─── URL parsing ─────────────────────────────────────────────────────────────────────────────
+
+Result<ParsedServerUrl> parse_server_url(std::wstring_view url) {
+    // Trimmed first: a URL pasted from a chat window arrives with whitespace on both ends often
+    // enough that rejecting it would be a support question rather than a lesson.
+    while (!url.empty() && (url.front() == L' ' || url.front() == L'\t')) url.remove_prefix(1);
+    while (!url.empty() && (url.back() == L' ' || url.back() == L'\t' || url.back() == L'\r' ||
+                            url.back() == L'\n')) {
+        url.remove_suffix(1);
+    }
+    if (url.empty()) {
+        return Status{StatusCode::InvalidArgument, "no server URL is configured"};
+    }
+
+    ParsedServerUrl out;
+    std::wstring_view rest = url;
+
+    // docs §2.6.1: four accepted schemes, http/https as synonyms because people type them.
+    const auto starts_with = [&](std::wstring_view p) {
+        return rest.size() >= p.size() && rest.compare(0, p.size(), p) == 0;
+    };
+    if (starts_with(L"wss://")) {
+        out.secure = true;
+        rest.remove_prefix(6);
+    } else if (starts_with(L"ws://")) {
+        rest.remove_prefix(5);
+    } else if (starts_with(L"https://")) {
+        out.secure = true;
+        rest.remove_prefix(8);
+    } else if (starts_with(L"http://")) {
+        rest.remove_prefix(7);
+    } else if (rest.find(L"://") != std::wstring_view::npos) {
+        return Status{StatusCode::InvalidArgument,
+                      "the URL scheme must be ws://, wss://, http:// or https://"};
+    } else {
+        // No scheme at all. Rejected rather than guessed: defaulting to ws:// would silently
+        // choose the unencrypted one, and defaulting to wss:// would fail confusingly against
+        // the loopback server this is usually pointed at. Say what to type.
+        return Status{StatusCode::InvalidArgument,
+                      "the URL needs a scheme — try ws://" + utf8::from_utf16_or_empty(url)};
+    }
+
+    if (rest.find(L'#') != std::wstring_view::npos) {
+        // A fragment is never sent to a server, so a URL carrying one is a page address that
+        // was pasted by mistake.
+        return Status{StatusCode::InvalidArgument,
+                      "the URL has a '#' fragment, which is never sent to a server — this looks "
+                      "like a page address rather than an endpoint"};
+    }
+
+    // Authority ends at the first '/', '?' — everything after is path and query, verbatim.
+    const size_t path_at = rest.find_first_of(L"/?");
+    std::wstring_view authority = path_at == std::wstring_view::npos ? rest : rest.substr(0, path_at);
+    out.path = path_at == std::wstring_view::npos ? L"/" : std::wstring(rest.substr(path_at));
+    if (out.path.empty() || out.path.front() == L'?') out.path.insert(0, L"/");
+
+    // Userinfo. `ws://a.example.com@b.example.com/` connects to *b*, which is exactly the trick
+    // a phishing link uses, and a parser that stops at the first '@' gets it backwards. Refused
+    // outright: this protocol has no credentials (docs §2.8), so userinfo here is either a
+    // mistake or a deception, and neither deserves a connection.
+    if (authority.find(L'@') != std::wstring_view::npos) {
+        return Status{StatusCode::InvalidArgument,
+                      "the URL contains '@' before the host. This protocol carries no "
+                      "credentials, and a URL of the form host-a@host-b connects to host-b"};
+    }
+    if (authority.empty()) {
+        return Status{StatusCode::InvalidArgument, "the URL has no host"};
+    }
+
+    std::wstring_view host_part = authority;
+    std::wstring_view port_part;
+    if (authority.front() == L'[') {
+        const size_t close = authority.find(L']');
+        if (close == std::wstring_view::npos) {
+            return Status{StatusCode::InvalidArgument,
+                          "the URL opens a '[' for an IPv6 address and never closes it"};
+        }
+        out.literal_ipv6 = true;
+        host_part = authority.substr(1, close - 1);
+        std::wstring_view after = authority.substr(close + 1);
+        if (!after.empty()) {
+            if (after.front() != L':') {
+                return Status{StatusCode::InvalidArgument,
+                              "unexpected text after the ']' of an IPv6 address"};
+            }
+            port_part = after.substr(1);
+        }
+    } else {
+        const size_t colon = authority.rfind(L':');
+        if (colon != std::wstring_view::npos) {
+            // A bare IPv6 address with no brackets has several colons; that is a real mistake
+            // people make and it deserves the sentence that fixes it.
+            if (authority.find(L':') != colon) {
+                return Status{StatusCode::InvalidArgument,
+                              "an IPv6 address in a URL must be in square brackets, e.g. "
+                              "ws://[::1]:10402/"};
+            }
+            host_part = authority.substr(0, colon);
+            port_part = authority.substr(colon + 1);
+        }
+    }
+
+    if (host_part.empty()) return Status{StatusCode::InvalidArgument, "the URL has no host"};
+
+    if (port_part.empty()) {
+        out.port = out.secure ? 443 : 80;
+    } else {
+        uint32_t port = 0;
+        for (wchar_t c : port_part) {
+            if (c < L'0' || c > L'9') {
+                return Status{StatusCode::InvalidArgument,
+                              "the port is not a number: '" +
+                                  utf8::from_utf16_or_empty(port_part) + "'"};
+            }
+            port = port * 10 + static_cast<uint32_t>(c - L'0');
+            if (port > 65535) break;
+        }
+        if (port == 0 || port > 65535) {
+            return Status{StatusCode::InvalidArgument, "the port must be between 1 and 65535"};
+        }
+        out.port = static_cast<uint16_t>(port);
+    }
+
+    out.host.assign(host_part);
+    return out;
+}
+
+// ─── host_is_private ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Parses exactly four dotted decimal octets. Deliberately strict: `10.0.1` and `010.0.0.1` are
+// *not* accepted as IPv4 here even though some resolvers accept them, because this function's
+// answer only ever decides whether to show a warning, and a shortened form that this said was
+// private while the resolver sent it somewhere public would defeat the warning entirely.
+bool parse_ipv4(std::wstring_view s, uint32_t& out) {
+    uint32_t parts[4] = {};
+    size_t part = 0;
+    size_t digits = 0;
+    uint32_t acc = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == L'.') {
+            if (digits == 0 || digits > 3 || part > 3) return false;
+            parts[part++] = acc;
+            acc = 0;
+            digits = 0;
+            continue;
+        }
+        if (s[i] < L'0' || s[i] > L'9') return false;
+        acc = acc * 10 + static_cast<uint32_t>(s[i] - L'0');
+        if (acc > 255) return false;
+        ++digits;
+    }
+    if (part != 4) return false;
+    out = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+    return true;
+}
+
+bool iequals_suffix(std::wstring_view s, std::wstring_view suffix) {
+    if (s.size() < suffix.size()) return false;
+    const size_t off = s.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        wchar_t a = s[off + i];
+        wchar_t b = suffix[i];
+        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool host_is_private(std::wstring_view host) {
+    if (host.empty()) return false;
+    if (host.front() == L'[' && host.back() == L']') host = host.substr(1, host.size() - 2);
+
+    uint32_t v4 = 0;
+    if (parse_ipv4(host, v4)) {
+        const uint32_t a = v4 >> 24;
+        const uint32_t b = (v4 >> 16) & 0xFF;
+        if (a == 127) return true;                                   // loopback
+        if (a == 10) return true;                                    // RFC 1918
+        if (a == 172 && b >= 16 && b <= 31) return true;             // RFC 1918
+        if (a == 192 && b == 168) return true;                       // RFC 1918
+        if (a == 169 && b == 254) return true;                       // RFC 3927 link-local
+        if (a == 100 && b >= 64 && b <= 127) return true;            // RFC 6598 CGNAT
+        if (a == 0) return true;                                     // "this network"
+        return false;
+    }
+
+    // IPv6, by prefix. Enough to recognise the three cases that occur in practice; anything
+    // else is treated as public, which is the safe direction for a warning.
+    if (host == L"::1" || host == L"::" || host == L"0:0:0:0:0:0:0:1") return true;
+    if (host.size() >= 2) {
+        const wchar_t c0 = host[0];
+        const wchar_t c1 = host[1];
+        // fc00::/7 unique-local, and fe80::/10 link-local.
+        if ((c0 == L'f' || c0 == L'F') && (c1 == L'c' || c1 == L'C' || c1 == L'd' || c1 == L'D')) {
+            return true;
+        }
+        if ((c0 == L'f' || c0 == L'F') && (c1 == L'e' || c1 == L'E') && host.size() >= 4 &&
+            (host[2] == L'8' || host[2] == L'9' || host[2] == L'a' || host[2] == L'A' ||
+             host[2] == L'b' || host[2] == L'B')) {
+            return true;
+        }
+    }
+
+    // A colon at this point means an IPv6 literal none of the prefixes above recognised — i.e.
+    // a global-unicast address. Falling through to the name rules below would reach the
+    // "unqualified label" test, which every IPv6 address passes for want of a dot, and would
+    // quietly suppress the warning on exactly the addresses that most need it.
+    if (host.find(L':') != std::wstring_view::npos) return false;
+
+    if (iequals_suffix(host, L"localhost")) return host.size() == 9 || host[host.size() - 10] == L'.';
+    if (iequals_suffix(host, L".local")) return true;
+    if (iequals_suffix(host, L".lan")) return true;
+    if (iequals_suffix(host, L".internal")) return true;
+    if (iequals_suffix(host, L".home.arpa")) return true;
+
+    // An unqualified single label — `strixhalo`, `nas` — is a machine on the local network in
+    // every deployment this tool has. A dotted name is not.
+    return host.find(L'.') == std::wstring_view::npos;
+}
+
 // ─── IpcClient::Impl ─────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -482,6 +1029,14 @@ struct IpcClient::Impl {
     Callbacks cb;
     std::wstring pipe_name;
     std::string model_id;
+
+    // ── WebSocket binding (docs/protocol.md §2.6). Empty/false on the pipe binding. ──
+    bool ws_mode = false;
+    ServerEndpoint endpoint;
+    std::unique_ptr<WsConn> ws;
+    std::thread ws_reader_thread;
+    std::mutex in_mu;
+    std::deque<InboundMessage> inbound;
 
     Handle pipe;
     Handle child_process;
@@ -582,6 +1137,11 @@ struct IpcClient::Impl {
     void enqueue_internal(std::vector<uint8_t> bytes);
     void log_main();
     void teardown_pipe();
+
+    void ws_main();
+    void ws_read_main();
+    void ws_drain_inbound();
+    bool ws_send_pending();
 };
 
 bool IpcClient::Impl::create_events() {
@@ -1139,6 +1699,344 @@ void IpcClient::Impl::log_main() {
     }
 }
 
+// ─── The WebSocket I/O threads ───────────────────────────────────────────────────────────────
+//
+// Two threads, not one, and the split is forced by the API: `WinHttpWebSocketReceive` blocks
+// until a message arrives, and a server is legitimately silent for minutes. So the reader parks
+// on its own thread and hands whole messages to the I/O thread, which keeps every callback on
+// the thread ipc_client.h promises them on and keeps the queue, the deadlines and the framing
+// state single-threaded exactly as the pipe binding does.
+
+void IpcClient::Impl::ws_read_main() {
+    for (;;) {
+        std::vector<uint8_t> msg;
+        const Status st = ws->recv_message(msg);
+        InboundMessage item;
+        if (st.ok()) {
+            item.bytes = std::move(msg);
+        } else if (st.code() == StatusCode::Malformed) {
+            // A text message or an oversized one: an L1 fault the reader is the first to see.
+            item.fault = true;
+            item.err.fatal = true;
+            item.err.code = st.message().rfind("frame_too_large", 0) == 0
+                                ? proto::ErrorCode::frame_too_large
+                                : proto::ErrorCode::unknown_frame_type;
+            item.err.msg = st.message();
+        } else {
+            // Close, socket error, or our own shutdown. All of them are end of stream; §10.3
+            // does not distinguish, and neither should this.
+            item.eof = true;
+        }
+        const bool last = item.eof || item.fault;
+        {
+            std::lock_guard<std::mutex> lk(in_mu);
+            inbound.push_back(std::move(item));
+        }
+        if (ev_wake.valid()) SetEvent(ev_wake.get());
+        if (last) return;
+    }
+}
+
+void IpcClient::Impl::ws_drain_inbound() {
+    for (;;) {
+        InboundMessage item;
+        {
+            std::lock_guard<std::mutex> lk(in_mu);
+            if (inbound.empty()) return;
+            item = std::move(inbound.front());
+            inbound.pop_front();
+        }
+        if (item.fault) {
+            fail_with(item.err);
+            return;
+        }
+        if (item.eof) {
+            reader.notify_eof();
+            drain_frames();
+            io_done = true;
+            return;
+        }
+        // §2.6.3: the redundant length prefix is validated, because a decoder that ignores a
+        // field it is given is a decoder that will be wrong the first time the field matters.
+        // Without this the FrameReader would happily treat two frames packed into one message
+        // as a legal stream, and the peer's mistake would surface later as garbled text.
+        std::string why;
+        if (!message_length_agrees(item.bytes, why)) {
+            fail(proto::ErrorCode::bad_frame, "one WebSocket message must hold exactly one "
+                                              "frame: " + why,
+                 reader.stream_offset());
+            return;
+        }
+        reader.push(item.bytes.data(), item.bytes.size());
+        drain_frames();
+        if (io_done) return;
+    }
+}
+
+bool IpcClient::Impl::ws_send_pending() {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (queue.empty()) return true;
+            write_item = std::move(queue.front());
+            queue.pop_front();
+            if (write_item.audio) {
+                --audio_items;
+                audio_samples -= write_item.samples;
+            } else {
+                --control_depth;
+            }
+        }
+        cv.notify_all();  // flush_audio() may be waiting for the audio queue to empty
+
+        write_started = now_ms();
+        const Status st = ws->send_binary(write_item.bytes.data(), write_item.bytes.size());
+        const Millis latency = now_ms() - write_started;
+        if (!st.ok()) {
+            if (st.code() == StatusCode::Overloaded) {
+                overloaded.store(true);
+                fail(write_item.audio ? proto::ErrorCode::overload_audio
+                                      : proto::ErrorCode::overload_control,
+                     st.message());
+            } else {
+                // The socket is gone. Drain whatever the reader already handed us first — the
+                // server may have written an `error` explaining itself before dying, and that
+                // message is the only explanation the user will ever get.
+                ws_drain_inbound();
+                if (!io_done) {
+                    reader.notify_eof();
+                    drain_frames();
+                    io_done = true;
+                }
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (write_item.audio) {
+                ++stats.audio_frames_sent;
+                stats.audio_bytes_sent += write_item.bytes.size();
+            } else {
+                ++stats.control_sent;
+            }
+            if (latency > stats.max_write_latency_ms) stats.max_write_latency_ms = latency;
+        }
+    }
+}
+
+void IpcClient::Impl::ws_main() {
+    set_state(proto::ConnState::Connecting);
+
+    const Result<ParsedServerUrl> parsed = parse_server_url(endpoint.url);
+    if (!parsed) {
+        fail(proto::ErrorCode::connect_refused, parsed.status().message());
+        std::lock_guard<std::mutex> lk(mu);
+        running = false;
+        cv.notify_all();
+        if (cb.on_disconnected) cb.on_disconnected();
+        return;
+    }
+
+    // docs §2.8. A warning, never a block: the user's network is not this program's to
+    // adjudicate, and a tool that refused to talk to the endpoint its owner named would simply
+    // be replaced by one that did.
+    if (!parsed->secure && !host_is_private(parsed->host)) {
+        KD_LOG_WARN("connecting to %s over an unencrypted ws:// — this host is neither loopback "
+                    "nor a private address, and audio crosses the network in the clear",
+                    utf8::from_utf16_or_empty(parsed->host).c_str());
+    }
+
+    uint32_t upgrade_ms = 0;
+    const Status opened = ws->open(*parsed, endpoint.connect_timeout_ms, proto::kWriteDeadlineMs,
+                                   &upgrade_ms);
+    if (!opened.ok()) {
+        proto::ProtocolError e;
+        e.fatal = true;
+        e.msg = opened.message();
+        e.code = opened.code() == StatusCode::Timeout      ? proto::ErrorCode::connect_timeout
+                 : opened.code() == StatusCode::Unsupported ? proto::ErrorCode::proto_unsupported
+                 : opened.message().rfind("tls_failed", 0) == 0 ? proto::ErrorCode::tls_failed
+                                                                : proto::ErrorCode::connect_refused;
+        fail_with(e);
+        set_state(proto::ConnState::Dead);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            running = false;
+        }
+        cv.notify_all();
+        if (cb.on_disconnected) cb.on_disconnected();
+        return;
+    }
+    KD_LOG_INFO("connected to %s in %u ms", utf8::from_utf16_or_empty(endpoint.url).c_str(),
+                upgrade_ms);
+
+    // §5, and the same division of labour as the pipe binding: this module arms
+    // HELLO_TIMEOUT_MS, SessionMachine writes the `hello`. One author for one frame.
+    set_state(proto::ConnState::Handshake);
+    state_deadline = now_ms() + proto::kHelloTimeoutMs;
+
+    ws_reader_thread = std::thread([this] { ws_read_main(); });
+
+    while (!io_done) {
+        ws_drain_inbound();
+        if (io_done) break;
+        if (!ws_send_pending()) break;
+        if (io_done) break;
+
+        HANDLE waits[2] = {ev_wake.get(), ev_quit.get()};
+        const DWORD w = WaitForMultipleObjects(2, waits, FALSE, next_timeout());
+        switch (w) {
+            case WAIT_OBJECT_0 + 0:
+                ResetEvent(ev_wake.get());
+                if (state_notify.exchange(false) && cb.on_state) cb.on_state(get_state());
+                break;
+            case WAIT_OBJECT_0 + 1:
+                io_done = true;
+                orderly = true;
+                break;
+            case WAIT_TIMEOUT:
+                check_deadlines();
+                break;
+            default:
+                fail(proto::ErrorCode::internal_error, "WaitForMultipleObjects failed");
+                break;
+        }
+    }
+
+    // Closing the handle is the only way to unblock a reader parked in a receive — WinHTTP has
+    // no cancel for one — so the order is: close, then join, then let WsConn's destructor run.
+    ws->shutdown();
+    if (ws_reader_thread.joinable()) ws_reader_thread.join();
+    ws_drain_inbound();  // anything the reader delivered on its way out, including the fault
+
+    if (get_state() != proto::ConnState::Dead) set_state(proto::ConnState::Dead);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        running = false;
+    }
+    cv.notify_all();
+    if (cb.on_disconnected) cb.on_disconnected();
+}
+
+// ─── probe_server ────────────────────────────────────────────────────────────────────────────
+
+Result<ServerProbe> probe_server(const ServerEndpoint& endpoint, uint32_t timeout_ms) {
+    if (endpoint.url.empty()) {
+        return Status{StatusCode::InvalidArgument,
+                      "no_server_configured: there is no server URL to test"};
+    }
+    const Result<ParsedServerUrl> parsed = parse_server_url(endpoint.url);
+    if (!parsed) return parsed.status();
+
+    const Millis deadline = now_ms() + timeout_ms;
+    WsConn conn;
+    ServerProbe probe;
+
+    const Status opened =
+        conn.open(*parsed, std::min<uint32_t>(timeout_ms, endpoint.connect_timeout_ms),
+                  proto::kWriteDeadlineMs, &probe.connect_ms);
+    if (!opened.ok()) return opened;
+
+    proto::HelloMsg hello;
+    hello.proto = proto::kProtoVersion;
+    hello.client = "kvit-dictate/1.0";
+    if (!endpoint.model.empty()) hello.model = endpoint.model;
+    const std::vector<uint8_t> frame = proto::encode_control_frame(proto::Message::of(hello));
+    if (const Status st = conn.send_binary(frame.data(), frame.size()); !st.ok()) return st;
+
+    proto::FrameReader reader;
+    bool got_ack = false;
+    std::vector<uint8_t> msg;
+
+    for (;;) {
+        if (now_ms() >= deadline) {
+            return Status{StatusCode::Timeout,
+                          got_ack ? "the server accepted the handshake but never sent `ready` — "
+                                    "a model may still be loading"
+                                  : "the server did not answer the handshake in time"};
+        }
+        const Status st = conn.recv_message(msg);
+        if (!st.ok()) {
+            return Status{StatusCode::Unavailable,
+                          "the connection ended during the handshake: " + st.message()};
+        }
+        std::string why;
+        if (!message_length_agrees(msg, why)) {
+            return Status{StatusCode::Malformed,
+                          "the server's framing is wrong — one WebSocket message must hold "
+                          "exactly one frame: " + why};
+        }
+        reader.push(msg.data(), msg.size());
+
+        for (;;) {
+            proto::Frame f;
+            const proto::FrameStatus fs = reader.next(f);
+            if (fs == proto::FrameStatus::NeedMore) break;
+            if (fs == proto::FrameStatus::EndOfStream) {
+                return Status{StatusCode::Unavailable, "the server closed the connection"};
+            }
+            if (fs == proto::FrameStatus::Error) {
+                return Status{StatusCode::Malformed, reader.error().to_string()};
+            }
+            if (f.type == proto::FrameType::Audio) {
+                return Status{StatusCode::Malformed,
+                              "the server sent an audio frame; audio is Client -> Server only"};
+            }
+            proto::Message m;
+            proto::ProtocolError perr;
+            if (!proto::decode_control(f.payload, m, perr)) {
+                return Status{StatusCode::Malformed, perr.to_string()};
+            }
+            if (const auto* e = m.get_if<proto::ErrorMsg>()) {
+                // The refusals that mean the endpoint works and is saying no (docs §2.7, §5.1)
+                // deserve their own sentences: "busy" and "no such model" are things the user
+                // can act on, and reporting either as "connection failed" wastes their afternoon.
+                std::string text = e->msg.empty() ? std::string(proto::to_string(e->code)) : e->msg;
+                if (e->code == proto::ErrorCode::server_busy) {
+                    text = "the server is busy: " + text;
+                } else if (e->code == proto::ErrorCode::model_unavailable) {
+                    text = "the server does not have that model: " + text;
+                    if (!e->available.empty()) {
+                        text += " (it offers ";
+                        for (size_t i = 0; i < e->available.size(); ++i) {
+                            if (i != 0) text += ", ";
+                            text += e->available[i];
+                        }
+                        text += ")";
+                    }
+                }
+                return Status{StatusCode::Unavailable, text};
+            }
+            if (const auto* ack = m.get_if<proto::HelloAckMsg>()) {
+                if (ack->proto != proto::kProtoVersion) {
+                    return Status{StatusCode::Unsupported,
+                                  "the server answered with proto " +
+                                      std::to_string(ack->proto) + "; this build speaks " +
+                                      std::to_string(proto::kProtoVersion)};
+                }
+                probe.server_build = ack->server.value_or(std::string{});
+                probe.models = ack->models;
+                probe.handshake_ms = static_cast<uint32_t>(now_ms() + timeout_ms - deadline);
+                got_ack = true;
+                continue;
+            }
+            if (const auto* ready = m.get_if<proto::ReadyMsg>()) {
+                probe.model = ready->model;
+                probe.mode = ready->mode;
+                probe.context_supported = ready->context_supported;
+                probe.chunk_ms = ready->chunk_ms.has_value()
+                                     ? static_cast<uint32_t>(*ready->chunk_ms)
+                                     : 0u;
+                probe.ready_ms = static_cast<uint32_t>(now_ms() + timeout_ms - deadline);
+                conn.shutdown();
+                return probe;
+            }
+            // `loading` and anything else: keep waiting. A cold model load is the ordinary
+            // reason a Test button takes a while, and it is not a failure.
+        }
+    }
+}
+
 // ─── IpcClient ───────────────────────────────────────────────────────────────────────────────
 
 IpcClient::IpcClient() : impl_(new Impl) {}
@@ -1347,6 +2245,62 @@ Status IpcClient::start(const ChildSpec& child, Callbacks cb) {
     return Status::success();
 }
 
+Status IpcClient::connect(const ServerEndpoint& endpoint, Callbacks cb) {
+    Impl& im = *impl_;
+    {
+        std::lock_guard<std::mutex> lk(im.mu);
+        if (im.running) return Status{StatusCode::Internal, "IpcClient::connect() while running"};
+    }
+    if (im.io_thread.joinable()) stop();
+
+    if (endpoint.url.empty()) {
+        // docs §10.6. Not a fault, and deliberately not logged as one: it is what every fresh
+        // install looks like. The caller shows ConnState::NoServer and does not open the
+        // microphone.
+        im.set_state_async(proto::ConnState::NoServer);
+        return Status{StatusCode::InvalidArgument,
+                      "no_server_configured: set a server URL in Settings"};
+    }
+    // Parsed here as well as on the I/O thread, so that a URL the user just typed is rejected
+    // synchronously with a sentence about it rather than asynchronously through the tray.
+    if (const Result<ParsedServerUrl> parsed = parse_server_url(endpoint.url); !parsed) {
+        return parsed.status();
+    }
+
+    im.reader.reset();
+    im.io_done = false;
+    im.reported = false;
+    im.orderly = false;
+    im.state_deadline = 0;
+    im.overloaded.store(false);
+    im.cb = std::move(cb);
+    im.ws_mode = true;
+    im.endpoint = endpoint;
+    im.model_id = endpoint.model;
+    im.ws = std::make_unique<WsConn>();
+    {
+        std::lock_guard<std::mutex> lk(im.in_mu);
+        im.inbound.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(im.mu);
+        im.queue.clear();
+        im.control_depth = 0;
+        im.audio_items = 0;
+        im.audio_samples = 0;
+        im.stats = Stats{};
+        im.running = true;
+    }
+    if (!im.create_events()) {
+        std::lock_guard<std::mutex> lk(im.mu);
+        im.running = false;
+        return os_failure(StatusCode::OsError, "CreateEventW", GetLastError());
+    }
+    im.io_thread = std::thread([&im] { im.ws_main(); });
+    im.io_native = im.io_thread.native_handle();
+    return Status::success();
+}
+
 Status IpcClient::attach_connected(uintptr_t connected_pipe_handle, Callbacks cb) {
     Impl& im = *impl_;
     {
@@ -1391,11 +2345,19 @@ Status IpcClient::attach_connected(uintptr_t connected_pipe_handle, Callbacks cb
 void IpcClient::stop() {
     Impl& im = *impl_;
     if (!im.io_thread.joinable() && !im.log_thread.joinable() && !im.child_process.valid() &&
-        !im.job.valid() && !im.pipe.valid()) {
+        !im.job.valid() && !im.pipe.valid() && im.ws == nullptr) {
         return;  // never started, or already stopped: idempotent, like `stop`/`cancel` on the wire
     }
 
     if (im.ev_quit.valid()) SetEvent(im.ev_quit.get());
+
+    if (im.ws_mode && im.ws != nullptr) {
+        // Closed from here rather than left to the I/O thread, because that thread may be inside
+        // a WinHttpWebSocketSend against a server that has stopped reading — bounded by
+        // WRITE_DEADLINE_MS, which is five seconds of a user waiting for the app to quit.
+        // Closing the handle ends both the send and the reader's parked receive at once.
+        im.ws->shutdown();
+    }
 
     if (im.io_thread.joinable()) {
         // A *timed* wait, then join. The I/O thread's last act may be FlushFileBuffers, which
@@ -1425,6 +2387,10 @@ void IpcClient::stop() {
     // Closing the job kills whatever is left of the child (and any grandchild it forked), which
     // is what keeps a model out of VRAM after we are gone.
     im.job.close();
+
+    if (im.ws_reader_thread.joinable()) im.ws_reader_thread.join();
+    im.ws.reset();
+    im.ws_mode = false;
 
     if (im.log_thread.joinable()) {
         // Safe only after the child is gone: the reader blocks in ReadFile until the write end
@@ -1589,6 +2555,8 @@ IpcClient::Stats IpcClient::stats() const noexcept {
 }
 
 std::wstring IpcClient::pipe_name() const { return impl_->pipe_name; }
+
+std::wstring IpcClient::server_url() const { return impl_->endpoint.url; }
 
 uint32_t IpcClient::child_pid() const noexcept { return impl_->pid.load(); }
 
