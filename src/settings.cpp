@@ -3154,9 +3154,10 @@ void build_controls(HWND dlg, DialogState& st) {
         // and it belongs with the other two paragraphs that explain consequences.
         c.section(L"While you are speaking");
         c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
-        c.note(L"Off by default. A batch model rewrites earlier words as it hears more, so a "
-               L"live preview against one either flickers or stops committing. With it off, each "
-               L"phrase lands when you pause.",
+        c.note(L"On by default. Words appear greyed while they are still moving and go solid "
+               L"once they settle. A batch model rewrites earlier words as it hears more, so "
+               L"against one nothing is typed any sooner — you watch it happen instead of "
+               L"waiting in silence.",
                4);
 
         c.section(L"What crosses your network");

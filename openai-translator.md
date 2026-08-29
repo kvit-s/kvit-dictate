@@ -321,10 +321,21 @@ to measure.
 
 **The batch-model caveat, which is why this matters immediately.** A batch model re-punctuates
 earlier words as later context arrives, so it violates monotonicity *structurally*, not
-occasionally — `models.json` records a violation within seconds of the first human run. v1
-therefore defaults this backend to **finalize-only**: one `final` at the endpoint, no `partial`s,
-`ready.mode = "pseudo-streaming"` (the protocol's taxonomy has no other value for a batch model
-behind a window). Live preview stays available, off by default, and labelled.
+occasionally — `models.json` records a violation within seconds of the first human run. `kvit-asrd`
+therefore defaults **its own command line** to `--finalize-only on`: one `final` at the endpoint,
+no `partial`s, `ready.mode = "pseudo-streaming"` (the protocol's taxonomy has no other value for a
+batch model behind a window). That stays, because a translator serving an unknown client should
+promise the least.
+
+**The client no longer agrees, and this paragraph was wrong about why.** `Settings::live_preview`
+now defaults to on, so kvit-dictate launches its own translator with `--finalize-only off`. The
+argument above is about *committing*, and it is unchanged and still enforced: the tracker refuses
+a mark it cannot stand behind, so against a batch model nothing is committed any earlier and the
+whole phrase still lands at the `final`. What it never weighed is that `partial`s are also what
+the overlay greys out as "still moving" — with them off there is no feedback at all until the
+speaker pauses, which is the single thing a person notices. The Python bridge this replaced
+defaulted the other way (`openai_http.py`'s `finalize_only=False`) and was the version people
+described as working. Off remains one checkbox away, still labelled.
 
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a

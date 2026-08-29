@@ -216,10 +216,20 @@ struct ServerSettings {
     std::string model;
 
     // Live preview in Local mode: `partial`s with a computed `stable_bytes` against a batch
-    // model that structurally violates monotonicity. Off by default and labelled in the dialog
-    // (openai-translator.md §4.3's batch-model caveat). Meaningless in Protocol mode, where the
+    // model that structurally violates monotonicity. Meaningless in Protocol mode, where the
     // server decides for itself what it publishes.
-    bool live_preview = false;
+    //
+    // **On by default**, which is a reversal. openai-translator.md §4.3 argued for off, and the
+    // argument was about committing: a batch model revises byte 0, so a preview against one
+    // cannot honestly publish a mark. That part is true and unchanged — the stability tracker
+    // still refuses to publish `stable_bytes` it cannot stand behind, and everything still
+    // commits at the `final`. What it got wrong is that the choice was never about committing:
+    // partials are also what the overlay greys out as "still moving", and with them off there
+    // is nothing to see until the speaker pauses. The Python bridge this replaced defaulted the
+    // other way (`openai_http.py`'s `finalize_only=False`) and that is the behaviour people
+    // recognise as the thing working. Costing nothing in the document and everything in the
+    // feedback, it belongs on.
+    bool live_preview = true;
 
     uint32_t connect_timeout_ms = 15000;
 

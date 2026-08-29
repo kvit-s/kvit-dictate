@@ -283,7 +283,7 @@ TLS on the listening side (§5 applies unchanged).
 | `--endpoint-silence-ms MS` | `1500` | How long a pause ends a phrase. |
 | `--log-level LEVEL` | `info` | Diagnostics go to stderr. |
 
-### Why live preview is off by default
+### Live preview, and why the two defaults differ
 
 A batch model does not extend its previous guess, it replaces it. Once it can hear where the
 sentence ended it re-cases the first word and inserts the punctuation it was not sure of, so
@@ -291,9 +291,20 @@ sentence ended it re-cases the first word and inserts the punctuation it was not
 binds each new hypothesis against the mark already published (`docs/protocol.md` §8.2), so once
 anything has been committed, no honest answer exists for the next message.
 
-With finalize-only, each phrase is transcribed once when you pause and lands whole. With live
-preview on, you watch the words arrive but nothing commits until the phrase ends anyway. It is
-available, it is labelled experimental in Settings, and it is off.
+So nothing is committed early. The stability tracker refuses to publish a mark it cannot stand
+behind, and against a batch model that means the whole phrase lands at the endpoint either way.
+Live preview does not change what is typed or when. What it changes is what you see while you
+are talking: with it on, words appear in the overlay greyed while they are still moving and go
+solid once they settle; with it off, you speak into silence until you pause.
+
+That is why the two defaults differ, and neither is an oversight:
+
+* **`kvit-asrd` on its own command line defaults to `--finalize-only on`.** A translator serving
+  a client it knows nothing about should promise the least it can.
+* **kvit-dictate turns it on** for the translator it launches itself, because it is the thing
+  drawing the overlay and it knows the feedback is the point. The checkbox is
+  *Settings → Server → "Show words as they are recognised"*, still labelled experimental, and
+  turning it off gives you the finalize-only behaviour described above.
 
 ---
 

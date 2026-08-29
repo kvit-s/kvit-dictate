@@ -68,9 +68,11 @@ struct TranslatorSpec {
     std::string model;
 
     // Live preview: `partial`s with a computed `stable_bytes`, against a model that
-    // structurally violates monotonicity. Off by default and labelled in the dialog
-    // (openai-translator.md §4.3's batch-model caveat).
-    bool live_preview = false;
+    // structurally violates monotonicity. On by default, and labelled in the dialog — see
+    // `ServerSettings::live_preview` for why the §4.3 default was reversed. Always written onto
+    // the command line explicitly either way, so this default only decides what a caller that
+    // fills none of this struct gets.
+    bool live_preview = true;
 
     uint32_t endpoint_silence_ms = 1500;
 };
