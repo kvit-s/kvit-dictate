@@ -2587,6 +2587,15 @@ void App::apply_settings(kd::Settings next) {
     const std::string previous_model = settings_.model_id;
     const std::string previous_url = settings_.server.url;
     const std::string previous_server_model = settings_.server.model;
+    // Everything in `TranslatorSpec`, plus the mode that decides whether there is a translator at
+    // all. The child takes its whole configuration on its command line and has no way to be told
+    // anything afterwards (translator.h), so a change to any of these is a new child — including
+    // the two that used not to be here. Reported as "I ticked live preview and nothing happened":
+    // the box was saved, the settings file said `true`, and the still-running translator had been
+    // launched with `--finalize-only on` and went on emitting no `partial` at all.
+    const kd::ServerMode previous_mode = settings_.server.mode;
+    const bool previous_live_preview = settings_.server.live_preview;
+    const uint32_t previous_endpoint_silence_ms = settings_.session.endpoint_silence_ms;
     const bool diagnostics_file_changed =
         next.diagnostics_file_enabled != settings_.diagnostics_file_enabled;
     settings_ = std::move(next);
@@ -2654,16 +2663,27 @@ void App::apply_settings(kd::Settings next) {
     // release-plan.md §2.2. Either field is a different conversation with a different peer, so
     // the connection is torn down and rebuilt rather than adjusted; §6.2 forbids a second
     // `ready` on one connection, which is the same rule seen from the wire.
-    if (settings_.server.url != previous_url ||
-        settings_.server.model != previous_server_model) {
-        KD_LOG_INFO("server changed: %s -> %s",
+    const bool translator_spec_changed =
+        settings_.server.mode != previous_mode ||
+        settings_.server.model != previous_server_model ||
+        settings_.server.live_preview != previous_live_preview ||
+        settings_.session.endpoint_silence_ms != previous_endpoint_silence_ms;
+
+    if (settings_.server.url != previous_url || translator_spec_changed) {
+        KD_LOG_INFO("server settings changed (%s -> %s, live preview %s): reconnecting",
                     previous_url.empty() ? "(none)" : previous_url.c_str(),
-                    settings_.server.url.empty() ? "(none)" : settings_.server.url.c_str());
+                    settings_.server.url.empty() ? "(none)" : settings_.server.url.c_str(),
+                    settings_.server.live_preview ? "on" : "off");
         reconnect_at_ms_ = 0;
         reconnect_delay_ms_ = 0;
         loaded_model_.clear();
         tray_reason_.clear();
         if (ipc_ != nullptr) ipc_->stop();
+        // Before the reconnect, not after: `translator_url()` reuses a running child rather than
+        // launching a second one, so without this the client would drop the socket and reconnect
+        // straight back to a translator still running the old command line. Idempotent when there
+        // is no child, which is the Protocol-mode case.
+        translator_.stop();
         if (settings_.server.configured()) {
             connect_server();
         } else {
