@@ -179,6 +179,11 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     backend_cfg.language = cfg.language;
     backend_cfg.finalize_only = cfg.finalize_only;
     backend_cfg.vad_gate = cfg.vad_gate;
+    // The window is sized from the endpointer's own safety valve, so that it always covers a
+    // whole utterance and `PseudoStreamingDriver` never slides. Read from `VadConfig` rather
+    // than repeated as a number: these two are one decision, and the failure mode when they
+    // drift apart is a stitch, which is worse than a slow decode. See `OpenAiBackendConfig`.
+    backend_cfg.window_ms = static_cast<uint32_t>(VadConfig{}.max_utterance_ms);
     OpenAiBackend backend(backend_cfg);
 
     const ULONGLONG load_started = GetTickCount64();

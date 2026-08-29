@@ -352,6 +352,23 @@ been offered. See `asrd_session.live_preview_publishes_no_mark_so_a_late_revisio
 So preview is on, the mark is off for this backend permanently, and everything still commits at
 the `final`. Off remains one checkbox away, still labelled.
 
+**And the window is now as long as an utterance, which retires the stitcher from the shipped
+path.** Turning the preview on also woke the sliding window: with `window_ms = 8000` a speaker
+who talks for twenty seconds slides it a dozen times, and every slide is stitched by
+`scrolled_off_words`, which matches the tail of the previous transcript against the head of the
+new one. One revised word inside that overlap — `give` becoming `gives` — makes every candidate
+`k` fail, and the fallback freezes the *entire* previous window while the new window still holds
+seven of those eight seconds. Reported the same evening as "a dictation that somehow duplicated",
+with the seam visible in the text.
+
+Sliding buys bounded decode cost for unbounded audio, and the audio is not unbounded: the
+endpointer cuts an utterance at `VadConfig::max_utterance_ms`. So `window_ms` is now read from
+that, the window always covers the whole utterance, `slid` is never true, and the preview and the
+`final` are the same computation over the same recording. `scrolled_off_words` and its tests
+stay — a smaller `--window-ms` would still need them — but nothing ships through them. See
+`asrd_backend.the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched` and, for
+the arithmetic, `a_window_shorter_than_the_utterance_duplicates_what_the_model_revises`.
+
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a
 property test: the C++ tracker and the Python tracker, over the same hypothesis sequences, agree

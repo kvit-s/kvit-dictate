@@ -17,6 +17,7 @@
 #include "kd_test.h"
 
 #include "asrd/backend_openai.h"
+#include "asrd/vad.h"
 #include "asrd/http.h"
 
 #include <cstdint>
@@ -315,6 +316,76 @@ KD_TEST(asrd_backend, reset_forgets_the_frozen_prefix_and_the_clock) {
     KD_CHECK_EQ(driver.audio_ms(), uint64_t{0});
     KD_CHECK(!driver.any_audio());
     KD_CHECK(!driver.take_window(true, window, slid));
+}
+
+// ─── The slide must never happen ─────────────────────────────────────────────────────────────
+
+KD_TEST(asrd_backend, the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched) {
+    // Reported 2026-08-28 as "a dictation that somehow duplicated": the same sentence two and
+    // three times in the document, each copy slightly reworded, joined at a visible seam
+    // ("and then give gives"). The second half of this test reproduces exactly that.
+    //
+    // The shipped window must be at least as long as the longest utterance the endpointer will
+    // ever hand over, because a window shorter than the utterance slides, and every slide is
+    // stitched by a heuristic that a revising model defeats. This is the assertion that keeps
+    // the two numbers together; `connection.cpp` reads one from the other for the same reason.
+    KD_CHECK(OpenAiBackendConfig{}.window_ms >= static_cast<uint32_t>(VadConfig{}.max_utterance_ms));
+
+    // Thirty seconds — the endpointer's own cut-off — through the shipped shape, hopping every
+    // second the whole way. Nothing slides, nothing is frozen, and every hypothesis reaching the
+    // client is one decode of one recording rather than two texts glued together.
+    PseudoStreamingDriver driver(OpenAiBackendConfig{}.window_ms, OpenAiBackendConfig{}.hop_ms);
+    const std::vector<int16_t> second = pcm_ms(1000);
+    for (int i = 0; i < 30; ++i) {
+        driver.feed(second.data(), second.size());
+        std::vector<int16_t> window;
+        bool slid = true;
+        KD_REQUIRE(driver.take_window(false, window, slid));
+        KD_CHECK(!slid);
+        // Whatever the model says is what the client is told. No prefix, no seam.
+        KD_CHECK_EQ(driver.commit("hypothesis " + std::to_string(i), slid),
+                    std::string("hypothesis " + std::to_string(i)));
+        KD_CHECK(driver.frozen_prefix().empty());
+    }
+}
+
+KD_TEST(asrd_backend, a_window_shorter_than_the_utterance_duplicates_what_the_model_revises) {
+    // Why the test above is worth its assertions, demonstrated rather than asserted about.
+    //
+    // Eight seconds of window, one second of hop, and a model that re-punctuates what it has
+    // already said — which is what every batch model does as it hears the end of a sentence.
+    // The stitch matches the tail of the previous transcript against the head of the new one;
+    // the revision breaks that match, and the fallback freezes the *entire* previous window
+    // while the new window still holds seven of those eight seconds.
+    PseudoStreamingDriver driver(8000, 1000);
+    const std::vector<int16_t> second = pcm_ms(1000);
+    for (int i = 0; i < 9; ++i) driver.feed(second.data(), second.size());
+
+    std::vector<int16_t> window;
+    bool slid = true;
+    KD_REQUIRE(driver.take_window(false, window, slid));
+    KD_CHECK(!slid);  // nothing transcribed yet, so nothing may be dropped
+    driver.commit("confused application does something weird and then give", slid);
+
+    driver.feed(second.data(), second.size());
+    KD_REQUIRE(driver.take_window(false, window, slid));
+    KD_CHECK(slid);
+    // One second of audio left the window. The model, hearing more, has repunctuated the middle
+    // and revised one word: "give" became "gives". That single substitution is enough — the
+    // matcher needs an exact run, so no k matches at all and the fallback freezes all of it.
+    const std::string stitched =
+        driver.commit("Application does something weird, and then gives inconsistent instruction",
+                      slid);
+
+    // Every word is present twice: once frozen from the old window, once from the new one. This
+    // is the reported defect, and it is the arithmetic of the fallback rather than a bug in it —
+    // it preserves the audio it drops, and it preserves seven seconds it did not drop with it.
+    KD_CHECK_EQ(driver.frozen_prefix(),
+                std::string("confused application does something weird and then give"));
+    KD_CHECK_EQ(stitched,
+                std::string("confused application does something weird and then give "
+                            "Application does something weird, and then gives inconsistent "
+                            "instruction"));
 }
 
 // ─── The slide must never lose audio ────────────────────────────────────────────────────────

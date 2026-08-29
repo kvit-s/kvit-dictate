@@ -70,7 +70,27 @@ struct OpenAiBackendConfig {
     std::string model = kDefaultModel;
     std::string language = kDefaultLanguage;  // empty means "omit the field, server default"
     uint32_t timeout_ms = 30000;
-    uint32_t window_ms = 8000;
+    // **Big enough to hold a whole utterance, which is the point.**
+    //
+    // A window smaller than the utterance has to slide, and a slide has to be stitched:
+    // `scrolled_off_words` guesses which words left the window by matching the tail of the
+    // previous transcript against the head of the new one. Against a model that revises as it
+    // hears more, that match often fails outright, and its fallback freezes the *entire*
+    // previous window — roughly 8 seconds of words — while the new window still contains 7 of
+    // those 8 seconds. The result is the same sentence twice, joined at a seam, which is
+    // exactly what a user reported on 2026-08-28: "a dictation that somehow duplicated".
+    //
+    // Sliding buys bounded decode cost for unbounded audio. The endpointer already bounds the
+    // audio: `VadConfig::max_utterance_ms` cuts an utterance at 30 s, so a window that size is
+    // never exceeded and `slid` is never true. Every hop then re-decodes the whole utterance
+    // from its first sample — which is what a batch model is good at, and what the `final`
+    // does anyway — so the preview and the committed text come from the same computation and
+    // no heuristic sits between the model and the document.
+    //
+    // The cost is a longer POST as the utterance grows. It is self-limiting: only one request
+    // is in flight at a time (§2.1), so a slower decode simply means fewer previews, never a
+    // queue. `connection.cpp` sets this from `VadConfig` so the two cannot drift.
+    uint32_t window_ms = 30000;
     uint32_t hop_ms = 1000;
     // openai-translator.md §4.3: the v1 default for a batch model. Makes hop >= window, so the
     // window never slides and no `partial` is ever emitted.
