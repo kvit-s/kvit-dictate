@@ -904,25 +904,40 @@ HRESULT OverlayCore::ensure_render_target() {
     // The pixel format must be premultiplied BGRA — that is what AC_SRC_ALPHA in the
     // BLENDFUNCTION below means, and D2D writes premultiplied output for this alpha mode, so no
     // conversion pass is needed.
+    //
+    // ── _SOFTWARE, deliberately, and it is not a fallback ───────────────────────────────────
+    //
+    // `_DEFAULT` means "hardware if there is any", and Direct2D honours it by creating a D3D11
+    // device through DXGI. That loads `d3d11.dll`, `dxgi.dll` and the vendor's user-mode driver
+    // into this process and costs ~18 MB of **dedicated video memory**, measured on an NVIDIA
+    // adapter with `\GPU Process Memory(*)\Dedicated Usage` — a fixed price for owning a
+    // device, unrelated to the size of the pill. A user found it in Task Manager and asked the
+    // obvious question: why does a text overlay need VRAM?
+    //
+    // It does not, and the hardware path is the wrong shape for this window anyway. The
+    // destination is a DIB section in system memory, because `UpdateLayeredWindow` takes a DC
+    // and nothing else; rendering into video memory only to read it back is work in the wrong
+    // direction. overlay.h is explicit that this window repaints a few times a second and runs
+    // no render loop, so there is no frame rate to defend — and the software rasteriser also
+    // sidesteps the alpha-channel question the old comment here flagged as unverified, and any
+    // GPU wake-up or hybrid-graphics switch on a laptop.
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 0.0f, 0.0f,
         D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
 
     HRESULT hr = d2d->CreateDCRenderTarget(&props, rt.put());
     if (FAILED(hr)) {
-        // **Uncertain Windows behaviour, handled rather than assumed.** A DC render target is
-        // documented to fall back to software, but the hardware path's handling of the alpha
-        // channel when the bound DC is a DIB section is not something I can verify from the
-        // documentation alone. If item 3 of the manual procedure ever shows an opaque black
-        // box instead of a translucent pill, force _SOFTWARE unconditionally here — that is the
-        // known workaround, and it costs nothing at this frame rate.
-        props.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
+        // Software rasterisation is part of Direct2D itself and has no device to lose, so this
+        // is close to unreachable. `_DEFAULT` is the one thing left to try rather than giving
+        // up and drawing nothing: a pill that costs VRAM beats no pill at all.
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
         hr = d2d->CreateDCRenderTarget(&props, rt.put());
         if (FAILED(hr)) {
             return hr;
         }
-        KD_LOG_WARN("D2D DC render target fell back to software (hr=0x%08lX)",
+        KD_LOG_WARN("D2D software DC render target failed (hr=0x%08lX); using the hardware path, "
+                    "which costs this process a D3D device and its video memory",
                     static_cast<unsigned long>(hr));
     }
 
