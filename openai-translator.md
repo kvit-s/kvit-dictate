@@ -207,7 +207,7 @@ Honest line counts against this tree, and what each row actually costs.
 | `stability.py` | 874 | **Port the tracker only, ~250 lines.** The grapheme/UTF-8 half is `util/utf8.cpp`. The algorithm is the Python tracker's, not `commit_engine.cpp` run backwards. |
 | `vad.py` | 1,207 | **Port `EnergyZcrScorer` + `VadEndpointer`, ~350 lines.** Silero is out of v1 — see §4.4, which is blunt about what that costs. |
 | `session.py` + `connection.py` | 1,358 | **Port the routing, ~400 lines.** Much of this is CLI surface and backend-selection machinery a fixed-backend exe does not need. |
-| `backends/base.py` `PseudoStreamingBackend` | ~200 of 811 | **Port, ~200 lines.** The overlapping-window driver, including the prefix-freeze on window slide, which is the subtle part. |
+| `backends/base.py` `PseudoStreamingBackend` | ~200 of 811 | **Ported, then cut back.** The hop cadence is ported; the overlapping window and its prefix-freeze-on-slide are deliberately *not* — see §4.5. The whole utterance is re-decoded every hop. |
 | `backends/openai_http.py` | 410 | **Port to WinHTTP, ~350 lines.** Multipart is hand-rolled on both sides; `normalizer.cpp` is the shape to copy. |
 | `server.py` | 1,316 | **Port the run loop, ~200 lines.** |
 
@@ -265,7 +265,7 @@ hello          → validate proto; hello_ack (with models[]); then load
 start          → open session, reset endpointer and stability, utterance_id = 1
 audio (0x02)   → append to the utterance buffer; feed the endpointer
   endpoint     → close utterance, emit final, ++utterance_id
-  hop elapsed  → decode window, emit partial  (off in finalize-only)
+  hop elapsed  → decode the whole utterance so far, emit partial  (off in finalize-only)
 stop           → flush, decode the remainder, final, stopped
 cancel         → drop everything, abort in-flight HTTP, stopped(reason=cancelled),
                  no further partial/final
@@ -352,39 +352,47 @@ been offered. See `asrd_session.live_preview_publishes_no_mark_so_a_late_revisio
 So preview is on, the mark is off for this backend permanently, and everything still commits at
 the `final`. Off remains one checkbox away, still labelled.
 
-**And the window is now as long as an utterance, which retires the stitcher from the shipped
-path.** Turning the preview on also woke the sliding window: with `window_ms = 8000` a speaker
-who talks for twenty seconds slides it a dozen times, and every slide is stitched by
-`scrolled_off_words`, which matches the tail of the previous transcript against the head of the
-new one. One revised word inside that overlap — `give` becoming `gives` — makes every candidate
-`k` fail, and the fallback freezes the *entire* previous window while the new window still holds
-seven of those eight seconds. Reported the same evening as "a dictation that somehow duplicated",
-with the seam visible in the text.
+**And the sliding window is gone, along with the stitcher, because its only failure mode was
+putting the same speech in the document twice.**
 
-Sliding buys bounded decode cost for unbounded audio, and the audio is not unbounded: the
-endpointer cuts an utterance at `VadConfig::max_utterance_ms`. So `window_ms` is read from the
-endpointer, the window always covers the whole utterance, `slid` is never true, and the preview
-and the `final` are the same computation over the same recording. `scrolled_off_words` and its
-tests stay — a smaller window would still need them — but nothing ships through them.
+Turning the preview on woke it. With `window_ms = 8000` a speaker who talks for twenty seconds
+slides the window a dozen times, and every slide has to be stitched: `scrolled_off_words` guesses
+which words left the window by matching the tail of the previous transcript against the head of
+the new one. It needs an exact run. One revised word inside the overlap — `give` becoming
+`gives`, which is what a batch model does as it hears the end of a sentence — makes every
+candidate `k` fail, and the fallback freezes the *entire* previous window while the new window
+still holds seven of those eight seconds. Reported the same evening as "a dictation that somehow
+duplicated", with the seam visible in the text.
 
-**Read from `max_utterance_audio_ms()`, not from `max_utterance_ms` — the first attempt used the
-valve itself and was 300 ms short.** The valve's clock starts at the *onset*; the audio handed to
-the backend starts one `preroll_ms` earlier, because the onset frame replays the pre-roll so the
-decoder hears the beginning of the first word. A cut utterance therefore arrives as 30 000 ms +
-300 ms + a frame of overshoot. Every hop was clean, which is what made it look fixed — and then
-the *finalize*, which takes the window whether or not a hop is due, crossed the boundary and slid,
-once per over-long dictation, deterministically. The same duplication was reported again on
-2026-08-29, one commit after it was declared fixed. A window is only "big enough to hold a whole
-utterance" if it is measured in the units of the audio rather than in the units of the timer that
-ends it, and `VadConfig::max_utterance_audio_ms()` is where that sum now lives so the two cannot
-drift apart a third time. A slide in a build that should never slide is also logged once per
-connection now: the symptom reached a user twice with nothing in the log to point at it.
+That was answered twice by making the window too big to slide: first `8000` →
+`max_utterance_ms`, then a 300 ms correction on top when the duplication came back the next day
+(the safety valve's clock starts at the *onset*, but the audio handed over also carries
+`preroll_ms` from before it, so a cut utterance is 30 300 ms against a 30 000 ms window and the
+*finalize* — which takes the window whether or not a hop is due — slid every time). Both fixes
+were correct and both were one arithmetic slip wide, which is the actual defect: a heuristic
+whose only failure mode is corrupting the user's document should not be sitting in the path at
+all, waiting for a buffer to cross a number.
 
-See `asrd_backend.the_window_is_sized_in_audio_not_in_the_timer_that_ends_the_utterance`,
-`the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched` (which walks every
-millisecond the endpointer can deliver, finalize included) and, for the arithmetic,
-`a_window_sized_at_the_valve_stitches_the_finalize_of_a_cut_utterance` and
-`a_window_shorter_than_the_utterance_duplicates_what_the_model_revises`.
+So there is no window. `PseudoStreamingDriver` buffers the utterance and **never drops a
+sample**; every take hands over the whole recording from its first sample, and the model's answer
+*is* the cumulative hypothesis — no frozen prefix, no join, nothing between the model and the
+document. Duplication is not unlikely here, it is unrepresentable: there is no second source of
+text. `scrolled_off_words`, `join_words` and the freeze are deleted rather than left switched
+off, and so are their tests.
+
+What the window bought was a bound on decode cost, and that bound now comes from the endpointer,
+which already had one: `VadConfig::max_utterance_ms` cuts an utterance at 30 s — a cut the user
+can see in their text rather than a stitch they cannot. It is a **precondition**, not an
+assumption: `connection.cpp` refuses the connection outright if the endpointer is configured to
+leave an utterance unbounded, because the buffer would then grow forever. A startup failure with
+a message is the honest alternative to a heuristic that fails quietly.
+
+The cost is a POST that grows with the utterance, self-limiting because only one request is in
+flight at a time (§2.1): a slower decode means fewer previews, never a queue.
+
+See `asrd_backend.every_take_hands_over_the_whole_utterance_from_its_first_sample`,
+`a_long_utterance_reaches_the_model_whole_in_finalize_only_too` and
+`the_endpointer_is_what_bounds_the_buffer`.
 
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a
@@ -437,12 +445,12 @@ doing real work — it is what stops 500 ms of silence being transcribed as "Yea
   the transcription when it says no. **It fails open** — a missing route (503), a timeout, a
   malformed answer all mean "go ahead". Losing something the user actually said is worse than an
   occasional invented word, and a VAD outage must never be able to silence dictation.
-* **The pseudo-streaming window**, ported from `PseudoStreamingBackend`: re-transcribe the whole
-  window every `hop_ms` and emit the result as the cumulative hypothesis. Past `window_ms` the
-  oldest audio scrolls out and its transcript must be **frozen** into a prefix, estimated by
-  word-overlap stitching — which can be wrong, in ways `base.py` documents honestly and which
-  must be copied across with the code rather than left behind with it. Finalize-only makes
-  `hop_ms >= window_ms`, so the window never slides; that is the v1 default.
+* **The hop cadence**, from `PseudoStreamingBackend`: re-transcribe the utterance so far every
+  `hop_ms` and emit the result as the cumulative hypothesis. `base.py`'s overlapping *window* is
+  not ported — the driver never drops audio, so there is no scrolled-off transcript to freeze
+  and no word-overlap stitch to get wrong. §4.5 says why that mattered enough to diverge from the
+  reference implementation. The utterance is bounded by the endpointer instead, and finalize-only
+  turns hops off entirely; that is the v1 default.
 
 ### 4.6 Configuration, Settings, and how it is started
 
@@ -677,7 +685,7 @@ the code, not just this file.
 
 | Risk | Mitigation |
 |---|---|
-| The pseudo-streaming freeze-on-slide heuristic mis-stitches and commits a wrong prefix | Inherited from `base.py` along with its documented failure cases. v1 defaults to finalize-only, where the window never slides because the utterance ends first. |
+| The pseudo-streaming freeze-on-slide heuristic mis-stitches and commits a wrong prefix | **Retired.** It did exactly this, three times, in real dictation. The window and the stitcher are deleted (§4.5): the driver never drops audio, so nothing has to be guessed. The residual risk moves to decode cost, bounded by `VadConfig::max_utterance_ms`, which `connection.cpp` now requires. |
 | Porting `stability.py` introduces a divergence the fixtures do not catch | T2 property tests, byte for byte, including the step-3 reading. `commit_engine.cpp` is not the oracle. |
 | Hand-rolled RFC 6455 on the server side has a bug the Python version does not | It is written third, against two working implementations and a corpus, and tested against a real WinHTTP client rather than against itself. Budget includes ping/pong and close. |
 | Spawning a child undoes §1.2's attack-surface reduction | The old path stays compiled out. The new path launches one fixed image from the install directory. The release grep is rewritten to match that fact rather than pretending `CreateProcessW` is absent. |

@@ -71,7 +71,15 @@ struct VadConfig {
     // Audio fed to the decoder ahead of the detected onset.
     double preroll_ms = 300.0;
     // Safety valve, not a product feature: an utterance that never endpoints would feed the
-    // backend without bound and never produce a `final`. 0 disables it.
+    // backend without bound and never produce a `final`. 0 disables it — and the OpenAI backend
+    // refuses to run with it disabled, because it buffers a whole utterance and never drops a
+    // sample, so this is the only thing bounding it.
+    //
+    // Note that this is *not* the amount of audio the backend receives: the clock starts at the
+    // onset, and the onset frame also replays `preroll_ms` from before it. An utterance cut here
+    // is handed over as roughly `max_utterance_ms + preroll_ms`. Nothing depends on that sum any
+    // more — it used to size a decode window, and being 300 ms short of it put the same speech
+    // in a user's document twice — but the arithmetic surprises people, so it is written down.
     double max_utterance_ms = 30000.0;
 
     // Energy/ZCR scorer.
@@ -91,18 +99,6 @@ struct VadConfig {
     [[nodiscard]] uint64_t endpoint_samples() const noexcept;
     [[nodiscard]] uint64_t preroll_samples() const noexcept;
     [[nodiscard]] uint64_t max_utterance_samples() const noexcept;
-
-    // The most audio one utterance can hand a decoder, in milliseconds. 0 means "unbounded",
-    // which is what `max_utterance_ms == 0` asks for.
-    //
-    // This is **not** `max_utterance_ms`, and the difference is the whole bug of 2026-08-29.
-    // The safety valve measures from the *onset*, but the audio handed over starts one
-    // `preroll_ms` before it (the onset frame replays the pre-roll so the decoder hears the
-    // beginning of the first word), and the cut is tested once per frame so it can overshoot by
-    // one. A decoder window sized at `max_utterance_ms` is therefore always a few hundred
-    // milliseconds too small, and in `PseudoStreamingDriver` "too small" means the window slides
-    // and its transcript is stitched — the duplicated dictation, again.
-    [[nodiscard]] double max_utterance_audio_ms() const noexcept;
 
     // Returns an empty string when the configuration is coherent, and the reason otherwise.
     // Same checks as `VadConfig.__post_init__`, including the one that is not obvious: a

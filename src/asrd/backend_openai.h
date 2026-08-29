@@ -4,37 +4,58 @@
 #pragma once
 //
 // The one backend v1 has: `POST {service}/v1/audio/transcriptions`, OpenAI-compatible.
-// Port of `server/kvit_asr/backends/openai_http.py` and the half of
-// `server/kvit_asr/backends/base.py` that drives an overlapping window over a batch model.
+// Port of `server/kvit_asr/backends/openai_http.py`, and of the half of
+// `server/kvit_asr/backends/base.py` that drives a batch model on a timer — but not of its
+// overlapping window, which is deliberately not here. See below.
 //
-// ─── This is a batch model behind a streaming interface, and that is not free ───────────────
+// ─── This is a batch model behind a streaming interface, and there is no window ─────────────
 //
-// The endpoint takes a recording and returns a string. `PseudoStreamingDriver` re-transcribes
-// the whole current window every `hop_ms` and emits the result as the cumulative hypothesis.
-// While the utterance is shorter than `window_ms` the window starts at the utterance start, so
-// the hypothesis is simply "the transcript of everything said so far" and cumulativity is
-// exact. Most dictation utterances endpoint well inside an 8-second window and never leave
-// that regime.
+// The endpoint takes a recording and returns a string. `PseudoStreamingDriver` buffers the
+// utterance and re-transcribes **all of it** every `hop_ms`. The transcript of that recording is
+// the cumulative hypothesis, exactly, with nothing computed on top of it: the preview and the
+// `final` are the same operation over the same audio, differing only in when they run.
 //
-// Past `window_ms` the oldest audio scrolls out and the model can no longer see it. Its
-// transcript must be **frozen** into a prefix, because nothing is left to re-derive it from,
-// and the freeze point is estimated by word-overlap stitching. base.py documents honestly when
-// that estimate is wrong, and the documentation comes across with the code rather than being
-// left behind with it:
+// ─── Why there is no sliding window, and no stitcher ────────────────────────────────────────
 //
-//   * repeated words ("the the", "very very") make the overlap ambiguous and can freeze one
-//     word too few or too many;
-//   * a model that repunctuates or recases across the boundary produces no exact overlap at
-//     all, and the fallback freezes the *entire* pre-slide transcript — conservative, because
-//     dropping it would delete words the user actually said;
-//   * a revision that would have crossed the boundary is simply lost.
+// There used to be both. A window of `window_ms` bounded the decode cost of an unbounded
+// utterance; past it the oldest audio scrolled out, and because nothing was left to re-derive
+// that audio's transcript from, its words had to be **frozen** into a prefix. The freeze point
+// was estimated by word-overlap stitching: the largest k such that the last k words of the
+// pre-slide transcript equal the first k words of the post-slide one.
 //
-// The frozen prefix is **not** "stable" in plan.md §1.4's sense — no stability computation
-// blessed it — it is merely unrecoverable. The stability tracker still runs on top and still
-// decides what reaches the document.
+// That estimate has exactly one failure mode, and it is not a small one. The match needs an
+// exact run of words. A model that revises as it hears more — which is what every batch model
+// does as it reaches the end of a sentence: `give` becomes `gives`, a comma appears, a word is
+// dropped — breaks the run, no k matches, and the fallback freezes the **entire** pre-slide
+// transcript while the new window still holds almost all of the same audio. The result is the
+// same speech twice, joined at a visible seam, each copy slightly reworded.
 //
-// Finalize-only (the v1 default) sets `hop_ms >= window_ms`, so the window never slides and
-// none of the above can happen. That is deliberate: see §4.3's batch-model caveat.
+// The other branch is worse: freezing nothing deletes words the user actually said. So the
+// design's own choice, once its guess failed, was between duplicating text and losing it.
+//
+// This was reported from real use three times. Twice it was addressed by making the window big
+// enough that it could not slide — first `8000` → `max_utterance_ms`, then a 300 ms pre-roll
+// correction on top of that — and each time the duplication was one arithmetic slip away from
+// coming back, because a heuristic whose only failure mode is corrupting the document was still
+// sitting in the path, waiting for the buffer to cross a number.
+//
+// So it is gone. **The driver never drops audio.** Every take hands over the whole utterance
+// from its first sample, so there is no scrolled-off transcript, nothing to freeze, nothing to
+// stitch, and no arrangement of hop and utterance length that can duplicate a word. What this
+// backend returns is what the model said about one recording.
+//
+// What the window bought was bounded decode cost, and that bound now comes from where it always
+// should have: the endpointer. `VadConfig::max_utterance_ms` cuts an utterance at 30 s — a cut
+// the user can see in their text, rather than a stitch they cannot. That bound is **required**,
+// not assumed: `connection.cpp` refuses a connection whose endpointer leaves an utterance
+// unbounded, because this driver would then buffer it forever. A missing bound is a startup
+// failure with a message, not a slow surprise mid-word.
+//
+// The cost is a POST that grows with the utterance, and it is self-limiting: only one request is
+// in flight at a time (§2.1), so a slower decode means fewer previews, never a queue.
+//
+// Finalize-only (the v1 default) sets `hop_ms = 0`, which turns hops off entirely: one request
+// per utterance, no live preview. See §4.3's batch-model caveat.
 //
 // ─── It invents words over silence, measured rather than assumed ────────────────────────────
 //
@@ -70,98 +91,58 @@ struct OpenAiBackendConfig {
     std::string model = kDefaultModel;
     std::string language = kDefaultLanguage;  // empty means "omit the field, server default"
     uint32_t timeout_ms = 30000;
-    // **Big enough to hold a whole utterance, which is the point.**
-    //
-    // A window smaller than the utterance has to slide, and a slide has to be stitched:
-    // `scrolled_off_words` guesses which words left the window by matching the tail of the
-    // previous transcript against the head of the new one. Against a model that revises as it
-    // hears more, that match often fails outright, and its fallback freezes the *entire*
-    // previous window — roughly 8 seconds of words — while the new window still contains 7 of
-    // those 8 seconds. The result is the same sentence twice, joined at a seam, which is
-    // exactly what a user reported on 2026-08-28: "a dictation that somehow duplicated".
-    //
-    // Sliding buys bounded decode cost for unbounded audio. The endpointer already bounds the
-    // audio, so `connection.cpp` sets this from `VadConfig::max_utterance_audio_ms()` and
-    // `slid` is never true. Every hop then re-decodes the whole utterance from its first sample
-    // — which is what a batch model is good at, and what the `final` does anyway — so the
-    // preview and the committed text come from the same computation and no heuristic sits
-    // between the model and the document.
-    //
-    // **`max_utterance_audio_ms()`, not `max_utterance_ms`.** The first fix used the valve
-    // itself, and it was 300 ms short: the valve measures from the onset, but the audio handed
-    // over begins one `preroll_ms` earlier, because the onset frame replays the pre-roll so the
-    // decoder hears the start of the first word. So the buffer crossed the window exactly when
-    // the valve cut, every utterance long enough to be cut slid on its own *finalize*, and the
-    // duplication came back — reported again on 2026-08-29, one commit after it was declared
-    // fixed. A window is only "big enough to hold a whole utterance" if it is measured in the
-    // same units as the audio, not in the units of the timer that ends it.
-    //
-    // The cost is a longer POST as the utterance grows. It is self-limiting: only one request
-    // is in flight at a time (§2.1), so a slower decode simply means fewer previews, never a
-    // queue. The default here is a plain fallback for callers that do not size it; the shipped
-    // value comes from the endpointer.
-    uint32_t window_ms = 30000;
+    // How often the utterance so far is re-transcribed for the live preview. There is no window
+    // to go with it — every hop decodes the whole utterance — so this is a rate, not a span.
     uint32_t hop_ms = 1000;
-    // openai-translator.md §4.3: the v1 default for a batch model. Makes hop >= window, so the
-    // window never slides and no `partial` is ever emitted.
+    // openai-translator.md §4.3: the v1 default for a batch model. Turns hops off entirely, so
+    // the only transcription is the one the finalize forces and no `partial` is ever emitted.
     bool finalize_only = true;
     bool vad_gate = true;
 };
 
-// The overlapping-window driver, with no network in it. Split out so the sliding, freezing and
-// stitching can be tested without a server, which is where every one of its bugs lives.
+// The utterance buffer, with no network in it. Split out so the hop cadence can be tested
+// without a server.
+//
+// **One invariant, and it is the whole design: no sample that has been fed ever leaves the
+// buffer before `reset()`.** A take hands over everything since the last reset, so the model
+// always sees the utterance from its first sample and the transcript it returns is the
+// cumulative hypothesis with nothing added to it. That is what makes duplication structurally
+// impossible here rather than merely improbable: there is no second source of text to join.
+//
+// The buffer is bounded by the caller. Audio is fed only while an utterance is open, and
+// `VadConfig::max_utterance_ms` closes one after 30 s; `connection.cpp` refuses to run without
+// that bound.
 class PseudoStreamingDriver {
 public:
-    PseudoStreamingDriver(uint32_t window_ms, uint32_t hop_ms);
+    // `hop_ms == 0` disables hops entirely: only a forced take produces a window, which is
+    // finalize-only.
+    explicit PseudoStreamingDriver(uint32_t hop_ms);
 
     void reset();
 
     // Append gated PCM. Returns true when at least one hop is now due.
     bool feed(const int16_t* samples, size_t count);
 
-    // Take the window that should be transcribed next, consuming one hop's worth of pending
-    // audio. `slid` reports whether the window dropped its oldest audio, which is what the
-    // freeze in commit() keys off. Returns false when there is nothing to transcribe.
+    // Take the audio to transcribe next — the whole utterance so far — consuming one hop's
+    // worth of pending audio. Returns false when there is nothing to transcribe.
     //
-    // `force` is finalize: take the window even when no hop is due.
-    bool take_window(bool force, std::vector<int16_t>& window, bool& slid);
-
-    // Turn one window transcript into the cumulative hypothesis for the utterance, applying the
-    // freeze-on-slide when `slid`.
-    std::string commit(const std::string& window_text, bool slid);
+    // `force` is finalize: take the buffer even when no hop is due, and even when hops are off.
+    bool take_window(bool force, std::vector<int16_t>& window);
 
     [[nodiscard]] uint64_t audio_ms() const noexcept { return audio_ms_; }
     [[nodiscard]] bool any_audio() const noexcept { return any_audio_; }
-    [[nodiscard]] const std::string& frozen_prefix() const noexcept { return frozen_; }
     [[nodiscard]] uint32_t hop_ms() const noexcept { return hop_ms_; }
-    [[nodiscard]] uint32_t window_ms() const noexcept { return window_ms_; }
+    [[nodiscard]] bool hops_enabled() const noexcept { return hop_samples_ != 0; }
 
 private:
-    uint32_t window_ms_;
     uint32_t hop_ms_;
-    size_t window_samples_;
-    size_t hop_samples_;
+    size_t hop_samples_;  // 0 means hops are off
 
     std::vector<int16_t> buf_;
-    std::string frozen_;
-    std::string prev_window_text_;
     size_t pending_samples_ = 0;
     uint64_t audio_ms_ = 0;
     bool any_audio_ = false;
 };
-
-// Estimate which words left the window between two successive transcripts. Exposed for the
-// tests, because this heuristic is where the wrapper can commit a wrong prefix.
-//
-// `prev_text` covers audio [s0, t0]; `new_text` covers [s1, t1] with s1 > s0 and t1 > t0. The
-// words that scrolled off are a prefix of `prev_text`: find the largest k such that the last k
-// words of `prev_text` equal the first k words of `new_text`. k == 0 freezes all of `prev_text`
-// — the conservative branch, which can commit text the next window would have revised, but the
-// alternative deletes words the user actually said.
-std::string scrolled_off_words(const std::string& prev_text, const std::string& new_text);
-
-// Join two fragments with exactly one space, tolerating empties.
-std::string join_words(const std::string& a, const std::string& b);
 
 // The backend itself. One per connection; its HTTP client is what `cancel()` reaches.
 class OpenAiBackend {
@@ -222,7 +203,7 @@ private:
     PseudoStreamingDriver driver_;
 
     bool vad_unavailable_ = false;  // latched after the first refusal, so it is logged once
-    bool slide_warned_ = false;     // likewise: a slide in a build that should never slide
+    bool oversize_warned_ = false;  // likewise: a buffer past any plausible utterance length
     uint64_t requests_ = 0;
     uint64_t vad_skipped_ = 0;
     uint64_t empty_responses_ = 0;

@@ -23,11 +23,10 @@ uint64_t samples_to_ms(size_t samples) {
     return static_cast<uint64_t>(samples) * 1000u / 16000u;
 }
 
-std::string rstrip(const std::string& s) {
-    size_t end = s.size();
-    while (end > 0 && std::isspace(static_cast<unsigned char>(s[end - 1])) != 0) --end;
-    return s.substr(0, end);
-}
+// Two minutes. Not a limit — nothing is ever dropped — just the point past which a buffer says
+// more about a broken endpointer than about a talkative user. Absolute rather than derived from
+// `VadConfig`, so there is no second number here that can drift out of step with the first.
+constexpr size_t kAbsurdAudioSamples = 120u * 16000u;
 
 std::string strip(const std::string& s) {
     size_t begin = 0;
@@ -37,100 +36,15 @@ std::string strip(const std::string& s) {
     return s.substr(begin, end - begin);
 }
 
-std::vector<std::string> split_words(const std::string& s) {
-    std::vector<std::string> out;
-    size_t at = 0;
-    while (at < s.size()) {
-        while (at < s.size() && std::isspace(static_cast<unsigned char>(s[at])) != 0) ++at;
-        const size_t begin = at;
-        while (at < s.size() && std::isspace(static_cast<unsigned char>(s[at])) == 0) ++at;
-        if (at > begin) out.emplace_back(s, begin, at - begin);
-    }
-    return out;
-}
-
-// Comparison key for stitching: case- and edge-punctuation-insensitive.
-//
-// Deliberately crude, and copied crude. A model that recases or repunctuates across a window
-// boundary should still stitch, but nothing here tries to be clever about it — an over-clever
-// matcher would silently freeze the wrong words, and a crude one that fails falls back to the
-// conservative branch.
-std::string norm_word(const std::string& w) {
-    static constexpr const char* kEdge = ".,;:!?\"'()[]{}\xE2\x80\xA6";  // … in UTF-8
-    size_t begin = 0;
-    size_t end = w.size();
-    const auto is_edge = [](char c) {
-        for (const char* p = kEdge; *p != '\0'; ++p) {
-            if (*p == c) return true;
-        }
-        return false;
-    };
-    while (begin < end && is_edge(w[begin])) ++begin;
-    while (end > begin && is_edge(w[end - 1])) --end;
-    std::string out = w.substr(begin, end - begin);
-    // ASCII-only fold, for the same reason normalizer.cpp gives: a locale-aware fold introduces
-    // the Turkish dotless-i problem into a comparison whose whole job is to be predictable.
-    for (char& c : out) {
-        const auto u = static_cast<unsigned char>(c);
-        if (u < 0x80) c = static_cast<char>(std::tolower(u));
-    }
-    return out;
-}
-
 }  // namespace
 
-std::string join_words(const std::string& a, const std::string& b) {
-    const std::string left = rstrip(a);
-    const std::string right = strip(b);
-    if (left.empty()) return right;
-    if (right.empty()) return left;
-    return left + " " + right;
-}
+// ─── PseudoStreamingDriver ────────────────────────────────────────────────────────────────
 
-std::string scrolled_off_words(const std::string& prev_text, const std::string& new_text) {
-    const std::vector<std::string> pw = split_words(prev_text);
-    const std::vector<std::string> nw = split_words(new_text);
-    if (pw.empty()) return {};
-
-    std::vector<std::string> pn;
-    std::vector<std::string> nn;
-    pn.reserve(pw.size());
-    nn.reserve(nw.size());
-    for (const std::string& w : pw) pn.push_back(norm_word(w));
-    for (const std::string& w : nw) nn.push_back(norm_word(w));
-
-    const size_t limit = std::min(pn.size(), nn.size());
-    const auto join_prefix = [&](size_t upto) {
-        std::string out;
-        for (size_t i = 0; i < upto; ++i) {
-            if (i != 0) out += ' ';
-            out += pw[i];
-        }
-        return out;
-    };
-    for (size_t k = limit; k >= 1; --k) {
-        if (std::equal(pn.end() - static_cast<ptrdiff_t>(k), pn.end(), nn.begin())) {
-            return join_prefix(pn.size() - k);
-        }
-    }
-    // No overlap found. Freeze everything, which can commit text the next window would have
-    // revised — but the alternative deletes words the user actually said, and losing text is
-    // worse than freezing it early.
-    return join_prefix(pw.size());
-}
-
-// ─── PseudoStreamingDriver ──────────────────────────────────────────────────────────────────
-
-PseudoStreamingDriver::PseudoStreamingDriver(uint32_t window_ms, uint32_t hop_ms)
-    : window_ms_(window_ms),
-      hop_ms_(hop_ms == 0 ? 1 : hop_ms),
-      window_samples_(ms_to_samples(window_ms)),
-      hop_samples_(ms_to_samples(hop_ms == 0 ? 1 : hop_ms)) {}
+PseudoStreamingDriver::PseudoStreamingDriver(uint32_t hop_ms)
+    : hop_ms_(hop_ms), hop_samples_(ms_to_samples(hop_ms)) {}
 
 void PseudoStreamingDriver::reset() {
     buf_.clear();
-    frozen_.clear();
-    prev_window_text_.clear();
     pending_samples_ = 0;
     audio_ms_ = 0;
     any_audio_ = false;
@@ -142,66 +56,35 @@ bool PseudoStreamingDriver::feed(const int16_t* samples, size_t count) {
     pending_samples_ += count;
     audio_ms_ += samples_to_ms(count);
     any_audio_ = true;
-    return pending_samples_ >= hop_samples_;
+    return hop_samples_ != 0 && pending_samples_ >= hop_samples_;
 }
 
-bool PseudoStreamingDriver::take_window(bool force, std::vector<int16_t>& window, bool& slid) {
-    if (!force && pending_samples_ < hop_samples_) return false;
+bool PseudoStreamingDriver::take_window(bool force, std::vector<int16_t>& window) {
+    if (!force && (hop_samples_ == 0 || pending_samples_ < hop_samples_)) return false;
     if (!any_audio_) return false;
 
-    if (pending_samples_ >= hop_samples_) {
+    if (hop_samples_ != 0 && pending_samples_ >= hop_samples_) {
         pending_samples_ -= hop_samples_;
     } else {
         pending_samples_ = 0;
     }
 
-    // ── The slide, and the condition that must hold before it is allowed ────────────────────
-    //
-    // Dropping audio out of the window is only survivable because `commit()` freezes its
-    // transcript first, and it can only do that by stitching the pre-slide transcript against
-    // the post-slide one. **With no pre-slide transcript there is nothing to stitch**, so
-    // `scrolled_off_words("", text)` freezes the empty string and the audio is simply gone.
-    //
-    // That is not hypothetical: it is what finalize-only did. With hop >= window no intermediate
-    // hop ever runs, so `prev_window_text_` is always empty — and every utterance longer than
-    // `window_ms` silently lost everything before its last window. openai-translator.md §4.5
-    // asserts "finalize-only makes hop_ms >= window_ms, so the window never slides", and that
-    // is false: it stops *hops* from firing, but the finalize still forces a take.
-    //
-    // Reported from real use as "a chunk of dictation was never captured", which is exactly what
-    // it looks like from the outside and exactly the failure this project says it will not have.
-    //
-    // So the window slides only when there is a transcript to freeze. The buffer is then bounded
-    // by `VadConfig::max_utterance_ms` instead — a cut utterance, logged, rather than a silent
-    // hole in the middle of one.
-    slid = buf_.size() > window_samples_ && !prev_window_text_.empty();
-    if (slid) {
-        // Keep the newest window_samples_. Everything older is gone from the model's view, and
-        // commit() is about to freeze its words.
-        buf_.erase(buf_.begin(),
-                   buf_.begin() + static_cast<ptrdiff_t>(buf_.size() - window_samples_));
-    }
+    // The whole utterance, from its first sample, every time. `buf_` is never erased from the
+    // front and never truncated — that is the invariant the header opens with, and the reason
+    // this function cannot produce a duplicated word no matter how long the speaker talks.
+    // Bounding the buffer is the endpointer's job, not this one's; trading audio for a bound
+    // here is what the stitcher did, and what it cost is on record.
     window = buf_;
     return true;
-}
-
-std::string PseudoStreamingDriver::commit(const std::string& window_text, bool slid) {
-    if (slid) {
-        frozen_ = join_words(frozen_, scrolled_off_words(prev_window_text_, window_text));
-    }
-    prev_window_text_ = window_text;
-    return join_words(frozen_, window_text);
 }
 
 // ─── OpenAiBackend ──────────────────────────────────────────────────────────────────────────
 
 OpenAiBackend::OpenAiBackend(OpenAiBackendConfig cfg)
     : cfg_(std::move(cfg)),
-      driver_(cfg_.window_ms,
-              // finalize_only turns the hop off entirely by making it at least as long as any
-              // window can be, so the only transcription is the one finalize forces: one
-              // request per utterance, no live preview.
-              cfg_.finalize_only ? std::max(cfg_.hop_ms, cfg_.window_ms) : cfg_.hop_ms) {
+      // finalize_only turns hops off, so the only transcription is the one the finalize forces:
+      // one request per utterance, no live preview.
+      driver_(cfg_.finalize_only ? 0 : cfg_.hop_ms) {
     while (!cfg_.base_url.empty() && cfg_.base_url.back() == '/') cfg_.base_url.pop_back();
     parse_http_url(cfg_.base_url + kTranscriptionsPath, transcribe_url_);
     parse_http_url(cfg_.base_url + kVadPath, vad_url_);
@@ -345,36 +228,35 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
 Status OpenAiBackend::transcribe(bool force, std::string& text, bool& have_text) {
     have_text = false;
     std::vector<int16_t> window;
-    bool slid = false;
     {
         std::lock_guard<std::mutex> lock(driver_mutex_);
-        if (!driver_.take_window(force, window, slid)) return Status::success();
+        if (!driver_.take_window(force, window)) return Status::success();
     }
-    if (slid && !slide_warned_) {
-        // In the shipped configuration this is unreachable: `connection.cpp` sizes the window
-        // from `VadConfig::max_utterance_audio_ms()`, so the window always holds a whole
-        // utterance. Reaching it means the two numbers have drifted apart again, and the
-        // symptom — the same sentence twice, joined at a seam — has now been reported from real
-        // use twice with nothing in the log to point at it. Once per connection is enough to
-        // find it the third time.
-        slide_warned_ = true;
+
+    if (window.size() > kAbsurdAudioSamples && !oversize_warned_) {
+        // Nothing is dropped and nothing is stitched — this is a diagnostic, not a policy. The
+        // buffer is bounded by `VadConfig::max_utterance_ms` and `connection.cpp` refuses to
+        // start without that bound, so getting here means an utterance is not being closed and
+        // the POST is about to be enormous. That should be visible in the log rather than felt
+        // as a mysteriously slow decode.
+        oversize_warned_ = true;
         KD_LOG_WARN(
-            "the decode window (%u ms) is shorter than this utterance, so it slid and its "
-            "transcript is being stitched by a heuristic a revising model defeats; expect "
-            "duplicated text. Logged once per connection.",
-            cfg_.window_ms);
+            "the utterance buffer has reached %llu ms, past any plausible dictation; the "
+            "endpointer is not closing utterances. Nothing is dropped. Logged once per "
+            "connection.",
+            static_cast<unsigned long long>(samples_to_ms(window.size())));
     }
 
     // The HTTP round trip is deliberately outside the lock: it is 237-541 ms, and holding the
     // driver's mutex across it would block the connection thread's feed() for exactly as long
     // as the decode thread exists to avoid.
-    std::string window_text;
-    const Status st = transcribe_batch(window, window_text);
-    if (!st.ok()) return st;
-
-    {
-        std::lock_guard<std::mutex> lock(driver_mutex_);
-        text = driver_.commit(window_text, slid);
+    //
+    // What comes back is the answer for the whole utterance so far, which *is* the cumulative
+    // hypothesis. There is no prefix to prepend and no seam to join: see the header.
+    const Status st = transcribe_batch(window, text);
+    if (!st.ok()) {
+        text.clear();
+        return st;
     }
     have_text = true;
     return Status::success();
