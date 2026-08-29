@@ -334,7 +334,7 @@ bool SessionServer::on_audio(const int16_t* samples, size_t count) {
         }
     }
 
-    if (hop_due && !cfg_.publish_stable_partials) {
+    if (hop_due && !cfg_.emit_partials) {
         // Finalize-only: the hop cannot fire, because hop_ms was raised to window_ms. Reaching
         // here would mean the driver and the mode disagree.
         hop_due = false;

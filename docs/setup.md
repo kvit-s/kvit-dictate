@@ -291,11 +291,12 @@ sentence ended it re-cases the first word and inserts the punctuation it was not
 binds each new hypothesis against the mark already published (`docs/protocol.md` §8.2), so once
 anything has been committed, no honest answer exists for the next message.
 
-So nothing is committed early. The stability tracker refuses to publish a mark it cannot stand
-behind, and against a batch model that means the whole phrase lands at the endpoint either way.
-Live preview does not change what is typed or when. What it changes is what you see while you
-are talking: with it on, words appear in the overlay greyed while they are still moving and go
-solid once they settle; with it off, you speak into silence until you pause.
+So the translator never tells the client that any of a preview is settled: against this backend
+every `partial` carries `stable_bytes = 0`, which promises nothing and therefore cannot be
+contradicted by the next one. The whole phrase lands at the endpoint either way. Live preview
+does not change what is typed or when. What it changes is what you see while you are talking:
+with it on, words appear in the overlay greyed while they are still moving and go solid once they
+settle; with it off, you speak into silence until you pause.
 
 That is why the two defaults differ, and neither is an oversight:
 

@@ -221,9 +221,12 @@ struct ServerSettings {
     //
     // **On by default**, which is a reversal. openai-translator.md §4.3 argued for off, and the
     // argument was about committing: a batch model revises byte 0, so a preview against one
-    // cannot honestly publish a mark. That part is true and unchanged — the stability tracker
-    // still refuses to publish `stable_bytes` it cannot stand behind, and everything still
-    // commits at the `final`. What it got wrong is that the choice was never about committing:
+    // cannot honestly publish a mark. That part is true, and it is now handled where it belongs:
+    // against this backend a `partial` carries `stable_bytes = 0` and promises nothing, so no
+    // revision can contradict one and everything still commits at the `final`. (It was not
+    // always: the two were one switch, and a mark this backend could not keep cost a real
+    // dictation its session mid-sentence. See openai-translator.md §4.3.) What the argument got
+    // wrong is that the choice was never about committing:
     // partials are also what the overlay greys out as "still moving", and with them off there
     // is nothing to see until the speaker pauses. The Python bridge this replaced defaulted the
     // other way (`openai_http.py`'s `finalize_only=False`) and that is the behaviour people

@@ -80,6 +80,19 @@ struct SessionServerConfig {
     StabilityParams stability;
     VadConfig vad;
 
+    // Whether a `partial` is emitted at all. Off is finalize-only: one `final` per utterance at
+    // the endpoint and nothing in between.
+    //
+    // **Independent of the mark below, and that separation is the whole point.** A `partial`
+    // with `stable_bytes = 0` promises nothing — §8.2 constrains only the published prefix, so
+    // with no prefix published the model may revise every byte it has ever emitted and stay
+    // conforming, and `final` need only begin with a zero-length prefix, which it does. What
+    // such a message *is* good for is the thing the user actually sees: the Client greys it out
+    // as "still moving" and commits none of it. Preview and mark were one flag until a batch
+    // model published 490 bytes, re-punctuated byte 421, and took the session — and the words
+    // in flight — down with it. See `publish_stable_partials`.
+    bool emit_partials = false;
+
     // Whether a `partial` may carry a non-zero `stable_bytes` at all.
     //
     // **False for any backend that re-decodes the whole utterance from scratch**, which is every

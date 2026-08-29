@@ -204,9 +204,22 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     SessionServerConfig session_cfg;
     session_cfg.stability = cfg.stability;
     session_cfg.vad.endpoint_silence_ms = static_cast<double>(cfg.endpoint_silence_ms);
-    // Read off the backend's own declaration rather than a setting. A pseudo-streaming backend
-    // replaces its previous hypothesis instead of extending it; see SessionServerConfig.
-    session_cfg.publish_stable_partials = !cfg.finalize_only;
+    // Two switches, not one, and they are set from different facts.
+    //
+    // Whether to *show* anything mid-utterance is the user's choice, and `--finalize-only off`
+    // is how it arrives. Whether a `partial` may carry a *mark* is the backend's property, and
+    // this process has exactly one backend: an OpenAI-compatible batch service, which re-decodes
+    // the whole window every hop and re-punctuates what it already said. Per
+    // `SessionServerConfig::publish_stable_partials`'s own comment — "false for any backend that
+    // re-decodes the whole utterance from scratch" — that is a permanent no, not a mode.
+    //
+    // These used to be the same line, `= !cfg.finalize_only`, which made turning the preview on
+    // also promise a mark this backend cannot keep. It kept it for 490 bytes and then re-cased a
+    // word at byte 421; §8.3 obliges the sender to refuse, so the session was failed and the
+    // utterance in flight was lost. Preview now publishes `stable_bytes = 0` and promises
+    // nothing, so there is no mark to contradict and everything still commits at the `final`.
+    session_cfg.emit_partials = !cfg.finalize_only;
+    session_cfg.publish_stable_partials = false;
     session_cfg.hostile_stability = cfg.hostile_stability;
 
     if (const std::string why = session_cfg.vad.validate(); !why.empty()) {

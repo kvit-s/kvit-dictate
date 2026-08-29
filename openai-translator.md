@@ -327,15 +327,30 @@ no `partial`s, `ready.mode = "pseudo-streaming"` (the protocol's taxonomy has no
 batch model behind a window). That stays, because a translator serving an unknown client should
 promise the least.
 
-**The client no longer agrees, and this paragraph was wrong about why.** `Settings::live_preview`
-now defaults to on, so kvit-dictate launches its own translator with `--finalize-only off`. The
-argument above is about *committing*, and it is unchanged and still enforced: the tracker refuses
-a mark it cannot stand behind, so against a batch model nothing is committed any earlier and the
-whole phrase still lands at the `final`. What it never weighed is that `partial`s are also what
-the overlay greys out as "still moving" — with them off there is no feedback at all until the
-speaker pauses, which is the single thing a person notices. The Python bridge this replaced
-defaulted the other way (`openai_http.py`'s `finalize_only=False`) and was the version people
-described as working. Off remains one checkbox away, still labelled.
+**The client no longer agrees, and the reason this was ever a dilemma was a conflation.**
+`Settings::live_preview` now defaults to on, so kvit-dictate launches its own translator with
+`--finalize-only off`. Two separate things were one flag:
+
+* **Showing a hypothesis** mid-utterance. This is what the user asked for and what the overlay
+  greys out as "still moving". It promises nothing.
+* **Publishing a mark** on it. This is a promise under §8.2, and this backend cannot keep it.
+
+They were the same line in `connection.cpp` — `publish_stable_partials = !finalize_only` — which
+made turning the preview on also start making promises. A `partial` with `stable_bytes = 0` makes
+none: §8.2 constrains only the published prefix, so with none published the model may revise every
+byte it has ever emitted and stay conforming, and the `final` need only begin with a zero-length
+prefix. `commit_engine.h` already says this is the shape it expects from a revising backend —
+"every op for such a backend is produced by `on_final`".
+
+The cost of getting that wrong was not flicker. Measured on 2026-08-28, in real dictation: the
+model extended honestly for 490 bytes, earned a mark, then re-punctuated byte 421. §8.3 obliges
+the sender to refuse rather than emit, refusing fails the session, and failing the session
+discards the utterance in flight — half a minute of speech, gone, with no key pressed. The
+tracker was not at fault and no setting of N/M/T would have helped; the mark should never have
+been offered. See `asrd_session.live_preview_publishes_no_mark_so_a_late_revision_cannot_take_the_session`.
+
+So preview is on, the mark is off for this backend permanently, and everything still commits at
+the `final`. Off remains one checkbox away, still labelled.
 
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a

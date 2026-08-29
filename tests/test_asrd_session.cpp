@@ -1049,3 +1049,80 @@ KD_TEST(asrd_session, live_preview_against_a_revising_model_never_reaches_the_cl
     }
     KD_CHECK(saw_revision);
 }
+
+KD_TEST(asrd_session, live_preview_publishes_no_mark_so_a_late_revision_cannot_take_the_session) {
+    // The failure this exists to prevent, from a real dictation on 2026-08-28:
+    //
+    //   session failed: server-side stability violation (stable_prefix_mutated):
+    //   utterance_id=2 previous_stable_bytes=490 incoming_stable_bytes=490 diverge_offset=421
+    //
+    // Half a minute of speech, gone. The model had been extending honestly for 490 bytes, so
+    // the tracker published a mark; then it re-punctuated byte 421, which is *below* that mark,
+    // and §8.3 obliges the sender to refuse rather than emit. Refusing fails the session, and
+    // failing the session drops the utterance in flight.
+    //
+    // The test above it never caught this because its stub revises byte 0 on the second
+    // hypothesis, so the N=2 candidate is empty and no mark is ever published — the conforming
+    // arm of that disjunction passes trivially. The dangerous case is the opposite one: a model
+    // that behaves *well enough to earn a mark* and then revises behind it. That is what this
+    // script is.
+    //
+    // The fix is not a better tracker. It is that live preview publishes no mark at all
+    // (`SessionServerConfig::emit_partials` vs `publish_stable_partials`): with nothing
+    // published there is nothing a revision can contradict, §8.2 is satisfied vacuously, and
+    // the words still land in one piece at the `final`.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    // Longer audio than the test above, and a script long enough to outlast it. A hop that
+    // fires while a POST is running replaces the pending work rather than queueing (§2.1), so a
+    // short case coalesces down to two transcriptions and the tracker never sees two hypotheses
+    // for one utterance — which is exactly the state in which the old wiring published nothing
+    // and looked fine.
+    stub.set_transcribe_script({
+        // Extending, honestly, for as long as it takes two consecutive hypotheses to give the
+        // tracker a non-empty common prefix. This is where a positive `stable_bytes` used to go
+        // out, and it is the promise the third reply then breaks.
+        {200, R"({"text":"the quick brown fox jumps"})"},
+        {200, R"({"text":"the quick brown fox jumps over"})"},
+        {200, R"({"text":"the quick brown fox jumps over the lazy"})"},
+        // ...and now the revision, well behind the mark that was just earned: "fox" gains a
+        // comma at byte 19. Anything already published as stable is mutated by this.
+        {200, R"({"text":"The quick brown fox, jumps over the lazy dog."})"},
+        {200, R"({"text":"The quick brown fox, jumps over the lazy dog today."})"},
+    });
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.finalize_only = false;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(8000, 1200)));
+
+    const auto partials = seen.of<kd::proto::PartialMsg>();
+    // Two, not one: with a single hypothesis the tracker has no common prefix to publish and
+    // even the old wiring emitted a zero mark, so a run that produced one partial would pass
+    // this test while proving nothing.
+    KD_REQUIRE_GT(partials.size(), size_t{1});
+    KD_CHECK_GT(stub.transcribe_requests(), 2);
+
+    // The mark, which is the whole fix: never published, on any partial, however well the model
+    // was behaving at the time. A single non-zero value here is the old bug, because it is the
+    // promise the next hypothesis is then free to break.
+    for (const kd::proto::PartialMsg& p : partials) {
+        KD_CHECK_EQ(p.stable_bytes, uint64_t{0});
+    }
+
+    // And therefore no refusal, and no lost utterance. Before the fix this run ended in
+    // `decode_failed` with the words in flight discarded.
+    for (const kd::proto::ErrorMsg& e : seen.of<kd::proto::ErrorMsg>()) {
+        KD_INFO("unexpected error: " + e.msg);
+    }
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+    KD_CHECK_EQ(seen.of<kd::proto::FinalMsg>().size(), size_t{1});
+
+    // The preview was still a preview: the client saw the words move while they were being
+    // spoken, which is the entire reason for turning this on.
+    KD_INFO("live preview: " + std::to_string(partials.size()) + " partial(s), last text \"" +
+            partials.back().text + "\"");
+}
