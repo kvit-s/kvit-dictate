@@ -362,12 +362,29 @@ seven of those eight seconds. Reported the same evening as "a dictation that som
 with the seam visible in the text.
 
 Sliding buys bounded decode cost for unbounded audio, and the audio is not unbounded: the
-endpointer cuts an utterance at `VadConfig::max_utterance_ms`. So `window_ms` is now read from
-that, the window always covers the whole utterance, `slid` is never true, and the preview and the
-`final` are the same computation over the same recording. `scrolled_off_words` and its tests
-stay — a smaller `--window-ms` would still need them — but nothing ships through them. See
-`asrd_backend.the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched` and, for
-the arithmetic, `a_window_shorter_than_the_utterance_duplicates_what_the_model_revises`.
+endpointer cuts an utterance at `VadConfig::max_utterance_ms`. So `window_ms` is read from the
+endpointer, the window always covers the whole utterance, `slid` is never true, and the preview
+and the `final` are the same computation over the same recording. `scrolled_off_words` and its
+tests stay — a smaller window would still need them — but nothing ships through them.
+
+**Read from `max_utterance_audio_ms()`, not from `max_utterance_ms` — the first attempt used the
+valve itself and was 300 ms short.** The valve's clock starts at the *onset*; the audio handed to
+the backend starts one `preroll_ms` earlier, because the onset frame replays the pre-roll so the
+decoder hears the beginning of the first word. A cut utterance therefore arrives as 30 000 ms +
+300 ms + a frame of overshoot. Every hop was clean, which is what made it look fixed — and then
+the *finalize*, which takes the window whether or not a hop is due, crossed the boundary and slid,
+once per over-long dictation, deterministically. The same duplication was reported again on
+2026-08-29, one commit after it was declared fixed. A window is only "big enough to hold a whole
+utterance" if it is measured in the units of the audio rather than in the units of the timer that
+ends it, and `VadConfig::max_utterance_audio_ms()` is where that sum now lives so the two cannot
+drift apart a third time. A slide in a build that should never slide is also logged once per
+connection now: the symptom reached a user twice with nothing in the log to point at it.
+
+See `asrd_backend.the_window_is_sized_in_audio_not_in_the_timer_that_ends_the_utterance`,
+`the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched` (which walks every
+millisecond the endpointer can deliver, finalize included) and, for the arithmetic,
+`a_window_sized_at_the_valve_stitches_the_finalize_of_a_cut_utterance` and
+`a_window_shorter_than_the_utterance_duplicates_what_the_model_revises`.
 
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a

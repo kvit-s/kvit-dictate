@@ -350,6 +350,20 @@ Status OpenAiBackend::transcribe(bool force, std::string& text, bool& have_text)
         std::lock_guard<std::mutex> lock(driver_mutex_);
         if (!driver_.take_window(force, window, slid)) return Status::success();
     }
+    if (slid && !slide_warned_) {
+        // In the shipped configuration this is unreachable: `connection.cpp` sizes the window
+        // from `VadConfig::max_utterance_audio_ms()`, so the window always holds a whole
+        // utterance. Reaching it means the two numbers have drifted apart again, and the
+        // symptom — the same sentence twice, joined at a seam — has now been reported from real
+        // use twice with nothing in the log to point at it. Once per connection is enough to
+        // find it the third time.
+        slide_warned_ = true;
+        KD_LOG_WARN(
+            "the decode window (%u ms) is shorter than this utterance, so it slid and its "
+            "transcript is being stitched by a heuristic a revising model defeats; expect "
+            "duplicated text. Logged once per connection.",
+            cfg_.window_ms);
+    }
 
     // The HTTP round trip is deliberately outside the lock: it is 237-541 ms, and holding the
     // driver's mutex across it would block the connection thread's feed() for exactly as long

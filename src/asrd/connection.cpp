@@ -172,6 +172,17 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     // transcription — before `ready` goes out, so the user is not talking into a dead box.
     // Failure is a fatal `error` *instead of* `ready`, which is what makes the client's Test
     // button mean "the translator and the speech host both answered".
+    //
+    // The endpointer is configured *first*, because the backend's window is sized from it. One
+    // `VadConfig`, used by both, so the two cannot drift.
+    VadConfig vad_cfg;
+    vad_cfg.endpoint_silence_ms = static_cast<double>(cfg.endpoint_silence_ms);
+    if (const std::string why = vad_cfg.validate(); !why.empty()) {
+        KD_LOG_ERROR("VAD configuration is not coherent: %s", why.c_str());
+        send_error(proto::ErrorCode::internal_error, true, why, nullptr);
+        return kExitInternal;
+    }
+
     OpenAiBackendConfig backend_cfg;
     backend_cfg.base_url = cfg.service;
     backend_cfg.model = cfg.model;
@@ -179,11 +190,27 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     backend_cfg.language = cfg.language;
     backend_cfg.finalize_only = cfg.finalize_only;
     backend_cfg.vad_gate = cfg.vad_gate;
-    // The window is sized from the endpointer's own safety valve, so that it always covers a
-    // whole utterance and `PseudoStreamingDriver` never slides. Read from `VadConfig` rather
-    // than repeated as a number: these two are one decision, and the failure mode when they
-    // drift apart is a stitch, which is worse than a slow decode. See `OpenAiBackendConfig`.
-    backend_cfg.window_ms = static_cast<uint32_t>(VadConfig{}.max_utterance_ms);
+    // The window is sized from the endpointer, so that it always covers a whole utterance and
+    // `PseudoStreamingDriver` never slides. Read from `VadConfig` rather than repeated as a
+    // number: these two are one decision, and the failure mode when they drift apart is a
+    // stitch, which is worse than a slow decode. See `OpenAiBackendConfig`.
+    //
+    // `max_utterance_audio_ms()`, not `max_utterance_ms`: the safety valve measures from the
+    // onset, but the audio that reaches this backend also carries `preroll_ms` from before it.
+    // Sizing the window at the valve left it 300 ms short, so every utterance long enough to be
+    // cut slid on its *finalize* — one guaranteed stitch per over-long dictation, which is the
+    // duplication reported on 2026-08-29 after the first fix.
+    const double audio_ms = vad_cfg.max_utterance_audio_ms();
+    if (audio_ms > 0.0) {
+        backend_cfg.window_ms = static_cast<uint32_t>(audio_ms + 0.5);
+    } else {
+        // `max_utterance_ms == 0` asks for an unbounded utterance, and no window can cover one.
+        // Leave the default and say so: the slide is then real, and so is its stitch.
+        KD_LOG_WARN(
+            "max_utterance_ms is 0, so an utterance is unbounded and no window can hold one; "
+            "the decode window stays at %u ms and long utterances will be stitched",
+            backend_cfg.window_ms);
+    }
     OpenAiBackend backend(backend_cfg);
 
     const ULONGLONG load_started = GetTickCount64();
@@ -208,7 +235,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
 
     SessionServerConfig session_cfg;
     session_cfg.stability = cfg.stability;
-    session_cfg.vad.endpoint_silence_ms = static_cast<double>(cfg.endpoint_silence_ms);
+    session_cfg.vad = vad_cfg;
     // Two switches, not one, and they are set from different facts.
     //
     // Whether to *show* anything mid-utterance is the user's choice, and `--finalize-only off`
@@ -226,12 +253,6 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     session_cfg.emit_partials = !cfg.finalize_only;
     session_cfg.publish_stable_partials = false;
     session_cfg.hostile_stability = cfg.hostile_stability;
-
-    if (const std::string why = session_cfg.vad.validate(); !why.empty()) {
-        KD_LOG_ERROR("VAD configuration is not coherent: %s", why.c_str());
-        send_error(proto::ErrorCode::internal_error, true, why, nullptr);
-        return kExitInternal;
-    }
 
     SessionServer session(backend, session_cfg, sink);
     std::vector<int16_t> pcm;

@@ -81,15 +81,25 @@ struct OpenAiBackendConfig {
     // exactly what a user reported on 2026-08-28: "a dictation that somehow duplicated".
     //
     // Sliding buys bounded decode cost for unbounded audio. The endpointer already bounds the
-    // audio: `VadConfig::max_utterance_ms` cuts an utterance at 30 s, so a window that size is
-    // never exceeded and `slid` is never true. Every hop then re-decodes the whole utterance
-    // from its first sample — which is what a batch model is good at, and what the `final`
-    // does anyway — so the preview and the committed text come from the same computation and
-    // no heuristic sits between the model and the document.
+    // audio, so `connection.cpp` sets this from `VadConfig::max_utterance_audio_ms()` and
+    // `slid` is never true. Every hop then re-decodes the whole utterance from its first sample
+    // — which is what a batch model is good at, and what the `final` does anyway — so the
+    // preview and the committed text come from the same computation and no heuristic sits
+    // between the model and the document.
+    //
+    // **`max_utterance_audio_ms()`, not `max_utterance_ms`.** The first fix used the valve
+    // itself, and it was 300 ms short: the valve measures from the onset, but the audio handed
+    // over begins one `preroll_ms` earlier, because the onset frame replays the pre-roll so the
+    // decoder hears the start of the first word. So the buffer crossed the window exactly when
+    // the valve cut, every utterance long enough to be cut slid on its own *finalize*, and the
+    // duplication came back — reported again on 2026-08-29, one commit after it was declared
+    // fixed. A window is only "big enough to hold a whole utterance" if it is measured in the
+    // same units as the audio, not in the units of the timer that ends it.
     //
     // The cost is a longer POST as the utterance grows. It is self-limiting: only one request
     // is in flight at a time (§2.1), so a slower decode simply means fewer previews, never a
-    // queue. `connection.cpp` sets this from `VadConfig` so the two cannot drift.
+    // queue. The default here is a plain fallback for callers that do not size it; the shipped
+    // value comes from the endpointer.
     uint32_t window_ms = 30000;
     uint32_t hop_ms = 1000;
     // openai-translator.md §4.3: the v1 default for a batch model. Makes hop >= window, so the
@@ -212,6 +222,7 @@ private:
     PseudoStreamingDriver driver_;
 
     bool vad_unavailable_ = false;  // latched after the first refusal, so it is logged once
+    bool slide_warned_ = false;     // likewise: a slide in a build that should never slide
     uint64_t requests_ = 0;
     uint64_t vad_skipped_ = 0;
     uint64_t empty_responses_ = 0;

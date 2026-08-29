@@ -46,6 +46,16 @@ uint64_t VadConfig::preroll_samples() const noexcept {
 uint64_t VadConfig::max_utterance_samples() const noexcept {
     return ms_to_samples(max_utterance_ms, sample_rate);
 }
+double VadConfig::max_utterance_audio_ms() const noexcept {
+    if (max_utterance_ms == 0.0) return 0.0;  // unbounded, by request
+    const double frame_ms = sample_rate == 0
+                                ? 0.0
+                                : 1000.0 * static_cast<double>(frame_samples) /
+                                      static_cast<double>(sample_rate);
+    // Pre-roll ahead of the onset, plus the one frame the safety valve can overshoot by, plus
+    // one more for the residue `flush()` hands over when the stream ends mid-frame.
+    return max_utterance_ms + preroll_ms + 2.0 * frame_ms;
+}
 
 std::string VadConfig::validate() const {
     if (sample_rate == 0) return "sample_rate must be positive";

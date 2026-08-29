@@ -320,6 +320,36 @@ KD_TEST(asrd_backend, reset_forgets_the_frozen_prefix_and_the_clock) {
 
 // ─── The slide must never happen ─────────────────────────────────────────────────────────────
 
+// How `connection.cpp` sizes the window. Kept here rather than repeated as a literal, so a
+// change to either side of that sum is caught by the tests below.
+static uint32_t shipped_window_ms() {
+    return static_cast<uint32_t>(VadConfig{}.max_utterance_audio_ms() + 0.5);
+}
+
+KD_TEST(asrd_backend, the_window_is_sized_in_audio_not_in_the_timer_that_ends_the_utterance) {
+    // The 2026-08-28 fix asserted `window_ms >= max_utterance_ms`, and the test below walked
+    // exactly 30 000 ms through it. Both passed, and the duplication was reported again the
+    // next day — because the endpointer does not hand over `max_utterance_ms` of audio. It
+    // hands over the pre-roll as well.
+    //
+    // The onset frame replays `preroll_ms` from before the detected onset so the decoder hears
+    // the beginning of the first word, and the safety valve's clock starts at the onset. So a
+    // cut utterance arrives as 30 000 ms + 300 ms + a frame of overshoot, the buffer crosses a
+    // 30 000 ms window during that last 300 ms, and the *finalize* — which takes the window
+    // whether or not a hop is due — slides every single time. One guaranteed stitch per
+    // over-long dictation.
+    const VadConfig vad;
+    KD_CHECK(vad.max_utterance_audio_ms() > vad.max_utterance_ms);
+    KD_CHECK(shipped_window_ms() >= static_cast<uint32_t>(vad.max_utterance_audio_ms()));
+
+    // 0 means "unbounded", and no window can hold that. It has to come back as 0 rather than as
+    // a plausible number, so `connection.cpp` notices instead of building a zero-length window
+    // that slides on its first hop.
+    VadConfig unbounded;
+    unbounded.max_utterance_ms = 0.0;
+    KD_CHECK_EQ(unbounded.max_utterance_audio_ms(), 0.0);
+}
+
 KD_TEST(asrd_backend, the_shipped_window_holds_a_whole_utterance_so_nothing_is_ever_stitched) {
     // Reported 2026-08-28 as "a dictation that somehow duplicated": the same sentence two and
     // three times in the document, each copy slightly reworded, joined at a visible seam
@@ -329,17 +359,21 @@ KD_TEST(asrd_backend, the_shipped_window_holds_a_whole_utterance_so_nothing_is_e
     // ever hand over, because a window shorter than the utterance slides, and every slide is
     // stitched by a heuristic that a revising model defeats. This is the assertion that keeps
     // the two numbers together; `connection.cpp` reads one from the other for the same reason.
-    KD_CHECK(OpenAiBackendConfig{}.window_ms >= static_cast<uint32_t>(VadConfig{}.max_utterance_ms));
+    const VadConfig vad;
+    PseudoStreamingDriver driver(shipped_window_ms(), OpenAiBackendConfig{}.hop_ms);
 
-    // Thirty seconds — the endpointer's own cut-off — through the shipped shape, hopping every
-    // second the whole way. Nothing slides, nothing is frozen, and every hypothesis reaching the
-    // client is one decode of one recording rather than two texts glued together.
-    PseudoStreamingDriver driver(OpenAiBackendConfig{}.window_ms, OpenAiBackendConfig{}.hop_ms);
+    // Every millisecond the endpointer can deliver — to the millisecond, since the whole defect
+    // was a 300 ms shortfall — hopping the whole way, and then the finalize on top. The
+    // finalize is the take that mattered: it forces a window whether or not a hop is due, so it
+    // is the one that slid on every over-long utterance. Nothing slides, nothing is frozen, and
+    // every hypothesis reaching the client is one decode of one recording.
+    const double deliverable_ms = vad.max_utterance_audio_ms();
+    const int whole_seconds = static_cast<int>(deliverable_ms / 1000.0);
     const std::vector<int16_t> second = pcm_ms(1000);
-    for (int i = 0; i < 30; ++i) {
+    std::vector<int16_t> window;
+    bool slid = true;
+    for (int i = 0; i < whole_seconds; ++i) {
         driver.feed(second.data(), second.size());
-        std::vector<int16_t> window;
-        bool slid = true;
         KD_REQUIRE(driver.take_window(false, window, slid));
         KD_CHECK(!slid);
         // Whatever the model says is what the client is told. No prefix, no seam.
@@ -347,6 +381,77 @@ KD_TEST(asrd_backend, the_shipped_window_holds_a_whole_utterance_so_nothing_is_e
                     std::string("hypothesis " + std::to_string(i)));
         KD_CHECK(driver.frozen_prefix().empty());
     }
+    const auto remainder_ms =
+        static_cast<uint32_t>(deliverable_ms - 1000.0 * static_cast<double>(whole_seconds));
+    const std::vector<int16_t> remainder = pcm_ms(remainder_ms);
+    driver.feed(remainder.data(), remainder.size());
+    KD_REQUIRE(driver.take_window(true, window, slid));
+    KD_CHECK(!slid);
+    KD_CHECK_EQ(driver.commit("the final", slid), std::string("the final"));
+    KD_CHECK(driver.frozen_prefix().empty());
+}
+
+KD_TEST(asrd_backend, a_window_sized_at_the_valve_stitches_the_finalize_of_a_cut_utterance) {
+    // The 2026-08-29 report, reduced to arithmetic: the window sized at `max_utterance_ms`, and
+    // the audio carrying `preroll_ms` on top of it. Every hop before the cut is clean — which
+    // is what made this hard to see — and then the finalize slides, freezes the whole previous
+    // window, and appends the new one. The user gets the tail of their dictation twice.
+    const VadConfig vad;
+    PseudoStreamingDriver driver(static_cast<uint32_t>(vad.max_utterance_ms),
+                                 OpenAiBackendConfig{}.hop_ms);
+
+    // The two hypotheses are the ones from the 2026-08-29 report, trimmed to one sentence. The
+    // model dropped a word on the re-decode — "so I need" became "so need" — which is all it
+    // takes: `scrolled_off_words` needs an exact run of words, and one substitution anywhere in
+    // the overlap makes every candidate k fail.
+    const std::string before =
+        "there are lots of scripts and stuff picking up for those serpent names, "
+        "so I need to review all of that";
+    const std::string after =
+        "there are lots of scripts and stuff picking up for those serpent names, "
+        "so need to review all of that";
+
+    // The pre-roll first, exactly as the onset frame delivers it, then the utterance.
+    const std::vector<int16_t> preroll = pcm_ms(static_cast<uint32_t>(vad.preroll_ms));
+    const std::vector<int16_t> second = pcm_ms(1000);
+    const int seconds = static_cast<int>(vad.max_utterance_ms / 1000.0);
+    std::vector<int16_t> window;
+    bool slid = true;
+
+    driver.feed(preroll.data(), preroll.size());
+    for (int i = 0; i + 1 < seconds; ++i) {
+        driver.feed(second.data(), second.size());
+        KD_REQUIRE(driver.take_window(false, window, slid));
+        KD_CHECK(!slid);
+        driver.commit(before, slid);
+    }
+    KD_CHECK(driver.frozen_prefix().empty());  // 29 clean seconds; it looks fixed all the way
+
+    // The thirtieth second. The buffer is now `preroll_ms` past a window sized at the valve, so
+    // the very next take — this hop, or the finalize the valve is about to force — slides, and
+    // the fallback freezes the entire previous window in front of a new one that still contains
+    // every second of it. This is what the user read back: the sentence twice, the second copy
+    // slightly reworded.
+    driver.feed(second.data(), second.size());
+    KD_REQUIRE(driver.take_window(false, window, slid));
+    KD_CHECK(slid);
+    KD_CHECK_EQ(driver.commit(after, slid), before + " " + after);
+    KD_CHECK_EQ(driver.frozen_prefix(), before);
+
+    // The same walk against a window sized in audio: no slide, nothing frozen, and the client is
+    // told exactly what the model said.
+    PseudoStreamingDriver fixed(shipped_window_ms(), OpenAiBackendConfig{}.hop_ms);
+    fixed.feed(preroll.data(), preroll.size());
+    for (int i = 0; i < seconds; ++i) {
+        fixed.feed(second.data(), second.size());
+        KD_REQUIRE(fixed.take_window(false, window, slid));
+        KD_CHECK(!slid);
+        fixed.commit(before, slid);
+    }
+    KD_REQUIRE(fixed.take_window(true, window, slid));
+    KD_CHECK(!slid);
+    KD_CHECK_EQ(fixed.commit(after, slid), after);
+    KD_CHECK(fixed.frozen_prefix().empty());
 }
 
 KD_TEST(asrd_backend, a_window_shorter_than_the_utterance_duplicates_what_the_model_revises) {
