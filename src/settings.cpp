@@ -2215,12 +2215,9 @@ void update_server_mode_ui(HWND dlg) {
                    local ? L"Speech service" : L"Server address");
     SetWindowTextW(
         GetDlgItem(dlg, kIdServerUrlNote),
-        local ? L"For example http://strixhalo.lan:10301 — the address of an OpenAI-compatible "
-                L"/v1/audio/transcriptions service. kvit-dictate starts and supervises the "
-                L"translator that talks to it; there is nothing else to run."
-              : L"For example ws://127.0.0.1:10402/ for a docs/protocol.md server on this "
-                L"machine, or ws://mybox.lan:10402/ for one on your network. Nothing is "
-                L"launched for you in this mode.");
+        local ? L"For example http://strixhalo.lan:10301. There is nothing else to run."
+              : L"For example ws://127.0.0.1:10402/. Nothing is launched for you in this "
+                L"mode.");
     // Live preview is a translator setting, so it means nothing when the translator is not the
     // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
     // the user cannot find again.
@@ -2239,9 +2236,8 @@ std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
     const Result<ParsedServerUrl> u = parse_server_url(url);
     if (!u) return L"⚠  " + wide(u.status().message());
     if (!u->secure && !host_is_private(u->host)) {
-        return L"⚠  This is not a loopback or private address, and ws:// is unencrypted. Your "
-               L"audio and every transcript cross the network in the clear, and anyone who can "
-               L"reach that port can send audio to it. Use a network you control.";
+        return L"⚠  Not a private address, and unencrypted: your audio crosses the network "
+               L"in the clear. Use a network you control.";
     }
     return {};
 }
@@ -2412,11 +2408,9 @@ void refresh_editing_page(HWND dlg) {
     EnableWindow(GetDlgItem(dlg, kIdEditingForeign), on ? TRUE : FALSE);
 
     SetWindowTextW(GetDlgItem(dlg, kIdEditingStatus),
-                   eos ? L"The compose buffer is available with this cadence."
-                       : L"Unavailable: the cadence on the Dictation page is not "
-                         L"\"end-of-session\". With any other cadence the text is already in "
-                         L"your document as you speak, so there is nothing left in the pill to "
-                         L"edit or for Enter to commit.");
+                   eos ? L""
+                       : L"Needs the \"end-of-session\" cadence, on the Dictation tab: with any "
+                         L"other one the text is already in your document as you speak.");
 }
 
 // ─── The rewriter (normalizer.h), in two controls ───────────────────────────────────────────
@@ -2487,15 +2481,13 @@ void refresh_normalizer_controls(HWND dlg, DialogState& st) {
         st.setting_normalizer_url = false;
     }
 
+    // Only ever the reason it is greyed. When it is available there is nothing to say that the
+    // box and the address above it do not already say.
     std::wstring status;
     if (!eos) {
-        status = L"Needs the \"end-of-session\" cadence on the Dictation page: a rewrite can "
-                 L"change a word you have already said.";
+        status = L"Needs the \"end-of-session\" cadence, on the Dictation tab.";
     } else if (!have_url) {
-        status = L"Needs an OpenAI-compatible speech service above to run it on.";
-    } else if (on && !st.normalizer_url_follows) {
-        status = L"Pointed somewhere other than your speech service. Clear the box to follow it "
-                 L"again.";
+        status = L"Needs a speech service above.";
     }
     SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus), status.c_str());
 }
@@ -3305,9 +3297,7 @@ void build_controls(HWND dlg, DialogState& st) {
     {
         Cursor c{dlg, inst, &st, 0, col1_x, top, top, col_w};
         c.section(L"Where your speech service is");
-        c.note(L"kvit-dictate does not recognise speech itself. It captures your voice, sends it "
-               L"to a service you run, and types back what comes out.",
-               3);
+        c.note(L"Your voice goes to a speech service you run, and comes back as text.", 2);
         // The address box comes FIRST and the radios after it, because for most people the only
         // thing to do on this page is type one address and press Test. The second radio is the
         // escape hatch for somebody who already runs a protocol server, not a choice everyone
@@ -3324,9 +3314,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.gap(4);
 
         c.label_edit(L"Model (optional)", kIdServerModel);
-        c.note(L"Leave this empty to take whatever the service offers. If you name a model it "
-               L"does not have, it says so — it never quietly substitutes another one.",
-               2);
+        c.note(L"Leave empty to use whatever the service offers.", 1);
         c.add(L"BUTTON", L"Test this service", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
         c.gap(6);
         // Seven lines, not nine. `describe_probe` writes six on a good answer and the box scrolls
@@ -3341,11 +3329,7 @@ void build_controls(HWND dlg, DialogState& st) {
         // and it belongs with the other two paragraphs that explain consequences.
         c.section(L"While you are speaking");
         c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
-        c.note(L"On by default. Words appear greyed while they are still moving and go solid "
-               L"once they settle. A batch model rewrites earlier words as it hears more, so "
-               L"against one nothing is typed any sooner — you watch it happen instead of "
-               L"waiting in silence.",
-               4);
+        c.note(L"Words show greyed while they are still moving.", 1);
 
         // ── The rewriter (docs/normalizer.md) ───────────────────────────────────────────────
         //
@@ -3354,72 +3338,46 @@ void build_controls(HWND dlg, DialogState& st) {
         // derived or defaulted (see kIdNormalizerEnabled).
         c.section(L"When you finish");
         c.check(L"Clean the text up before typing it in", kIdNormalizerEnabled);
-        c.note(L"A small text model takes out the ums and the false starts and puts the "
-               L"punctuation in, once, when the session ends. It rewrites the pill, never your "
-               L"document — and if it is down, slow, or drops one of your vocabulary terms, you "
-               L"get exactly what you dictated.",
-               4);
+        c.note(L"Remove filler words and add punctuation.", 1);
         // Filled in from the speech service and greyed out until the box above is ticked. It
         // keeps following that address until the user types here; emptying it starts following
         // again. Nobody has to touch it, and the deployment that splits the two models across
         // machines costs one edit.
-        c.label_edit(L"Text service — follows the address above", kIdNormalizerUrl);
+        c.label_edit(L"Text service (follows the one above)", kIdNormalizerUrl);
         c.add(L"STATIC", L"", 0, st.line_h * 2, kIdNormalizerStatus);
         c.gap(4);
 
         c.section(L"What crosses your network");
-        c.note(L"Your audio goes to the service you name and nowhere else. No cloud service, no "
-               L"telemetry, and nothing is sent until you press the hotkey.",
-               3);
-        c.note(L"It is sent unencrypted and the service is not asked who you are, so run this on "
-               L"a network you control. wss:// works behind a proxy with a certificate.",
-               3);
+        c.note(L"Audio goes only to the service you name, unencrypted, and nothing is sent "
+               L"until you press the hotkey.",
+               2);
         c.add(L"STATIC", L"", 0, st.line_h * 4, kIdServerWarning);
         c.gap(6);
 
         c.section(L"When it is not there");
-        c.note(L"The hotkey does not open the microphone and the tray says why. If the connection "
-               L"drops mid-sentence, everything already typed stays in your document and only the "
-               L"uncommitted tail is lost.",
-               4);
+        c.note(L"The hotkey will not open the microphone, and the tray says why.", 2);
     }
 
     // ── Page 1: the compose buffer (docs/editing.md) ────────────────────────────────────────
     {
         Cursor c{dlg, inst, &st, 1, col1_x, top, top, col_w};
         c.section(L"The pill as a compose buffer");
-        c.note(L"Nothing reaches your document until you say so. Speech accumulates in the pill; "
-               L"Enter types it in and finishes, Esc throws it away, and the hotkey only ever "
-               L"means \"dictate\" — it starts a session and resumes one, and never finishes "
-               L"one.",
-               5);
+        c.note(L"Nothing reaches your document until you press Enter. Esc throws it away.", 2);
         c.check(L"Let me edit the pill before it is typed in", kIdEditingEnabled);
-        c.add(L"STATIC", L"", 0, st.line_h * 5, kIdEditingStatus);
+        c.add(L"STATIC", L"", 0, st.line_h * 3, kIdEditingStatus);
         c.gap(6);
 
         c.section(L"While you are editing");
-        c.note(L"The microphone is CLOSED. Editing and speaking are separate states and you are "
-               L"only ever in one of them; the pill and the tray both say which. Press the "
-               L"hotkey, or the button in the pill, to start talking again.",
-               4);
-        c.note(L"The session-silence timer does not run while you are editing, so reading back a "
-               L"long dictation cannot end the session under you.",
-               3);
+        c.note(L"The microphone is closed. Press the hotkey to talk again.", 2);
     }
     {
         Cursor c{dlg, inst, &st, 1, col2_x, top, top, col_w};
         c.section(L"The keyboard belongs to the pill");
-        c.note(L"While a session is composing, editing keys — Backspace, Delete, the arrows, "
-               L"Home/End, Ctrl+A/C/X/V/Z and ordinary characters — go to the pill instead of to "
-               L"your document. Volume, media and Print Screen keys are never intercepted.",
-               5);
+        c.note(L"Editing keys go to the pill, not to your document.", 1);
         c.label_combo(L"Any other key (Ctrl+S, F5, Alt+Tab)", kIdEditingForeign);
 
         c.section(L"Mouse");
-        c.note(L"Click in the pill to place the caret, drag to select, and scroll with the wheel "
-               L"to read back what you have said. Clicking anywhere else still finishes the "
-               L"session and types the text in.",
-               4);
+        c.note(L"Click to place the caret, drag to select, scroll to read back.", 2);
         c.check(L"Let me click and scroll inside the pill", kIdEditingMouse);
     }
 
@@ -3429,41 +3387,29 @@ void build_controls(HWND dlg, DialogState& st) {
         c.section(L"Activation");
         c.label_combo(L"Hotkey", kIdHotkey);
         c.check(L"Push to talk — hold the hotkey, release to type it in", kIdPushToTalk);
-        c.note(L"Unticked, the hotkey toggles: press to start, press again to finish. Ticked, it "
-               L"is a walkie-talkie — the microphone is open only while you hold the key, and "
-               L"letting go types the text into your document. Transcription runs while you "
-               L"talk either way. Bindings you can comfortably hold — F13–F24, right Ctrl, "
-               L"right Alt, CapsLock — suit this better than a Win-key combo.",
-               5);
+        c.note(L"Unticked, the hotkey toggles: press to start, press again to finish.", 2);
 
-        c.section(L"Endpoint silence — ends an UTTERANCE");
-        c.note(L"How long a pause finishes the current sentence: it is punctuated, finalised and "
-               L"committed. The session keeps running and the microphone stays open.",
-               3);
+        c.section(L"Endpoint silence — ends a sentence");
+        c.note(L"How long a pause finishes a sentence. The session keeps running.", 2);
         c.label_edit(L"Endpoint silence (ms, default 800)", kIdEndpointMs, ES_NUMBER);
 
-        c.section(L"Session silence — ends the SESSION");
-        c.note(L"A different timer, and never the same one: how long the whole session survives "
-               L"with no speech at all. The microphone closes when it fires. A click or a "
-               L"keystroke already ends the session, so a generous value is safe.",
-               4);
+        c.section(L"Session silence — ends the session");
+        c.note(L"How long the session survives with no speech at all.", 1);
         c.label_edit(L"Session silence (ms, default 120000)", kIdSessionMs, ES_NUMBER);
         c.check(L"Never end the session on silence", kIdSessionNever);
     }
     {
         Cursor c{dlg, inst, &st, 2, col2_x, top, top, col_w};
-        c.section(L"Stability — what is SAFE to commit");
-        c.note(L"Eligibility is decided by stability alone. Committed text is never repaired, so "
-               L"nothing below may ever be widened by the cadence setting.",
-               3);
+        c.section(L"Stability — what is safe to commit");
+        c.note(L"Committed text is never repaired. Leave these alone unless you are tuning.", 2);
         c.label_edit(L"N — hypotheses compared (default 2)", kIdStabN, ES_NUMBER);
         c.label_edit(L"M — clusters retracted from the decode head (default 3)", kIdStabM,
                      ES_NUMBER);
         c.label_edit(L"T — milliseconds unchanged before committing (default 200)", kIdStabT,
                      ES_NUMBER);
 
-        c.section(L"Cadence — WHEN an eligible prefix is flushed");
-        c.note(L"Timing only. It can delay a commit; it can never promote unstable text.", 2);
+        c.section(L"Cadence — when it is typed in");
+        c.note(L"Timing only. It can delay a commit, never widen one.", 1);
         c.label_combo(L"Cadence", kIdCadence);
         c.label_edit(L"Interval (ms, used only by \"periodic\")", kIdCadenceMs, ES_NUMBER);
     }
@@ -3486,15 +3432,11 @@ void build_controls(HWND dlg, DialogState& st) {
     {
         Cursor c{dlg, inst, &st, 3, col2_x, top, top, col_w};
         c.section(L"Per-app injection policy");
-        c.note(L"One line per application:   process.exe = sendinput | clipboard "
-               L"[, ctrl-shift-v] [, unsupported]   # note",
-               3);
+        c.note(L"process.exe = sendinput | clipboard [, ctrl-shift-v] [, unsupported]", 2);
         c.multiline(kIdAppPolicies, 110);
 
         c.section(L"Model and backend");
-        c.note(L"Selecting a model restarts the sidecar under that model's own interpreter. "
-               L"kvit-dictate never learns what the model is — only which executable to launch.",
-               3);
+        c.note(L"Selecting a model restarts the sidecar under its own interpreter.", 2);
         c.label_combo(L"Model", kIdModel);
         c.add(L"STATIC", L"", 0, 44, kIdModelStatus);
     }
@@ -3525,9 +3467,7 @@ void build_controls(HWND dlg, DialogState& st) {
     {
         Cursor c{dlg, inst, &st, 4, col2_x, top, top, col_w};
         c.section(L"Privacy and diagnostics");
-        c.note(L"Shipping policy, not preference: nothing you dictate is written to disk, and "
-               L"nothing here ever touches the network.",
-               3);
+        c.note(L"Nothing you dictate is written to disk unless you tick the box below.", 2);
         c.label_combo(L"Diagnostic log level", kIdLogLevel);
         c.check(L"Write diagnostics to a file (shapes and timings, never text)", kIdDiagFile);
         c.check(L"Log recognised text to a transcript file (off by default)", kIdTranscript);
@@ -3536,13 +3476,12 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Start kvit-dictate with Windows", kIdStartup);
 
         c.section(L"Vocabulary context");
-        c.note(L"One term per line, sent with each session so the model can bias towards them.",
-               2);
+        c.note(L"One term per line, sent with each session.", 1);
         c.check(L"Send vocabulary context to the model", kIdSendContext);
         c.multiline(kIdContextTerms, 90);
     }
 
-    // // ── Tabs and buttons ────────────────────────────────────────────────────────────────────
+    // ── Tabs and buttons ────────────────────────────────────────────────────────────────────
     HWND tabs = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                 px(st, kMargin), px(st, kMargin), px(st, kPageWidth),
                                 px(st, kTabStrip), dlg,
