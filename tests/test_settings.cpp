@@ -29,6 +29,7 @@ kd::Settings unusual() {
 
     s.hotkey.vk = kd::vk::kF13 + 4;  // F17 — a binding that needs no Start-menu hack
     s.hotkey.mods = kd::kModNone;
+    s.hotkey.push_to_talk = true;    // a sibling key, not part of the spelling
 
     s.session.endpoint_silence_ms = 1234;
     s.session.session_silence_ms = 45678;
@@ -107,6 +108,10 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
 
     KD_CHECK_EQ(out.model_id, in.model_id);
     KD_CHECK_EQ(out.hotkey.to_display_string(), in.hotkey.to_display_string());
+    // The spelling carries the keys and the sibling key carries the gesture. The parser assigns
+    // a freshly parsed spec over `hotkey`, so reading the mode in the wrong order would drop it
+    // silently and this is the only place that would notice.
+    KD_CHECK_EQ(out.hotkey.push_to_talk, in.hotkey.push_to_talk);
 
     KD_CHECK_EQ(out.session.endpoint_silence_ms, in.session.endpoint_silence_ms);
     KD_CHECK_EQ(out.session.session_silence_ms, in.session.session_silence_ms);

@@ -2343,12 +2343,14 @@ void App::push_edit_view() {
     if (overlay_ == nullptr) return;
     overlay_->set_edit_view(composing() && editing_, edit_.caret(), edit_.selection_begin(),
                             edit_.selection_end());
-    // §7.5's legend, from the same funnel and for the same reason: both of its inputs follow the
+    // §7.5's legend, from the same funnel and for the same reason: its inputs follow the
     // session (the binding can be re-bound while one is not running, and `composing()` needs a
     // target), and the overlay ignores a push that changes nothing. Which keys the line names is
-    // the overlay's decision from the state it is painting — this only supplies the two facts it
-    // cannot see.
-    overlay_->set_key_legend(settings_.hotkey.to_display_string(), composing());
+    // the overlay's decision from the state it is painting — this only supplies the facts it
+    // cannot see — how the chord is spelled, whether the pill is a compose buffer, and whether
+    // the binding is held or toggled.
+    overlay_->set_key_legend(settings_.hotkey.to_display_string(), composing(),
+                             settings_.hotkey.push_to_talk);
 }
 
 void App::flush_deferred_commits(const char* why) {

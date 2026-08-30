@@ -366,6 +366,30 @@ KD_TEST(overlay, without_the_compose_buffer_enter_is_not_a_commit_and_is_not_nam
     KD_CHECK(mentions(line, "any key ends it"));
 }
 
+KD_TEST(overlay, push_to_talk_names_the_gesture_the_user_is_already_making) {
+    // The keys do not change and neither does what they do; the verb does. Someone whose finger
+    // is on the binding is told to let go, not to press — a legend that said "Win+Y to finish"
+    // to a user already holding Win+Y is naming a key that appears to do nothing.
+    const std::string plain = key_legend(OverlayState::Listening, false, "Win+Y", true);
+    KD_CHECK(mentions(plain, "let go of Win+Y to finish"));
+    KD_CHECK(mentions(plain, "Esc to cancel"));
+    KD_CHECK(mentions(plain, "any key ends it"));
+
+    // Composing: Enter still commits, but it is no longer the gesture worth naming first.
+    const std::string composing = key_legend(OverlayState::Listening, true, "Win+Y", true);
+    KD_CHECK(mentions(composing, "let go to finish"));
+    KD_CHECK(!mentions(composing, "Enter to finish"));
+    KD_CHECK(mentions(composing, "type or click to edit"));
+
+    // Editing, which is reachable: an edit key closes the microphone while the binding is held.
+    const std::string editing = key_legend(OverlayState::Editing, true, "Win+Y", true);
+    KD_CHECK(mentions(editing, "hold Win+Y to resume"));
+
+    // And the toggle is untouched by all of it.
+    KD_CHECK(mentions(key_legend(OverlayState::Listening, false, "Win+Y"), "Win+Y to finish"));
+    KD_CHECK(!mentions(key_legend(OverlayState::Listening, false, "Win+Y"), "let go"));
+}
+
 KD_TEST(overlay, the_separator_is_one_middle_dot_and_the_line_is_valid_utf8) {
     // It shipped as `\xC3\x82\xC2\xB7` — the UTF-8 encoding of U+00B7 encoded a second time —
     // and the pill drew a capital A-circumflex before every dot. Nothing above caught it:

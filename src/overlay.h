@@ -295,7 +295,11 @@ public:
     //     `Settings::normalise` has already forced false for any cadence but end-of-session).
     //     Enter only finishes, and typing only edits, when it is true; with it false the legend
     //     says what plan.md §1.8 actually does instead.
-    void set_key_legend(std::string_view hotkey, bool composing);
+    //   * `push_to_talk` — whether the binding is held rather than toggled
+    //     (`HotkeySpec::push_to_talk`). It changes the verb, not the keys: the gesture that ends
+    //     the session is releasing the chord, so the legend has to say "let go" where it would
+    //     otherwise say "press".
+    void set_key_legend(std::string_view hotkey, bool composing, bool push_to_talk = false);
 
     // §7.3. Scrollback is a prerequisite, not a nicety: the pill shows the newest `kMaxLines`
     // with front-elision, so a session-long buffer sits behind that window unseen, and
@@ -371,7 +375,8 @@ private:
 // that does nothing in the state it is shown in. `composing` false is plan.md §1.8's session,
 // where Enter is not a commit and any key ends the session; true is docs/editing.md's, where it
 // is and they do not.
-[[nodiscard]] std::string key_legend(OverlayState state, bool composing, std::string_view hotkey);
+[[nodiscard]] std::string key_legend(OverlayState state, bool composing, std::string_view hotkey,
+                                    bool push_to_talk = false);
 
 // ─── Pure layout helper ─────────────────────────────────────────────────────────────────────
 //

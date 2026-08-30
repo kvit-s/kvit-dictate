@@ -804,6 +804,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "schema": 1,
 //     "model_id": "mock",
 //     "hotkey": "Win+Y",                                  // HotkeySpec::to_display_string()
+//     "push_to_talk": false,                              // true: hold to talk, release types it in
 //     "session":   { "endpoint_silence_ms": 800,          // plan.md §1.6 — ends an UTTERANCE
 //                    "session_silence_ms": 120000,        //            — ends the SESSION
 //                    "session_silence_never": false,
@@ -1172,6 +1173,9 @@ std::string serialize_settings(const Settings& s) {
     put_u64(root, "schema", static_cast<uint64_t>(s.schema));
     put_str(root, "model_id", s.model_id);
     put_str(root, "hotkey", s.hotkey.to_display_string());
+    // A sibling key rather than part of the spelling: `hotkey` names the keys and has to survive
+    // HotkeySpec::parse() unchanged, which is only true while it says nothing about the gesture.
+    put_bool(root, "push_to_talk", s.hotkey.push_to_talk);
 
     {
         // Always written, even when empty. A key that is present and blank says "there is no
@@ -1393,6 +1397,10 @@ Result<Settings> parse_settings(std::string_view json_text) {
                               "\" is not a binding this build understands"};
         }
         s.hotkey = parsed;
+        // AFTER the assignment, never before: `parsed` is a fresh spec carrying the field's
+        // default, so reading the mode first and assigning second would silently discard it.
+        top.bool_opt("push_to_talk", s.hotkey.push_to_talk);
+        if (top.failed()) return Status{StatusCode::Malformed, top.error()};
     }
 
     if (const json::Value* v = root.find("session")) {
@@ -1705,6 +1713,7 @@ enum : int {
     kIdDefaults = 100,
     kIdTabs,
     kIdHotkey,
+    kIdPushToTalk,
     kIdEndpointMs,
     kIdSessionMs,
     kIdSessionNever,
@@ -2733,6 +2742,7 @@ void load_controls(HWND dlg, DialogState& st) {
         hk_sel = static_cast<int>(presets.size());
     }
     SendMessageW(hk, CB_SETCURSEL, static_cast<WPARAM>(hk_sel), 0);
+    CheckDlgButton(dlg, kIdPushToTalk, s.hotkey.push_to_talk ? BST_CHECKED : BST_UNCHECKED);
 
     set_int(GetDlgItem(dlg, kIdEndpointMs), s.session.endpoint_silence_ms);
     set_int(GetDlgItem(dlg, kIdSessionMs), s.session.session_silence_ms);
@@ -2934,6 +2944,9 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     if (hk_sel >= 0 && static_cast<size_t>(hk_sel) < presets.size()) {
         s.hotkey = presets[static_cast<size_t>(hk_sel)].second;
     }  // else: the hand-set binding at the end of the list — leave s.hotkey as it was
+    // After the preset assignment, which overwrites the whole spec: the presets are keys, and
+    // the mode is the checkbox's to decide whichever branch above ran.
+    s.hotkey.push_to_talk = IsDlgButtonChecked(dlg, kIdPushToTalk) == BST_CHECKED;
 
     if (!read_uint(dlg, kIdEndpointMs, L"Endpoint silence", 100, 10000, n)) return false;
     s.session.endpoint_silence_ms = static_cast<uint32_t>(n);
@@ -3220,7 +3233,14 @@ void build_controls(HWND dlg, DialogState& st) {
     {
         Cursor c{dlg, inst, &st, 2, col1_x, top, top, col_w};
         c.section(L"Activation");
-        c.label_combo(L"Hotkey (toggle: press to start, press again to finalise)", kIdHotkey);
+        c.label_combo(L"Hotkey", kIdHotkey);
+        c.check(L"Push to talk — hold the hotkey, release to type it in", kIdPushToTalk);
+        c.note(L"Unticked, the hotkey toggles: press to start, press again to finish. Ticked, it "
+               L"is a walkie-talkie — the microphone is open only while you hold the key, and "
+               L"letting go types the text into your document. Transcription runs while you "
+               L"talk either way. Bindings you can comfortably hold — F13–F24, right Ctrl, "
+               L"right Alt, CapsLock — suit this better than a Win-key combo.",
+               5);
 
         c.section(L"Endpoint silence — ends an UTTERANCE");
         c.note(L"How long a pause finishes the current sentence: it is punctuated, finalised and "

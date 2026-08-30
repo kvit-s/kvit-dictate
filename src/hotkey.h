@@ -166,10 +166,32 @@ struct HotkeySpec {
     uint32_t mods = kModWin;        // Win+Y, the default (plan.md §1.8)
     bool require_left_win = false;  // false = either Win key
 
+    // ─── Push-to-talk ───────────────────────────────────────────────────────────────────────
+    //
+    // Toggle (false, the default) is plan.md §1.8: press to start, press again to finalise.
+    // Push-to-talk (true) is the walkie-talkie gesture: **hold** the binding to dictate, and
+    // the release finalises — the same finalise the second press produces, so the text lands in
+    // the target application exactly as it does today. Nothing about transcription changes; it
+    // still runs live while the key is held. Only the gesture that ends the session moves, from
+    // a second press to the release of the first.
+    //
+    // It lives on the spec rather than beside it because the filter needs to know both facts at
+    // the same instant, and `set_hotkey()` is already the one channel that carries the binding
+    // to the hook thread. A second setter would be a second thing to forget to call.
+    //
+    // Which bindings suit it: any of them, but the ones worth holding for a sentence are the
+    // ones that are not also a modifier you are using for something else — F13–F24, right Ctrl,
+    // right Alt or CapsLock. Win+Y works and is the default for continuity, not because holding
+    // the Win key for ten seconds is comfortable.
+    bool push_to_talk = false;
+
     // The settings menu offers, per plan.md §1.8: Win+Y (default) · Win+J · Win+O ·
     // F13–F24 (free, no Win-key hack) · Ctrl+Win+Space · right Ctrl / right Alt / CapsLock.
     [[nodiscard]] bool needs_start_menu_suppression() const noexcept { return (mods & kModWin) != 0; }
 
+    // The display string names the KEYS only ("Win+Y"). Push-to-talk is a separate settings key,
+    // deliberately: `parse()` has to accept everything `to_display_string()` produces, and the
+    // moment the spelling carries a mode the two stop being inverses of each other.
     [[nodiscard]] std::string to_display_string() const;  // "Win+Y"
     static bool parse(std::string_view s, HotkeySpec& out);
 };
@@ -498,6 +520,14 @@ private:
     bool session_active_ = false;
     uint64_t session_started_ms_ = 0;
     bool hotkey_chord_consumed_ = false;  // one activation per physical chord press
+
+    // Push-to-talk: the binding is being held for *this* session, so its release finalises.
+    //
+    // Distinct from `hotkey_chord_consumed_`, which answers "did we swallow this key's press"
+    // and must survive the end of the session so the matching key-up is swallowed too. This one
+    // answers "does the release mean finish", and is cleared the moment it fires so the rest of
+    // the chord coming up cannot finalise a second time.
+    bool ptt_held_ = false;
 };
 
 // ─── The Windows-facing manager ─────────────────────────────────────────────────────────────

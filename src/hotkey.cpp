@@ -403,6 +403,10 @@ void InputFilter::set_hotkey(const HotkeySpec& spec) {
     // ours. Clearing is the honest choice: the worst case is one stray key-up reaching the
     // target at the exact moment the user changed the binding in the settings dialog.
     hotkey_chord_consumed_ = false;
+    // Same argument, and one more: the release we were waiting for belongs to a binding that no
+    // longer exists. A held key that is no longer part of the chord must not finalise on its way
+    // up — the user changed a setting, they did not finish dictating.
+    ptt_held_ = false;
 }
 
 const HotkeySpec& InputFilter::hotkey() const noexcept { return spec_; }
@@ -448,6 +452,11 @@ void InputFilter::note_session_started(uint64_t now_ms) {
 void InputFilter::note_session_ended() {
     session_active_ = false;
     session_started_ms_ = 0;
+    // The session is over by some route other than the release — Esc, a stop-on-input click, the
+    // silence timer. The binding may well still be held, and its release must then mean nothing:
+    // finalising a session that has already ended is at best a no-op and at worst, once the next
+    // one has started, ends a session the user only just began.
+    ptt_held_ = false;
     editing_active_ = false;
     ui_fail_open_ = false;
     pill_dragging_ = false;
@@ -679,6 +688,26 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
         // rest of the process's life.
         bit_clear(down_at_activation_, e.vk);
 
+        // ── Push-to-talk: the release IS the finalise ────────────────────────────────────────
+        //
+        // Computed here, above every early return below, and folded into whatever outcome those
+        // returns produce — the binding key's release takes one of them, so deciding further
+        // down would have covered the modifier and missed the key.
+        //
+        // "Let go" means letting go of any part of the chord, not specifically the bound key.
+        // Somebody holding Win+Y and releasing Win first has stopped holding the hotkey, and a
+        // gesture that only ended on the Y would leave them talking into a session they thought
+        // was over. Cleared before it fires so the rest of the chord coming up — the Y a few
+        // milliseconds after the Win — cannot finalise a second time.
+        //
+        // It is the same `toggle_finalize` the second press produces: `stop`, a last decode, and
+        // the text typed into the target application. Push-to-talk moves *when* that happens,
+        // never what it does.
+        if (ptt_held_ && (e.vk == spec_.vk || is_binding_modifier(e.vk))) {
+            ptt_held_ = false;
+            out.toggle_finalize = true;
+        }
+
         // The binding key's release. We swallowed its press, so we must swallow its release too:
         // a target that saw no key-down but does see a key-up can get its own modifier tracking
         // stuck (this is how "my Shift key is stuck on" bugs are born).
@@ -721,6 +750,24 @@ FilterOutcome InputFilter::on_key_event(const InputEvent& e, bool down) {
             if (!session_active_) {
                 out.activate = true;
                 begin_session_state(e.time_ms);
+                ptt_held_ = spec_.push_to_talk;
+            } else if (spec_.push_to_talk) {
+                // Push-to-talk: **a press never ends a session.** The release does, in the key-up
+                // path above. Reaching here at all means a session was started by some route
+                // other than this binding — the tray menu — because the chord's own repeats are
+                // stopped by `hotkey_chord_consumed_` and the only way to press the binding
+                // again is to release it first, which is the finalise. The user is now holding
+                // the binding over someone else's session, and under this gesture that can only
+                // mean "keep going, and finish when I let go".
+                //
+                // Placed before the toggle branch rather than folded into it, because the two
+                // are mutually exclusive by definition and interleaving them would make the
+                // toggle's own reasoning conditional on a mode it predates.
+                if (editing_active_) {
+                    editing_active_ = false;
+                    out.resume_dictation = true;  // §3.3, exactly as the toggle binding does
+                }
+                ptt_held_ = true;
             } else if (!composing()) {
                 // plan.md §1.8's toggle, exactly as it was. It survives wherever the compose
                 // buffer does not exist — `editing.enabled` false, or a cadence other than
@@ -1550,7 +1597,8 @@ Status HotkeyManager::start(const HotkeySpec& spec, uintptr_t owner_window,
     }
 
     rt->running.store(true, std::memory_order_release);
-    KD_LOG_INFO("hotkey installed: %s", spec.to_display_string().c_str());
+    KD_LOG_INFO("hotkey installed: %s (%s)", spec.to_display_string().c_str(),
+                spec.push_to_talk ? "push-to-talk" : "toggle");
     return Status::success();
 }
 

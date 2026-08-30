@@ -1410,3 +1410,176 @@ KD_TEST(hotkey, injected_mouse_events_neither_stop_nor_cache) {
     KD_CHECK(!o.click_captured);
     KD_CHECK(f.session_active());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  Push-to-talk: the release finalises (HotkeySpec::push_to_talk)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The default binding with the gesture flipped. Returned by value so each test owns its spec.
+kd::HotkeySpec ptt_win_y() {
+    kd::HotkeySpec s{};
+    s.push_to_talk = true;
+    return s;
+}
+
+kd::HotkeySpec ptt_f13() {
+    kd::HotkeySpec s{};
+    s.vk = kd::vk::kF13;
+    s.mods = kd::kModNone;
+    s.push_to_talk = true;
+    return s;
+}
+
+}  // namespace
+
+KD_TEST(hotkey, push_to_talk_is_off_by_default_and_survives_a_display_string_round_trip) {
+    // The spelling names the keys and nothing else: a mode carried in the string would make
+    // parse() and to_display_string() stop being inverses.
+    const kd::HotkeySpec fresh{};
+    KD_CHECK(!fresh.push_to_talk);
+
+    kd::HotkeySpec parsed{};
+    KD_REQUIRE(kd::HotkeySpec::parse(ptt_win_y().to_display_string(), parsed));
+    KD_CHECK_EQ(parsed.vk, kd::vk::kY);
+    KD_CHECK(!parsed.push_to_talk);
+}
+
+KD_TEST(hotkey, holding_the_binding_starts_and_releasing_it_finalises) {
+    kd::InputFilter f;
+    f.set_hotkey(ptt_win_y());
+
+    f.on_event(kdown(kd::vk::kLWin, 100));
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kY, 110));
+    KD_REQUIRE(o.activate);
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(o.swallow);
+
+    // Still held: the session is running and the chord's own repeats change nothing.
+    o = f.on_event(kdown(kd::vk::kY, 200));
+    KD_CHECK(!o.activate);
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(o.swallow);
+    KD_CHECK(f.session_active());
+
+    // Let go. This is the same finalise the second press produces under the toggle — `stop`, a
+    // last decode, and the text typed into the target.
+    o = f.on_event(kup(kd::vk::kY, 900));
+    KD_CHECK(o.toggle_finalize);
+    KD_CHECK(o.swallow);        // still our key: its press was swallowed, so its release is too
+    KD_CHECK(!o.stop_on_input);
+    KD_CHECK(!o.activate);
+}
+
+KD_TEST(hotkey, releasing_the_modifier_first_also_finalises_and_only_once) {
+    // Win+Y released Win-first. Somebody who has let go of the Win key has stopped holding the
+    // hotkey, and a gesture that waited for the Y would leave them talking into a dead session.
+    kd::InputFilter f;
+    f.set_hotkey(ptt_win_y());
+    f.on_event(kdown(kd::vk::kLWin, 100));
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kY, 110)).activate);
+
+    kd::FilterOutcome o = f.on_event(kup(kd::vk::kLWin, 800));
+    KD_CHECK(o.toggle_finalize);
+    KD_CHECK(!o.stop_on_input);
+
+    // The Y coming up a few milliseconds later must not finalise a second session.
+    o = f.on_event(kup(kd::vk::kY, 810));
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(o.swallow);
+}
+
+KD_TEST(hotkey, a_modifier_free_binding_finalises_on_its_own_release) {
+    kd::InputFilter f;
+    f.set_hotkey(ptt_f13());
+
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kF13, 100));
+    KD_REQUIRE(o.activate);
+    KD_CHECK(!o.suppress_start_menu);  // no Win key, no hack — the point of offering F13–F24
+
+    o = f.on_event(kup(kd::vk::kF13, 700));
+    KD_CHECK(o.toggle_finalize);
+    KD_CHECK(o.swallow);
+}
+
+KD_TEST(hotkey, under_push_to_talk_a_press_never_finalises) {
+    // The whole difference between the two gestures, stated as one property: with the binding
+    // held, every further press of it — repeat, or a fresh one after the owner started a session
+    // some other way — leaves the session running.
+    kd::InputFilter f;
+    f.set_hotkey(ptt_f13());
+    f.note_session_started(50);  // as the tray menu would
+
+    kd::FilterOutcome o = f.on_event(kdown(kd::vk::kF13, 100));
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(!o.activate);
+    KD_CHECK(o.swallow);
+    KD_CHECK(f.session_active());
+
+    // ...and the release ends it, because holding it is what the user was told to do.
+    KD_CHECK(f.on_event(kup(kd::vk::kF13, 600)).toggle_finalize);
+}
+
+KD_TEST(hotkey, the_release_is_inert_once_the_session_has_ended_some_other_way) {
+    // Esc, a click, or the silence timer ends the session while the key is still down. The
+    // release must then mean nothing: finalising here would, once the next session has started,
+    // end one the user only just began.
+    kd::InputFilter f;
+    f.set_hotkey(ptt_f13());
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kF13, 100)).activate);
+
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kEscape, 200)).cancel);
+    f.note_session_ended();
+
+    const kd::FilterOutcome o = f.on_event(kup(kd::vk::kF13, 300));
+    KD_CHECK(!o.toggle_finalize);
+    KD_CHECK(o.swallow);  // its press was swallowed; its release still has to be
+}
+
+KD_TEST(hotkey, rebinding_mid_hold_does_not_finalise_on_the_stale_release) {
+    // The settings dialog closed while the binding was held. The key going up now belongs to a
+    // binding that no longer exists; the user changed a setting, they did not finish dictating.
+    kd::InputFilter f;
+    f.set_hotkey(ptt_f13());
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kF13, 100)).activate);
+
+    f.set_hotkey(ptt_win_y());
+    const kd::FilterOutcome o = f.on_event(kup(kd::vk::kF13, 200));
+    KD_CHECK(!o.toggle_finalize);
+}
+
+KD_TEST(hotkey, push_to_talk_still_ends_the_session_on_a_foreign_keystroke) {
+    // plan.md §1.8 is unchanged: the gesture that *finishes* moved, and nothing else did.
+    kd::InputFilter f;
+    f.set_hotkey(ptt_f13());
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kF13, 100)).activate);
+
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kA, 200));
+    KD_CHECK(o.stop_on_input);
+    KD_CHECK_EQ(static_cast<int>(o.stop_reason), static_cast<int>(kd::StopInputReason::Keystroke));
+    KD_CHECK(!o.swallow);
+}
+
+KD_TEST(hotkey, an_edit_key_closes_the_microphone_and_the_release_still_finalises) {
+    // Editing is reachable under push-to-talk — an edit key pressed with the other hand closes
+    // the microphone while the binding is still held — and it must not change what letting go
+    // means. Resuming from editing is not: the only way to press the binding again is to release
+    // it first, and that is the finalise.
+    kd::InputFilter f;
+    kd::EditingConfig cfg;
+    cfg.enabled = true;
+    f.set_editing(cfg);
+    f.set_hotkey(ptt_f13());
+    KD_REQUIRE(f.on_event(kdown(kd::vk::kF13, 100)).activate);
+
+    const kd::FilterOutcome edit = f.on_event(kdown(kd::vk::kBack, 200));
+    KD_CHECK(edit.editing_began);
+    KD_CHECK(edit.swallow);
+    KD_CHECK(f.editing_active());
+    KD_CHECK(f.session_active());
+
+    const kd::FilterOutcome o = f.on_event(kup(kd::vk::kF13, 400));
+    KD_CHECK(o.toggle_finalize);
+    KD_CHECK(o.swallow);
+}

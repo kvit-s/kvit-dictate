@@ -97,7 +97,7 @@ worse than one that refuses.
 
 ## Dictating
 
-**Hold or press Win+Y.** A small pill appears near your caret and fills with what you are saying.
+**Press Win+Y.** A small pill appears near your caret and fills with what you are saying.
 Text is typed into your document as it becomes stable — once a word is in, it is never taken back
 and never rewritten.
 
@@ -113,6 +113,18 @@ and never rewritten.
 
 The hotkey is configurable (Win+J, Win+O, F13–F24, right Ctrl, CapsLock and others) in
 Settings → Dictation.
+
+### Push to talk
+
+Tick **Push to talk** in Settings → Dictation and the hotkey stops toggling: the microphone is
+open only while you hold the key, and letting go finishes the session and types the text into
+your document. Transcription still runs while you talk — releasing the key is what sends the
+result to the application, not what starts the work.
+
+Releasing any part of the chord counts as letting go, so a binding you can comfortably hold with
+one finger — F13–F24, right Ctrl, right Alt or CapsLock — suits this better than a Win-key
+combination. Everything else is unchanged: Esc still throws the session away, and clicking
+somewhere else still ends it.
 
 ## When it does not work
 

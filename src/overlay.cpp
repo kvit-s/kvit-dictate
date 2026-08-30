@@ -499,7 +499,8 @@ OverlayMode overlay_mode_for(OverlayMode configured, const std::optional<anchor:
     return OverlayMode::FloatingPill;
 }
 
-std::string key_legend(OverlayState state, bool composing, std::string_view hotkey) {
+std::string key_legend(OverlayState state, bool composing, std::string_view hotkey,
+                       bool push_to_talk) {
     // Only the three states where the session is the user's to steer. Finalizing is deliberately
     // not one of them: by then `stop` has gone out and none of these keys would do what the line
     // promised. Idle, ModelLoading, Warning, Unsupported and Error have no session to steer at
@@ -521,11 +522,22 @@ std::string key_legend(OverlayState state, bool composing, std::string_view hotk
         // not. The hotkey is named only while editing, because §4.5 gives it exactly one meaning
         // and while the microphone is already open that meaning is a no-op — a legend that named
         // it there would be advertising a key that does nothing.
-        item("Enter to finish");
+        //
+        // Under push-to-talk the first item is the gesture the user is *already making*: their
+        // finger is on the key, and letting go is what finishes. Enter still commits — the filter
+        // does not change — but naming it first would put the second-best way out in front of the
+        // one the user chose in settings.
+        item(push_to_talk ? "let go to finish" : "Enter to finish");
         item("Esc to cancel");
         if (state == OverlayState::Editing) {
             if (!hotkey.empty()) {
-                std::string resume(hotkey);
+                // Editing is reachable under push-to-talk — an edit key pressed with the other
+                // hand closes the microphone while the binding is still held — and the verb has
+                // to match the gesture. "Win+Y to resume" would be asking for a press from
+                // someone who has never let go.
+                std::string resume;
+                if (push_to_talk) resume.append("hold ");
+                resume.append(hotkey);
                 resume.append(" to resume");
                 item(resume);
             }
@@ -539,7 +551,9 @@ std::string key_legend(OverlayState state, bool composing, std::string_view hotk
     // Enter is not a commit here and must not be named as one; the hotkey finishes, and every
     // other key ends the session by passing through to the target.
     if (!hotkey.empty()) {
-        std::string finish(hotkey);
+        std::string finish;
+        if (push_to_talk) finish.append("let go of ");
+        finish.append(hotkey);
         finish.append(" to finish");
         item(finish);
     }
@@ -694,6 +708,7 @@ struct OverlayCore {
     // is a compose buffer this session); the line itself is composed per paint from `state`.
     std::string legend_hotkey;
     bool legend_composing = false;
+    bool legend_push_to_talk = false;
 
     // §7.3. `scroll_pinned` is the default and is what makes a session with no editing look and
     // behave exactly as it does today: the view follows the bottom of a transcript that only ever
@@ -1297,7 +1312,7 @@ HRESULT OverlayCore::paint_once() {
     DWRITE_TEXT_METRICS legend_metrics{};
     if (em == OverlayMode::FloatingPill) {
         const std::wstring line = utf8::to_utf16_or_empty(
-            key_legend(state, legend_composing, legend_hotkey));
+            key_legend(state, legend_composing, legend_hotkey, legend_push_to_talk));
         if (!line.empty() &&
             SUCCEEDED(dwrite->CreateTextLayout(line.c_str(), static_cast<UINT32>(line.size()),
                                                format_note.get(), max_text_w, 4096.0f,
@@ -1896,12 +1911,14 @@ void Overlay::set_hint(std::string_view h) {
     impl_->dirty = true;
 }
 
-void Overlay::set_key_legend(std::string_view hotkey, bool composing) {
-    if (impl_->legend_hotkey == hotkey && impl_->legend_composing == composing) {
+void Overlay::set_key_legend(std::string_view hotkey, bool composing, bool push_to_talk) {
+    if (impl_->legend_hotkey == hotkey && impl_->legend_composing == composing &&
+        impl_->legend_push_to_talk == push_to_talk) {
         return;
     }
     impl_->legend_hotkey.assign(hotkey);
     impl_->legend_composing = composing;
+    impl_->legend_push_to_talk = push_to_talk;
     impl_->dirty = true;
 }
 
