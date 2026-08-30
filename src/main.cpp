@@ -319,7 +319,7 @@ private:
     // offset that arrives without the text it indexes is an offset into the previous frame.
     void push_edit_view();
 
-    void request_normalize();
+    void pump_normalize();
     void drain_normalize_queue();
     void cancel_normalize();
     // Empties the compose buffer into the document, or onto the clipboard when the target is
@@ -415,16 +415,37 @@ private:
     // The rewriter (normalizer.h). Only ever touches `edit_`, only under Cadence::EndOfSession,
     // and never after the user has started editing.
     std::unique_ptr<kd::Normalizer> normalizer_;
-    // The raw accumulation, kept alongside `edit_` because a rewriter is not idempotent: feeding
-    // it its own output makes it keep editing, and the drift is toward shorter. Every request
-    // sends this, never the pill's current contents.
-    std::string normalize_raw_;
+    // Bytes at the front of `edit_` that are finished with — rewritten, or left as spoken
+    // because the request failed or the guard refused it. Everything after this offset is raw
+    // and waiting its turn.
+    size_t normalize_settled_bytes_ = 0;
+    // The committed chunks living after that offset, oldest first, each exactly as it was
+    // appended to `edit_`. The front one is in flight whenever `normalize_pending_id_` is
+    // non-zero, and nothing but `drain_normalize_queue` ever pops it.
+    //
+    // **One chunk per request, not the whole buffer per request**, and that is the whole of this
+    // feature. Sending the buffer meant every answer was superseded by the next utterance while
+    // the speaker kept talking (`drain_normalize_queue`'s "the buffer grew while it was in
+    // flight"), so in a continuous dictation the rewrite landed exactly once — at the end — and
+    // everything the user watched accumulate until then was raw. A chunk, by contrast, is closed
+    // the moment it arrives: the commit engine is several sentences behind the live tail by
+    // then, so nothing can arrive later that changes it, its answer can never be stale, and it
+    // lands rewritten as it is committed.
+    //
+    // It also retires the raw baseline the whole-buffer form needed. A rewriter is not
+    // idempotent, and the rule that its own output is never sent back to it is structural here:
+    // a chunk leaves this queue when it has been through the model, and nothing puts it back.
+    std::deque<std::string> normalize_chunks_;
     uint64_t normalize_pending_id_ = 0;
+    // Exactly what went out for the chunk in flight: the front chunk minus its leading
+    // whitespace. plan.md §1.6's space between utterances is the pill's, not the model's — send
+    // it and it comes back eaten, and two utterances run into one word.
+    std::string normalize_sent_;
     // Cleared for the session the moment the user edits. Their text is authoritative and a
     // rewrite arriving afterwards would silently discard the correction they just made.
     bool normalize_active_ = false;
-    // `stopped` arrived while a rewrite was still in flight. The target is held (it already is,
-    // for `final`) until the answer lands or the finalize grace expires, because the last
+    // `stopped` arrived with rewriting still outstanding. The target is held (it already is,
+    // for `final`) until the queue drains or the finalize grace expires, because the last
     // utterance of a session is otherwise the one utterance that never gets normalized.
     bool finish_awaiting_normalize_ = false;
     std::mutex normalize_mutex_;
@@ -1332,16 +1353,22 @@ void App::drain_ipc_queue() {
 
         if (m.get_if<kd::proto::StoppedMsg>() != nullptr &&
             outcome.verdict == kd::Verdict::Accept) {
-            // The last utterance's `final` arrives moments before `stopped`, so a rewrite fired
-            // from it is almost always still in flight right here. Committing now would make the
-            // last utterance of every session the one utterance that never gets normalized. The
+            // The last utterance's `final` arrives moments before `stopped`, so its chunk is
+            // almost always still in flight right here. Committing now would make the last
+            // utterance of every session the one utterance that never gets normalized. The
             // target is already held for exactly this kind of wait, and finalize_deadline_ms_
             // still bounds it — NormalizerConfig::validate caps the timeout well inside the
             // grace, so this can defer the commit but never prevent it.
-            if (normalize_pending_id_ != 0) {
+            //
+            // The whole queue is waited on, not just the chunk in flight. It is rarely more than
+            // that one: chunks go out as they are committed, and rewriting a single utterance
+            // takes a fraction of the silence that ended it, so the queue is empty between
+            // utterances. When it is not, the grace covers the difference.
+            if (normalize_pending_id_ != 0 || !normalize_chunks_.empty()) {
                 finish_awaiting_normalize_ = true;
-                KD_LOG_DEBUG("`stopped` held: normalize #%llu is still in flight",
-                             static_cast<unsigned long long>(normalize_pending_id_));
+                KD_LOG_DEBUG("`stopped` held: normalize #%llu in flight, %zu chunk(s) behind it",
+                             static_cast<unsigned long long>(normalize_pending_id_),
+                             normalize_chunks_.size());
             } else {
                 finish_dictation("stopped");
             }
@@ -1651,17 +1678,18 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         // closes the microphone at the first edit key, so the only way speech reaches this line
         // is after the user's own resume gesture.
         edit_.append(text);
-        // The raw baseline grows in step, and it is what every request sends. normalizer.h: a
-        // rewriter is not idempotent, so re-sending its own output makes it keep editing.
-        normalize_raw_ += text;
+        // Queued as its own unit of rewriting, at the offset it just landed on.
+        normalize_chunks_.push_back(text);
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
                      text.size(), edit_.size());
         // At an utterance boundary, which is the one moment in a session when both machines are
         // idle: the endpointer has just fired on silence, so the recogniser is not decoding, and
-        // the user has stopped talking. The rewrite lands in the pill during that pause, so by
-        // the time they press Enter they have already read what they are committing — which is
-        // the whole of docs/editing.md §2, and the reason this needs no extra keystroke.
-        request_normalize();
+        // the user has stopped talking. This chunk's rewrite lands in the pill during that
+        // pause, and every chunk before it has already been through — so by the time they press
+        // Enter they have been reading what they are committing all along, rather than meeting
+        // it for the first time at the end. That is docs/editing.md §2, and the reason this
+        // needs no extra keystroke.
+        pump_normalize();
         // Again, because the buffer just grew. Without this the preview empties at every
         // utterance boundary: the call above renders the engine's `pending_text`, which is scoped
         // to the utterance in progress and is empty on a `final` — so everything said so far
@@ -2115,8 +2143,8 @@ void App::begin_dictation() {
     editing_began_ms_ = 0;
     hint_expires_ms_ = 0;
     // Cleared here for the reason note_session_ended() is: the abort paths skip end_dictation
-    // entirely, and a baseline left behind would make the next session's first rewrite request
-    // carry the previous session's words.
+    // entirely, and a queue left behind would spend the next session rewriting the previous
+    // one's words at offsets that no longer mean anything.
     cancel_normalize();
     if (overlay_ != nullptr) {
         overlay_->clear_hint();
@@ -2275,18 +2303,41 @@ void App::render_preview(std::string_view tail) {
 // arrives without the text it indexes is an offset into the previous frame.
 // ─── The rewriter (normalizer.h) ────────────────────────────────────────────────────────────
 
-void App::request_normalize() {
-    if (normalizer_ == nullptr || normalize_raw_.empty()) return;
+void App::pump_normalize() {
+    if (normalizer_ == nullptr) return;
     // Belt and braces with Settings::normalise(), which already forces `enabled` off under any
     // other cadence. Stated here too because this is the line that would corrupt a document if
     // the forcing ever regressed: under Cadence::Immediate the text is already typed.
     if (settings_.stability.cadence != kd::Cadence::EndOfSession) return;
     if (editing_) return;
+    // One at a time and in order. The alternative — every chunk in flight at once — would have
+    // them answering out of order into a buffer addressed by byte offset, and would put several
+    // requests on a small model that serves one utterance in a fraction of the pause that ended
+    // it. The queue behind this is what makes the serialisation free.
+    if (normalize_pending_id_ != 0) return;
 
-    const uint64_t id = normalizer_->request(normalize_raw_);
-    if (id == 0) return;  // disabled, empty, or past max_bytes — each logged by the module
-    normalize_pending_id_ = id;
-    normalize_active_ = true;
+    while (!normalize_chunks_.empty()) {
+        const std::string& chunk = normalize_chunks_.front();
+        // plan.md §1.6's leading space stays here and is put back when the answer lands. The
+        // model is being asked to rewrite an utterance, not to preserve the whitespace that
+        // joins it to the one before.
+        const size_t lead = chunk.find_first_not_of(" \t\n");
+        std::string sent = lead == std::string::npos ? std::string() : chunk.substr(lead);
+
+        const uint64_t id = sent.empty() ? 0 : normalizer_->request(sent);
+        if (id != 0) {
+            normalize_sent_ = std::move(sent);
+            normalize_pending_id_ = id;
+            normalize_active_ = true;
+            return;
+        }
+
+        // The module declined it — disabled, empty, or past max_bytes, each logged there with
+        // the reason. It settles as spoken rather than standing in front of the chunks behind
+        // it: one oversized utterance must not stop the rest of the session being rewritten.
+        normalize_settled_bytes_ += chunk.size();
+        normalize_chunks_.pop_front();
+    }
 }
 
 void App::cancel_normalize() {
@@ -2294,7 +2345,9 @@ void App::cancel_normalize() {
     normalize_pending_id_ = 0;
     normalize_active_ = false;
     finish_awaiting_normalize_ = false;
-    normalize_raw_.clear();
+    normalize_chunks_.clear();
+    normalize_sent_.clear();
+    normalize_settled_bytes_ = 0;
 }
 
 void App::drain_normalize_queue() {
@@ -2313,6 +2366,22 @@ void App::drain_normalize_queue() {
             continue;
         }
         normalize_pending_id_ = 0;
+        if (normalize_chunks_.empty()) {
+            // Cannot happen: the queue is only popped here, after the answer for its front has
+            // been dealt with. Checked anyway, because the alternative to checking is indexing
+            // the buffer with a length taken from a chunk that is not there.
+            KD_LOG_WARN("normalize #%llu answered with no chunk waiting for it",
+                        static_cast<unsigned long long>(r.id));
+            continue;
+        }
+
+        // The chunk this answers, and where it sits in the pill. Both are taken now, and the
+        // bytes are marked settled whatever the verdict below turns out to be: the only question
+        // left about them is whether they end up the model's words or the speaker's.
+        const std::string chunk = normalize_chunks_.front();
+        normalize_chunks_.pop_front();
+        const size_t at = normalize_settled_bytes_;
+        normalize_settled_bytes_ += chunk.size();
 
         if (!r.status.ok()) {
             KD_LOG_WARN("normalize #%llu failed after %llu ms (%s); the text stands as spoken",
@@ -2324,11 +2393,14 @@ void App::drain_normalize_queue() {
             // answer. Their text wins.
             KD_LOG_DEBUG("dropping normalize #%llu: the buffer is no longer ours to rewrite",
                          static_cast<unsigned long long>(r.id));
-        } else if (r.raw != normalize_raw_) {
-            // More speech landed while this was in flight. A newer request is already out for the
-            // longer buffer, and applying this one would drop the words that arrived since.
-            KD_LOG_DEBUG("dropping normalize #%llu: the buffer grew while it was in flight",
-                         static_cast<unsigned long long>(r.id));
+        } else if (r.raw.size() > chunk.size() || at + chunk.size() > edit_.size() ||
+                   edit_.text().compare(at, chunk.size(), chunk) != 0) {
+            // The chunk is not where it was put. Nothing in the dictating half of a session
+            // moves it — speech only appends, and the first edit key cancels the rewriter
+            // outright — so this is a bug rather than a race, and splicing on a stale offset
+            // would corrupt the buffer in a way the user would have to notice by reading.
+            KD_LOG_WARN("dropping normalize #%llu: the chunk is no longer at offset %zu",
+                        static_cast<unsigned long long>(r.id), at);
         } else {
             const kd::GuardResult g =
                 kd::guard_verdict(r.raw, r.normalized, settings_.normalizer.protect_terms);
@@ -2336,25 +2408,41 @@ void App::drain_normalize_queue() {
                 // Named, not counted. bench/metrics.py:675 predicted `sm 120` for `sm_120`
                 // before this model existed, and a log line that says which term died is the
                 // difference between tuning the term table and guessing at it.
-                KD_LOG_WARN("normalize #%llu rejected (%s%s%s); the text stands as spoken",
+                //
+                // Per chunk, this rejection is also cheaper than it used to be: one utterance
+                // stands as spoken among rewritten neighbours, where the whole-buffer form threw
+                // away the rewrite of everything the user had said so far.
+                KD_LOG_WARN("normalize #%llu rejected (%s%s%s); the chunk stands as spoken",
                             static_cast<unsigned long long>(r.id), kd::to_string(g.verdict),
                             g.lost_term.empty() ? "" : ": ", g.lost_term.c_str());
             } else {
-                KD_LOG_INFO("normalize #%llu applied in %llu ms: %zu -> %zu bytes",
+                KD_LOG_INFO("normalize #%llu applied in %llu ms at %zu: %zu -> %zu bytes",
                             static_cast<unsigned long long>(r.id),
-                            static_cast<unsigned long long>(r.elapsed_ms), r.raw.size(),
+                            static_cast<unsigned long long>(r.elapsed_ms), at, r.raw.size(),
                             r.normalized.size());
-                // The pill's text is replaced wholesale; `normalize_raw_` is deliberately left
-                // as it was, so the next utterance extends the raw baseline and the next request
-                // still sends text the model has never seen.
-                edit_.clear();
-                edit_.append(r.normalized);
+                // The chunk is replaced where it lies; everything before it is already settled
+                // and everything after it is raw and still queued, so both survive untouched and
+                // the queue's offsets shift with the buffer rather than against it.
+                const std::string& cur = edit_.text();
+                const size_t lead = chunk.size() - r.raw.size();  // the space §1.6 put on
+                std::string next = cur.substr(0, at + lead);
+                next += r.normalized;
+                next += cur.substr(at + chunk.size());
+                edit_.set_text(next);
+                normalize_settled_bytes_ = at + lead + r.normalized.size();
                 render_preview({});
             }
         }
 
-        // Whatever the verdict, a session that was waiting on this answer may now end.
-        if (finish_awaiting_normalize_) {
+        // The next chunk goes out now rather than at the next utterance boundary: a queue that
+        // built up during a fast passage drains through the pause instead of waiting for one
+        // pause per chunk.
+        pump_normalize();
+
+        // A session that was waiting on this may now end — but only once the queue behind it is
+        // empty too, or the last utterances would be committed raw with their answers in flight.
+        if (finish_awaiting_normalize_ && normalize_pending_id_ == 0 &&
+            normalize_chunks_.empty()) {
             finish_awaiting_normalize_ = false;
             finish_dictation("stopped");
         }

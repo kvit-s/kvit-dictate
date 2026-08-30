@@ -96,25 +96,49 @@ unread into the document. Firing at the utterance boundary avoids all three:
 * The cleaned text is in the pill by the time Enter is pressed. `docs/editing.md` §2's "text the
   user has read and approved" holds with **no extra gesture**.
 
-The visible cost is that the pill churns: words already read can change as later speech arrives.
-That is the model changing its mind in the pill instead of in the document, which is what
-compose-then-commit is for — but it is a real UX cost and `bench/metrics.py`'s `flicker()` is how
-to measure it rather than argue about it.
+### One committed chunk per request
 
-### Always renormalise from raw
+`App::normalize_chunks_` holds the committed chunks that have not been through the model yet,
+oldest first, and `App::normalize_settled_bytes_` says how much of `edit_` is already finished
+with. One chunk is in flight at a time; each answer is spliced into the pill where its chunk
+lies, and the chunks queued behind it shift with the buffer.
 
-`App::normalize_raw_` grows alongside `edit_` and is what every request sends. A rewriter is not
-idempotent: feed it its own output and it keeps editing, toward shorter and more confident, which
-is the direction that loses words. Sending the whole raw buffer every time also resolves a
-correction the VAD happened to split in two, because the model always sees the entire session.
+A rewriter is not idempotent — feed it its own output and it keeps editing, toward shorter and
+more confident, which is the direction that loses words — so text that has been through the model
+is never sent again. Here that is structural: a chunk leaves the queue when it is answered, and
+nothing puts it back.
 
-### `stopped` is held for an in-flight rewrite
+**Why not the whole buffer.** The first form sent all of `App::normalize_raw_` on every utterance
+boundary and replaced the pill wholesale. For a speaker who pauses between paragraphs it works;
+for one who does not, every answer was superseded by the next utterance before it arrived, so the
+rewrite landed exactly once — at the end. The session's text accumulated raw in front of the
+user and turned into prose the instant before they committed it, which is the one moment they
+have stopped reading it. Reported as "it post-processes the whole thing, so I never see how it
+looks".
 
-The last utterance's `final` arrives moments before `stopped`, so a rewrite fired from it is
-almost always still in flight when the session ends. Without a wait, the last utterance of every
-session would be the one that never got normalized. The target is already held for exactly this
-kind of wait and `finalize_deadline_ms_` still bounds it — `NormalizerConfig::validate()` caps
-the timeout well inside `kFinalizeGraceMs` — so this can defer a commit but never prevent one.
+A chunk can be rewritten alone because it is **closed**: `commit_engine.h` only hands over text
+that is several sentences behind the live tail and can never be revised, so a correction the
+speaker made is already resolved inside the chunk carrying it. The whole-buffer form's one real
+advantage — resolving a correction the VAD split across an utterance boundary — is given up
+knowingly for that.
+
+What it buys: the pill only grows, earlier sentences stop churning under the reader, a guard
+rejection costs one utterance instead of the session's whole rewrite, and a request is one
+utterance long rather than growing all session toward `max_bytes`.
+
+The leading space `plan.md` §1.6 puts between utterances is stripped before sending and put back
+on the answer. It belongs to the pill, not to the model, which returns a rewritten utterance and
+eats it — running two utterances into one word.
+
+### `stopped` is held until the queue drains
+
+The last utterance's `final` arrives moments before `stopped`, so its chunk is almost always
+still in flight when the session ends. Without a wait, the last utterance of every session would
+be the one that never got normalized. The whole queue is waited on, not just the chunk in
+flight — though it is rarely more than that one, because rewriting a single utterance takes a
+fraction of the silence that ended it. The target is already held for exactly this kind of wait
+and `finalize_deadline_ms_` still bounds it — `NormalizerConfig::validate()` caps the timeout
+well inside `kFinalizeGraceMs` — so this can defer a commit but never prevent one.
 
 ---
 

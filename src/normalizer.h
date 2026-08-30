@@ -53,14 +53,32 @@
 // Settings::normalise() forces `enabled` off under any other cadence, exactly as it already does
 // for `editing.enabled`.
 //
-// ─── Always renormalise from the raw text ───────────────────────────────────────────────────
+// ─── One committed chunk per request ────────────────────────────────────────────────────────
 //
 // A rewriter is not idempotent: feed it its own output and it keeps editing, and the drift is
-// toward shorter and more confident, which is the direction that loses words. So the caller keeps
-// the raw accumulation as the baseline and re-sends **the whole raw buffer** every time, rather
-// than sending the delta or re-sending the previous answer. That also fixes the cross-utterance
-// case for free, because the model always sees the entire session and can resolve a correction
-// the VAD happened to split in two.
+// toward shorter and more confident, which is the direction that loses words. So text that has
+// been through the model is never sent to it again. The caller (`App::pump_normalize`) sends
+// **one committed chunk per request**, in order, one at a time, and splices each answer into the
+// pill where its chunk lies.
+//
+// The first form of this sent the whole raw buffer every time and replaced the pill wholesale,
+// keeping a separate raw baseline so the model never saw its own output. It is not what shipped,
+// because of what it did to a speaker who does not stop: every answer was superseded by the next
+// utterance (`requests_superseded`), so in a continuous dictation the rewrite landed exactly
+// once, at the end. What the user watched accumulate for the length of the session was raw text,
+// and the pill flipped to prose the instant before they committed it — the one moment they are
+// no longer reading it.
+//
+// A chunk is safe to rewrite alone because it is *closed*: commit_engine.h hands over text that
+// is several sentences behind the live tail and can never be revised, so a correction the
+// speaker made — "no wait, Thursday" — is already resolved inside the chunk that carries it. The
+// whole-buffer form's one real advantage, resolving a correction the VAD split across the
+// boundary between two utterances, is the narrow residue of that; it is given up knowingly, and
+// what is bought with it is that every chunk arrives rewritten at the moment it arrives at all.
+//
+// The rest follows: the pill only ever grows, earlier sentences stop churning under the reader,
+// a guard rejection costs one utterance rather than the session's whole rewrite, and each
+// request is one utterance long instead of growing without bound toward `max_bytes`.
 //
 // ─── The term guard, which is the reason this is safe to enable ─────────────────────────────
 //
