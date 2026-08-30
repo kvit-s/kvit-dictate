@@ -70,17 +70,44 @@ struct VadConfig {
     double endpoint_silence_ms = 1500.0;
     // Audio fed to the decoder ahead of the detected onset.
     double preroll_ms = 300.0;
-    // Safety valve, not a product feature: an utterance that never endpoints would feed the
-    // backend without bound and never produce a `final`. 0 disables it — and the OpenAI backend
-    // refuses to run with it disabled, because it buffers a whole utterance and never drops a
-    // sample, so this is the only thing bounding it.
+    // ─── Two ways a long utterance ends, and only one of them is any good ──────────────────
     //
-    // Note that this is *not* the amount of audio the backend receives: the clock starts at the
-    // onset, and the onset frame also replays `preroll_ms` from before it. An utterance cut here
-    // is handed over as roughly `max_utterance_ms + preroll_ms`. Nothing depends on that sum any
-    // more — it used to size a decode window, and being 300 ms short of it put the same speech
-    // in a user's document twice — but the arithmetic surprises people, so it is written down.
-    double max_utterance_ms = 30000.0;
+    // A batch model has to be handed a bounded recording, so an utterance that never endpoints
+    // has to be ended by something. The question is *where*, and the two fields below are the
+    // second and third of three answers, in descending order of quality:
+    //
+    //   1. The model's own segment boundary, from the timestamps in its response. Exact, and
+    //      handled in `backend_openai.cpp` rather than here — it knows where a sentence ended
+    //      because it just transcribed it. Not always offered: measured 2026-08-30 against
+    //      Qwen3-ASR, a 21 s clip came back as two segments but the same audio at 13/16/19 s
+    //      came back as one, so the boundary can lag the pause by several seconds.
+    //   2. `soft_max_utterance_ms` — the next *breath*. Past this much audio the hangover
+    //      boundary (`hangover_ms` of quiet, far more frequent than a full endpoint) ends the
+    //      utterance instead of merely noting a pause. Cuts between words.
+    //   3. `max_utterance_ms` — the stopwatch. Cuts wherever the clock lands, mid-word if that
+    //      is where it lands, which garbles a word on both sides of the seam.
+    //
+    // Only 3 existed before 2026-08-30, and it fired during ordinary long-winded dictation
+    // rather than in the emergency it was written for. That is the wrong tool doing the common
+    // job: `progress.md` §3b already raised `endpoint_silence_ms` 800 → 1500 so that utterance
+    // boundaries land on *sentences*, and a stopwatch cut contradicts that outright.
+
+    // Past this much audio, the next hangover boundary ends the utterance. 0 disables it, which
+    // leaves the stopwatch as the only answer.
+    double soft_max_utterance_ms = 20000.0;
+
+    // The stopwatch, and now genuinely a safety valve: with 2 in place it is reachable only by
+    // audio with no quiet gap at all in 28 seconds — a stuck detector, a television, a fan the
+    // threshold is calibrated wrong for. 0 disables it, and the OpenAI backend refuses to run
+    // that way, because it buffers a whole utterance and never drops a sample.
+    //
+    // 28 s, not 30: the clock starts at the *onset*, but the audio handed over also carries
+    // `preroll_ms` from before it, so a cut utterance reaches the model as roughly
+    // `max_utterance_ms + preroll_ms`. Whisper-family models have a 30 s native window, and
+    // 30 000 + 300 was over it. (The 300 ms also used to be exactly the amount by which a decode
+    // window was undersized, which put the same speech in a user's document twice. Nothing
+    // depends on that sum any more, but the arithmetic surprises people, so it is written down.)
+    double max_utterance_ms = 28000.0;
 
     // Energy/ZCR scorer.
     double energy_snr_db = 10.0;
@@ -99,6 +126,7 @@ struct VadConfig {
     [[nodiscard]] uint64_t endpoint_samples() const noexcept;
     [[nodiscard]] uint64_t preroll_samples() const noexcept;
     [[nodiscard]] uint64_t max_utterance_samples() const noexcept;
+    [[nodiscard]] uint64_t soft_max_utterance_samples() const noexcept;
 
     // Returns an empty string when the configuration is coherent, and the reason otherwise.
     // Same checks as `VadConfig.__post_init__`, including the one that is not obvious: a

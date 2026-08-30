@@ -29,6 +29,14 @@ namespace {
 
 using namespace kd::asrd;
 
+// Milliseconds of audio in `samples`, matching the driver's own arithmetic.
+uint64_t samples_ms(size_t samples) { return static_cast<uint64_t>(samples) * 1000u / 16000u; }
+
+// A buffer only just longer than a proposed cut at `cut_s`, so the tail falls under the minimum.
+size_t cut_just_past(double cut_s) {
+    return static_cast<size_t>(cut_s * 16000.0 + 0.5) + 16000u / 4u;
+}
+
 std::vector<int16_t> pcm_ms(uint32_t ms, int16_t value = 1000) {
     return std::vector<int16_t>(static_cast<size_t>(ms) * 16, value);
 }
@@ -43,6 +51,23 @@ uint32_t le32_at(const std::string& s, size_t off) {
 uint16_t le16_at(const std::string& s, size_t off) {
     return static_cast<uint16_t>(static_cast<uint8_t>(s[off]) |
                                  (static_cast<uint8_t>(s[off + 1]) << 8));
+}
+
+std::vector<Segment> two_segments() {
+    // The shape measured against the real endpoint on 2026-08-30: a 21 s clip came back as two
+    // segments with an interior boundary at 15.22 s, and cutting the audio there and decoding
+    // the halves separately reproduced the whole transcript character for character.
+    return {Segment{0.0, 15.22, "The first sentence. The second sentence. The third sentence."},
+            Segment{15.22, 21.39, "The fourth sentence is still being revised."}};
+}
+
+std::string whole_text(const std::vector<Segment>& segs) {
+    std::string out;
+    for (const Segment& s : segs) {
+        if (!out.empty()) out += ' ';
+        out += s.text;
+    }
+    return out;
 }
 
 }  // namespace
@@ -215,6 +240,107 @@ KD_TEST(asrd_backend, take_window_refuses_when_nothing_has_arrived) {
     KD_CHECK(!driver.any_audio());
 }
 
+KD_TEST(asrd_backend, reset_forgets_the_utterance_and_the_clock) {
+    // Per utterance, not per session: audio carried across an utterance boundary would prepend
+    // the previous utterance's speech to the next one's first partial.
+    PseudoStreamingDriver driver(1000);
+    const std::vector<int16_t> chunk = pcm_ms(3000);
+    driver.feed(chunk.data(), chunk.size());
+    std::vector<int16_t> window;
+    KD_REQUIRE(driver.take_window(true, window));
+
+    driver.reset();
+    KD_CHECK_EQ(driver.audio_ms(), uint64_t{0});
+    KD_CHECK(!driver.any_audio());
+    KD_CHECK(!driver.take_window(true, window));
+}
+
+// ─── Committing the settled head on the model's own boundary ─────────────────────────
+
+KD_TEST(asrd_backend, a_segment_table_gives_both_the_text_to_commit_and_where_to_cut) {
+    // The whole point of `verbose_json`: the response relates text to time itself, so committing
+    // a prefix needs no matching, no overlap and no guess. `committed_text` is not an estimate
+    // of what the head decodes to — it is what the model said the head decodes to.
+    const std::vector<Segment> segs = two_segments();
+    ProposedCut cut;
+    KD_REQUIRE(propose_segment_cut(OpenAiBackendConfig{}, 22 * 16000, whole_text(segs), segs, cut));
+    KD_CHECK_EQ(cut.cut_samples, static_cast<size_t>(15.22 * 16000.0 + 0.5));
+    KD_CHECK_EQ(cut.committed_text, segs[0].text);
+    // The last segment is the one still being revised, and it is exactly what is *not* committed.
+    KD_CHECK(cut.committed_text.find("fourth") == std::string::npos);
+}
+
+KD_TEST(asrd_backend, a_cut_partitions_the_recording_so_no_audio_is_described_twice) {
+    // The invariant that replaced the stitcher, now stated across a commit rather than within
+    // one decode: the committed text describes [0, cut) and nothing else, and the audio left in
+    // the buffer is exactly [cut, end). Add them up and every sample is accounted for once.
+    const std::vector<Segment> segs = two_segments();
+    const size_t buffered = 22 * 16000;
+    ProposedCut cut;
+    KD_REQUIRE(propose_segment_cut(OpenAiBackendConfig{}, buffered, whole_text(segs), segs, cut));
+
+    PseudoStreamingDriver driver(1000);
+    const std::vector<int16_t> pcm(buffered, 1000);
+    driver.feed(pcm.data(), pcm.size());
+    driver.retain_tail(cut.cut_samples);
+
+    std::vector<int16_t> window;
+    KD_REQUIRE(driver.take_window(true, window));
+    KD_CHECK_EQ(window.size(), buffered - cut.cut_samples);
+    KD_CHECK_EQ(driver.audio_ms(), samples_ms(buffered - cut.cut_samples));
+}
+
+KD_TEST(asrd_backend, a_cut_is_refused_on_anything_that_cannot_be_fully_accounted_for) {
+    const OpenAiBackendConfig cfg;
+    const size_t buffered = 22 * 16000;
+    ProposedCut cut;
+
+    // One segment: the model drew no line inside this recording, so there is nothing to commit.
+    {
+        const std::vector<Segment> one{Segment{0.0, 21.39, "all of it in one piece"}};
+        KD_CHECK(!propose_segment_cut(cfg, buffered, whole_text(one), one, cut));
+    }
+    // No segments at all — a service that ignored `verbose_json`. Not an error, just no cut.
+    KD_CHECK(!propose_segment_cut(cfg, buffered, "some text", {}, cut));
+
+    // The table does not reconcile with `text`. This is the check that makes the rest safe: if
+    // the segments say something the transcript does not, committing part of them would commit
+    // words the model never put in its answer.
+    {
+        std::vector<Segment> segs = two_segments();
+        segs[0].text = "something else entirely";
+        KD_CHECK(!propose_segment_cut(cfg, buffered, whole_text(two_segments()), segs, cut));
+    }
+    // Times that go backwards. `end` is about to be used as a sample offset; a table that is not
+    // a partition in order is a table whose offsets mean nothing.
+    {
+        std::vector<Segment> segs = two_segments();
+        segs[1].start_s = 9.0;
+        KD_CHECK(!propose_segment_cut(cfg, buffered, whole_text(segs), segs, cut));
+    }
+    // A boundary past the audio we actually hold. Trusting it would drop the whole buffer.
+    {
+        const std::vector<Segment> segs = two_segments();
+        KD_CHECK(!propose_segment_cut(cfg, 10 * 16000, whole_text(segs), segs, cut));
+    }
+    // Too little either side to be worth an utterance boundary.
+    {
+        const std::vector<Segment> segs{Segment{0.0, 0.4, "hi"}, Segment{0.4, 21.0, "the rest"}};
+        KD_CHECK(!propose_segment_cut(cfg, buffered, whole_text(segs), segs, cut));
+    }
+    {
+        const std::vector<Segment> segs = two_segments();
+        KD_CHECK(!propose_segment_cut(cfg, cut_just_past(15.22), whole_text(segs), segs, cut));
+    }
+    // Switched off: back to committing the utterance whole.
+    {
+        OpenAiBackendConfig off = cfg;
+        off.min_cut_head_ms = 60000;
+        const std::vector<Segment> segs = two_segments();
+        KD_CHECK(!propose_segment_cut(off, buffered, whole_text(segs), segs, cut));
+    }
+}
+
 // ─── The invariant: audio is never dropped, so text is never duplicated ─────────────────────
 
 KD_TEST(asrd_backend, every_take_hands_over_the_whole_utterance_from_its_first_sample) {
@@ -277,21 +403,6 @@ KD_TEST(asrd_backend, the_hypothesis_is_the_window_transcript_with_nothing_added
     driver.feed(chunk.data(), chunk.size());
     KD_REQUIRE(driver.take_window(false, window));
     KD_CHECK_EQ(window.size(), size_t{2 * 16000});  // the first second is still in there
-}
-
-KD_TEST(asrd_backend, reset_forgets_the_utterance_and_the_clock) {
-    // Per utterance, not per session: audio carried across an utterance boundary would prepend
-    // the previous utterance's speech to the next one's first partial.
-    PseudoStreamingDriver driver(1000);
-    const std::vector<int16_t> chunk = pcm_ms(3000);
-    driver.feed(chunk.data(), chunk.size());
-    std::vector<int16_t> window;
-    KD_REQUIRE(driver.take_window(true, window));
-
-    driver.reset();
-    KD_CHECK_EQ(driver.audio_ms(), uint64_t{0});
-    KD_CHECK(!driver.any_audio());
-    KD_CHECK(!driver.take_window(true, window));
 }
 
 KD_TEST(asrd_backend, the_endpointer_is_what_bounds_the_buffer) {

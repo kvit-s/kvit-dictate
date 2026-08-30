@@ -387,12 +387,73 @@ assumption: `connection.cpp` refuses the connection outright if the endpointer i
 leave an utterance unbounded, because the buffer would then grow forever. A startup failure with
 a message is the honest alternative to a heuristic that fails quietly.
 
+**And the growth is now bounded by the model itself, not just by the endpointer.**
+
+Buffering the whole utterance is correct but not free: past a certain length the early sentences
+are re-uploaded and re-decoded every hop for nothing, because they are not going to change. A
+batch model revises its *tail*, where its context was incomplete. Measured 2026-08-30 against
+this endpoint: the transcript of the first 11 s of a clip was a character-exact prefix (143/143)
+of the transcript of the whole 21 s.
+
+The obvious move — notice the text has settled, drop the audio behind it — is the trap that
+produced every duplication above. Text stability says *what* settled, never *where in the audio*
+it ended, and recovering the one from the other by matching words is `scrolled_off_words` under
+a new name.
+
+`response_format=verbose_json` removes the guess, because the response relates the two itself:
+
+```
+{"text": "...", "duration": 21.395,
+ "segments": [{"id":0,"start":0.0,"end":15.22,"text":"..."},
+              {"id":1,"start":15.22,"end":21.39,"text":"..."}]}
+```
+
+Text and time, together, from the model. So committing all but the last segment and cutting the
+recording at that segment's `start` needs no inference: both halves of the decision are handed
+over. Verified end to end on 2026-08-30 — cutting the clip at 15.22 s and decoding the halves
+independently gave a head decode equal to `segments[0].text` exactly, and head + tail reproduced
+the whole-clip transcript character for character, nothing lost or repeated at the join.
+
+`propose_segment_cut` refuses rather than improvises: fewer than two segments, times that are not
+a partition in order, a table that does not reconcile with `text`, or a boundary that would leave
+too little either side — all return nothing and the utterance simply keeps buffering. A refusal
+costs decode time; being wrong there costs the user words. `SessionServer::split_utterance` then
+does what the protocol already understands: one `final` for the old id (§6.2), the id incremented
+by one (§7.3), the tracker reset (plan.md §1.4 step 7) — and the next utterance simply begins with
+audio already in hand rather than with silence. **Every sample is still decoded exactly once, in
+exactly one utterance.**
+
+**It is offered, not guaranteed.** The same audio truncated to 13, 16 and 19 s came back as a
+single segment; the boundary at 15.22 s only appeared once 21.4 s had arrived. So there are three
+answers to "where does a long utterance end", in descending order of quality, and the lower two
+live in `VadConfig`:
+
+1. **The model's segment boundary** — exact, and free of inference. Not always on offer.
+2. **`soft_max_utterance_ms` (20 s)** — past that much audio, the next *breath* (`hangover_ms` of
+   quiet, far more frequent than a full endpoint) ends the utterance. Cuts between words.
+   `progress.md` §3b already raised `endpoint_silence_ms` 800 → 1500 so boundaries land on
+   sentences; a stopwatch cut contradicts that outright, and this is the repair.
+3. **`max_utterance_ms` (28 s)** — the stopwatch, and now genuinely a safety valve: with 2 in
+   place it is reachable only by audio with no quiet gap at all in 28 seconds, which is a stuck
+   detector rather than a talkative user. 28 rather than 30 because the clock starts at the onset
+   while the audio carries `preroll_ms` from before it, and a Whisper-family model's native
+   window is 30 s.
+
+Only 3 existed before 2026-08-30, and it was firing during ordinary long-winded dictation — the
+wrong tool doing the common job, cutting mid-word, where a batch model handed a fragment that
+begins mid-word invents a plausible beginning for it.
+
 The cost is a POST that grows with the utterance, self-limiting because only one request is in
 flight at a time (§2.1): a slower decode means fewer previews, never a queue.
 
 See `asrd_backend.every_take_hands_over_the_whole_utterance_from_its_first_sample`,
-`a_long_utterance_reaches_the_model_whole_in_finalize_only_too` and
-`the_endpointer_is_what_bounds_the_buffer`.
+`a_long_utterance_reaches_the_model_whole_in_finalize_only_too`,
+`a_segment_table_gives_both_the_text_to_commit_and_where_to_cut`,
+`a_cut_partitions_the_recording_so_no_audio_is_described_twice`,
+`a_cut_is_refused_on_anything_that_cannot_be_fully_accounted_for`,
+`asrd_session.a_segment_boundary_commits_the_settled_head_and_carries_the_rest_over`,
+`a_service_that_ignores_verbose_json_simply_gets_no_cut`, and
+`asrd_vad.past_the_soft_limit_the_next_breath_ends_the_utterance`.
 
 The stability tracker is still built and still runs, because the moment a streaming backend
 arrives it is the thing standing between the model and the user's document. T2's gate is a

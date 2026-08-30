@@ -45,9 +45,10 @@
 // This translator has no such queue: the connection thread runs the endpointer (about 31 frames
 // per second of audio over 512 integers) and appends gated audio to the backend's window, and
 // then returns. Nothing on that path waits for the network, so there is no queue to overflow
-// and no bound to enforce. The buffer that *does* grow is the current utterance's window, and
-// that is bounded by `VadConfig::max_utterance_ms`, which is a different mechanism with a
-// different failure (a cut utterance, logged) and is not §9's.
+// and no bound to enforce. The buffer that *does* grow is the current utterance's audio, and it
+// is bounded three ways — the model's own segment boundary, `VadConfig::soft_max_utterance_ms`
+// and `max_utterance_ms` — none of which is §9's mechanism and all of which fail as a closed
+// utterance rather than as a dropped frame.
 
 #include <atomic>
 #include <chrono>
@@ -164,6 +165,9 @@ private:
 
     void open_utterance();
     void close_utterance();
+    // Close the current utterance *at a point inside it* and open the next one on the audio
+    // that follows, instead of on silence. Decode thread only. See the definition.
+    bool split_utterance(const ProposedCut& cut, uint64_t utt);
     bool emit_text(proto::Message& m);
     void emit_partial(const std::string& text, uint64_t stable_bytes);
     void emit_final(const std::string& text, uint64_t stable_bytes);

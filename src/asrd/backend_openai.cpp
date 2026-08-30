@@ -28,6 +28,27 @@ uint64_t samples_to_ms(size_t samples) {
 // `VadConfig`, so there is no second number here that can drift out of step with the first.
 constexpr size_t kAbsurdAudioSamples = 120u * 16000u;
 
+// Collapse every run of whitespace to one space and trim. Used only to ask whether a segment
+// table accounts for the same words as `text`; the committed text itself keeps the model's own
+// spacing.
+std::string squash_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool pending = false;
+    for (const char c : s) {
+        if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            pending = !out.empty();
+            continue;
+        }
+        if (pending) {
+            out += ' ';
+            pending = false;
+        }
+        out += c;
+    }
+    return out;
+}
+
 std::string strip(const std::string& s) {
     size_t begin = 0;
     while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin])) != 0) ++begin;
@@ -76,6 +97,22 @@ bool PseudoStreamingDriver::take_window(bool force, std::vector<int16_t>& window
     // here is what the stitcher did, and what it cost is on record.
     window = buf_;
     return true;
+}
+
+void PseudoStreamingDriver::retain_tail(size_t cut_samples) {
+    if (cut_samples == 0) return;
+    if (cut_samples >= buf_.size()) {
+        // The caller committed everything. Keep the clock honest and start the next stretch
+        // empty rather than silently keeping a sample that has already been transcribed.
+        buf_.clear();
+    } else {
+        buf_.erase(buf_.begin(), buf_.begin() + static_cast<ptrdiff_t>(cut_samples));
+    }
+    // `audio_ms_` is what the session reports as the utterance's length, so it tracks the
+    // buffer rather than everything ever fed. `pending_samples_` is hop bookkeeping and is
+    // deliberately untouched: dropping committed audio is not a reason to skip the next hop.
+    audio_ms_ = samples_to_ms(buf_.size());
+    any_audio_ = !buf_.empty();
 }
 
 // ─── OpenAiBackend ──────────────────────────────────────────────────────────────────────────
@@ -170,8 +207,10 @@ bool OpenAiBackend::vad_says_speech(const std::vector<int16_t>& pcm) {
     return value;
 }
 
-Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::string& out) {
+Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::string& out,
+                                       std::vector<Segment>& segments) {
     out.clear();
+    segments.clear();
     if (pcm.empty()) return Status::success();
 
     if (cfg_.vad_gate && !vad_unavailable_ && !vad_says_speech(pcm)) {
@@ -184,7 +223,11 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
     std::vector<std::pair<std::string, std::string>> fields;
     fields.emplace_back("model", cfg_.model);
     if (!cfg_.language.empty()) fields.emplace_back("language", cfg_.language);
-    fields.emplace_back("response_format", "json");
+    // `verbose_json` is the same answer with a segment table attached, and every field `json`
+    // returns is still there. A service that does not implement it either ignores the value or
+    // returns `text` alone, and both are handled: `segments` simply stays empty and no cut is
+    // proposed. Nothing downstream requires it.
+    fields.emplace_back("response_format", cfg_.segment_cuts ? "verbose_json" : "json");
 
     std::string content_type;
     const std::string body =
@@ -222,11 +265,83 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
     // and must not be treated as an error. Counted so a session that produced nothing at all can
     // be told apart from one that was never asked.
     if (out.empty()) ++empty_responses_;
+
+    // The segment table, when there is one. Absent, malformed or half-typed entries are not an
+    // error: they cost a cut, not a transcription, and the transcription is the part the user
+    // is waiting for.
+    const kd::json::Value* segs = doc.find("segments");
+    if (segs != nullptr && segs->is_array()) {
+        for (size_t i = 0; i < segs->size(); ++i) {
+            const kd::json::Value* e = segs->at(i);
+            if (e == nullptr || !e->is_object()) continue;
+            const kd::json::Value* vs = e->find("start");
+            const kd::json::Value* ve = e->find("end");
+            const kd::json::Value* vt = e->find("text");
+            Segment seg;
+            std::string_view st_sv;
+            if (vs == nullptr || !vs->get_double(seg.start_s)) continue;
+            if (ve == nullptr || !ve->get_double(seg.end_s)) continue;
+            if (vt == nullptr || !vt->get_string(st_sv)) continue;
+            seg.text = strip(std::string(st_sv));
+            segments.push_back(std::move(seg));
+        }
+    }
     return Status::success();
 }
 
-Status OpenAiBackend::transcribe(bool force, std::string& text, bool& have_text) {
-    have_text = false;
+bool propose_segment_cut(const OpenAiBackendConfig& cfg, size_t buffered_samples,
+                         const std::string& text, const std::vector<Segment>& segments,
+                         ProposedCut& out) {
+    out = {};
+    // Nothing to commit unless the model itself drew a line inside this recording.
+    if (segments.size() < 2) return false;
+
+    // The table must be a partition of the recording, in order, with no negative spans. A table
+    // that is not is a table whose `end` cannot be trusted as a sample offset.
+    double prev_end = -1.0;
+    for (const Segment& s : segments) {
+        if (!(s.end_s >= s.start_s)) return false;
+        if (!(s.start_s >= prev_end - 0.001)) return false;
+        prev_end = s.end_s;
+    }
+
+    // ...and it must account for the same words as `text`. If the segments say something the
+    // transcript does not, committing part of them commits text the user did not hear the model
+    // say. This is the check that makes the rest of it safe rather than merely plausible.
+    std::string joined;
+    for (const Segment& s : segments) {
+        if (s.text.empty()) continue;
+        if (!joined.empty()) joined += ' ';
+        joined += s.text;
+    }
+    if (squash_ws(joined) != squash_ws(text)) return false;
+
+    // Commit all but the last segment: the last is the one the model is still revising, which is
+    // the whole premise. Its `start` is the cut, and is also the previous segment's `end`.
+    const size_t keep_from = segments.size() - 1;
+    const double cut_s = segments[keep_from].start_s;
+    if (!(cut_s > 0.0)) return false;
+
+    const size_t cut_samples = static_cast<size_t>(cut_s * 16000.0 + 0.5);
+    if (cut_samples == 0 || cut_samples >= buffered_samples) return false;
+    if (cut_samples < ms_to_samples(cfg.min_cut_head_ms)) return false;
+    if (buffered_samples - cut_samples < ms_to_samples(cfg.min_cut_tail_ms)) return false;
+
+    std::string committed;
+    for (size_t i = 0; i < keep_from; ++i) {
+        if (segments[i].text.empty()) continue;
+        if (!committed.empty()) committed += ' ';
+        committed += segments[i].text;
+    }
+    if (committed.empty()) return false;
+
+    out.cut_samples = cut_samples;
+    out.committed_text = std::move(committed);
+    return true;
+}
+
+Status OpenAiBackend::transcribe(bool force, Transcription& out) {
+    out = {};
     std::vector<int16_t> window;
     {
         std::lock_guard<std::mutex> lock(driver_mutex_);
@@ -235,10 +350,10 @@ Status OpenAiBackend::transcribe(bool force, std::string& text, bool& have_text)
 
     if (window.size() > kAbsurdAudioSamples && !oversize_warned_) {
         // Nothing is dropped and nothing is stitched — this is a diagnostic, not a policy. The
-        // buffer is bounded by `VadConfig::max_utterance_ms` and `connection.cpp` refuses to
-        // start without that bound, so getting here means an utterance is not being closed and
-        // the POST is about to be enormous. That should be visible in the log rather than felt
-        // as a mysteriously slow decode.
+        // buffer is bounded by `VadConfig`'s soft cut and its stopwatch, and `connection.cpp`
+        // refuses to start without the latter, so getting here means an utterance is not being
+        // closed and the POST is about to be enormous. That should be visible in the log rather
+        // than felt as a mysteriously slow decode.
         oversize_warned_ = true;
         KD_LOG_WARN(
             "the utterance buffer has reached %llu ms, past any plausible dictation; the "
@@ -251,15 +366,35 @@ Status OpenAiBackend::transcribe(bool force, std::string& text, bool& have_text)
     // driver's mutex across it would block the connection thread's feed() for exactly as long
     // as the decode thread exists to avoid.
     //
-    // What comes back is the answer for the whole utterance so far, which *is* the cumulative
-    // hypothesis. There is no prefix to prepend and no seam to join: see the header.
-    const Status st = transcribe_batch(window, text);
+    // What comes back is the answer for the whole buffer, which *is* the cumulative hypothesis.
+    // There is no prefix to prepend and no seam to join: see the header.
+    std::vector<Segment> segments;
+    const Status st = transcribe_batch(window, out.text, segments);
     if (!st.ok()) {
-        text.clear();
+        out.text.clear();
         return st;
     }
-    have_text = true;
+    out.have_text = true;
+
+    // A finalize is about to end the utterance anyway, so a cut would buy nothing and would put
+    // two `final`s where the protocol expects one.
+    if (!force && cfg_.segment_cuts && !out.text.empty()) {
+        if (segments.empty() && !no_segments_warned_) {
+            no_segments_warned_ = true;
+            KD_LOG_INFO(
+                "the service returned no segment table for verbose_json, so the utterance will "
+                "be committed whole and bounded by the endpointer instead. Not an error. "
+                "Logged once per connection.");
+        }
+        out.have_cut = propose_segment_cut(cfg_, window.size(), out.text, segments, out.cut);
+    }
     return Status::success();
+}
+
+void OpenAiBackend::retain_tail(size_t cut_samples) {
+    std::lock_guard<std::mutex> lock(driver_mutex_);
+    driver_.retain_tail(cut_samples);
+    ++segment_cuts_;
 }
 
 }  // namespace kd::asrd

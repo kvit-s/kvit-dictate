@@ -57,6 +57,40 @@
 // Finalize-only (the v1 default) sets `hop_ms = 0`, which turns hops off entirely: one request
 // per utterance, no live preview. See §4.3's batch-model caveat.
 //
+// ─── Committing the settled part, using the model's own timestamps ────────────────────────
+//
+// Buffering the whole utterance is correct but not free: the POST grows with the utterance, and
+// past a certain length the early sentences are being re-uploaded and re-decoded every hop for
+// no reason. They are not going to change — a batch model revises the *tail*, where it had
+// incomplete context, and leaves settled text alone. Measured 2026-08-30 against this endpoint:
+// the transcript of the first 11 s of a clip was a character-exact prefix (143/143) of the
+// transcript of the whole 21 s.
+//
+// The obvious move — notice the text has settled, drop the audio behind it — is the trap. Text
+// stability tells you *what* settled, not *where in the audio* it ended, and mapping the one to
+// the other by matching words is `scrolled_off_words` reinvented, with the same failure and the
+// same duplicated dictation at the end of it.
+//
+// `response_format=verbose_json` removes the guess. The response carries a segment table:
+//
+//   {"text": "...", "duration": 21.395,
+//    "segments": [{"id":0, "start":0.0, "end":15.22, "text":"..."},
+//                 {"id":1, "start":15.22, "end":21.39, "text":"..."}]}
+//
+// Each entry gives the text **and** the time, together, from the model. So committing all but
+// the last segment and cutting the audio at that segment's `end` needs no inference at all: the
+// text to commit is handed over, and so is the sample offset. Verified end to end on 2026-08-30
+// by cutting the clip at 15.22 s and decoding the halves independently — the head decode equalled
+// `segments[0].text` exactly, and head + tail reproduced the whole-clip transcript character for
+// character, with nothing lost or repeated at the join.
+//
+// **It is offered, not guaranteed.** The same audio truncated to 13, 16 and 19 s came back as a
+// single segment; the boundary at 15.22 s only appeared once 21.4 s had arrived. So the model
+// may hand over no cut point for a long time, and `propose_cut` refuses rather than improvises:
+// fewer than two segments, a table that does not reconcile with `text`, a degenerate offset —
+// all return nothing, and the utterance simply keeps buffering until `VadConfig`'s soft cut or
+// its stopwatch ends it. Every refusal costs decode time; none can cost a word.
+//
 // ─── It invents words over silence, measured rather than assumed ────────────────────────────
 //
 // Measured against this endpoint on 2026-08-21: 500 ms of digital silence returns "Yeah.",
@@ -97,6 +131,15 @@ struct OpenAiBackendConfig {
     // openai-translator.md §4.3: the v1 default for a batch model. Turns hops off entirely, so
     // the only transcription is the one the finalize forces and no `partial` is ever emitted.
     bool finalize_only = true;
+    // Ask for `verbose_json` and act on the segment table when one comes back. Off falls back to
+    // `json` and a plain string, which every OpenAI-compatible service supports — so this is the
+    // switch to reach for when pointing at a service whose segmentation is not trustworthy.
+    bool segment_cuts = true;
+    // A proposed cut must leave at least this much audio behind it and this much in front, or it
+    // is not worth the utterance boundary it costs. Guards against a degenerate segment table
+    // producing a boundary every hop.
+    uint32_t min_cut_head_ms = 4000;
+    uint32_t min_cut_tail_ms = 1000;
     bool vad_gate = true;
 };
 
@@ -129,6 +172,17 @@ public:
     // `force` is finalize: take the buffer even when no hop is due, and even when hops are off.
     bool take_window(bool force, std::vector<int16_t>& window);
 
+    // Drop the first `cut_samples` and keep the rest, for a caller that has just committed the
+    // transcript of exactly that audio.
+    //
+    // **This is the one operation allowed to remove audio from the buffer, and it is not an
+    // exception to the invariant above — it is the invariant restated across a boundary.** The
+    // dropped samples are not discarded, they are *finished*: their transcript has already gone
+    // out as a `final`. Every sample is still decoded exactly once, in exactly one utterance,
+    // and no two pieces of text ever describe the same audio. The caller owes that guarantee;
+    // `OpenAiBackend::propose_cut` is what establishes it, from the model's own segment table.
+    void retain_tail(size_t cut_samples);
+
     [[nodiscard]] uint64_t audio_ms() const noexcept { return audio_ms_; }
     [[nodiscard]] bool any_audio() const noexcept { return any_audio_; }
     [[nodiscard]] uint32_t hop_ms() const noexcept { return hop_ms_; }
@@ -143,6 +197,40 @@ private:
     uint64_t audio_ms_ = 0;
     bool any_audio_ = false;
 };
+
+// One entry of a `verbose_json` segment table: a span of the recording and its transcript.
+struct Segment {
+    double start_s = 0.0;
+    double end_s = 0.0;
+    std::string text;
+};
+
+// A cut the model proposed for itself. `committed_text` is the transcript of exactly the first
+// `cut_samples` samples — not an estimate of it, not a prefix matched against it — so a caller
+// may emit that text as final and keep the rest of the audio with no overlap between the two.
+struct ProposedCut {
+    size_t cut_samples = 0;
+    std::string committed_text;
+};
+
+struct Transcription {
+    // The cumulative hypothesis for everything currently buffered.
+    std::string text;
+    bool have_text = false;
+    // Set only when the response's own segment table supports it, and never on a finalize.
+    bool have_cut = false;
+    ProposedCut cut;
+};
+
+// Decide whether a response's segment table supports committing a prefix of the recording.
+//
+// Free rather than a member, and pure: it is the one place where text and audio are allowed to
+// be related to each other, so every refusal in it needs to be pinned by a test that does not
+// need a server. Returns false — keep buffering, commit nothing — on anything it cannot fully
+// account for. A refusal costs decode time; being wrong here costs the user words.
+bool propose_segment_cut(const OpenAiBackendConfig& cfg, size_t buffered_samples,
+                         const std::string& text, const std::vector<Segment>& segments,
+                         ProposedCut& out);
 
 // The backend itself. One per connection; its HTTP client is what `cancel()` reaches.
 class OpenAiBackend {
@@ -166,14 +254,13 @@ public:
     // Append gated PCM to the window. Cheap; no network. Returns true when a hop is due.
     bool feed(const int16_t* samples, size_t count);
 
-    // Transcribe the current window. `force` finalises. On success `have_text` says whether
-    // there was anything to transcribe at all; `text` is the cumulative hypothesis.
+    // Transcribe the current buffer. `force` finalises.
     //
     // Blocking, and that is why it is called on the decode thread: a round trip against the
     // measured endpoint is 237–541 ms (plus 50–176 ms for the optional VAD gate), and doing
     // that on the connection thread would stall audio intake for half a second at a time and
     // overflow the AUDIO_QUEUE_MAX_MS budget docs/protocol.md §9 makes fatal.
-    Status transcribe(bool force, std::string& text, bool& have_text);
+    Status transcribe(bool force, Transcription& out);
 
     // Abort whatever is in flight, from any thread.
     void cancel();
@@ -185,11 +272,16 @@ public:
     [[nodiscard]] bool finalize_only() const noexcept { return cfg_.finalize_only; }
     [[nodiscard]] uint64_t requests() const noexcept { return requests_; }
     [[nodiscard]] uint64_t vad_skipped() const noexcept { return vad_skipped_; }
+    [[nodiscard]] uint64_t segment_cuts_taken() const noexcept { return segment_cuts_; }
+
+    // Drop the committed head and keep the tail, after a `ProposedCut` has been acted on.
+    void retain_tail(size_t cut_samples);
 
 private:
     // The server's Silero route. Returns true — "go ahead" — on every failure. See the header.
     bool vad_says_speech(const std::vector<int16_t>& pcm);
-    Status transcribe_batch(const std::vector<int16_t>& pcm, std::string& out);
+    Status transcribe_batch(const std::vector<int16_t>& pcm, std::string& out,
+                            std::vector<Segment>& segments);
 
     OpenAiBackendConfig cfg_;
     HttpUrl transcribe_url_{};
@@ -204,8 +296,10 @@ private:
 
     bool vad_unavailable_ = false;  // latched after the first refusal, so it is logged once
     bool oversize_warned_ = false;  // likewise: a buffer past any plausible utterance length
+    bool no_segments_warned_ = false;  // likewise: verbose_json asked for, plain text returned
     uint64_t requests_ = 0;
     uint64_t vad_skipped_ = 0;
+    uint64_t segment_cuts_ = 0;
     uint64_t empty_responses_ = 0;
 };
 

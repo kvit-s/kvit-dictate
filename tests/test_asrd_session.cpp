@@ -1050,6 +1050,91 @@ KD_TEST(asrd_session, live_preview_against_a_revising_model_never_reaches_the_cl
     KD_CHECK(saw_revision);
 }
 
+// ─── Committing the settled head on the model's own segment boundary ───────────────────
+
+KD_TEST(asrd_session, a_segment_boundary_commits_the_settled_head_and_carries_the_rest_over) {
+    // Through real HTTP, against a scripted `verbose_json` body, with no timing in it: the
+    // buffer is fed exactly once and the decode is forced, so this asserts the mechanism rather
+    // than racing the hop clock.
+    //
+    // The shape is the one measured against the real endpoint on 2026-08-30 — a long clip coming
+    // back as two segments with an interior boundary, the last segment being the part still
+    // being revised. Committing all but the last needs no matching and no overlap, because the
+    // response gives the text and the time together.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe(StubSpeechService::Reply{
+        200,
+        R"({"text":"The first sentence. The second sentence. The fourth is still moving.",)"
+        R"("duration":10.0,)"
+        R"("segments":[{"id":0,"start":0.0,"end":7.0,)"
+        R"("text":"The first sentence. The second sentence."},)"
+        R"({"id":1,"start":7.0,"end":10.0,"text":"The fourth is still moving."}]})"});
+
+    OpenAiBackendConfig cfg;
+    cfg.base_url = stub.base_url();
+    cfg.model = "stub-model";
+    cfg.finalize_only = false;
+    cfg.vad_gate = false;
+    OpenAiBackend backend(cfg);
+    KD_REQUIRE(backend.load().ok());
+
+    const std::vector<int16_t> pcm(10 * 16000, 1000);
+    backend.feed(pcm.data(), pcm.size());
+
+    Transcription tr;
+    KD_REQUIRE(backend.transcribe(/*force=*/false, tr).ok());
+    KD_CHECK(tr.have_text);
+    KD_REQUIRE(tr.have_cut);
+    // The text to commit is the model's, verbatim — not a prefix of the hypothesis found by
+    // matching words against it.
+    KD_CHECK_EQ(tr.cut.committed_text,
+                std::string("The first sentence. The second sentence."));
+    KD_CHECK_EQ(tr.cut.cut_samples, size_t{7 * 16000});
+    // ...and it is a strict prefix of what the client was told, so committing it can never
+    // contradict the hypothesis already on the wire.
+    KD_CHECK_EQ(tr.text.rfind(tr.cut.committed_text, 0), size_t{0});
+
+    // Acting on it leaves exactly the audio the committed text does not describe. Three seconds
+    // in, seven seconds committed, ten seconds fed: nothing decoded twice, nothing dropped.
+    backend.retain_tail(tr.cut.cut_samples);
+    KD_CHECK_EQ(backend.audio_ms(), uint64_t{3000});
+    KD_CHECK_EQ(backend.segment_cuts_taken(), uint64_t{1});
+
+    // A finalize never proposes one: the utterance is ending anyway, and a second boundary there
+    // would put two `final`s where docs/protocol.md §6.2 allows exactly one.
+    Transcription fin;
+    KD_REQUIRE(backend.transcribe(/*force=*/true, fin).ok());
+    KD_CHECK(fin.have_text);
+    KD_CHECK(!fin.have_cut);
+}
+
+KD_TEST(asrd_session, a_service_that_ignores_verbose_json_simply_gets_no_cut) {
+    // Every OpenAI-compatible service answers `{"text": ...}`; the segment table is an extra
+    // this one happens to offer. Without it the utterance is committed whole and bounded by the
+    // endpointer, which is the behaviour that shipped before any of this. Not an error.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe(StubSpeechService::Reply{200, R"({"text":"no segments here at all"})"});
+
+    OpenAiBackendConfig cfg;
+    cfg.base_url = stub.base_url();
+    cfg.model = "stub-model";
+    cfg.finalize_only = false;
+    cfg.vad_gate = false;
+    OpenAiBackend backend(cfg);
+    KD_REQUIRE(backend.load().ok());
+
+    const std::vector<int16_t> pcm(10 * 16000, 1000);
+    backend.feed(pcm.data(), pcm.size());
+
+    Transcription tr;
+    KD_REQUIRE(backend.transcribe(false, tr).ok());
+    KD_CHECK_EQ(tr.text, std::string("no segments here at all"));
+    KD_CHECK(!tr.have_cut);
+    KD_CHECK_EQ(backend.audio_ms(), uint64_t{10000});  // nothing was cut away
+}
+
 KD_TEST(asrd_session, live_preview_publishes_no_mark_so_a_late_revision_cannot_take_the_session) {
     // The failure this exists to prevent, from a real dictation on 2026-08-28:
     //

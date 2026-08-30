@@ -97,6 +97,11 @@ VadConfig test_config() {
 KD_TEST(asrd_vad, the_shipped_defaults_are_coherent) {
     KD_CHECK(VadConfig{}.validate().empty());
     KD_CHECK_EQ(VadConfig{}.endpoint_silence_ms, 1500.0);
+    // 28 s, not 30: the clock starts at the onset but the audio handed over also carries
+    // `preroll_ms` from before it, and a Whisper-family model's native window is 30 s. See
+    // `VadConfig::max_utterance_ms`.
+    KD_CHECK_EQ(VadConfig{}.max_utterance_ms, 28000.0);
+    KD_CHECK(VadConfig{}.soft_max_utterance_ms < VadConfig{}.max_utterance_ms);
 }
 
 KD_TEST(asrd_vad, rejects_a_hangover_longer_than_the_endpoint) {
@@ -427,12 +432,101 @@ KD_TEST(asrd_vad, a_zero_gap_discontinuity_invents_no_duration) {
     KD_CHECK_EQ(vad.position_samples(), before);
 }
 
-KD_TEST(asrd_vad, the_max_utterance_valve_cuts_and_says_so) {
-    // A safety valve, not a product feature: an utterance that never endpoints would feed the
-    // backend without bound and never produce a `final`. The reason distinguishes it from a
-    // real endpoint in the log, because the fix is different — check the threshold or the input
-    // level, not the endpoint timer.
+KD_TEST(asrd_vad, past_the_soft_limit_the_next_breath_ends_the_utterance) {
+    // The cut that ordinary long-winded dictation should get, instead of the stopwatch below.
+    //
+    // `progress.md` §3b raised `endpoint_silence_ms` 800 → 1500 precisely so that utterance
+    // boundaries land on sentences rather than on breaths. A stopwatch cut contradicts that and
+    // lands wherever the clock does, which is mid-word about as often as not — and a batch model
+    // handed a fragment that starts mid-word invents a plausible beginning for it, so one bad
+    // boundary garbles both sides. Past the soft limit the utterance ends at the next hangover
+    // boundary instead: not a sentence, but between two words, which is the part that matters.
     VadConfig cfg = test_config();
+    cfg.soft_max_utterance_ms = 1000.0;
+    cfg.max_utterance_ms = 3000.0;
+    VadEndpointer vad(cfg);
+
+    std::vector<int16_t> audio;
+    append_silence(audio, 400);
+    append_tone(audio, 700, 0.5);
+    append_silence(audio, 250);  // a breath: past hangover_ms, well inside endpoint_silence_ms
+    append_tone(audio, 700, 0.5);
+    append_silence(audio, 250);  // and the one that lands past the soft limit
+    append_tone(audio, 700, 0.5);
+    append_silence(audio, 250);
+
+    std::vector<VadItem> items;
+    vad.process(audio.data(), audio.size(), items);
+    KD_INFO(trace(items));
+
+    size_t soft = 0;
+    size_t hard = 0;
+    size_t endpoint = 0;
+    for (const VadItem& i : items) {
+        if (i.kind != VadItemKind::UtteranceEnd) continue;
+        if (i.reason == "soft_max_utterance") ++soft;
+        if (i.reason == "max_utterance") ++hard;
+        if (i.reason == "endpoint") ++endpoint;
+    }
+    KD_CHECK_EQ(soft, size_t{1});
+    // The whole point: the stopwatch never gets to fire, and neither does a real endpoint —
+    // the speaker never paused long enough for one.
+    KD_CHECK_EQ(hard, size_t{0});
+    KD_CHECK_EQ(endpoint, size_t{0});
+
+    // And it lands on a breath: the close is reported at the same sample as the SpeechEnd that
+    // triggered it, not at the frame the timer happened to be examined on.
+    uint64_t last_speech_end = 0;
+    bool matched = false;
+    for (const VadItem& i : items) {
+        if (i.kind == VadItemKind::SpeechEnd) last_speech_end = i.sample;
+        if (i.kind == VadItemKind::UtteranceEnd && i.reason == "soft_max_utterance") {
+            matched = (i.sample == last_speech_end);
+        }
+    }
+    KD_CHECK(matched);
+}
+
+KD_TEST(asrd_vad, the_soft_limit_waits_for_a_breath_and_does_not_invent_one) {
+    // Speech with no gap in it at all gets no soft cut, however long it runs. That is what the
+    // stopwatch is still for, and why it cannot be deleted: the soft cut has nothing to cut on.
+    VadConfig cfg = test_config();
+    cfg.soft_max_utterance_ms = 500.0;
+    cfg.max_utterance_ms = 0.0;  // disabled, so a soft cut is the only thing that could fire
+    VadEndpointer vad(cfg);
+
+    std::vector<int16_t> audio;
+    append_silence(audio, 400);
+    append_tone(audio, 4000, 0.5);  // never pauses
+
+    std::vector<VadItem> items;
+    vad.process(audio.data(), audio.size(), items);
+    KD_CHECK_EQ(count_of(items, VadItemKind::UtteranceEnd), size_t{0});
+}
+
+KD_TEST(asrd_vad, the_soft_limit_must_be_coherent_with_the_two_timers_around_it) {
+    VadConfig cfg;
+    KD_CHECK(cfg.validate().empty());
+    // Below the hangover there is no boundary to wait for.
+    cfg.soft_max_utterance_ms = cfg.hangover_ms;
+    KD_CHECK(!cfg.validate().empty());
+    // Above the stopwatch it is dead code that reads as if it were live.
+    cfg = VadConfig{};
+    cfg.soft_max_utterance_ms = cfg.max_utterance_ms + 1.0;
+    KD_CHECK(!cfg.validate().empty());
+    // 0 disables it, which is coherent — it just leaves the stopwatch as the only answer.
+    cfg = VadConfig{};
+    cfg.soft_max_utterance_ms = 0.0;
+    KD_CHECK(cfg.validate().empty());
+}
+
+KD_TEST(asrd_vad, the_max_utterance_valve_cuts_and_says_so) {
+    // The last resort, and now genuinely a safety valve: with the soft cut in place this is
+    // reachable only by audio with no quiet gap at all, which is a stuck detector rather than a
+    // talkative user. The reason distinguishes it from a real endpoint in the log, because the
+    // fix is different — check the threshold or the input level, not the endpoint timer.
+    VadConfig cfg = test_config();
+    cfg.soft_max_utterance_ms = 0.0;  // this test is about the stopwatch on its own
     cfg.max_utterance_ms = 1000.0;
     VadEndpointer vad(cfg);
 

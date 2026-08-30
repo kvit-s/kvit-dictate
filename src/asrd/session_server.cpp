@@ -396,6 +396,53 @@ void SessionServer::close_utterance() {
     request_work(false, true, false);
 }
 
+// Commit the settled head of an utterance that is still being spoken, and carry the rest over.
+//
+// Called on the decode thread with the utterance still open and the speaker still talking, which
+// is what makes it different from every other boundary here: nothing external happened. The
+// model reported, in the same response as the text, that the recording contains a boundary it is
+// confident about, and `propose_cut` established that `cut.committed_text` is the transcript of
+// exactly the first `cut.cut_samples` samples.
+//
+// So this is an ordinary utterance boundary in every respect the protocol can see — one `final`
+// for the old id (§6.2), the id incremented by exactly one (§7.3), the tracker reset (§1.4 step 7)
+// — and the only unusual part is that the next utterance begins with audio already in hand
+// rather than with silence. No sample is decoded twice and none is dropped, which is the
+// property that the sliding window could never offer and that this whole design exists to keep.
+//
+// Returns false when the session moved on underneath us, in which case nothing was emitted.
+bool SessionServer::split_utterance(const ProposedCut& cut, uint64_t utt) {
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (terminal_ || cancelled_ || !utterance_open_ || utterance_id_ != utt) return false;
+    }
+
+    uint64_t stable = 0;
+    Violation v;
+    if (!stability_.finalize(cut.committed_text, stable, v)) {
+        fail_session(proto::ErrorCode::decode_failed, v.to_wire_message());
+        return false;
+    }
+    emit_final(cut.committed_text, stable);
+
+    // Order matters: the audio goes first, so that a `feed` racing in from the connection thread
+    // lands in the new utterance's buffer rather than being counted against the committed head.
+    backend_.retain_tail(cut.cut_samples);
+
+    std::lock_guard<std::mutex> lock(m_);
+    ++utterance_id_;
+    stability_.reset(utterance_id_);
+    last_text_.clear();
+    have_last_text_ = false;
+    last_stable_ = 0;
+    KD_LOG_INFO(
+        "committed %llu ms of utterance %llu at the model's own segment boundary and carried "
+        "the rest into utterance %llu",
+        static_cast<unsigned long long>(static_cast<uint64_t>(cut.cut_samples) * 1000u / 16000u),
+        static_cast<unsigned long long>(utt), static_cast<unsigned long long>(utterance_id_));
+    return true;
+}
+
 // ─── Emission ───────────────────────────────────────────────────────────────────────────────
 
 bool SessionServer::emit_text(proto::Message& m) {
@@ -546,9 +593,10 @@ void SessionServer::worker() {
         if (stability_.utterance_id() != utt) stability_.reset(utt);
 
         if (hop || finalize) {
-            std::string text;
-            bool have = false;
-            const Status st = backend_.transcribe(finalize, text, have);
+            Transcription tr;
+            const Status st = backend_.transcribe(finalize, tr);
+            std::string text = tr.text;
+            const bool have = tr.have_text;
 
             bool stale = false;
             {
@@ -617,6 +665,11 @@ void SessionServer::worker() {
                     }
                     if (changed) emit_partial(text, stable);
                 }
+
+                // The settled head, committed at a boundary the model drew itself. Done after
+                // the `partial` so the client sees the hypothesis it is about to have confirmed,
+                // and only when the hypothesis was publishable in the first place.
+                if (tr.have_cut) split_utterance(tr.cut, utt);
             }
 
             if (finalize) {

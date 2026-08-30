@@ -46,6 +46,9 @@ uint64_t VadConfig::preroll_samples() const noexcept {
 uint64_t VadConfig::max_utterance_samples() const noexcept {
     return ms_to_samples(max_utterance_ms, sample_rate);
 }
+uint64_t VadConfig::soft_max_utterance_samples() const noexcept {
+    return ms_to_samples(soft_max_utterance_ms, sample_rate);
+}
 
 std::string VadConfig::validate() const {
     if (sample_rate == 0) return "sample_rate must be positive";
@@ -65,6 +68,16 @@ std::string VadConfig::validate() const {
     }
     if (max_utterance_ms != 0.0 && max_utterance_ms <= endpoint_silence_ms) {
         return "max_utterance_ms must exceed endpoint_silence_ms, or be 0 to disable";
+    }
+    if (soft_max_utterance_ms != 0.0) {
+        // Below the hangover there is no boundary to wait for, and above the stopwatch the
+        // stopwatch wins and the soft cut is dead code that reads as if it were live.
+        if (soft_max_utterance_ms <= hangover_ms) {
+            return "soft_max_utterance_ms must exceed hangover_ms, or be 0 to disable";
+        }
+        if (max_utterance_ms != 0.0 && soft_max_utterance_ms > max_utterance_ms) {
+            return "soft_max_utterance_ms must not exceed max_utterance_ms";
+        }
     }
     return {};
 }
@@ -335,6 +348,27 @@ void VadEndpointer::on_frame(const int16_t* frame, size_t n, std::vector<VadItem
         if (speech_ && silence_samples_ >= cfg.hangover_samples()) {
             speech_ = false;
             emit(frame_items, VadItemKind::SpeechEnd, last_speech_end_, "");
+
+            // The soft cut. This breath is not an endpoint — the speaker is mid-thought and
+            // `endpoint_silence_ms` has not elapsed — but the utterance is long enough that the
+            // alternative is the stopwatch, and the stopwatch cuts mid-word. Ending it here puts
+            // the boundary between two words instead, which is the whole difference: a batch
+            // model handed a fragment starting mid-word invents a plausible beginning for it.
+            //
+            // Nothing is lost by ending early. The audio after this point opens the next
+            // utterance and is transcribed there; every sample is still decoded exactly once.
+            if (utterance_open_ && cfg.soft_max_utterance_ms != 0.0 &&
+                start - utterance_start_ >= cfg.soft_max_utterance_samples()) {
+                emit(frame_items, VadItemKind::UtteranceEnd, last_speech_end_,
+                     "soft_max_utterance");
+                utterance_open_ = false;
+                last_boundary_ = end;
+                KD_LOG_INFO(
+                    "utterance %llu passed soft_max_utterance_ms=%.0f and was closed at the next "
+                    "breath (sample %llu) rather than left to the stopwatch",
+                    static_cast<unsigned long long>(utterance_index_), cfg.soft_max_utterance_ms,
+                    static_cast<unsigned long long>(last_speech_end_));
+            }
         }
         if (utterance_open_ && !speech_ && silence_samples_ >= cfg.endpoint_samples()) {
             // plan.md §1.6's endpoint: this ends the UTTERANCE. The session is untouched and
