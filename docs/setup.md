@@ -216,6 +216,46 @@ The message names which of four things happened, because each has a different fi
 
 ---
 
+## 3.1 Cleaning the text up afterwards (optional, off by default)
+
+**Settings → Server → When you finish → "Clean the text up before typing it in."** One tick box.
+When a session ends, what is in the pill goes to a small text model that writes it as prose:
+fillers dropped, false starts resolved to whatever you landed on, punctuation and capitalisation
+applied, spoken numbers and dates and email addresses in written form. `docs/normalizer.md` is
+the whole story.
+
+There is no address to type. The route is your speech service with `/v1/text/normalize` on the
+end, derived from the box above it, and it follows that box if you move the service. The tick box
+is greyed, with the reason under it, when there is nothing to derive an address from
+(second-radio `ws://` mode) or when **Settings → Dictation → Cadence** is not `end-of-session` —
+a rewrite can change a word you have already said, and under any other cadence that word is
+already in your document.
+
+Nothing about it can cost you a word. A service that is missing, slow or broken leaves the raw
+text exactly as it was and logs why, and so does a rewrite that drops one of your **vocabulary
+terms**, comes back empty, or comes back suspiciously shorter than what you said. The rewrite
+lands in the pill where you can see it, edit it, or throw it away with Esc.
+
+### The five fields with no controls
+
+They have defaults that suit the reference deployment, and they are in the `normalizer` block of
+`%LOCALAPPDATA%\kvit-dictate\settings.json` for the deployment that does not. Put them on the
+page and every one of them stands between you and the only question you actually have.
+
+| Field | Default | What it is |
+|---|---|---|
+| `url` | derived | Set it by hand and it is yours: the dialog then never overwrites it, and the status line says it is in use. This is how you run the text model on a different machine from the recogniser. |
+| `styling` | `semi-formal` | `casual`, `semi-formal`, `formal`. |
+| `structure` | `prose` | `prose`, or `lists` to have it broken into bullet points. |
+| `context` | `general` | `general`, or `email`. |
+| `timeout_ms` | `3000` | The whole request. Bounded well inside the finalise grace, so a service that has stopped answering can never be the reason a session fails to end. |
+| `max_bytes` | `4000` | The longest buffer worth sending. Past it the text is left raw and the log says so; the model's card asks for chunking past about a thousand tokens and this does not chunk. |
+
+These are the endpoint's own trained control values — it answers anything else with 400 rather
+than guessing, and the settings file is refused at load with the field named.
+
+---
+
 ## 4. Putting a server you already run behind the protocol
 
 The protocol is published (`docs/protocol.md`, Apache-2.0) precisely so this is possible without

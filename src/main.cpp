@@ -73,6 +73,27 @@ constexpr UINT kMsgNormalized  = WM_APP + 7;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
 
+// docs/editing.md §10.1's heartbeat, on a timer of its own with a TIMERPROC rather than a window.
+//
+// The stamp in App::run() below is not enough, and the way it was not enough is worth keeping:
+// the settings dialog pumps its own loop (settings.cpp, "modal by hand"), and while it was open
+// the outer loop never turned, so the hook decided the UI thread was hung two seconds in and
+// handed the keyboard back to the application. A session started with the settings window open
+// then sent the user's Enter to the target and injected the dictated text after it — the exact
+// ordering bug the commit key exists to prevent. MessageBoxW and TrackPopupMenu have the same
+// shape, and so will the next nested loop somebody writes.
+//
+// A TIMERPROC is dispatched by DispatchMessageW itself, so it fires from inside every one of
+// those pumps without any of them knowing this exists. That is the point: the property must not
+// depend on remembering.
+//
+// It does NOT paper over a real stall — a UI thread blocked inside a single dispatch is not
+// pumping at all, no WM_TIMER is delivered, and the latch trips as it should.
+constexpr UINT_PTR kHeartbeatTimer = 2;
+constexpr UINT kHeartbeatIntervalMs = 200;  // an order of magnitude inside InputFilter::kUiStaleMs
+
+void CALLBACK heartbeat_timer_proc(HWND, UINT, UINT_PTR, DWORD) { kd::note_ui_alive(); }
+
 // How long the target is held after `stop` while waiting for `final` and `stopped`. Generous
 // because a real model's flush is not instant, finite because a child that never answers must not
 // strand the session forever.
@@ -701,6 +722,7 @@ bool App::startup() {
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
 
     SetTimer(hwnd_, kTickTimer, kTickIntervalMs, nullptr);
+    SetTimer(hwnd_, kHeartbeatTimer, kHeartbeatIntervalMs, heartbeat_timer_proc);
 
     // release-plan.md §2.2, first run. With no settings file the old default came from
     // `models.json`'s `default_model`, which is `"mock"` — a scripted fixture that types
@@ -2826,6 +2848,7 @@ void App::shutdown() {
     done = true;
 
     KillTimer(hwnd_, kTickTimer);
+    KillTimer(hwnd_, kHeartbeatTimer);
     if (hotkey_ != nullptr) hotkey_->stop();
     if (audio_running_ && capture_ != nullptr) capture_->stop();
     if (anchor_ != nullptr) anchor_->stop();

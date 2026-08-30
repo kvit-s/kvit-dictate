@@ -1134,6 +1134,24 @@ KD_TEST(hotkey, failing_open_is_latched_for_the_session_and_cleared_by_the_next_
     KD_CHECK(f.composing());
 }
 
+KD_TEST(hotkey, failing_open_records_how_far_behind_the_ui_thread_was) {
+    // The latch used to trip in silence, and the log then showed a session the user ended with
+    // Enter as `stop-on-input: keystroke` with no hint of why. deliver() posts this number to the
+    // UI thread so the warning can name it; it is zero until the latch trips and zero again for
+    // the next session.
+    kd::InputFilter f;
+    activate_composing(f, 100);
+    f.note_ui_heartbeat(500);
+    KD_CHECK_EQ(f.failed_open_behind_ms(), 0u);
+
+    f.on_event(kdown(kd::vk::kBack, 500 + 3000));
+    KD_REQUIRE(f.failed_open());
+    KD_CHECK_EQ(f.failed_open_behind_ms(), 3000u);
+
+    f.note_session_ended();
+    KD_CHECK_EQ(f.failed_open_behind_ms(), 0u);
+}
+
 KD_TEST(hotkey, the_stale_check_survives_a_tick_count_wrap) {
     // Tick counts wrap every 49.7 days. An unsigned compare would declare the UI thread dead for
     // the whole second half of that cycle, which is the one bug this check must not have.

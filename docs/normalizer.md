@@ -5,8 +5,8 @@ its settings block are in the tree and tested; the first measurement against the
 in `bench/results/normalizer/2026-08-24-s1-mini.md` and it is a damage test, not a quality test.
 No one has yet dictated a real sentence through it.
 
-Implemented by `src/normalizer.{h,cpp}`, wired in `src/main.cpp`, measured by
-`bench/normalize.py`. Depends on `docs/editing.md` §2 (compose-then-commit) and is bounded by
+Implemented by `src/normalizer.{h,cpp}`, wired in `src/main.cpp`, switched on from **Settings →
+Server** (`src/settings.cpp`; `docs/setup.md` §3.1), measured by `bench/normalize.py`. Depends on `docs/editing.md` §2 (compose-then-commit) and is bounded by
 `plan.md` §1.4 (the committed-prefix invariant).
 
 ---
@@ -198,7 +198,8 @@ machine, so:
 
 * It is off by default, and a settings file with no `normalizer` block leaves it off — nothing
   written before this feature existed can start sending dictation anywhere.
-* Turning it on is an explicit act by the user, in the settings file or the dialog.
+* Turning it on is an explicit act by the user: one tick box on **Settings → Server**, next to
+  the paragraph about what crosses the network, or the `normalizer` block in `settings.json`.
 * The URL is whatever the user names. If that name is ever pointed at the internet, the text of
   everything dictated goes with it. That is a settings decision, made once, and deliberately not
   something the module second-guesses per request.

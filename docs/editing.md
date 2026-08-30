@@ -599,12 +599,30 @@ hook is fine, the consumer is not.
 
 **The mitigation is mandatory and is the single most important property of the feature: fail open.**
 
-* The UI thread stamps a monotonic heartbeat every message-loop iteration.
+* The UI thread stamps a monotonic heartbeat every message-loop iteration, **and from a 200 ms
+  `SetTimer` with a `TIMERPROC`**.
 * Before swallowing anything on behalf of the pill, the hook compares the heartbeat against now.
   If it is more than **2000 ms** stale, the hook stops swallowing and stops posting, permanently,
   for that session. Keys go to the application. The user has their machine back.
 * The comparison is a load and a subtraction. It costs nothing against the callback budget that
   `Stats::max_callback_us` exists to watch.
+* When it trips it says so: the hook posts `HotkeyPost::FailedOpen` once per session and the UI
+  thread logs a warning naming how many milliseconds behind it was.
+
+**The timer is not redundant, and why it exists is the whole of the first bug this section
+produced in the field.** The per-iteration stamp measures the *owner's* loop, and the owner's loop
+is not the only one: the settings dialog pumps its own (`settings.cpp`, "modal by hand"), and so do
+`MessageBoxW` and `TrackPopupMenu`. Each of those is a perfectly healthy UI thread that has simply
+stopped turning the outer loop — and each of them looked exactly like a hung one. Open the settings
+window, dictate into another application, press Enter: two seconds in the hook had already handed
+the keyboard back, so the Enter reached the target and the dictated text was injected *after* it —
+the ordering bug of §2, reintroduced through the one mechanism meant to be a safety net. A
+`TIMERPROC` is dispatched by `DispatchMessageW` itself, so it fires from inside every one of those
+pumps without any of them knowing it exists. That is the point: the property must not depend on
+each new loop remembering to stamp.
+
+It still does not paper over a real stall. A UI thread blocked inside a single dispatch is not
+pumping at all, no `WM_TIMER` is delivered, and the latch trips exactly as it should.
 
 Additionally, **Esc clears capture inside the filter itself**, synchronously in the hook callback,
 rather than waiting for the UI thread to confirm via `note_session_ended()`. Esc is the user saying

@@ -429,6 +429,11 @@ public:
     void note_ui_heartbeat(uint64_t tick_ms) noexcept;
     [[nodiscard]] bool failed_open() const noexcept;
 
+    // How far behind the UI thread was at the instant the latch tripped, in milliseconds. Zero
+    // until it does. Kept because the latch turns the whole feature off silently and mid-session,
+    // and a number is the difference between "the settings dialog was open" and a guess.
+    [[nodiscard]] uint32_t failed_open_behind_ms() const noexcept;
+
     // True while the pill owns the keyboard: a session is running, editing is enabled, and the UI
     // thread is answering. docs/editing.md §4.1 states the price of the feature in one line —
     // "While a session is composing, the keyboard belongs to the pill" — and this is that line as
@@ -513,6 +518,7 @@ private:
     // block means, and this is what a filter nobody has configured means. See the constructor.
     uint64_t ui_heartbeat_ms_ = 0;
     bool ui_fail_open_ = false;   // latched for the rest of the session once it trips
+    uint32_t ui_behind_ms_ = 0;   // how far behind it was when it tripped, for the log
     bool editing_active_ = false;
     int32_t pill_left_ = 0, pill_top_ = 0, pill_right_ = 0, pill_bottom_ = 0;
     bool pill_dragging_ = false;  // a button-down landed in the pill and has not been released
@@ -610,12 +616,29 @@ enum class HotkeyPost : uint32_t {
     ResumeDictation,
     ForeignKey,      // lParam: vk | (mods << 16)
     PillPointer,     // lParam: pack_pill_post()
+    FailedOpen,      // the fail-open latch tripped; lParam: how many ms behind the UI thread was
 };
 
 
 // Call from the owner window's WndProc. Returns true if the message belonged to this module,
 // in which case the listener has already been invoked and the WndProc should return 0.
 bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam);
+
+// docs/editing.md §10.1's fail-open heartbeat, as a free function so that **any** message pump on
+// the UI thread can stamp it without holding a HotkeyManager.
+//
+// That is not a convenience. `HotkeyManager::heartbeat()` is called once per iteration of the
+// owner's loop, and the owner's loop is not the only loop: the settings dialog pumps its own
+// (settings.cpp, "modal by hand"), MessageBoxW pumps its own, TrackPopupMenu pumps its own. Every
+// one of those is a *healthy* UI thread that is simply not turning the outer loop, and each of
+// them used to look identical to a hung one — two seconds in, the hook stopped swallowing, and a
+// session started while the settings window was open sent Enter to the target and injected the
+// dictated text after it. The fix that survives the next nested loop somebody adds is a timer
+// with a TIMERPROC (main.cpp), because DispatchMessageW delivers those from inside every one of
+// these pumps; this is the entry point it calls.
+//
+// A no-op when the hooks are not installed, which is also when nothing can fail open.
+void note_ui_alive() noexcept;
 
 class HotkeyManager {
 public:

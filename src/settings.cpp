@@ -1767,6 +1767,37 @@ enum : int {
     kIdServerUrlLabel,
     kIdServerUrlNote,
     kIdServerLivePreview,
+    // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
+    // though it is an address the user types: it rewrites **the pill** and nothing else, and its
+    // one hard precondition — the end-of-session cadence — is the same one that page already
+    // spends a paragraph explaining. A user who has just read why the pill exists is the user
+    // who can decide whether they want it rewritten.
+    //
+    // **One check box and one line of status, on the Server page.** That is the whole surface,
+    // and it is a decision rather than an omission.
+    //
+    // This started as its own tab with the address, `styling`, `structure`, `context` and
+    // `timeout_ms` on it, which is what the settings block contains — and every one of those
+    // controls was another paragraph standing between the user and the only question they
+    // actually have, which is *clean it up or not*. The address in particular was asking them to
+    // go and look up something they had already typed into the box directly above.
+    //
+    // So: a tick box, and one address that fills itself in. `styling`, `structure`, `context`,
+    // `timeout_ms` and `max_bytes` keep their defaults, stay in `settings.json` for the
+    // deployment that needs them, and round-trip untouched through the working copy this dialog
+    // edits. docs/setup.md §3.1 says where they are. A dialog that has to be read is a dialog
+    // that does not get used.
+    //
+    // The address **follows the speech service** — `normalizer_url_from_server`, the same host
+    // and port with `/v1/text/normalize` on the end, which is how the reference deployment runs
+    // — and keeps following it while the user leaves it alone, so moving the service moves this
+    // with it and there is nothing to notice. Typing in the box stops it following, permanently
+    // and for that address only: the text model on a different machine from the recogniser is a
+    // real deployment, it is just not the common one, and it should cost one edit rather than a
+    // page. `DialogState::normalizer_url_follows` is where "left it alone" is remembered.
+    kIdNormalizerEnabled,
+    kIdNormalizerUrl,
+    kIdNormalizerStatus,
 };
 
 constexpr int kPageCount = 5;
@@ -1819,6 +1850,20 @@ struct DialogState {
     bool dark = false;
     HBRUSH face_brush = nullptr;
     HBRUSH field_brush = nullptr;
+
+    // ── The rewriter's address (kIdNormalizerEnabled) ──────────────────────────────────────
+    //
+    // True while the address box is still whatever the speech service derives to, so that a
+    // change to the speech service carries it along. Set from the file at load, cleared the
+    // first time the user types in the box, and never set again by anything but "Restore
+    // defaults" — a user who has pointed the rewriter somewhere else does not want it wandering
+    // back the next time they correct a typo in the server address.
+    bool normalizer_url_follows = true;
+
+    // Set while *this file* is writing the address box, so that the EN_CHANGE it provokes is not
+    // mistaken for the user typing. Without it, following the server address would immediately
+    // stop following it.
+    bool setting_normalizer_url = false;
 
     // Which push button the pointer is over, or null. Owner-drawn buttons are told whether they
     // are pressed, focused or disabled and are never told they are hot, so the hover state is
@@ -2374,6 +2419,87 @@ void refresh_editing_page(HWND dlg) {
                          L"edit or for Enter to commit.");
 }
 
+// ─── The rewriter (normalizer.h), in two controls ───────────────────────────────────────────
+
+// The normalize route on whatever machine the user already named as their speech service.
+//
+// Asking a second time for an address the user typed into the box directly above is asking them
+// to go and look it up, and the answer is the same host and port with a different route on the
+// end — that is how the reference deployment runs (docs/setup.md §2.2: one box serving
+// `/v1/audio/transcriptions` and `/v1/text/normalize`). So there is no address field: this
+// derives it, and a deployment that really does split the two models across machines writes
+// `normalizer.url` in the file, which is honoured ahead of this.
+//
+// Empty when the speech service is not an HTTP address: in Protocol mode `url` is a `ws://`
+// kvit-dictate server (openai-translator.md §4.6), which has no such route and never will.
+std::wstring normalizer_url_from_server(HWND dlg) {
+    if (mode_of(dlg) != ServerMode::Local) return {};
+    std::wstring url = get_text(GetDlgItem(dlg, kIdServerUrl));
+    while (!url.empty() && (url.front() == L' ' || url.front() == L'	')) url.erase(0, 1);
+    while (!url.empty() && (url.back() == L' ' || url.back() == L'	' || url.back() == L'/')) {
+        url.pop_back();
+    }
+    if (url.rfind(L"http://", 0) != 0 && url.rfind(L"https://", 0) != 0) return {};
+    return url + L"/v1/text/normalize";
+}
+
+// True when `normalizer.url` in the file is something the user chose rather than something a
+// previous OK derived from the speech service. The test is that it is not what the *stored*
+// speech-service address derives to; anything else is theirs and is never overwritten.
+bool stored_normalizer_url_is_custom(const DialogState& st) {
+    if (st.settings.normalizer.url.empty()) return false;
+    std::string server = st.settings.server.url;
+    while (!server.empty() && server.back() == '/') server.pop_back();
+    if (server.empty()) return true;
+    return st.settings.normalizer.url != server + "/v1/text/normalize";
+}
+
+// The same rule as refresh_editing_page above, for the same reason and with the same shape: a
+// box the user can tick, whose value the loader then quietly reverts, is worse than a box that
+// says why it is greyed.
+//
+// `normalizer.enabled` has one hard precondition — Cadence::EndOfSession — enforced in three
+// places that must agree: NormalizerConfig::validate() refuses the file, Settings::normalise()
+// forces the flag off, and App::request_normalize() refuses to send. It has one soft one: there
+// has to be an address, which here means an HTTP speech service to derive one from, or a
+// `normalizer.url` already in the file.
+void refresh_normalizer_controls(HWND dlg, DialogState& st) {
+    const bool eos = SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) ==
+                     cadence_index(Cadence::EndOfSession);
+    const std::wstring derived = normalizer_url_from_server(dlg);
+    // Which address this would actually use: the one in the file when the user put it there by
+    // hand, otherwise the one derived from whatever is in the server box *now*. Same test as
+    // read_controls, so the line the user reads and the value that gets written agree.
+    const std::wstring custom =
+        stored_normalizer_url_is_custom(st) ? wide(st.settings.normalizer.url) : std::wstring();
+    const bool have_url = !derived.empty() || !custom.empty() || !st.normalizer_url_follows;
+    const bool available = eos && have_url;
+    EnableWindow(GetDlgItem(dlg, kIdNormalizerEnabled), available ? TRUE : FALSE);
+
+    const bool on = available && IsDlgButtonChecked(dlg, kIdNormalizerEnabled) == BST_CHECKED;
+    HWND url_box = GetDlgItem(dlg, kIdNormalizerUrl);
+    EnableWindow(url_box, on ? TRUE : FALSE);
+    // While it is following, the box *is* the derived address — rewritten here rather than only
+    // at OK, so that editing the speech service above visibly carries this with it.
+    if (st.normalizer_url_follows && get_text(url_box) != derived) {
+        st.setting_normalizer_url = true;
+        SetWindowTextW(url_box, derived.c_str());
+        st.setting_normalizer_url = false;
+    }
+
+    std::wstring status;
+    if (!eos) {
+        status = L"Needs the \"end-of-session\" cadence on the Dictation page: a rewrite can "
+                 L"change a word you have already said.";
+    } else if (!have_url) {
+        status = L"Needs an OpenAI-compatible speech service above to run it on.";
+    } else if (on && !st.normalizer_url_follows) {
+        status = L"Pointed somewhere other than your speech service. Clear the box to follow it "
+                 L"again.";
+    }
+    SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus), status.c_str());
+}
+
 // The three colour fields belong to the "custom colours" scheme and to nothing else, so they are
 // enabled by it and greyed the rest of the time. Same rule as refresh_editing_page above and for
 // the same reason: a field the user can type into, whose value the program then ignores, is a
@@ -2775,6 +2901,15 @@ void load_controls(HWND dlg, DialogState& st) {
     // After the cadence combo above has been filled in and selected: this reads it.
     refresh_editing_page(dlg);
 
+    // The rewriter (docs/normalizer.md). Also after the cadence combo, and for the same reason.
+    CheckDlgButton(dlg, kIdNormalizerEnabled, s.normalizer.enabled ? BST_CHECKED : BST_UNCHECKED);
+    st.normalizer_url_follows = !stored_normalizer_url_is_custom(st);
+    st.setting_normalizer_url = true;
+    SetWindowTextW(GetDlgItem(dlg, kIdNormalizerUrl),
+                   st.normalizer_url_follows ? L"" : wide(s.normalizer.url).c_str());
+    st.setting_normalizer_url = false;
+    refresh_normalizer_controls(dlg, st);
+
     // Injection.
     HWND im = GetDlgItem(dlg, kIdInjectMethod);
     SendMessageW(im, CB_RESETCONTENT, 0, 0);
@@ -2983,6 +3118,45 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
             ? ForeignKeyAction::EndSession
             : ForeignKeyAction::Ignore;
 
+    // The rewriter. `enabled` as the user left it, forced off by normalise() if the cadence
+    // does not permit it — the same division of labour as the compose buffer above.
+    //
+    // The address is derived rather than asked for, and re-derived here so that moving the
+    // speech service moves the rewriter with it. It is only overwritten when it is empty or
+    // when it is still exactly what the *old* speech-service address derived to: an address the
+    // user put in the file by hand is theirs, and following the server box would silently throw
+    // it away. `styling`, `structure`, `context`, `timeout_ms` and `max_bytes` have no controls
+    // and survive untouched, because this function starts from the working copy.
+    {
+        s.normalizer.enabled = IsDlgButtonChecked(dlg, kIdNormalizerEnabled) == BST_CHECKED;
+        std::wstring typed = get_text(GetDlgItem(dlg, kIdNormalizerUrl));
+        while (!typed.empty() && (typed.front() == L' ' || typed.front() == L'	')) {
+            typed.erase(0, 1);
+        }
+        while (!typed.empty() && (typed.back() == L' ' || typed.back() == L'	')) typed.pop_back();
+        // An emptied box means "follow the speech service again", which is the only way back
+        // once the user has pointed this somewhere else.
+        if (typed.empty()) st.normalizer_url_follows = true;
+        s.normalizer.url =
+            narrow(st.normalizer_url_follows ? normalizer_url_from_server(dlg) : typed);
+
+        if (s.normalizer.enabled && s.stability.cadence == Cadence::EndOfSession) {
+            const bool http = s.normalizer.url.rfind("http://", 0) == 0 ||
+                              s.normalizer.url.rfind("https://", 0) == 0;
+            if (!http) {
+                MessageBoxW(dlg,
+                            s.normalizer.url.empty()
+                                ? L"Cleaning the text up needs a service to do it. Either give "
+                                  L"the speech service above an http:// address, or type one for "
+                                  L"the text service."
+                                : L"The text service address must begin with http:// or https://.",
+                            L"kvit-dictate settings", MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, kIdNormalizerUrl));
+                return false;
+            }
+        }
+    }
+
     s.inject.method = SendMessageW(GetDlgItem(dlg, kIdInjectMethod), CB_GETCURSEL, 0, 0) == 1
                           ? InjectMethod::Clipboard
                           : InjectMethod::SendInput;
@@ -3173,6 +3347,26 @@ void build_controls(HWND dlg, DialogState& st) {
                L"waiting in silence.",
                4);
 
+        // ── The rewriter (docs/normalizer.md) ───────────────────────────────────────────────
+        //
+        // One check box, next to the other thing that service does for you, because that is the
+        // whole decision. Everything else about it — the route, the styling, the timeout — is
+        // derived or defaulted (see kIdNormalizerEnabled).
+        c.section(L"When you finish");
+        c.check(L"Clean the text up before typing it in", kIdNormalizerEnabled);
+        c.note(L"A small text model takes out the ums and the false starts and puts the "
+               L"punctuation in, once, when the session ends. It rewrites the pill, never your "
+               L"document — and if it is down, slow, or drops one of your vocabulary terms, you "
+               L"get exactly what you dictated.",
+               4);
+        // Filled in from the speech service and greyed out until the box above is ticked. It
+        // keeps following that address until the user types here; emptying it starts following
+        // again. Nobody has to touch it, and the deployment that splits the two models across
+        // machines costs one edit.
+        c.label_edit(L"Text service — follows the address above", kIdNormalizerUrl);
+        c.add(L"STATIC", L"", 0, st.line_h * 2, kIdNormalizerStatus);
+        c.gap(4);
+
         c.section(L"What crosses your network");
         c.note(L"Your audio goes to the service you name and nowhere else. No cloud service, no "
                L"telemetry, and nothing is sent until you press the hotkey.",
@@ -3348,7 +3542,7 @@ void build_controls(HWND dlg, DialogState& st) {
         c.multiline(kIdContextTerms, 90);
     }
 
-    // ── Tabs and buttons ────────────────────────────────────────────────────────────────────
+    // // ── Tabs and buttons ────────────────────────────────────────────────────────────────────
     HWND tabs = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                 px(st, kMargin), px(st, kMargin), px(st, kPageWidth),
                                 px(st, kTabStrip), dlg,
@@ -3614,10 +3808,27 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // other page already telling them what it now permits, rather than
                         // discovering it on the next launch (docs/editing.md §12).
                         refresh_editing_page(hwnd);
+                        // The rewriter's precondition is the same one, so it follows the same
+                        // combo. Both pages are told at once rather than each finding out when
+                        // it is next shown.
+                        refresh_normalizer_controls(hwnd, *st);
                     }
                     return 0;
                 case kIdEditingEnabled:
                     refresh_editing_page(hwnd);
+                    return 0;
+                case kIdNormalizerEnabled:
+                    refresh_normalizer_controls(hwnd, *st);
+                    return 0;
+                case kIdNormalizerUrl:
+                    // The user typing here is what stops the address following the speech
+                    // service. `setting_normalizer_url` is why this can tell that apart from
+                    // the refresh writing the derived address into the same box.
+                    if (code == EN_CHANGE && !st->setting_normalizer_url) {
+                        st->normalizer_url_follows =
+                            get_text(GetDlgItem(hwnd, kIdNormalizerUrl)).empty();
+                        refresh_normalizer_controls(hwnd, *st);
+                    }
                     return 0;
                 case kIdModel:
                     if (code == CBN_SELCHANGE) update_model_status(hwnd, *st);
@@ -3630,6 +3841,9 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // Live, because the warning is about the address being typed and a
                         // warning that only appears after OK is a warning nobody reads.
                         update_server_warning(hwnd);
+                        // The rewriter's address is derived from this box, and whether there is
+                        // one at all decides if its check box is available at all.
+                        refresh_normalizer_controls(hwnd, *st);
                     }
                     return 0;
                 case kIdServerModeLocal:
@@ -3639,6 +3853,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // recomputed here rather than only on the next keystroke.
                     update_server_mode_ui(hwnd);
                     update_server_warning(hwnd);
+                    refresh_normalizer_controls(hwnd, *st);
                     return 0;
                 case kIdTheme:
                     if (code == CBN_SELCHANGE) {

@@ -426,6 +426,7 @@ void InputFilter::begin_session_state(uint64_t now_ms) noexcept {
     // session", which is only meaningful if the next session gets a fresh answer.
     editing_active_ = false;
     ui_fail_open_ = false;
+    ui_behind_ms_ = 0;
     pill_dragging_ = false;
     // Seeded from the activation, so that a UI thread which is answering *now* is not judged
     // stale on the very first keystroke merely because nobody has stamped a tick yet.
@@ -459,6 +460,7 @@ void InputFilter::note_session_ended() {
     ptt_held_ = false;
     editing_active_ = false;
     ui_fail_open_ = false;
+    ui_behind_ms_ = 0;
     pill_dragging_ = false;
     for (size_t i = 0; i < kVkWords; ++i) down_at_activation_[i] = 0;
     // hotkey_chord_consumed_ is deliberately NOT cleared: the binding key may still be held, and
@@ -660,7 +662,10 @@ FilterOutcome InputFilter::on_event(const InputEvent& e) {
     if (session_active_ && editing_.enabled && !ui_fail_open_) {
         const int32_t behind = static_cast<int32_t>(static_cast<uint32_t>(e.time_ms) -
                                                     static_cast<uint32_t>(ui_heartbeat_ms_));
-        if (behind > static_cast<int32_t>(kUiStaleMs)) ui_fail_open_ = true;
+        if (behind > static_cast<int32_t>(kUiStaleMs)) {
+            ui_fail_open_ = true;
+            ui_behind_ms_ = static_cast<uint32_t>(behind);
+        }
     }
 
     switch (e.kind) {
@@ -1038,6 +1043,8 @@ void InputFilter::note_ui_heartbeat(uint64_t tick_ms) noexcept { ui_heartbeat_ms
 
 bool InputFilter::failed_open() const noexcept { return ui_fail_open_; }
 
+uint32_t InputFilter::failed_open_behind_ms() const noexcept { return ui_behind_ms_; }
+
 bool InputFilter::composing() const noexcept {
     return session_active_ && editing_.enabled && !ui_fail_open_;
 }
@@ -1221,6 +1228,10 @@ struct HookRuntime {
     std::atomic<int32_t> click_x{0};
     std::atomic<int32_t> click_y{0};
     std::atomic<uint64_t> click_time{0};
+
+    // Edge detection for the fail-open latch, so the UI thread is told once per session rather
+    // than once per keystroke. Hook-thread-only: no other thread touches it.
+    bool fail_open_reported = false;
 };
 
 std::atomic<HookRuntime*> g_runtime{nullptr};
@@ -1322,6 +1333,24 @@ void deliver(HookRuntime* rt, const FilterOutcome& o, const InputEvent& e) noexc
                       static_cast<intptr_t>(o.key_vk | (o.key_mods << 16)));
     }
     if (o.stop_on_input) post_to_owner(rt, HotkeyPost::StopInput, static_cast<intptr_t>(o.stop_reason));
+
+    // The latch, reported exactly once per session (docs/editing.md §10.1).
+    //
+    // It used to trip in silence, and silence is the wrong answer for the one mechanism that
+    // turns the compose buffer off in the middle of a session: the pill stays on screen, still
+    // filling with text, while every keystroke — Enter included — goes to the application
+    // instead. The log then shows `stop-on-input: keystroke` for a session the user ended with
+    // Enter, and nothing at all about why. This is a post, not a log call, because logging is
+    // forbidden on this thread; a wedged UI thread simply reads it late, which is when it is
+    // able to read anything.
+    const bool failed = rt->filter.failed_open();
+    if (failed && !rt->fail_open_reported) {
+        rt->fail_open_reported = true;
+        post_to_owner(rt, HotkeyPost::FailedOpen,
+                      static_cast<intptr_t>(rt->filter.failed_open_behind_ms()));
+    } else if (!failed) {
+        rt->fail_open_reported = false;
+    }
     if (o.click_invalidated) post_to_owner(rt, HotkeyPost::Wheel, 0);
     if (o.click_captured) {
         write_click(rt, e.x, e.y, e.time_ms);
@@ -1713,6 +1742,12 @@ HotkeyManager::Stats HotkeyManager::stats() const noexcept {
     return s;
 }
 
+void note_ui_alive() noexcept {
+    HookRuntime* rt = g_runtime.load(std::memory_order_acquire);
+    if (rt == nullptr) return;
+    rt->ui_heartbeat.store(GetTickCount64() & 0xFFFFFFFFull, std::memory_order_relaxed);
+}
+
 bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
     if (msg != kMsgHotkey) return false;
 
@@ -1726,6 +1761,13 @@ bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
         case HotkeyPost::Commit: rt->listener->on_commit(); break;
         case HotkeyPost::Edit:
             rt->listener->on_edit(unpack_edit_post(static_cast<uint64_t>(lparam)));
+            break;
+        case HotkeyPost::FailedOpen:
+            KD_LOG_WARN(
+                "fail-open: the UI thread was %ld ms behind, so the pill has given the keyboard "
+                "back to the application for the rest of this session — Enter will reach the "
+                "target instead of committing (docs/editing.md 10.1)",
+                static_cast<long>(lparam));
             break;
         case HotkeyPost::EditingBegan: rt->listener->on_editing_began(); break;
         case HotkeyPost::PillPointer:
