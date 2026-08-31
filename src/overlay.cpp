@@ -321,6 +321,36 @@ constexpr uint32_t kMaxLines = 8;
 // bites it is logged rather than silently truncating.
 constexpr size_t kMaxDisplayUnits = 32768;
 
+// ─── The level meter (overlay.h, set_input_level) ──────────────────────────────────────────
+//
+// The state dot has always sat in a gutter `dot_r * 2` wide, and below the dot that gutter is
+// empty for the whole height of the pill — which under scrollback is up to `kMaxLines`. The
+// meter is drawn there: a track down the gutter and a fill rising from the bottom of it with the
+// microphone's level. It costs no width, it is next to the thing whose colour already says which
+// state the session is in, and it moves.
+//
+// One line of pill is not enough gutter to read a bar in, so below this the meter is not drawn
+// and the dot's own radius carries the level instead (see kDotLevelGain). Both, above it.
+constexpr float kMeterMinGutterDip = 26.0f;
+
+// The dot breathes with the level even when the meter is drawn, because the dot is the part that
+// is visible at every pill height and in `StatusOnly`. Silence is not zero — a dot that vanished
+// would read as "off", which is the opposite of what it means.
+constexpr float kDotLevelFloor = 0.62f;
+constexpr float kDotLevelGain = 0.55f;
+
+// How faint the meter's unfilled track is against the pill, light scheme then dark.
+constexpr uint32_t kMeterTrack[2] = {0x18000000, 0x20FFFFFF};
+
+// ─── When a stalled transcriber gets said out loud (overlay.h, set_transcriber_lag) ─────────
+//
+// Below this the pill says nothing: a batch model behind a hop takes a second or two to answer
+// on a good day, and a caption that appeared every time it did would be noise. Past it the
+// speaker has been talking into a preview that has not moved for long enough to wonder whether
+// anything is on, and the honest answer — it is listening, the words have not come back — is
+// better than leaving them to guess from a dot.
+constexpr uint64_t kLagNoteMs = 4000;
+
 // A caret is a solid 1-DIP bar and does not blink (docs/editing.md §7.1). overlay.h is explicit
 // that this window runs no render loop, and a blinking caret needs a ~530 ms timer for the whole
 // session to buy nothing but familiarity.
@@ -752,6 +782,11 @@ struct OverlayCore {
     // composing session is running; WS_EX_NOACTIVATE is untouched either way.
     bool click_through = true;
 
+    // overlay.h: the microphone's own level, and how long the transcriber has been quiet. The
+    // two halves of "is it listening?" that a static dot could not tell apart.
+    float input_level = 0.0f;
+    uint64_t transcriber_lag_ms = 0;
+
     bool want_visible = false;
     bool dirty = true;
 
@@ -1092,6 +1127,16 @@ HRESULT OverlayCore::paint_once() {
         // toast that disappears before the user has finished reading their own document.
         note = utf8::to_utf16_or_empty("\xE2\x9A\xA0 ");  // U+26A0 WARNING SIGN
         note.append(wide_or_log(violation_reason, "violation reason"));
+    } else if (transcriber_lag_ms >= kLagNoteMs &&
+               (state == OverlayState::Listening || state == OverlayState::Speaking)) {
+        // The words are still coming; they are just behind. Said here rather than through
+        // `state`, because the session is not in a different state and the microphone has not
+        // done anything wrong — see set_transcriber_lag(). The seconds are in it because "5s"
+        // and "20s" call for different reactions from the speaker.
+        std::string line = "â³ heard you â waiting on the transcriber (";
+        line += std::to_string(transcriber_lag_ms / 1000);
+        line += "s)";
+        note = utf8::to_utf16_or_empty(line);
     } else if (em != OverlayMode::StatusOnly && state != OverlayState::Idle &&
                state != OverlayState::Listening && state != OverlayState::Speaking) {
         note = utf8::to_utf16_or_empty(state_label(state));
@@ -1414,8 +1459,44 @@ HRESULT OverlayCore::paint_once() {
         rt->DrawRoundedRectangle(rr, brush_border.get(), 1.0f);
     }
 
+    // The dot, breathing with the microphone. `live` is the only condition under which the level
+    // means anything: in every other state the device is closed or the session is over, and a dot
+    // that pulsed there would be reporting a microphone nobody is holding open.
+    const bool live = state == OverlayState::Listening || state == OverlayState::Speaking;
+    const float level = live ? input_level : 0.0f;
+    const float dot_scale = live ? (kDotLevelFloor + kDotLevelGain * level) : 1.0f;
     const D2D1_POINT_2F dot_centre = D2D1::Point2F(pad + dot_r, pad + dot_r + 1.0f);
-    rt->FillEllipse(D2D1::Ellipse(dot_centre, dot_r, dot_r), brush_dot.get());
+    rt->FillEllipse(D2D1::Ellipse(dot_centre, dot_r * dot_scale, dot_r * dot_scale),
+                    brush_dot.get());
+
+    // The meter, down the gutter the dot already reserves. Only when the pill is tall enough for
+    // a bar to be readable — see kMeterMinGutterDip — and only while the device is open.
+    const float meter_top = dot_centre.y + dot_r + gap;
+    const float meter_bottom = draw_h - pad;
+    if (live && meter_bottom - meter_top >= kMeterMinGutterDip) {
+        const float meter_w = std::max(2.0f, dot_r * 0.8f);
+        const float meter_x = dot_centre.x - meter_w * 0.5f;
+        const float meter_r = meter_w * 0.5f;
+        const D2D1_ROUNDED_RECT track = D2D1::RoundedRect(
+            D2D1::RectF(meter_x, meter_top, meter_x + meter_w, meter_bottom), meter_r, meter_r);
+        if (brush_border) {
+            const D2D1_COLOR_F was = brush_border->GetColor();
+            brush_border->SetColor(argb(kMeterTrack[painting_dark ? 1 : 0]));
+            rt->FillRoundedRectangle(track, brush_border.get());
+            brush_border->SetColor(was);
+        }
+        // Rising from the bottom, which is where a level meter's zero belongs: the fill grows
+        // toward the dot, so the eye reads the two as one indicator rather than as a bar and an
+        // unrelated circle.
+        const float fill_h = (meter_bottom - meter_top) * level;
+        if (fill_h > 0.5f) {
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(meter_x, meter_bottom - fill_h, meter_x + meter_w, meter_bottom),
+                    meter_r, meter_r),
+                brush_dot.get());
+        }
+    }
 
     if (body_layout) {
         // The scrolled window. Everything is drawn at `-view_top` and clipped to the pill's text
@@ -1861,6 +1942,28 @@ void Overlay::set_mode(OverlayMode m) {
     }
     impl_->mode = m;
     impl_->dirty = true;
+}
+
+void Overlay::set_input_level(float level01) {
+    const float clamped = std::clamp(level01, 0.0f, 1.0f);
+    // Quantised before it is compared, so a level arriving at capture rate repaints the pill only
+    // when the bar would actually move. Thirty-two steps is finer than the meter can show at any
+    // pill height and coarse enough that microphone noise floor does not flicker it.
+    const float stepped = std::round(clamped * 32.0f) / 32.0f;
+    if (stepped == impl_->input_level) {
+        return;
+    }
+    impl_->input_level = stepped;
+    impl_->dirty = true;
+}
+
+void Overlay::set_transcriber_lag(uint64_t lag_ms) {
+    // Only the crossing matters, not the number: the note says the same thing at 4 s and at 9 s,
+    // and repainting a pill for a value it does not draw would undo set_input_level's care.
+    const bool was = impl_->transcriber_lag_ms >= kLagNoteMs;
+    const bool now = lag_ms >= kLagNoteMs;
+    impl_->transcriber_lag_ms = lag_ms;
+    if (was != now) impl_->dirty = true;
 }
 
 void Overlay::set_anchor(const std::optional<anchor::Anchor>& a) {

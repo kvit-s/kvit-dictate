@@ -25,7 +25,9 @@
 #include <objbase.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <iterator>
 #include <filesystem>
@@ -328,6 +330,10 @@ private:
     // What the overlay should be showing right now, given the cadence. `tail` is the engine's
     // unstable text for the utterance in progress.
     void render_preview(std::string_view tail);
+    void note_input_level(const kd::audio::AudioChunk& chunk);
+    // Push the microphone level and the transcriber's lag at the pill, and pick between
+    // Listening and Speaking from the first of them. Called from the tick that already runs.
+    void publish_listening_state();
 
     // release-plan.md §1: a shipped build connects to a server the user configured; it spawns
     // nothing. spawn_sidecar() is kept for the bench and for a source tree with a models.json,
@@ -510,6 +516,14 @@ private:
     std::deque<kd::proto::Message> ipc_queue_;
     std::mutex audio_mutex_;
     std::vector<int16_t> audio_queue_;
+
+    // The microphone's own level, 0 to 1, written by the capture thread and read by the UI
+    // thread's tick. See note_input_level() for why this exists at all.
+    std::atomic<float> input_level_{0.0f};
+    // When the last `partial` or `final` carrying text arrived, and whether we are waiting for
+    // one. Together they are how long the pill has had nothing new to show while the microphone
+    // was open — the other half of "is it listening?", and the half the level cannot answer.
+    uint64_t last_text_ms_ = 0;
     std::mutex hook_mutex_;
     std::deque<HookNote> hook_queue_;
     std::atomic<bool> anchor_dirty_{false};
@@ -536,7 +550,50 @@ void App::on_audio(const kd::audio::AudioChunk& chunk) {
         std::lock_guard<std::mutex> lock(audio_mutex_);
         audio_queue_.insert(audio_queue_.end(), chunk.samples, chunk.samples + chunk.count);
     }
+    note_input_level(chunk);
     if (hwnd_ != nullptr) PostMessageW(hwnd_, kMsgAudioQueue, 0, 0);
+}
+
+// The one thing the pill can say about the microphone that does not depend on the network.
+//
+// plan.md §1.6 requires listening state to be unambiguous, and it was not: the only evidence the
+// device was open was a static six-pixel dot, so a stalled transcriber, a muted headset and a
+// dead sidecar were the same picture — no words appearing. Reported exactly that way ("I speak,
+// but I don't see. I don't even see if I'm being listened to").
+//
+// Peak rather than RMS, on the chunk the capture thread is already holding: a speaking voice is
+// mostly gaps, and an RMS over a 10 ms chunk spends much of a sentence near the noise floor even
+// while the speaker is perfectly audible. Peak tracks syllables, which is what the eye is
+// looking for.
+//
+// Fast attack, slow release, because a meter is read as reassurance rather than measured: it has
+// to reach full height on the first syllable and fall smoothly enough that ordinary speech keeps
+// it alive between words rather than strobing at the syllable rate.
+void App::note_input_level(const kd::audio::AudioChunk& chunk) {
+    if (chunk.samples == nullptr || chunk.count == 0) return;
+
+    int32_t peak = 0;
+    for (size_t i = 0; i < chunk.count; ++i) {
+        const int32_t v = chunk.samples[i] < 0 ? -static_cast<int32_t>(chunk.samples[i])
+                                               : static_cast<int32_t>(chunk.samples[i]);
+        if (v > peak) peak = v;
+    }
+
+    // Decibels, not amplitude. A voice at a comfortable dictating distance peaks around -30 dBFS
+    // and a shout around -6, and on a linear scale that whole range lives in the bottom eighth of
+    // the bar — which is a meter that only moves when you are too loud. kFloorDb is where the bar
+    // reaches zero; a room's noise floor sits below it.
+    constexpr float kFloorDb = -52.0f;
+    const float amp = static_cast<float>(peak) / 32768.0f;
+    const float db = amp > 1e-6f ? 20.0f * std::log10(amp) : kFloorDb;
+    const float target = std::clamp((db - kFloorDb) / -kFloorDb, 0.0f, 1.0f);
+
+    // The atomic is the whole synchronisation: the capture thread writes, the UI thread reads on
+    // the tick it already runs, and neither waits for the other. Smoothed here rather than there
+    // so the decay is in units of audio rather than of however often the UI happens to paint.
+    const float previous = input_level_.load(std::memory_order_relaxed);
+    const float smoothed = target > previous ? target : previous + (target - previous) * 0.25f;
+    input_level_.store(smoothed, std::memory_order_relaxed);
 }
 
 void App::on_discontinuity(uint32_t gap_ms, const char* reason) {
@@ -1144,6 +1201,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     // arrived meant set_text() marked the overlay dirty and nothing ever painted
                     // it — the preview was invisible for a whole session unless a new anchor
                     // happened to land in the same 50 ms tick.
+                    publish_listening_state();
                     overlay_->render();
                     publish_pill_rect();
                 }
@@ -1348,6 +1406,11 @@ void App::drain_ipc_queue() {
             const auto* f = m.get_if<kd::proto::FinalMsg>();
             if ((p != nullptr && !p->text.empty()) || (f != nullptr && !f->text.empty())) {
                 apply(session_->on_local(kd::LocalEvent::SpeechDetected));
+                // Also the newest moment the user has seen their own words. publish_listening_
+                // state() measures the pill's silence from here, which is why it is stamped on
+                // text arriving rather than on any message: a `stopped` or an `error` is not
+                // something the speaker can read.
+                last_text_ms_ = clock_.now_ms();
             }
         }
 
@@ -2142,6 +2205,12 @@ void App::begin_dictation() {
     editing_ = false;
     editing_began_ms_ = 0;
     hint_expires_ms_ = 0;
+    // The transcriber's lag is measured from the newest words the user has seen, and at this
+    // instant that is "none yet, and none owed": stamping now means the pill waits a whole
+    // kLagNoteMs from activation before it can complain, rather than opening on a caption
+    // inherited from the previous session's last utterance.
+    last_text_ms_ = clock_.now_ms();
+    input_level_.store(0.0f, std::memory_order_relaxed);
     // Cleared here for the reason note_session_ended() is: the abort paths skip end_dictation
     // entirely, and a queue left behind would spend the next session rewriting the previous
     // one's words at offsets that no longer mean anything.
@@ -2266,6 +2335,62 @@ void App::end_dictation(kd::LocalEvent why) {
     finalize_deadline_ms_ = clock_.now_ms() + kFinalizeGraceMs;
     set_tray_state(kd::OverlayState::Finalizing);
     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Finalizing);
+}
+
+// docs/editing.md §7.4 and plan.md §1.6: what the pill says about the microphone, once per
+// tick, from the two facts the user actually wants and neither of which it had.
+//
+// `Speaking` was declared in overlay.h from the beginning — with a dot colour, a tray tint and a
+// tooltip of its own — and **nothing in the client ever set it**. So the pill's only answer to
+// "is it hearing me?" was a green dot that looked the same whether the device was open, muted or
+// gone, and its only answer to "why is nothing appearing?" was silence. Both are answered here.
+//
+// The hysteresis is not decoration. One threshold at a speaking voice's level would flip the
+// state at the syllable rate, and every flip repaints the pill *and* redraws the tray icon.
+void App::publish_listening_state() {
+    if (overlay_ == nullptr) return;
+
+    const bool open = target_.has_value() && !finalizing_ && !editing_ && audio_running_;
+    if (!open) {
+        // The device is closed. The level is stale by definition and the lag is not the user's
+        // problem any more; both are cleared so a resumed session does not open on the last
+        // frame of the previous one.
+        input_level_.store(0.0f, std::memory_order_relaxed);
+        overlay_->set_input_level(0.0f);
+        overlay_->set_transcriber_lag(0);
+        return;
+    }
+
+    const float level = input_level_.load(std::memory_order_relaxed);
+    overlay_->set_input_level(level);
+
+    // Schmitt trigger. `kSpeakOn` is above a quiet room and below a dictating voice; `kSpeakOff`
+    // is low enough that ordinary between-word gaps do not drop out of Speaking, which is what
+    // makes the tray icon settle instead of blinking through a sentence.
+    constexpr float kSpeakOn = 0.34f;
+    constexpr float kSpeakOff = 0.18f;
+    const bool was_speaking = tray_state_ == kd::OverlayState::Speaking;
+    // Only ever between these two. Warning is raised by a stability violation *during* a
+    // session and is a persistent mark on text that may be wrong (plan.md §1.4); a meter that
+    // pushed the pill back to Listening on the next tick would erase it, and the user would
+    // never see which sentence was flagged.
+    if (!was_speaking && tray_state_ != kd::OverlayState::Listening) return;
+    const bool speaking = was_speaking ? (level > kSpeakOff) : (level >= kSpeakOn);
+    const kd::OverlayState want =
+        speaking ? kd::OverlayState::Speaking : kd::OverlayState::Listening;
+    if (tray_state_ != want) {
+        set_tray_state(want);
+        overlay_->set_state(want);
+    }
+
+    // How long the pill has had nothing new to show. `last_text_ms_` is stamped by every
+    // `partial` or `final` that carried text, so this is the age of the newest words the user
+    // has actually seen — which under a batch model behind a hop is the number that grows with
+    // the sentence and is worst exactly when they are furthest from it.
+    const uint64_t now = clock_.now_ms();
+    overlay_->set_transcriber_lag(last_text_ms_ == 0 || now <= last_text_ms_
+                                      ? uint64_t{0}
+                                      : now - last_text_ms_);
 }
 
 void App::render_preview(std::string_view tail) {

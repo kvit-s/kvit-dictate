@@ -256,6 +256,32 @@ public:
     void set_state(OverlayState s);
     void set_mode(OverlayMode m);
 
+    // How loud the microphone is right now, 0 (silence) to 1 (clipping), already smoothed by the
+    // caller. Drawn as a level meter beside the state dot.
+    //
+    // **This is the one indicator that comes from the microphone rather than from the network**,
+    // and that is the whole reason it exists. plan.md §1.6 requires listening state to be
+    // unambiguous, and until this the pill's answer was a static six-pixel dot: a stalled
+    // transcriber, a muted device and a dead sidecar all looked identical to a speaker who could
+    // see no words appearing. A meter that moves with the voice separates "you are not being
+    // heard" from "you are being heard and the words have not come back yet" — which are the two
+    // halves of what a user actually means by "is it listening?".
+    //
+    // Quantised by the implementation before it marks anything dirty, so feeding it at capture
+    // rate does not repaint the pill on microphone noise.
+    void set_input_level(float level01);
+
+    // No `partial` or `final` has arrived for this long while the microphone is open, in
+    // milliseconds; 0 when text is flowing normally or there is nothing to wait for. Past a
+    // threshold the pill says so in its note line.
+    //
+    // Deliberately separate from `set_state`: the session is not in a *different* state — the
+    // microphone is open and the words are coming — it is a latency the user is entitled to see
+    // instead of inferring from a preview that stopped moving. A batch model re-decodes the whole
+    // open utterance on every hop, so this grows with the sentence and is at its worst exactly
+    // when the speaker is furthest from the last thing they saw.
+    void set_transcriber_lag(uint64_t lag_ms);
+
     // Position. An absent anchor means "no usable estimate", which drives the fallback the
     // config in anchor.h selected — the overlay never invents a position from a stale anchor.
     void set_anchor(const std::optional<anchor::Anchor>& a);

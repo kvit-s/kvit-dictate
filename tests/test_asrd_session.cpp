@@ -1227,15 +1227,20 @@ KD_TEST(asrd_session, live_preview_publishes_no_mark_so_a_late_revision_cannot_t
 KD_TEST(asrd_session, a_transient_failure_on_a_hop_does_not_end_the_session) {
     StubSpeechService stub;
     KD_REQUIRE(stub.start());
-    // Two good hypotheses, then a dropped connection, then the model comes back. The audio for
-    // the failed hop is still in the backend's buffer — `PseudoStreamingDriver` never erases
-    // from the front — so the reply after it covers everything the failed one would have.
+    // One good answer, then a dropped connection, then the model comes back — and it is the
+    // *second* request that fails, whichever request that turns out to be. How many hops a given
+    // run makes is not fixed: a hop that fires while a POST is in flight replaces the pending
+    // work rather than queueing it (§2.1), so on a loaded machine an utterance that makes five
+    // requests idle makes two. Placing the failure by index rather than by role is what keeps
+    // this a test of the policy instead of a test of the scheduler.
+    //
+    // The audio for the failed request is still in the backend's buffer — `PseudoStreamingDriver`
+    // never erases from the front — so whatever comes next covers everything it would have.
+    const char* kHeard = R"({"text":"the quick brown fox jumps over the lazy dog"})";
     stub.set_transcribe_script({
-        {200, R"({"text":"the quick brown"})"},
-        {200, R"({"text":"the quick brown fox"})"},
+        {200, kHeard},
         {500, R"({"detail":"upstream reset the connection"})"},
-        {200, R"({"text":"the quick brown fox jumps over"})"},
-        {200, R"({"text":"The quick brown fox jumps over the lazy dog."})"},
+        {200, kHeard},
     });
 
     TranslatorConfig cfg = config_for(stub);
@@ -1244,22 +1249,24 @@ KD_TEST(asrd_session, a_transient_failure_on_a_hop_does_not_end_the_session) {
     KD_REQUIRE(harness.start());
 
     Observed seen;
-    KD_REQUIRE(run_session(harness, seen, one_utterance(8000, 1200)));
+    KD_REQUIRE(run_session(harness, seen, one_utterance(3000, 1200)));
 
-    // The failure reached the log and nothing else. No `error`, no early `stopped`, and the
-    // utterance still closes exactly once.
+    // The 500 was actually served — a run that never reached the second reply would pass every
+    // assertion below while proving nothing.
+    KD_CHECK_GT(stub.transcribe_requests(), 1);
+
+    // And it reached the log and nothing else. No `error`, no early `stopped`, and the utterance
+    // still closes exactly once with the words in it.
     for (const kd::proto::ErrorMsg& e : seen.of<kd::proto::ErrorMsg>()) {
         KD_INFO("unexpected error: " + e.msg);
     }
     KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
-    KD_CHECK_EQ(seen.of<kd::proto::FinalMsg>().size(), size_t{1});
-    KD_CHECK_GT(stub.transcribe_requests(), 3);
 
     const auto finals = seen.of<kd::proto::FinalMsg>();
-    KD_REQUIRE_GT(finals.size(), size_t{0});
-    // And the words the hop would have carried are in it, because the next request re-decoded
-    // the same audio rather than resuming after it.
-    KD_CHECK(finals[0].text.find("brown fox") != std::string::npos);
+    KD_REQUIRE_EQ(finals.size(), size_t{1});
+    // The audio the failed request covered is in it, because the request after it re-decoded the
+    // same recording from its first sample rather than resuming after the gap.
+    KD_CHECK_EQ(finals[0].text, std::string("the quick brown fox jumps over the lazy dog"));
 }
 
 KD_TEST(asrd_session, a_failed_flush_closes_the_utterance_with_the_last_partial) {
