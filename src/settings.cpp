@@ -825,6 +825,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //                    "color_pending": "#FF3C3C3C", ... },   // read only under theme "custom"
 //     "audio_device_id": "",
 //     "privacy":   { "log_level": "info", "diagnostics_file_enabled": false,
+//                    "crash_recovery": true,
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,
@@ -1290,6 +1291,7 @@ std::string serialize_settings(const Settings& s) {
         json::Value o = json::Value::object();
         put_str(o, "log_level", log::to_string(s.log_level));
         put_bool(o, "diagnostics_file_enabled", s.diagnostics_file_enabled);
+        put_bool(o, "crash_recovery", s.crash_recovery);
         json::Value t = json::Value::object();
         put_bool(t, "enabled", s.transcript.enabled);
         put_str(t, "file", path_to_utf8(s.transcript.file));
@@ -1613,6 +1615,7 @@ Result<Settings> parse_settings(std::string_view json_text) {
         std::string level = log::to_string(s.log_level);
         o.str_opt("log_level", level);
         o.bool_opt("diagnostics_file_enabled", s.diagnostics_file_enabled);
+        o.bool_opt("crash_recovery", s.crash_recovery);
         if (o.failed()) return Status{StatusCode::Malformed, o.error()};
         if (!log::parse_level(level, s.log_level)) {
             return Status{StatusCode::Malformed,

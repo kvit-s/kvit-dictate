@@ -32,6 +32,8 @@
 #include <deque>
 #include <iterator>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -107,6 +109,11 @@ constexpr uint64_t kFinalizeGraceMs = 5000;
 // again. Long enough to read the paragraph the user scrolled to, short enough that a notch they
 // did not mean for the pill costs them a few seconds rather than the session.
 constexpr uint64_t kScrollRepinMs = 6000;
+
+// How often the undelivered buffer is written to disk while it is changing. The bound on what a
+// crash can cost is this plus whatever has not been committed by the recogniser yet, and a
+// second is far inside the gap between utterances.
+constexpr uint64_t kRecoverySaveMs = 1000;
 
 // `scheme://host:port` out of a URL, lowercased, or empty when there is no authority to take.
 // Used for one question only: are the rewriter and the speech service the same machine, and
@@ -357,6 +364,22 @@ private:
     // unstable text for the utterance in progress.
     void render_preview(std::string_view tail);
     void note_input_level(const kd::audio::AudioChunk& chunk);
+
+    // ── Surviving anything that is not the user ending the session ──────────────────────────
+    //
+    // settings.h `privacy.crash_recovery` carries the argument for why these exist and why they
+    // default to on. In short: under `Cadence::EndOfSession` the undelivered text lives only in
+    // `EditBuffer`, the clipboard fallback sits on the graceful path, and the overlay is
+    // excluded from screen capture — so nothing outside this process can see the buffer, and any
+    // end that is not `finish_dictation` destroys it.
+    [[nodiscard]] static std::filesystem::path recovery_path();
+    // Write the buffer, atomically. Nothing is ever appended: the file holds the current buffer
+    // or it does not exist.
+    void save_recovery();
+    // Delete it. Called the instant the text is delivered, and when the user throws it away.
+    void clear_recovery(const char* why);
+    // At startup: hand back whatever an interrupted session left behind. Runs once.
+    void recover_previous_session();
     // Are the rewriter and the speech service the same machine? Re-derived whenever either
     // address can have changed. See pump_normalize().
     void note_rewriter_host();
@@ -545,6 +568,11 @@ private:
     std::deque<kd::proto::Message> ipc_queue_;
     std::mutex audio_mutex_;
     std::vector<int16_t> audio_queue_;
+
+    // The buffer has changed since it was last written to disk. Set at every mutation site and
+    // consumed by the tick, so a burst of edits costs one write rather than one write each.
+    bool recovery_dirty_ = false;
+    uint64_t recovery_saved_ms_ = 0;
 
     // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
     // Read only by pump_normalize(), and only when the rewriter is on the same host.
@@ -839,6 +867,10 @@ bool App::startup() {
     nid.hIcon = tray_icon_ != nullptr ? tray_icon_ : LoadIcon(nullptr, IDI_APPLICATION);
     lstrcpynW(nid.szTip, L"kvit-dictate — idle", ARRAYSIZE(nid.szTip));
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+
+    // After the tray exists, because this is one of the two things that can raise a Warning
+    // before the user has touched anything, and a warning nobody can see is not a warning.
+    recover_previous_session();
 
     SetTimer(hwnd_, kTickTimer, kTickIntervalMs, nullptr);
     SetTimer(hwnd_, kHeartbeatTimer, kHeartbeatIntervalMs, heartbeat_timer_proc);
@@ -1217,6 +1249,13 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
                     hint_expires_ms_ = 0;
                     if (overlay_ != nullptr) overlay_->clear_hint();
+                }
+                // The recovery copy, on the tick so that a burst of edits or a fast passage of
+                // speech costs one write rather than one write each. A second is the most speech
+                // this can lose that the buffer already had, and it is well under the interval
+                // between utterances.
+                if (recovery_dirty_ && clock_.now_ms() - recovery_saved_ms_ >= kRecoverySaveMs) {
+                    save_recovery();
                 }
                 // And the scrolled-back view, on the same tick and for a sharper reason.
                 //
@@ -1811,6 +1850,7 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         // closes the microphone at the first edit key, so the only way speech reaches this line
         // is after the user's own resume gesture.
         edit_.append(text);
+        recovery_dirty_ = true;
         // Queued as its own unit of rewriting, at the offset it just landed on.
         normalize_chunks_.push_back(text);
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
@@ -2091,7 +2131,10 @@ void App::apply_pill_pointer(const kd::PillPost& p) {
     c.op = p.kind == kd::FilterOutcome::PillPointerKind::Down ? kd::EditOp::PlaceCaret
                                                               : kd::EditOp::ExtendCaret;
     c.offset = offset;
-    if (edit_.apply(c).changed()) render_preview({});
+    if (edit_.apply(c).changed()) {
+        recovery_dirty_ = true;
+        render_preview({});
+    }
 }
 
 void App::show_foreign_key_hint(uint32_t vk, uint32_t mods) {
@@ -2392,6 +2435,9 @@ void App::end_dictation(kd::LocalEvent why) {
         KD_LOG_INFO("discarding %zu deferred bytes: Esc cancels the session", edit_.size());
         edit_.clear();
         cancel_normalize();
+        // The user asked for this text to go away. Leaving a copy on disk would be the one thing
+        // they explicitly said not to do.
+        clear_recovery("Esc discarded the session");
     }
 
     apply(session_->on_local(why));
@@ -2662,6 +2708,7 @@ void App::drain_normalize_queue() {
                 next += r.normalized;
                 next += cur.substr(at + chunk.size());
                 edit_.set_text(next);
+                recovery_dirty_ = true;
                 normalize_settled_bytes_ = at + lead + r.normalized.size();
                 render_preview({});
             }
@@ -2696,6 +2743,108 @@ void App::push_edit_view() {
                              settings_.hotkey.push_to_talk);
 }
 
+// ─── Crash recovery ─────────────────────────────────────────────────────────────────────────
+
+std::filesystem::path App::recovery_path() {
+    // Beside settings.json, which is already the program's own per-user directory and is already
+    // created by the time anything here runs.
+    return kd::default_settings_path().parent_path() / "recover.txt";
+}
+
+void App::save_recovery() {
+    recovery_dirty_ = false;
+    if (!settings_.crash_recovery) return;
+
+    if (edit_.empty()) {
+        clear_recovery("the buffer is empty");
+        return;
+    }
+
+    const std::filesystem::path final_path = recovery_path();
+    std::filesystem::path tmp = final_path;
+    tmp += ".tmp";
+
+    // Written whole to a temporary and then moved over the target. A plain overwrite would spend
+    // the whole write with the file truncated, and the one moment this file has to be readable is
+    // the moment the process dies — which is precisely the window a truncating write opens.
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            KD_LOG_WARN("could not open %s for the recovery copy; this session is not protected",
+                        tmp.string().c_str());
+            return;
+        }
+        const std::string& text = edit_.text();
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.flush();
+        if (!out) {
+            KD_LOG_WARN("the recovery copy could not be written; this session is not protected");
+            return;
+        }
+    }
+    // MOVEFILE_WRITE_THROUGH so the rename is on the disk before this returns. Without it the
+    // rename can sit in the cache, which is the same failure the temporary file exists to avoid.
+    if (MoveFileExW(tmp.wstring().c_str(), final_path.wstring().c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        KD_LOG_WARN("could not replace %s with the recovery copy (error %lu)",
+                    final_path.string().c_str(), GetLastError());
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    recovery_saved_ms_ = clock_.now_ms();
+    KD_LOG_DEBUG("recovery copy written: %zu bytes", edit_.size());
+}
+
+void App::clear_recovery(const char* why) {
+    recovery_dirty_ = false;
+    std::error_code ec;
+    if (std::filesystem::remove(recovery_path(), ec)) {
+        KD_LOG_DEBUG("recovery copy removed: %s", why);
+    }
+}
+
+void App::recover_previous_session() {
+    const std::filesystem::path path = recovery_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return;
+
+    std::string text;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            KD_LOG_WARN("a recovery copy exists at %s but could not be read", path.string().c_str());
+            return;
+        }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    if (text.empty()) {
+        clear_recovery("it was empty");
+        return;
+    }
+
+    // The clipboard, and the tray, because that is already this program's idiom for "there is
+    // text and nowhere to put it" — flush_deferred_commits does exactly this when injection
+    // fails, and a second mechanism for the same situation would be one more thing to learn.
+    // Deliberately not injected: the window that had focus when the session died is not
+    // necessarily the one in front now, and typing a paragraph into the wrong document is worse
+    // than making the user press Ctrl+V.
+    if (kd::set_clipboard_text(text)) {
+        KD_LOG_WARN("a previous session ended without delivering %zu bytes; they are on the "
+                    "clipboard (Ctrl+V) and in %s",
+                    text.size(), path.string().c_str());
+        set_tray_state(kd::OverlayState::Warning);
+    } else {
+        KD_LOG_ERROR("a previous session left %zu bytes in %s and the clipboard could not be "
+                     "reached; the file is the only copy",
+                     text.size(), path.string().c_str());
+        set_tray_state(kd::OverlayState::Error);
+    }
+    // The file stays. It is the durable half of the recovery — a clipboard survives neither the
+    // next copy nor a reboot — and the next session's first save replaces it, so at most one
+    // exists and it is always the newest undelivered text.
+}
+
 void App::flush_deferred_commits(const char* why) {
     if (edit_.empty()) return;
     // Taken first, so no path can flush the same text twice. EditBuffer::take() moves the text
@@ -2712,6 +2861,7 @@ void App::flush_deferred_commits(const char* why) {
         const kd::InjectResult res = injector_->inject(*target_, text);
         if (res.status == kd::InjectStatus::Ok) {
             KD_LOG_INFO("flushed %zu deferred bytes on %s", text.size(), why);
+            clear_recovery("the text reached the document");
             if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
             return;
         }

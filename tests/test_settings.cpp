@@ -66,6 +66,9 @@ kd::Settings unusual() {
     s.audio_device_id = "{0.0.1.00000000}.{deadbeef}";
     s.log_level = kd::log::Level::Debug;
     s.diagnostics_file_enabled = true;
+    // Flipped away from its default so the round trip proves the field is written and read,
+    // rather than proving that two defaults agree.
+    s.crash_recovery = false;
     s.start_with_windows = true;
     s.context_terms = {"llama.cpp", "Qwen3", "WASAPI"};
     s.send_context = true;
@@ -145,6 +148,7 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(out.audio_device_id, in.audio_device_id);
     KD_CHECK_EQ(static_cast<int>(out.log_level), static_cast<int>(in.log_level));
     KD_CHECK_EQ(out.diagnostics_file_enabled, in.diagnostics_file_enabled);
+    KD_CHECK_EQ(out.crash_recovery, in.crash_recovery);
     KD_CHECK_EQ(out.start_with_windows, in.start_with_windows);
     KD_CHECK_EQ(out.context_terms.size(), in.context_terms.size());
     KD_CHECK_EQ(out.send_context, in.send_context);
@@ -678,4 +682,21 @@ KD_TEST(settings, an_http_url_in_protocol_mode_is_left_alone) {
     s.normalise();
     KD_CHECK(s.server.mode == kd::ServerMode::Protocol);
     KD_CHECK(s.validate().ok());
+}
+
+// settings.h `privacy.crash_recovery`. Defaults ON, which is the one privacy default in this
+// program that points away from "off", so it is asserted rather than left to be noticed when a
+// refactor flips it: with it off, an interrupted session's words are unrecoverable — not merely
+// inconvenient, because the overlay is excluded from screen capture and nothing outside the
+// process can see the buffer.
+KD_TEST(settings, crash_recovery_defaults_on_and_survives_a_file_that_predates_it) {
+    const kd::Settings fresh;
+    KD_CHECK(fresh.crash_recovery);
+
+    // A settings file written before the field existed. It must come back on, not off: a user
+    // who upgrades has not opted out of anything.
+    const char* older = R"({"schema":1,"privacy":{"log_level":"info"}})";
+    const kd::Result<kd::Settings> loaded = kd::parse_settings(older);
+    KD_REQUIRE(static_cast<bool>(loaded));
+    KD_CHECK(loaded->crash_recovery);
 }
