@@ -479,6 +479,15 @@ uint64_t Normalizer::requests_superseded() const noexcept {
     return impl_->superseded.load(std::memory_order_relaxed);
 }
 
+// normalizer.h: the settings dialog's Test button, sharing the worker's own HTTP path.
+::kd::Result<std::string> normalize_once(const NormalizerConfig& cfg, std::string_view text) {
+    if (cfg.url.empty()) {
+        return Status{StatusCode::InvalidArgument, "no address to test"};
+    }
+    Normalizer::Impl impl;
+    return impl.post(cfg, std::string(text), cfg.timeout_ms);
+}
+
 void Normalizer::Impl::run() {
     for (;;) {
         NormalizerConfig c;

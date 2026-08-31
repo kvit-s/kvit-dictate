@@ -308,6 +308,22 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    // The one-shot below is the same POST this class's worker makes, and sharing it is the
+    // point: two HTTP paths to the same endpoint is two things to keep in agreement.
+    friend ::kd::Result<std::string> normalize_once(const NormalizerConfig& cfg,
+                                                   std::string_view text);
 };
+
+// One request, on the calling thread, for the settings dialog's Test button.
+//
+// Blocking, and deliberately so: it is the same POST the worker makes, against the same config,
+// bounded by the same `cfg.timeout_ms` — so a green Test means the address the user just typed
+// really does answer, rather than that it parsed. It shares `Impl::post` with the worker so
+// there is one HTTP path to get right and Test cannot pass where dictation would fail.
+//
+// `cfg.enabled` and the cadence are not consulted: the point of the button is to check an
+// address *before* committing to it.
+Result<std::string> normalize_once(const NormalizerConfig& cfg, std::string_view text);
 
 }  // namespace kd

@@ -395,4 +395,18 @@ std::string serialize_settings(const Settings& s);
 bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
                           const ModelManifest& manifest);
 
+// The open dialog's HWND, as an opaque value, or 0 when there is none.
+//
+// For the caller's "Settings…" handler, which can be reached again while the dialog is already
+// up — from the tray menu, or from a second launch of the executable. The answer to all of them
+// is to raise the one dialog that exists, and this is how the caller finds it.
+//
+// GetLastActivePopup on the owner is the usual way and does not work here: the owner is a
+// *message-only* window (main.cpp), which is not on the desktop and tracks no popups, so it
+// returns itself and the caller concludes there is nothing to raise. That was the bug — the
+// tray's Settings item looked dead whenever the dialog was behind another window.
+//
+// Valid only on the thread that opened the dialog, which is the only thread that may touch it.
+uintptr_t open_settings_dialog_window() noexcept;
+
 }  // namespace kd

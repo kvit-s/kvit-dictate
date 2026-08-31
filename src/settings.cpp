@@ -1731,8 +1731,6 @@ enum : int {
     kIdRefuseElevated,
     kIdAppPolicies,
     kIdAudioDevice,
-    kIdModel,
-    kIdModelStatus,
     kIdOverlayMode,
     kIdFallback,
     kIdMinConfidence,
@@ -1764,8 +1762,6 @@ enum : int {
     // by looking at the URL — which is the whole reason `ServerMode` exists.
     kIdServerModeLocal,
     kIdServerModeProtocol,
-    kIdServerUrlLabel,
-    kIdServerUrlNote,
     kIdServerLivePreview,
     // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
     // though it is an address the user types: it rewrites **the pill** and nothing else, and its
@@ -1797,6 +1793,7 @@ enum : int {
     // page. `DialogState::normalizer_url_follows` is where "left it alone" is remembered.
     kIdNormalizerEnabled,
     kIdNormalizerUrl,
+    kIdNormalizerTest,
     kIdNormalizerStatus,
 };
 
@@ -1807,11 +1804,14 @@ constexpr int kPageCount = 5;
 // overwriting the newer one.
 constexpr UINT kMsgProbeDone = WM_APP + 41;
 
+// The same shape for the rewriter's own Test button, on its own generation counter so the two
+// cannot answer into each other's status line.
+constexpr UINT kMsgNormalizeTestDone = WM_APP + 42;
+
 struct DialogState {
     Settings settings;                       // the working copy; only copied out on OK
     const ModelManifest* manifest = nullptr;
     std::vector<audio::DeviceInfo> devices;  // parallel to the audio combo's items, minus item 0
-    std::vector<const ModelEntry*> models;   // parallel to the model combo's items
     std::vector<HWND> page_controls[kPageCount];
     HFONT font = nullptr;
     int dpi = 96;
@@ -1823,6 +1823,8 @@ struct DialogState {
     // it never touches this struct, because the dialog may have been destroyed by then.
     uint32_t probe_generation = 0;
     bool probe_running = false;
+    uint32_t normalize_test_generation = 0;
+    bool normalize_test_running = false;
 
     //: One line of `font`, in *logical* px, measured rather than assumed.
     //:
@@ -1850,20 +1852,6 @@ struct DialogState {
     bool dark = false;
     HBRUSH face_brush = nullptr;
     HBRUSH field_brush = nullptr;
-
-    // ── The rewriter's address (kIdNormalizerEnabled) ──────────────────────────────────────
-    //
-    // True while the address box is still whatever the speech service derives to, so that a
-    // change to the speech service carries it along. Set from the file at load, cleared the
-    // first time the user types in the box, and never set again by anything but "Restore
-    // defaults" — a user who has pointed the rewriter somewhere else does not want it wandering
-    // back the next time they correct a typo in the server address.
-    bool normalizer_url_follows = true;
-
-    // Set while *this file* is writing the address box, so that the EN_CHANGE it provokes is not
-    // mistaken for the user typing. Without it, following the server address would immediately
-    // stop following it.
-    bool setting_normalizer_url = false;
 
     // Which push button the pointer is over, or null. Owner-drawn buttons are told whether they
     // are pressed, focused or disabled and are never told they are hot, so the hover state is
@@ -2057,6 +2045,17 @@ struct Cursor {
     }
 };
 
+// The grey example text an empty EDIT shows. This is where "for example
+// http://strixhalo.lan:10301" belongs: in the box it is an example *of*, shown exactly while the
+// box is empty and gone the moment it is not — rather than as a paragraph underneath that is
+// still there, still being read, long after the user has filled the box in.
+//
+// TRUE, so it stays visible when the box has focus: the user clicks into an empty box and the
+// example is the thing they most want to still be able to see.
+void set_cue(HWND edit, const wchar_t* text) {
+    if (edit != nullptr) SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(text));
+}
+
 void combo_add(HWND combo, const wchar_t* text) {
     SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
 }
@@ -2211,19 +2210,12 @@ ServerMode mode_of(HWND dlg) {
 // wants `http://strixhalo.lan:10301` is how the two get confused in the first place.
 void update_server_mode_ui(HWND dlg) {
     const bool local = mode_of(dlg) == ServerMode::Local;
-    SetWindowTextW(GetDlgItem(dlg, kIdServerUrlLabel),
-                   local ? L"Speech service" : L"Server address");
-    SetWindowTextW(
-        GetDlgItem(dlg, kIdServerUrlNote),
-        local ? L"For example http://strixhalo.lan:10301. There is nothing else to run."
-              : L"For example ws://127.0.0.1:10402/. Nothing is launched for you in this "
-                L"mode.");
+    set_cue(GetDlgItem(dlg, kIdServerUrl),
+            local ? L"http://strixhalo.lan:10301" : L"ws://127.0.0.1:10402/");
     // Live preview is a translator setting, so it means nothing when the translator is not the
     // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
     // the user cannot find again.
     EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
-    SetWindowTextW(GetDlgItem(dlg, kIdServerTest),
-                   local ? L"Test this service" : L"Test this server");
 }
 
 std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
@@ -2378,18 +2370,6 @@ void start_server_test(HWND dlg, DialogState& st) {
 
 // ─── Populating the controls from a Settings ────────────────────────────────────────────────
 
-void update_model_status(HWND dlg, DialogState& st) {
-    const int sel = static_cast<int>(SendMessageW(GetDlgItem(dlg, kIdModel), CB_GETCURSEL, 0, 0));
-    std::wstring text = L"No model selected.";
-    if (sel >= 0 && static_cast<size_t>(sel) < st.models.size()) {
-        const ModelEntry* e = st.models[static_cast<size_t>(sel)];
-        Status ok = check_model_launchable(*st.manifest, e->id);
-        text = ok.is_ok() ? (L"Ready: " + wide(path_to_utf8(e->interpreter)))
-                          : wide(ok.message());
-    }
-    SetWindowTextW(GetDlgItem(dlg, kIdModelStatus), text.c_str());
-}
-
 // docs/editing.md §6.1 and §12: `editing.enabled` is forced off unless the cadence is
 // `end-of-session`, "and the settings dialog must say why rather than silently ignoring it".
 //
@@ -2454,32 +2434,30 @@ bool stored_normalizer_url_is_custom(const DialogState& st) {
 //
 // `normalizer.enabled` has one hard precondition — Cadence::EndOfSession — enforced in three
 // places that must agree: NormalizerConfig::validate() refuses the file, Settings::normalise()
-// forces the flag off, and App::request_normalize() refuses to send. It has one soft one: there
+// forces the flag off, and App::pump_normalize() refuses to send. It has one soft one: there
 // has to be an address, which here means an HTTP speech service to derive one from, or a
 // `normalizer.url` already in the file.
-void refresh_normalizer_controls(HWND dlg, DialogState& st) {
+void refresh_normalizer_controls(HWND dlg) {
     const bool eos = SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) ==
                      cadence_index(Cadence::EndOfSession);
     const std::wstring derived = normalizer_url_from_server(dlg);
     // Which address this would actually use: the one in the file when the user put it there by
     // hand, otherwise the one derived from whatever is in the server box *now*. Same test as
     // read_controls, so the line the user reads and the value that gets written agree.
-    const std::wstring custom =
-        stored_normalizer_url_is_custom(st) ? wide(st.settings.normalizer.url) : std::wstring();
-    const bool have_url = !derived.empty() || !custom.empty() || !st.normalizer_url_follows;
+    const bool have_url =
+        !derived.empty() || !get_text(GetDlgItem(dlg, kIdNormalizerUrl)).empty();
     const bool available = eos && have_url;
     EnableWindow(GetDlgItem(dlg, kIdNormalizerEnabled), available ? TRUE : FALSE);
 
     const bool on = available && IsDlgButtonChecked(dlg, kIdNormalizerEnabled) == BST_CHECKED;
     HWND url_box = GetDlgItem(dlg, kIdNormalizerUrl);
     EnableWindow(url_box, on ? TRUE : FALSE);
-    // While it is following, the box *is* the derived address — rewritten here rather than only
-    // at OK, so that editing the speech service above visibly carries this with it.
-    if (st.normalizer_url_follows && get_text(url_box) != derived) {
-        st.setting_normalizer_url = true;
-        SetWindowTextW(url_box, derived.c_str());
-        st.setting_normalizer_url = false;
-    }
+    EnableWindow(GetDlgItem(dlg, kIdNormalizerTest), on ? TRUE : FALSE);
+    // An empty box means "the speech service above", and the cue banner is what says so — it
+    // shows the address that resolves to, and follows that address as it is edited. No flag to
+    // keep, nothing written into the box behind the user, and clearing the box is how you go
+    // back to following.
+    set_cue(url_box, derived.c_str());
 
     // Only ever the reason it is greyed. When it is available there is nothing to say that the
     // box and the address above it do not already say.
@@ -2490,6 +2468,61 @@ void refresh_normalizer_controls(HWND dlg, DialogState& st) {
         status = L"Needs a speech service above.";
     }
     SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus), status.c_str());
+}
+
+// The rewriter's Test button.
+//
+// It sends one short sentence with a filler and a spoken date in it and shows what comes back,
+// because that answers the question the user actually has — *is this thing going to do what I
+// want to my text* — in a way that "connected OK" does not. `normalize_once` is the worker's own
+// POST, so a green answer here is the same call dictation will make.
+//
+// Same worker-thread shape as start_server_test: everything it touches is copied in, it reads no
+// DialogState, and it hands back one heap-allocated string that whoever wins frees.
+void start_normalize_test(HWND dlg, DialogState& st) {
+    if (st.normalize_test_running) return;
+
+    NormalizerConfig cfg = st.settings.normalizer;
+    const std::wstring typed = get_text(GetDlgItem(dlg, kIdNormalizerUrl));
+    cfg.url = narrow(typed.empty() ? normalizer_url_from_server(dlg) : typed);
+    cfg.enabled = true;
+    if (cfg.url.rfind("http://", 0) != 0 && cfg.url.rfind("https://", 0) != 0) {
+        SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus),
+                       cfg.url.empty()
+                           ? L"No address: give the speech service above an http:// address, or "
+                             L"type one here."
+                           : L"The address must begin with http:// or https://.");
+        return;
+    }
+
+    st.normalize_test_running = true;
+    const uint32_t generation = ++st.normalize_test_generation;
+    SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus), L"Sending a test sentence…");
+    EnableWindow(GetDlgItem(dlg, kIdNormalizerTest), FALSE);
+
+    std::thread([dlg, generation, cfg]() {
+        static constexpr char kProbeText[] =
+            "um so i think we should uh ship it on friday the third";
+        const uint64_t began = SteadyClock::instance().now_ms();
+        const Result<std::string> answer = normalize_once(cfg, kProbeText);
+        const uint64_t elapsed = SteadyClock::instance().now_ms() - began;
+
+        std::wstring text;
+        if (answer) {
+            text = L"Answered in " + std::to_wstring(elapsed) + L" ms.\r\n\r\n\x201c" +
+                   wide(kProbeText) + L"\x201d\r\nbecomes\r\n\x201c" + wide(*answer) +
+                   L"\x201d";
+        } else {
+            text = L"No answer from " + wide(cfg.url) + L"\r\n" +
+                   wide(answer.status().message());
+        }
+
+        auto* payload = new std::wstring(std::move(text));
+        if (!PostMessageW(dlg, kMsgNormalizeTestDone, static_cast<WPARAM>(generation),
+                          reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
+        }
+    }).detach();
 }
 
 // The three colour fields belong to the "custom colours" scheme and to nothing else, so they are
@@ -2895,12 +2928,9 @@ void load_controls(HWND dlg, DialogState& st) {
 
     // The rewriter (docs/normalizer.md). Also after the cadence combo, and for the same reason.
     CheckDlgButton(dlg, kIdNormalizerEnabled, s.normalizer.enabled ? BST_CHECKED : BST_UNCHECKED);
-    st.normalizer_url_follows = !stored_normalizer_url_is_custom(st);
-    st.setting_normalizer_url = true;
     SetWindowTextW(GetDlgItem(dlg, kIdNormalizerUrl),
-                   st.normalizer_url_follows ? L"" : wide(s.normalizer.url).c_str());
-    st.setting_normalizer_url = false;
-    refresh_normalizer_controls(dlg, st);
+                   stored_normalizer_url_is_custom(st) ? wide(s.normalizer.url).c_str() : L"");
+    refresh_normalizer_controls(dlg);
 
     // Injection.
     HWND im = GetDlgItem(dlg, kIdInjectMethod);
@@ -2946,28 +2976,6 @@ void load_controls(HWND dlg, DialogState& st) {
         if (st.devices[i].id == s.audio_device_id) dev_sel = static_cast<int>(i) + 1;
     }
     SendMessageW(dev, CB_SETCURSEL, static_cast<WPARAM>(dev_sel), 0);
-
-    // Model.
-    HWND model = GetDlgItem(dlg, kIdModel);
-    SendMessageW(model, CB_RESETCONTENT, 0, 0);
-    st.models.clear();
-    int model_sel = -1;
-    if (st.manifest) {
-        for (const ModelEntry& e : st.manifest->models) {
-            std::wstring label = wide(e.display_name);
-            label += L"  [";
-            label += wide(proto::to_string(e.streaming_mode));
-            label += L"]";
-            if (!e.enabled) label += L"  (disabled)";
-            else if (!e.interpreter_available()) label += L"  (interpreter missing)";
-            combo_add(model, label.c_str());
-            if (e.id == s.model_id) model_sel = static_cast<int>(st.models.size());
-            st.models.push_back(&e);
-        }
-    }
-    if (model_sel < 0 && !st.models.empty()) model_sel = 0;
-    SendMessageW(model, CB_SETCURSEL, static_cast<WPARAM>(model_sel), 0);
-    update_model_status(dlg, st);
 
     // Overlay.
     HWND om = GetDlgItem(dlg, kIdOverlayMode);
@@ -3126,11 +3134,8 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
             typed.erase(0, 1);
         }
         while (!typed.empty() && (typed.back() == L' ' || typed.back() == L'	')) typed.pop_back();
-        // An emptied box means "follow the speech service again", which is the only way back
-        // once the user has pointed this somewhere else.
-        if (typed.empty()) st.normalizer_url_follows = true;
-        s.normalizer.url =
-            narrow(st.normalizer_url_follows ? normalizer_url_from_server(dlg) : typed);
+        // Empty means the speech service above, which is what the cue banner has been showing.
+        s.normalizer.url = narrow(typed.empty() ? normalizer_url_from_server(dlg) : typed);
 
         if (s.normalizer.enabled && s.stability.cadence == Cadence::EndOfSession) {
             const bool http = s.normalizer.url.rfind("http://", 0) == 0 ||
@@ -3176,12 +3181,6 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     s.audio_device_id.clear();
     if (dev_sel > 0 && static_cast<size_t>(dev_sel - 1) < st.devices.size()) {
         s.audio_device_id = st.devices[static_cast<size_t>(dev_sel - 1)].id;
-    }
-
-    const int model_sel =
-        static_cast<int>(SendMessageW(GetDlgItem(dlg, kIdModel), CB_GETCURSEL, 0, 0));
-    if (model_sel >= 0 && static_cast<size_t>(model_sel) < st.models.size()) {
-        s.model_id = st.models[static_cast<size_t>(model_sel)]->id;
     }
 
     {
@@ -3296,26 +3295,22 @@ void build_controls(HWND dlg, DialogState& st) {
     // this dialog tunes behaviour; this one decides whether there is any.
     {
         Cursor c{dlg, inst, &st, 0, col1_x, top, top, col_w};
-        c.section(L"Where your speech service is");
-        c.note(L"Your voice goes to a speech service you run, and comes back as text.", 2);
+        c.section(L"Speech service");
         // The address box comes FIRST and the radios after it, because for most people the only
         // thing to do on this page is type one address and press Test. The second radio is the
         // escape hatch for somebody who already runs a protocol server, not a choice everyone
         // has to make.
-        c.add(L"STATIC", L"Speech service", SS_LEFTNOWORDWRAP, 15, kIdServerUrlLabel);
         c.add(L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 21, kIdServerUrl,
               WS_EX_CLIENTEDGE);
+        c.gap(8);
+
+        c.radio(L"OpenAI-compatible speech service", kIdServerModeLocal, true);
+        c.radio(L"kvit-dictate service", kIdServerModeProtocol, false);
         c.gap(6);
-        c.add(L"STATIC", L"", 0, st.line_h * 3, kIdServerUrlNote);
-        c.gap(2);
 
-        c.radio(L"That address is an OpenAI-compatible speech service", kIdServerModeLocal, true);
-        c.radio(L"I run my own kvit-dictate server (ws://…)", kIdServerModeProtocol, false);
-        c.gap(4);
-
-        c.label_edit(L"Model (optional)", kIdServerModel);
-        c.note(L"Leave empty to use whatever the service offers.", 1);
-        c.add(L"BUTTON", L"Test this service", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
+        set_cue(c.label_edit(L"Model (optional)", kIdServerModel),
+                L"whatever the service offers");
+        c.add(L"BUTTON", L"Test", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
         c.gap(6);
         // Seven lines, not nine. `describe_probe` writes six on a good answer and the box scrolls
         // nothing, so the last two were dead space paid for on *every* page — the dialog is one
@@ -3324,60 +3319,45 @@ void build_controls(HWND dlg, DialogState& st) {
     }
     {
         Cursor c{dlg, inst, &st, 0, col2_x, top, top, col_w};
-        // The live-preview switch lives in this column rather than under the address, because it
-        // is not part of "point this at a service": it is a thing to read about and then decide,
-        // and it belongs with the other two paragraphs that explain consequences.
-        c.section(L"While you are speaking");
-        c.check(L"Show words as they are recognised (experimental)", kIdServerLivePreview);
-        c.note(L"Words show greyed while they are still moving.", 1);
+        c.section(L"Live preview");
+        c.check(L"Show words as they are recognised", kIdServerLivePreview);
+        c.gap(6);
 
         // ── The rewriter (docs/normalizer.md) ───────────────────────────────────────────────
         //
         // One check box, next to the other thing that service does for you, because that is the
         // whole decision. Everything else about it — the route, the styling, the timeout — is
         // derived or defaulted (see kIdNormalizerEnabled).
-        c.section(L"When you finish");
-        c.check(L"Clean the text up before typing it in", kIdNormalizerEnabled);
-        c.note(L"Remove filler words and add punctuation.", 1);
-        // Filled in from the speech service and greyed out until the box above is ticked. It
-        // keeps following that address until the user types here; emptying it starts following
-        // again. Nobody has to touch it, and the deployment that splits the two models across
-        // machines costs one edit.
-        c.label_edit(L"Text service (follows the one above)", kIdNormalizerUrl);
-        c.add(L"STATIC", L"", 0, st.line_h * 2, kIdNormalizerStatus);
-        c.gap(4);
-
-        c.section(L"What crosses your network");
-        c.note(L"Audio goes only to the service you name, unencrypted, and nothing is sent "
-               L"until you press the hotkey.",
-               2);
-        c.add(L"STATIC", L"", 0, st.line_h * 4, kIdServerWarning);
+        c.section(L"Clean-up");
+        c.check(L"Remove filler words and add punctuation", kIdNormalizerEnabled);
+        // Empty means "use the speech service above", and the cue banner shows the address that
+        // resolves to, so the common case is a box nobody has to touch and the split-machine
+        // deployment costs one edit.
+        c.label_edit(L"Text service (optional)", kIdNormalizerUrl);
+        c.add(L"BUTTON", L"Test", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdNormalizerTest);
+        c.gap(6);
+        c.add(L"STATIC", L"", 0, st.line_h * 4, kIdNormalizerStatus);
         c.gap(6);
 
-        c.section(L"When it is not there");
-        c.note(L"The hotkey will not open the microphone, and the tray says why.", 2);
+        // No heading and no prose: it is empty unless the address is one worth warning about,
+        // and a permanent paragraph about the network is not a setting.
+        c.add(L"STATIC", L"", 0, st.line_h * 4, kIdServerWarning);
     }
 
     // ── Page 1: the compose buffer (docs/editing.md) ────────────────────────────────────────
     {
         Cursor c{dlg, inst, &st, 1, col1_x, top, top, col_w};
-        c.section(L"The pill as a compose buffer");
-        c.note(L"Nothing reaches your document until you press Enter. Esc throws it away.", 2);
+        c.section(L"Compose buffer");
         c.check(L"Let me edit the pill before it is typed in", kIdEditingEnabled);
+        c.note(L"Enter types it in, Esc throws it away.", 1);
         c.add(L"STATIC", L"", 0, st.line_h * 3, kIdEditingStatus);
-        c.gap(6);
-
-        c.section(L"While you are editing");
-        c.note(L"The microphone is closed. Press the hotkey to talk again.", 2);
     }
     {
         Cursor c{dlg, inst, &st, 1, col2_x, top, top, col_w};
-        c.section(L"The keyboard belongs to the pill");
-        c.note(L"Editing keys go to the pill, not to your document.", 1);
+        c.section(L"Keyboard");
         c.label_combo(L"Any other key (Ctrl+S, F5, Alt+Tab)", kIdEditingForeign);
 
         c.section(L"Mouse");
-        c.note(L"Click to place the caret, drag to select, scroll to read back.", 2);
         c.check(L"Let me click and scroll inside the pill", kIdEditingMouse);
     }
 
@@ -3387,30 +3367,23 @@ void build_controls(HWND dlg, DialogState& st) {
         c.section(L"Activation");
         c.label_combo(L"Hotkey", kIdHotkey);
         c.check(L"Push to talk — hold the hotkey, release to type it in", kIdPushToTalk);
-        c.note(L"Unticked, the hotkey toggles: press to start, press again to finish.", 2);
 
-        c.section(L"Endpoint silence — ends a sentence");
-        c.note(L"How long a pause finishes a sentence. The session keeps running.", 2);
-        c.label_edit(L"Endpoint silence (ms, default 800)", kIdEndpointMs, ES_NUMBER);
-
-        c.section(L"Session silence — ends the session");
-        c.note(L"How long the session survives with no speech at all.", 1);
-        c.label_edit(L"Session silence (ms, default 120000)", kIdSessionMs, ES_NUMBER);
+        c.section(L"Silence");
+        c.label_edit(L"Ends a sentence after (ms, default 800)", kIdEndpointMs, ES_NUMBER);
+        c.label_edit(L"Ends the session after (ms, default 120000)", kIdSessionMs, ES_NUMBER);
         c.check(L"Never end the session on silence", kIdSessionNever);
     }
     {
         Cursor c{dlg, inst, &st, 2, col2_x, top, top, col_w};
-        c.section(L"Stability — what is safe to commit");
-        c.note(L"Committed text is never repaired. Leave these alone unless you are tuning.", 2);
+        c.section(L"Stability");
         c.label_edit(L"N — hypotheses compared (default 2)", kIdStabN, ES_NUMBER);
         c.label_edit(L"M — clusters retracted from the decode head (default 3)", kIdStabM,
                      ES_NUMBER);
         c.label_edit(L"T — milliseconds unchanged before committing (default 200)", kIdStabT,
                      ES_NUMBER);
 
-        c.section(L"Cadence — when it is typed in");
-        c.note(L"Timing only. It can delay a commit, never widen one.", 1);
-        c.label_combo(L"Cadence", kIdCadence);
+        c.section(L"Cadence");
+        c.label_combo(L"Mode", kIdCadence);
         c.label_edit(L"Interval (ms, used only by \"periodic\")", kIdCadenceMs, ES_NUMBER);
     }
 
@@ -3435,10 +3408,6 @@ void build_controls(HWND dlg, DialogState& st) {
         c.note(L"process.exe = sendinput | clipboard [, ctrl-shift-v] [, unsupported]", 2);
         c.multiline(kIdAppPolicies, 110);
 
-        c.section(L"Model and backend");
-        c.note(L"Selecting a model restarts the sidecar under its own interpreter.", 2);
-        c.label_combo(L"Model", kIdModel);
-        c.add(L"STATIC", L"", 0, 44, kIdModelStatus);
     }
 
     // ── Page 3: overlay, privacy, vocabulary ────────────────────────────────────────────────
@@ -3467,7 +3436,6 @@ void build_controls(HWND dlg, DialogState& st) {
     {
         Cursor c{dlg, inst, &st, 4, col2_x, top, top, col_w};
         c.section(L"Privacy and diagnostics");
-        c.note(L"Nothing you dictate is written to disk unless you tick the box below.", 2);
         c.label_combo(L"Diagnostic log level", kIdLogLevel);
         c.check(L"Write diagnostics to a file (shapes and timings, never text)", kIdDiagFile);
         c.check(L"Log recognised text to a transcript file (off by default)", kIdTranscript);
@@ -3476,8 +3444,8 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Start kvit-dictate with Windows", kIdStartup);
 
         c.section(L"Vocabulary context");
-        c.note(L"One term per line, sent with each session.", 1);
         c.check(L"Send vocabulary context to the model", kIdSendContext);
+        c.note(L"One term per line.", 1);
         c.multiline(kIdContextTerms, 90);
     }
 
@@ -3490,7 +3458,7 @@ void build_controls(HWND dlg, DialogState& st) {
     if (tabs) {
         SendMessageW(tabs, WM_SETFONT, reinterpret_cast<WPARAM>(st.font), TRUE);
         const wchar_t* names[kPageCount] = {L"Server", L"Compose buffer", L"Dictation",
-                                            L"Injection && model", L"Overlay && privacy"};
+                                            L"Injection", L"Overlay && privacy"};
         for (int i = 0; i < kPageCount; ++i) {
             TCITEMW item{};
             item.mask = TCIF_TEXT;
@@ -3684,6 +3652,22 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case kMsgNormalizeTestDone: {
+            auto* text = reinterpret_cast<std::wstring*>(lp);
+            if (st) {
+                st->normalize_test_running = false;
+                // Through refresh, not EnableWindow: by the time an answer lands the user may
+                // have unticked the feature, and the button follows the feature.
+                refresh_normalizer_controls(hwnd);
+                if (static_cast<uint32_t>(wp) == st->normalize_test_generation &&
+                    text != nullptr) {
+                    SetWindowTextW(GetDlgItem(hwnd, kIdNormalizerStatus), text->c_str());
+                }
+            }
+            delete text;
+            return 0;
+        }
+
         case WM_NOTIFY: {
             auto* hdr = reinterpret_cast<NMHDR*>(lp);
             if (st && hdr && hdr->idFrom == kIdTabs && hdr->code == TCN_SELCHANGE) {
@@ -3750,30 +3734,25 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // The rewriter's precondition is the same one, so it follows the same
                         // combo. Both pages are told at once rather than each finding out when
                         // it is next shown.
-                        refresh_normalizer_controls(hwnd, *st);
+                        refresh_normalizer_controls(hwnd);
                     }
                     return 0;
                 case kIdEditingEnabled:
                     refresh_editing_page(hwnd);
                     return 0;
                 case kIdNormalizerEnabled:
-                    refresh_normalizer_controls(hwnd, *st);
+                    refresh_normalizer_controls(hwnd);
                     return 0;
                 case kIdNormalizerUrl:
-                    // The user typing here is what stops the address following the speech
-                    // service. `setting_normalizer_url` is why this can tell that apart from
-                    // the refresh writing the derived address into the same box.
-                    if (code == EN_CHANGE && !st->setting_normalizer_url) {
-                        st->normalizer_url_follows =
-                            get_text(GetDlgItem(hwnd, kIdNormalizerUrl)).empty();
-                        refresh_normalizer_controls(hwnd, *st);
-                    }
-                    return 0;
-                case kIdModel:
-                    if (code == CBN_SELCHANGE) update_model_status(hwnd, *st);
+                    // Whether there is an address at all is what decides if the check box above
+                    // is available, and that can change with every keystroke here.
+                    if (code == EN_CHANGE) refresh_normalizer_controls(hwnd);
                     return 0;
                 case kIdServerTest:
                     start_server_test(hwnd, *st);
+                    return 0;
+                case kIdNormalizerTest:
+                    start_normalize_test(hwnd, *st);
                     return 0;
                 case kIdServerUrl:
                     if (code == EN_CHANGE) {
@@ -3782,7 +3761,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         update_server_warning(hwnd);
                         // The rewriter's address is derived from this box, and whether there is
                         // one at all decides if its check box is available at all.
-                        refresh_normalizer_controls(hwnd, *st);
+                        refresh_normalizer_controls(hwnd);
                     }
                     return 0;
                 case kIdServerModeLocal:
@@ -3792,7 +3771,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // recomputed here rather than only on the next keystroke.
                     update_server_mode_ui(hwnd);
                     update_server_warning(hwnd);
-                    refresh_normalizer_controls(hwnd, *st);
+                    refresh_normalizer_controls(hwnd);
                     return 0;
                 case kIdTheme:
                     if (code == CBN_SELCHANGE) {
@@ -3888,7 +3867,16 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// The one open dialog, published for open_settings_dialog_window(). Not atomic and not
+// guarded: the dialog is created, pumped and destroyed on one thread, and the accessor is
+// documented as belonging to that thread too.
+HWND g_open_dialog = nullptr;
+
 }  // namespace
+
+uintptr_t open_settings_dialog_window() noexcept {
+    return reinterpret_cast<uintptr_t>(g_open_dialog);
+}
 
 bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
                           const ModelManifest& manifest) {
@@ -4010,6 +3998,38 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
         }
     }
 
+    g_open_dialog = dlg;
+
+    // ── Centre it ────────────────────────────────────────────────────────────────────────────
+    //
+    // CW_USEDEFAULT above lets Windows place the window, and Windows cascades from the *owner* —
+    // which here is a message-only window with no position at all, so every launch landed in the
+    // top-left corner of the primary monitor.
+    //
+    // The monitor under the pointer, not the primary one and not the owner's: the tray menu the
+    // user just clicked is where the pointer is, and on a multi-monitor desktop that is the
+    // screen they are looking at. Clamped to the work area rather than centred blindly, so a
+    // dialog taller than the screen starts at the top with its tabs reachable instead of
+    // hanging equally off both ends.
+    {
+        RECT frame{};
+        POINT cursor{};
+        if (GetWindowRect(dlg, &frame) && GetCursorPos(&cursor)) {
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi)) {
+                const int w = frame.right - frame.left;
+                const int h = frame.bottom - frame.top;
+                int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
+                int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2;
+                if (x < mi.rcWork.left) x = mi.rcWork.left;
+                if (y < mi.rcWork.top) y = mi.rcWork.top;
+                SetWindowPos(dlg, nullptr, x, y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
+
     // Modal by hand rather than DialogBoxParam, because there is no dialog template: disable the
     // owner, pump until the dialog is destroyed, then re-enable. Re-enabling BEFORE the window is
     // destroyed is what stops Windows activating another application's window in between.
@@ -4036,6 +4056,7 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
         }
     }
 
+    g_open_dialog = nullptr;
     if (owner_hwnd && owner_was_enabled) EnableWindow(owner_hwnd, TRUE);
     if (IsWindow(dlg)) DestroyWindow(dlg);
     if (owner_hwnd) SetActiveWindow(owner_hwnd);

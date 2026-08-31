@@ -2671,8 +2671,20 @@ void App::show_settings() {
     // from the tray, or from a second launch of the executable, which posts it here rather than
     // exiting silently. One dialog is the answer to all of them.
     if (settings_open_) {
-        if (HWND owned = GetLastActivePopup(hwnd_); owned != nullptr && owned != hwnd_) {
-            SetForegroundWindow(owned);
+        // Raise the one that is already up. GetLastActivePopup(hwnd_) was the old way and could
+        // never work: hwnd_ is a message-only window, which tracks no popups and returns itself,
+        // so choosing Settings again while the dialog sat behind another window did nothing at
+        // all — which reads exactly like a broken menu item.
+        //
+        // Restore first (it can be minimised), then three calls rather than one, because
+        // SetForegroundWindow alone is refused when this process does not own the foreground —
+        // the very case this is for. BringWindowToTop and SetActiveWindow together get the
+        // window in front even when Windows declines to give it focus.
+        if (HWND dlg = reinterpret_cast<HWND>(kd::open_settings_dialog_window())) {
+            if (IsIconic(dlg)) ShowWindow(dlg, SW_RESTORE);
+            BringWindowToTop(dlg);
+            SetForegroundWindow(dlg);
+            SetActiveWindow(dlg);
         }
         return;
     }
