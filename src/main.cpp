@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <deque>
 #include <iterator>
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "anchor.h"
@@ -105,6 +107,25 @@ constexpr uint64_t kFinalizeGraceMs = 5000;
 // again. Long enough to read the paragraph the user scrolled to, short enough that a notch they
 // did not mean for the pill costs them a few seconds rather than the session.
 constexpr uint64_t kScrollRepinMs = 6000;
+
+// `scheme://host:port` out of a URL, lowercased, or empty when there is no authority to take.
+// Used for one question only: are the rewriter and the speech service the same machine, and
+// therefore competing for it? See App::pump_normalize.
+//
+// Deliberately not a URL parser. Nothing downstream of this consumes the result — it decides
+// whether to wait, and a comparison that is wrong in either direction costs a rewrite arriving a
+// pause later or a pause earlier than it might have.
+std::string url_authority(std::string_view url) {
+    const size_t scheme = url.find("://");
+    if (scheme == std::string_view::npos) return std::string();
+    const size_t host = scheme + 3;
+    const size_t end = url.find('/', host);
+    std::string out(url.substr(0, end == std::string_view::npos ? url.size() : end));
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
 
 // How long a hotkey press waits for a model that is still loading before it is given up on. The
 // protocol allows the sidecar 180 s to reach ready (docs/protocol.md §1.1 READY_TIMEOUT_MS), which
@@ -336,6 +357,9 @@ private:
     // unstable text for the utterance in progress.
     void render_preview(std::string_view tail);
     void note_input_level(const kd::audio::AudioChunk& chunk);
+    // Are the rewriter and the speech service the same machine? Re-derived whenever either
+    // address can have changed. See pump_normalize().
+    void note_rewriter_host();
     // Push the microphone level and the transcriber's lag at the pill, and pick between
     // Listening and Speaking from the first of them. Called from the tick that already runs.
     void publish_listening_state();
@@ -521,6 +545,13 @@ private:
     std::deque<kd::proto::Message> ipc_queue_;
     std::mutex audio_mutex_;
     std::vector<int16_t> audio_queue_;
+
+    // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
+    // Read only by pump_normalize(), and only when the rewriter is on the same host.
+    bool asr_utterance_open_ = false;
+    // Do `normalizer.url` and `server.url` name the same host and port? Resolved once at
+    // startup; see pump_normalize() for what it gates.
+    bool rewriter_shares_the_speech_host_ = false;
 
     // When the wheel last moved the pill's view, or 0 when the view is following the newest
     // words. See the tick that consumes it for why an unpinned view has to expire.
@@ -791,6 +822,7 @@ bool App::startup() {
             KD_LOG_ERROR("normalizer disabled: %s", st.to_string().c_str());
         }
     }
+    note_rewriter_host();
 
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -1213,6 +1245,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (session_ != nullptr) apply(session_->on_tick());
                 if (commit_ != nullptr) perform_commit(commit_->on_tick());
+                // A chunk held back while the recogniser was busy needs a way out that does not
+                // depend on another utterance being committed — otherwise the last one of a
+                // fast passage waits for speech that may never come. Only while a session is
+                // running: `finish_dictation` leaves the queue for `drain_normalize_queue` to
+                // discard, and re-sending it afterwards would rewrite text already typed.
+                if (target_.has_value() && !normalize_chunks_.empty()) pump_normalize();
                 if (overlay_ != nullptr) {
                     if (anchor_dirty_.exchange(false, std::memory_order_acq_rel)) {
                         {
@@ -1613,9 +1651,13 @@ void App::apply(const kd::SessionMachine::Outcome& o, const kd::proto::Message* 
 
 void App::apply_text(const kd::proto::Message& m) {
     if (commit_ == nullptr) return;
+    // Set before perform_commit, not after: that call reaches pump_normalize() on the deferred
+    // path, and a flag updated afterwards would be describing the previous message.
     if (const auto* p = m.get_if<kd::proto::PartialMsg>()) {
+        asr_utterance_open_ = true;
         perform_commit(commit_->on_partial(*p));
     } else if (const auto* f = m.get_if<kd::proto::FinalMsg>()) {
+        asr_utterance_open_ = false;
         perform_commit(commit_->on_final(*f));
     }
 }
@@ -2241,6 +2283,7 @@ void App::begin_dictation() {
     last_text_ms_ = clock_.now_ms();
     input_level_.store(0.0f, std::memory_order_relaxed);
     scroll_touched_ms_ = 0;
+    asr_utterance_open_ = false;
     // Cleared here for the reason note_session_ended() is: the abort paths skip end_dictation
     // entirely, and a queue left behind would spend the next session rewriting the previous
     // one's words at offsets that no longer mean anything.
@@ -2458,6 +2501,20 @@ void App::render_preview(std::string_view tail) {
 // arrives without the text it indexes is an offset into the previous frame.
 // ─── The rewriter (normalizer.h) ────────────────────────────────────────────────────────────
 
+void App::note_rewriter_host() {
+    const std::string speech = url_authority(settings_.server.url);
+    const std::string rewriter = url_authority(settings_.normalizer.url);
+    const bool shared = !speech.empty() && speech == rewriter;
+    if (shared == rewriter_shares_the_speech_host_) return;
+    rewriter_shares_the_speech_host_ = shared;
+    // At INFO because it changes when the rewrite reaches the pill, and "why did the rewriting
+    // stop happening while I talk" has to be answerable from the log.
+    KD_LOG_INFO("the rewriter is %s the speech service (%s vs %s); rewrites %s",
+                shared ? "on" : "not on", rewriter.empty() ? "(none)" : rewriter.c_str(),
+                speech.empty() ? "(none)" : speech.c_str(),
+                shared ? "wait for a pause in speech" : "go out as soon as a chunk closes");
+}
+
 void App::pump_normalize() {
     if (normalizer_ == nullptr) return;
     // Belt and braces with Settings::normalise(), which already forces `enabled` off under any
@@ -2470,6 +2527,27 @@ void App::pump_normalize() {
     // requests on a small model that serves one utterance in a fraction of the pause that ended
     // it. The queue behind this is what makes the serialisation free.
     if (normalize_pending_id_ != 0) return;
+
+    // And not while the recogniser is mid-utterance, **when the two are the same machine**.
+    //
+    // A chunk is queued at an utterance boundary because that is meant to be the one moment in a
+    // session when both models are idle: the endpointer has just fired on silence, so nothing is
+    // decoding. For a speaker who pauses between sentences that holds. For one who does not, the
+    // boundary is `soft_max_utterance_ms` firing at 20 s while the speech never stops — and then
+    // the rewrite and the next preview hop are two requests on one GPU, with the preview the one
+    // the speaker is waiting to see.
+    //
+    // Measured 2026-08-31 against a shared host: rewrites took 0.5 s at 90 bytes and 2.5 s at
+    // 505, every one of them overlapping speech, and the previews they were competing with are
+    // whole-utterance re-decodes that grow with the sentence. What the user saw was a preview
+    // that stopped moving as soon as they talked for more than a few seconds.
+    //
+    // Gated on the two addresses rather than applied always, because the contention is the only
+    // reason to hold: point `normalizer.url` at a different machine and there is nothing to
+    // wait for, and the rewrite should land in the pill as soon as the chunk is closed. The
+    // finalize path is exempt for the obvious reason — nothing is decoding after `stop`, and
+    // `stopped` is already waiting on this queue.
+    if (rewriter_shares_the_speech_host_ && asr_utterance_open_ && !finalizing_) return;
 
     while (!normalize_chunks_.empty()) {
         const std::string& chunk = normalize_chunks_.front();
@@ -2905,6 +2983,7 @@ void App::apply_settings(kd::Settings next) {
     // field is one more place for a field to be forgotten.
     if (injector_ != nullptr) injector_->set_config(settings_.inject);
     if (normalizer_ != nullptr) normalizer_->set_config(settings_.normalizer);
+    note_rewriter_host();
     if (commit_ != nullptr) commit_->set_params(settings_.stability);
     if (session_ != nullptr) session_->set_config(settings_.session);
     if (overlay_ != nullptr) {
