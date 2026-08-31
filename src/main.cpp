@@ -101,6 +101,11 @@ void CALLBACK heartbeat_timer_proc(HWND, UINT, UINT_PTR, DWORD) { kd::note_ui_al
 // strand the session forever.
 constexpr uint64_t kFinalizeGraceMs = 5000;
 
+// How long a scrolled-back pill stays where the wheel left it before following the newest words
+// again. Long enough to read the paragraph the user scrolled to, short enough that a notch they
+// did not mean for the pill costs them a few seconds rather than the session.
+constexpr uint64_t kScrollRepinMs = 6000;
+
 // How long a hotkey press waits for a model that is still loading before it is given up on. The
 // protocol allows the sidecar 180 s to reach ready (docs/protocol.md §1.1 READY_TIMEOUT_MS), which
 // is far too long to hold a microphone-shaped promise on screen; a model that has not loaded in
@@ -516,6 +521,10 @@ private:
     std::deque<kd::proto::Message> ipc_queue_;
     std::mutex audio_mutex_;
     std::vector<int16_t> audio_queue_;
+
+    // When the wheel last moved the pill's view, or 0 when the view is following the newest
+    // words. See the tick that consumes it for why an unpinned view has to expire.
+    uint64_t scroll_touched_ms_ = 0;
 
     // The microphone's own level, 0 to 1, written by the capture thread and read by the UI
     // thread's tick. See note_input_level() for why this exists at all.
@@ -1176,6 +1185,25 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
                     hint_expires_ms_ = 0;
                     if (overlay_ != nullptr) overlay_->clear_hint();
+                }
+                // And the scrolled-back view, on the same tick and for a sharper reason.
+                //
+                // `Overlay::scroll_by_lines` unpins the view permanently, and the only things
+                // that ever re-pinned it were the start of a session, the start of editing and
+                // the end. So one wheel notch — including one meant for the document underneath,
+                // which the pill eats whenever the pointer happens to be over it (§5.2) — froze
+                // the preview for the rest of the session while speech piled up below the
+                // window, with nothing on screen to say why. That is half of "when it gets
+                // longer I don't see the new text any more"; the scroll indicator is the other
+                // half.
+                //
+                // Only while dictating. Editing is the state where the user is deliberately
+                // reading their buffer with the microphone shut, and yanking them to the bottom
+                // mid-sentence would be the opposite of a fix.
+                if (scroll_touched_ms_ != 0 && !editing_ &&
+                    clock_.now_ms() - scroll_touched_ms_ >= kScrollRepinMs) {
+                    scroll_touched_ms_ = 0;
+                    if (overlay_ != nullptr) overlay_->scroll_to_bottom();
                 }
                 // Two seconds' worth of ticks. See poll_taskbar_theme() for why the taskbar's
                 // scheme is polled at all rather than arriving as a message.
@@ -1994,6 +2022,7 @@ void App::apply_pill_pointer(const kd::PillPost& p) {
         // looking for. A positive delta is away from the user, which scrolls back.
         const int32_t notches = p.wheel / WHEEL_DELTA;
         overlay_->scroll_by_lines(notches != 0 ? -notches * 3 : (p.wheel > 0 ? -3 : 3));
+        scroll_touched_ms_ = clock_.now_ms();
         return;
     }
 
@@ -2211,6 +2240,7 @@ void App::begin_dictation() {
     // inherited from the previous session's last utterance.
     last_text_ms_ = clock_.now_ms();
     input_level_.store(0.0f, std::memory_order_relaxed);
+    scroll_touched_ms_ = 0;
     // Cleared here for the reason note_session_ended() is: the abort paths skip end_dictation
     // entirely, and a queue left behind would spend the next session rewriting the previous
     // one's words at offsets that no longer mean anything.

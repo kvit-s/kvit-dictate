@@ -298,8 +298,9 @@ constexpr DotColors kDots[2] = {
 //
 // Front-elision is what makes this a scrolled view rather than a truncated one: the box always
 // shows the newest `kMaxLines` worth of text, which is the bottom of a transcript that only ever
-// grows. There is no scrollbar and no way to look further back — under Cadence::EndOfSession a
-// whole session accumulates behind this window and only the tail is visible.
+// grows. Scrollback (docs/editing.md §7.3) reaches the rest, and the indicator down the right
+// padding strip is what says the rest is there — for a while this file said "there is no
+// scrollbar and no way to look further back" and only the second half stopped being true.
 //
 // Three lines suited a preview that emptied into the document every sentence. It does not suit a
 // buffer that holds a whole session, so this is eight — about a paragraph. Note the interaction
@@ -1160,6 +1161,11 @@ HRESULT OverlayCore::paint_once() {
     // section below needs to put a window onto a buffer taller than the pill.
     float view_top = 0.0f;      // how far down the layout the visible window starts
     float view_height = 0.0f;   // how tall that window is
+    // What the scroll indicator needs, hoisted out of the block that computes them: how many
+    // lines the buffer has, and how many of them the window is showing. Equal means the whole
+    // buffer fits and there is nothing to indicate.
+    uint32_t total_lines = 0;
+    uint32_t shown_lines = 0;
     bool caret_known = false;
     float caret_x = 0.0f, caret_y = 0.0f, caret_h = 0.0f;
     std::vector<DWRITE_HIT_TEST_METRICS> selection_boxes;
@@ -1290,6 +1296,8 @@ HRESULT OverlayCore::paint_once() {
 
             view_top = line_top[scroll_line];
             view_height = line_top[scroll_line + visible] - view_top;
+            total_lines = line_count;
+            shown_lines = visible;
         } else {
             view_height = body_metrics.height;
         }
@@ -1540,6 +1548,52 @@ HRESULT OverlayCore::paint_once() {
         hit_origin_x = origin_x;
         hit_origin_y = origin_y;
         hit_dpi = monitor_dpi;
+
+        // ── The scroll indicator (docs/editing.md §7.3) ─────────────────────────────────────
+        //
+        // Until this there was none, and overlay.cpp said so in as many words: "There is no
+        // scrollbar and no way to look further back." Scrollback then arrived and made the second
+        // half untrue while leaving the first half in place, which is the worse of the two
+        // states — the wheel and the arrow keys move a view whose position nothing reports. The
+        // front-elision ellipsis is not that report: it appears at `kMaxDisplayUnits`, about five
+        // thousand words, so a session showing the last eight lines of eighteen shows nothing at
+        // all to say the other ten exist. Reported as "it starts scrolling, but I don't see a
+        // scroll bar appearing".
+        //
+        // In the right padding strip, which is already reserved and empty, so it costs no width
+        // and cannot reflow anything. Track and thumb, proportional, drawn only when there is
+        // something off-screen — a full-height thumb on a buffer that fits would be furniture.
+        if (total_lines > shown_lines && shown_lines > 0 && brush_border && brush_unstable) {
+            const float bar_w = std::max(2.0f, pad * 0.4f);
+            const float bar_x = draw_w - pad * 0.5f - bar_w * 0.5f;
+            const float bar_top = pad;
+            const float bar_bottom = pad + body_h;
+            const float bar_r = bar_w * 0.5f;
+            if (bar_bottom - bar_top > bar_w * 2.0f) {
+                const D2D1_COLOR_F was = brush_border->GetColor();
+                brush_border->SetColor(argb(kMeterTrack[painting_dark ? 1 : 0]));
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(bar_x, bar_top, bar_x + bar_w, bar_bottom),
+                                      bar_r, bar_r),
+                    brush_border.get());
+                brush_border->SetColor(was);
+
+                const float track_h = bar_bottom - bar_top;
+                // Never shorter than its own width, or a long session's thumb becomes a dot that
+                // reads as a mark on the pill rather than as a position in a buffer.
+                const float thumb_h =
+                    std::max(bar_w * 2.0f, track_h * static_cast<float>(shown_lines) /
+                                               static_cast<float>(total_lines));
+                const float span = static_cast<float>(total_lines - shown_lines);
+                const float at = std::clamp(static_cast<float>(scroll_line) / span, 0.0f, 1.0f);
+                const float thumb_top = bar_top + (track_h - thumb_h) * at;
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(
+                        D2D1::RectF(bar_x, thumb_top, bar_x + bar_w, thumb_top + thumb_h), bar_r,
+                        bar_r),
+                    brush_unstable.get());
+            }
+        }
     }
     const float note_y = pad + body_h + (body_layout ? gap : 0.0f);
     if (note_layout) {
