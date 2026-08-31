@@ -175,6 +175,7 @@ set(KD_CORE_SOURCES
     src/session.cpp
     src/commit_engine.cpp
     src/settings.cpp
+    src/corpus.cpp
     src/edit_buffer.cpp
 
     # Windows-facing, but with no UI: launching and supervising kvit-asrd.exe.
@@ -206,6 +207,7 @@ set(KD_CORE_HEADERS
     src/settings.h
     src/theme.h
     src/tray_icon.h
+    src/corpus.h
     src/edit_buffer.h
     src/translator.h
 )
@@ -446,6 +448,7 @@ if(KD_BUILD_TESTS)
         tests/test_overlay.cpp
         tests/test_tray_icon.cpp
         tests/test_settings.cpp
+        tests/test_corpus.cpp
         tests/test_edit_buffer.cpp
         tests/test_normalizer.cpp
         tests/test_injector.cpp
@@ -515,6 +518,7 @@ if(KD_BUILD_TESTS)
         anchor          # src/anchor.cpp — diff scorer and DPI maths on synthetic bitmaps
         overlay         # src/overlay.cpp — overlay_mode_for, plan.md §1.5's degradation rule
         tray_icon       # src/tray_icon.cpp — the drawn notification icon: fill means mic-open
+        corpus          # src/corpus.cpp - the prune rule, which deletes the user's data
         edit_buffer     # src/edit_buffer.cpp
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
         normalizer      # src/normalizer.cpp — the term guard and the request/response codecs

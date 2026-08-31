@@ -99,6 +99,7 @@
 #include <vector>
 
 #include "anchor.h"
+#include "corpus.h"
 #include "commit_engine.h"
 #include "hotkey.h"
 #include "normalizer.h"
@@ -348,6 +349,12 @@ struct Settings {
     // invisible to screen recorders too. Nothing outside the process can see it. That is what
     // makes an on-disk copy the only recovery there can be, and why this defaults to on.
     bool crash_recovery = true;
+
+    // corpus.h — the dictation corpus: audio plus the hypothesis timeline, kept so a different
+    // model can be asked the same question later. **Off unless the user turned it on**, which is
+    // the opposite of `crash_recovery` above and for a reason: this one is durable, accumulating
+    // and includes the recording, which is precisely what plan.md §1.9 is about.
+    CorpusConfig corpus;
 
     bool start_with_windows = false;
 

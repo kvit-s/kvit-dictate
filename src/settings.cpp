@@ -826,6 +826,8 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "audio_device_id": "",
 //     "privacy":   { "log_level": "info", "diagnostics_file_enabled": false,
 //                    "crash_recovery": true,
+//                    "corpus": { "enabled": false, "dir": "", "max_bytes": 8589934592,
+//                                "max_age_days": 60 },
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,
@@ -843,6 +845,13 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 // undoing.
 
 void Settings::normalise() {
+    // corpus.h: an enabled corpus with no directory would refuse every session at `open`. Give
+    // it the same home as settings.json, which is correct if unambitious — a collection run of
+    // any length wants somewhere with room, and that is what the field is for.
+    if (corpus.enabled && corpus.dir.empty()) {
+        corpus.dir = default_settings_path().parent_path() / "corpus";
+    }
+
     // `server.mode` and `server.url` must agree, and where they cannot, the URL wins.
     //
     // A `ws://` or `wss://` address in Local mode is never meaningful: `kvit-asrd` speaks
@@ -1292,6 +1301,12 @@ std::string serialize_settings(const Settings& s) {
         put_str(o, "log_level", log::to_string(s.log_level));
         put_bool(o, "diagnostics_file_enabled", s.diagnostics_file_enabled);
         put_bool(o, "crash_recovery", s.crash_recovery);
+        json::Value c = json::Value::object();
+        put_bool(c, "enabled", s.corpus.enabled);
+        put_str(c, "dir", path_to_utf8(s.corpus.dir));
+        put_u64(c, "max_bytes", s.corpus.max_bytes);
+        put_u64(c, "max_age_days", s.corpus.max_age_days);
+        o.set("corpus", std::move(c));
         json::Value t = json::Value::object();
         put_bool(t, "enabled", s.transcript.enabled);
         put_str(t, "file", path_to_utf8(s.transcript.file));
@@ -1616,6 +1631,19 @@ Result<Settings> parse_settings(std::string_view json_text) {
         o.str_opt("log_level", level);
         o.bool_opt("diagnostics_file_enabled", s.diagnostics_file_enabled);
         o.bool_opt("crash_recovery", s.crash_recovery);
+        if (const json::Value* cv = v->find("corpus")) {
+            Obj c(*cv, "settings.privacy.corpus");
+            c.bool_opt("enabled", s.corpus.enabled);
+            std::string dir = path_to_utf8(s.corpus.dir);
+            c.str_opt("dir", dir);
+            s.corpus.dir = path_from_utf8(dir);
+            // 0 disables each bound rather than meaning "keep nothing" — corpus_prune_set is
+            // explicit about that, and the ceiling here is only a guard against a typo that
+            // would overflow the arithmetic downstream.
+            c.u64_opt("max_bytes", s.corpus.max_bytes, 0, 1ull << 44);
+            c.u32_opt("max_age_days", s.corpus.max_age_days, 0, 3650);
+            if (c.failed()) return Status{StatusCode::Malformed, c.error()};
+        }
         if (o.failed()) return Status{StatusCode::Malformed, o.error()};
         if (!log::parse_level(level, s.log_level)) {
             return Status{StatusCode::Malformed,

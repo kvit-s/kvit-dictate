@@ -44,6 +44,7 @@
 #include "anchor.h"
 #include "audio_capture.h"
 #include "commit_engine.h"
+#include "corpus.h"
 #include "hotkey.h"
 #include "normalizer.h"
 #include "injector.h"
@@ -182,6 +183,10 @@ constexpr UINT kMenuToggle = 100;
 constexpr UINT kMenuSettings = 101;
 constexpr UINT kMenuOpenLogs = 102;
 constexpr UINT kMenuQuit = 103;
+// corpus.h: the per-session opt-out. A fortnight of collection will contain a session
+// nobody wants kept, and "delete it afterwards" is not a control anyone reaches in time.
+constexpr UINT kMenuCorpusSkip = 104;
+constexpr UINT kMenuCorpusOpen = 105;
 
 const wchar_t kWindowClass[] = L"kvit-dictate-message-window";
 const wchar_t kSingleInstanceMutex[] = L"Local\\kvit-dictate-single-instance";
@@ -389,6 +394,10 @@ private:
     // Are the rewriter and the speech service the same machine? Re-derived whenever either
     // address can have changed. See pump_normalize().
     void note_rewriter_host();
+    // Start recording this session, if the user asked for a corpus and did not skip this one.
+    void corpus_open();
+    // What the corpus needs to know about a `partial` or `final` to be replayable offline.
+    void corpus_note_text(const kd::proto::Message& m);
     // Push the microphone level and the transcriber's lag at the pill, and pick between
     // Listening and Speaking from the first of them. Called from the tick that already runs.
     void publish_listening_state();
@@ -584,6 +593,13 @@ private:
     // whether a late preview is something the speaker is actually waiting on.
     uint64_t last_speech_ms_ = 0;
 
+    // corpus.h. Recording is per session and only when `privacy.corpus.enabled`; `corpus_skip_`
+    // is the per-session opt-out from the tray, which survives until the session ends and is
+    // then cleared — a "don't record this one" that silently became "don't record ever" would be
+    // the worse of the two mistakes, and so would its opposite.
+    kd::Corpus corpus_;
+    bool corpus_skip_ = false;
+
     // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
     // Read only by pump_normalize(), and only when the rewriter is on the same host.
     bool asr_utterance_open_ = false;
@@ -629,6 +645,10 @@ void App::on_audio(const kd::audio::AudioChunk& chunk) {
         audio_queue_.insert(audio_queue_.end(), chunk.samples, chunk.samples + chunk.count);
     }
     note_input_level(chunk);
+    // The same samples that go on the wire, on the capture thread that already owns them. This
+    // is the one call here that touches the corpus, and `Corpus` is documented as expecting
+    // exactly that: one writer for the audio, the UI thread for everything else.
+    corpus_.append_audio(chunk.samples, chunk.count);
     if (hwnd_ != nullptr) PostMessageW(hwnd_, kMsgAudioQueue, 0, 0);
 }
 
@@ -1266,6 +1286,10 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 // between utterances.
                 if (recovery_dirty_ && clock_.now_ms() - recovery_saved_ms_ >= kRecoverySaveMs) {
                     save_recovery();
+                    // On the same schedule and for the same reason: a WAV header carries the
+                    // sample count, so a recording whose process died mid-session would otherwise
+                    // claim zero bytes and play as silence.
+                    corpus_.flush_sizes();
                 }
                 // And the scrolled-back view, on the same tick and for a sharper reason.
                 //
@@ -1342,6 +1366,32 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                     return 0;
+                case kMenuCorpusSkip:
+                    corpus_skip_ = !corpus_skip_;
+                    // Takes effect now, not at the next session: the reason someone reaches for
+                    // this is that the thing they did not want recorded is being said.
+                    if (corpus_skip_ && corpus_.active()) {
+                        const std::filesystem::path dir = corpus_.session_dir();
+                        corpus_.close("skipped by the user", kd::json::Value::object());
+                        std::error_code ec;
+                        std::filesystem::remove_all(dir, ec);
+                        KD_LOG_INFO("corpus: this session was skipped and %s removed",
+                                    dir.string().c_str());
+                    } else if (!corpus_skip_ && target_.has_value() && !corpus_.active()) {
+                        corpus_open();
+                    }
+                    return 0;
+                case kMenuCorpusOpen: {
+                    const std::filesystem::path dir =
+                        settings_.corpus.dir.empty()
+                            ? kd::default_settings_path().parent_path() / "corpus"
+                            : settings_.corpus.dir;
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr,
+                                  SW_SHOWNORMAL);
+                    return 0;
+                }
                 case kMenuSettings:
                     PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
                     return 0;
@@ -1702,6 +1752,7 @@ void App::apply_text(const kd::proto::Message& m) {
     if (commit_ == nullptr) return;
     // Set before perform_commit, not after: that call reaches pump_normalize() on the deferred
     // path, and a flag updated afterwards would be describing the previous message.
+    corpus_note_text(m);
     if (const auto* p = m.get_if<kd::proto::PartialMsg>()) {
         asr_utterance_open_ = true;
         perform_commit(commit_->on_partial(*p));
@@ -2370,6 +2421,9 @@ void App::begin_dictation() {
         overlay_->set_state(kd::OverlayState::Listening);
         overlay_->show();
     }
+    // After the target is settled and the session id exists, so the header describes the session
+    // that is actually about to run rather than the one that was requested.
+    corpus_open();
     KD_LOG_INFO("dictation started: process=%s pid=%lu password_field=%d console=%d compose=%d",
                 target_->process_name.c_str(),
                 static_cast<unsigned long>(target_->process_id),
@@ -2732,6 +2786,19 @@ void App::drain_normalize_queue() {
                 next += cur.substr(at + chunk.size());
                 edit_.set_text(next);
                 recovery_dirty_ = true;
+                if (corpus_.active()) {
+                    // Both halves, because which one is *better* is the question a corpus exists
+                    // to answer: `raw` is what the recogniser produced and `text` is what the
+                    // rewriter made of it, and an evaluation that only kept one could not score
+                    // the other.
+                    kd::json::Value ev = kd::json::Value::object();
+                    ev.set("at", kd::json::Value::number(static_cast<int64_t>(at)));
+                    ev.set("raw", kd::json::Value::string(r.raw));
+                    ev.set("text", kd::json::Value::string(r.normalized));
+                    ev.set("elapsed_ms",
+                           kd::json::Value::number(static_cast<int64_t>(r.elapsed_ms)));
+                    corpus_.event("normalize", std::move(ev));
+                }
                 normalize_settled_bytes_ = at + lead + r.normalized.size();
                 render_preview({});
             }
@@ -2764,6 +2831,76 @@ void App::push_edit_view() {
     // the binding is held or toggled.
     overlay_->set_key_legend(settings_.hotkey.to_display_string(), composing(),
                              settings_.hotkey.push_to_talk);
+}
+
+// ─── The dictation corpus (corpus.h) ────────────────────────────────────────────────────────
+
+void App::corpus_open() {
+    if (!settings_.corpus.enabled || corpus_skip_) return;
+
+    // Everything a replay needs to reproduce the conditions, because a corpus whose entries were
+    // recorded under settings nobody wrote down cannot be compared with anything. The decoding
+    // parameters matter as much as the model name: `endpoint_silence_ms` decides where utterances
+    // break, and a different value is a different segmentation of the same speech.
+    kd::json::Value h = kd::json::Value::object();
+    h.set("model", kd::json::Value::string(loaded_model_.empty() ? settings_.server.model
+                                                                 : loaded_model_));
+    h.set("service", kd::json::Value::string(settings_.server.url));
+    h.set("language", kd::json::Value::string(std::string("en")));
+    h.set("target", kd::json::Value::string(target_.has_value() ? target_->process_name
+                                                                : std::string()));
+    h.set("cadence", kd::json::Value::string(std::string(
+                         settings_.stability.cadence == kd::Cadence::EndOfSession
+                             ? "end-of-session"
+                             : "immediate")));
+    h.set("endpoint_silence_ms",
+          kd::json::Value::number(static_cast<int64_t>(settings_.session.endpoint_silence_ms)));
+    h.set("live_preview", kd::json::Value::boolean(settings_.server.live_preview));
+    h.set("normalizer", kd::json::Value::boolean(settings_.normalizer.enabled));
+
+    if (const kd::Status st = corpus_.open(settings_.corpus, session_ != nullptr ? session_->current_session_id()
+                                                              : std::string(),
+                    h);
+        !st.ok()) {
+        // Never fatal, and never a dialog. A corpus that cannot be written is a collection run
+        // that misses a session; a dictation that refuses to start because of it would be a
+        // research tool breaking the tool it is researching.
+        KD_LOG_WARN("not recording this session: %s", st.message().c_str());
+    }
+}
+
+void App::corpus_note_text(const kd::proto::Message& m) {
+    if (!corpus_.active()) return;
+    const auto* p = m.get_if<kd::proto::PartialMsg>();
+    const auto* f = m.get_if<kd::proto::FinalMsg>();
+    if (p == nullptr && f == nullptr) return;
+
+    kd::json::Value e = kd::json::Value::object();
+    // `audio_pos_ms` is the protocol's own offset into the session's audio (docs/protocol.md
+    // §8.1), and it is what makes the recording and the hypotheses one artefact rather than two:
+    // utterance boundaries are *derived* from these numbers offline, using exactly the values the
+    // live session used, instead of being guessed at by re-running a VAD over the WAV.
+    e.set("utt", kd::json::Value::number(
+                     static_cast<int64_t>(p != nullptr ? p->utterance_id : f->utterance_id)));
+    e.set("seq", kd::json::Value::number(
+                     static_cast<int64_t>(p != nullptr ? p->seq : f->seq)));
+    // Both fields are optional on one message type and required on the other (protocol.h), and
+    // an absent one is written as null rather than as zero: a corpus that turned "the server did
+    // not say" into "the server said 0" would put a false offset into the one column the offline
+    // segmentation is derived from.
+    if (p != nullptr) {
+        e.set("audio_pos_ms", p->audio_pos_ms.has_value()
+                                  ? kd::json::Value::number(*p->audio_pos_ms)
+                                  : kd::json::Value::null());
+        e.set("stable", kd::json::Value::number(static_cast<int64_t>(p->stable_bytes)));
+    } else {
+        e.set("audio_pos_ms", kd::json::Value::number(f->audio_pos_ms));
+        e.set("stable", f->stable_bytes.has_value()
+                            ? kd::json::Value::number(static_cast<int64_t>(*f->stable_bytes))
+                            : kd::json::Value::null());
+    }
+    e.set("text", kd::json::Value::string(p != nullptr ? p->text : f->text));
+    corpus_.event(p != nullptr ? "partial" : "final", std::move(e));
 }
 
 // ─── Crash recovery ─────────────────────────────────────────────────────────────────────────
@@ -2918,6 +3055,18 @@ void App::finish_dictation(const char* why) {
     // Before target_ is cleared below, and before the overlay is torn down: this is the one path
     // every session ends through, so it is the one place a deferred buffer is guaranteed to be
     // dealt with rather than dropped.
+    // Before flush_deferred_commits, so the recording carries what was actually delivered.
+    if (corpus_.active()) {
+        kd::json::Value tail = kd::json::Value::object();
+        tail.set("delivered", kd::json::Value::string(edit_.text()));
+        tail.set("delivered_bytes", kd::json::Value::number(static_cast<int64_t>(edit_.size())));
+        corpus_.close(why, tail);
+    }
+    // Cleared here rather than at the start of the next session: the tray shows it, and a
+    // "skip this one" that quietly outlived its session would be indistinguishable from the
+    // corpus having switched itself off.
+    corpus_skip_ = false;
+
     flush_deferred_commits(why);
     finalizing_ = false;
     finalize_deadline_ms_ = 0;
@@ -3330,6 +3479,22 @@ void App::show_tray_menu() {
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, (L"Model: " + widen(loaded_model_)).c_str());
     } else {
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Model: not loaded");
+    }
+    // The corpus says so for as long as it is recording. An enabled collection that gave no
+    // sign of itself would be exactly the thing plan.md §1.9 is written to prevent, whatever the
+    // setting said a fortnight ago when it was switched on.
+    if (settings_.corpus.enabled) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (corpus_.active()) {
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"● Recording to the corpus");
+        } else if (corpus_skip_) {
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Corpus: skipping this session");
+        } else {
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Corpus: on, idle");
+        }
+        AppendMenuW(menu, MF_STRING | (corpus_skip_ ? MF_CHECKED : MF_UNCHECKED), kMenuCorpusSkip,
+                    L"Do not record this session");
+        AppendMenuW(menu, MF_STRING, kMenuCorpusOpen, L"Open the corpus folder");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuSettings, L"Settings…");
