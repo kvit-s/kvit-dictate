@@ -340,8 +340,34 @@ constexpr float kMeterMinGutterDip = 26.0f;
 constexpr float kDotLevelFloor = 0.62f;
 constexpr float kDotLevelGain = 0.55f;
 
-// How faint the meter's unfilled track is against the pill, light scheme then dark.
+// How faint the meter's unfilled track is against the pill, light scheme then dark. It is only
+// ever read as the *backdrop* to a saturated, moving fill, so it can afford to be nearly
+// invisible; the scroll indicator's track cannot, and has its own value below.
 constexpr uint32_t kMeterTrack[2] = {0x18000000, 0x20FFFFFF};
+
+// ─── The scroll indicator's dimensions, which are not the meter's ──────────────────────────
+//
+// The first version of this borrowed both: the meter's width and the meter's track colour, with
+// the *unstable* ink for the thumb. On paper that is the same bar. On screen it was invisible,
+// and the meter beside it was not, for three reasons that all had to be fixed together:
+//
+//   * the meter's fill is opaque and saturated and **moves**, so a 2.4 DIP column of it is
+//     unmissable. A static 60%-alpha grey of the same width is not. The thumb takes the pending
+//     ink — the same opaque colour the committed text is drawn in — for that reason.
+//   * it sat 1.2 DIP from a border with a 6 DIP corner radius, at the extreme right edge of a
+//     720 DIP pill, where the eye is not.
+//   * and a proportional thumb says nothing at the overflow that actually happens. Nine lines
+//     with eight visible is a thumb filling 89% of its track, which is indistinguishable from a
+//     buffer that fits — and nine-of-eight is exactly where a session first crosses into
+//     scrolling, so the indicator was absent precisely when it first became true.
+constexpr float kScrollBarWidthDip = 3.5f;
+constexpr uint32_t kScrollTrack[2] = {0x24000000, 0x2CFFFFFF};
+
+// The thumb is proportional between these. The floor stops a long session's thumb collapsing to
+// a dot that reads as a mark on the pill; the ceiling is what makes the *first* line of overflow
+// visible, at the cost of the bar being a slight exaggeration near the bottom of its range.
+// That trade is the right way round: an indicator nobody can see has no accuracy to protect.
+constexpr float kScrollThumbMaxFraction = 0.72f;
 
 // ─── When a stalled transcriber gets said out loud (overlay.h, set_transcriber_lag) ─────────
 //
@@ -1563,15 +1589,20 @@ HRESULT OverlayCore::paint_once() {
         // In the right padding strip, which is already reserved and empty, so it costs no width
         // and cannot reflow anything. Track and thumb, proportional, drawn only when there is
         // something off-screen — a full-height thumb on a buffer that fits would be furniture.
-        if (total_lines > shown_lines && shown_lines > 0 && brush_border && brush_unstable) {
-            const float bar_w = std::max(2.0f, pad * 0.4f);
-            const float bar_x = draw_w - pad * 0.5f - bar_w * 0.5f;
+        if (total_lines > shown_lines && shown_lines > 0 && brush_border && brush_pending) {
+            const float bar_w = std::min(kScrollBarWidthDip, std::max(2.0f, pad - 1.0f));
+            // Centred in the *usable* part of the right padding strip — the strip less the
+            // border line that runs down its outer edge — rather than in the strip itself, which
+            // put a 3.5 DIP bar a quarter of a DIP from a 1 DIP border under a 6 DIP corner
+            // radius. Clearing both sides is what stops it reading as a thickening of the pill's
+            // own edge.
+            const float bar_x = draw_w - pad + std::max(0.0f, (pad - 1.0f - bar_w) * 0.5f);
             const float bar_top = pad;
             const float bar_bottom = pad + body_h;
             const float bar_r = bar_w * 0.5f;
-            if (bar_bottom - bar_top > bar_w * 2.0f) {
+            if (bar_bottom - bar_top > bar_w * 3.0f) {
                 const D2D1_COLOR_F was = brush_border->GetColor();
-                brush_border->SetColor(argb(kMeterTrack[painting_dark ? 1 : 0]));
+                brush_border->SetColor(argb(kScrollTrack[painting_dark ? 1 : 0]));
                 rt->FillRoundedRectangle(
                     D2D1::RoundedRect(D2D1::RectF(bar_x, bar_top, bar_x + bar_w, bar_bottom),
                                       bar_r, bar_r),
@@ -1579,19 +1610,20 @@ HRESULT OverlayCore::paint_once() {
                 brush_border->SetColor(was);
 
                 const float track_h = bar_bottom - bar_top;
-                // Never shorter than its own width, or a long session's thumb becomes a dot that
-                // reads as a mark on the pill rather than as a position in a buffer.
                 const float thumb_h =
-                    std::max(bar_w * 2.0f, track_h * static_cast<float>(shown_lines) /
-                                               static_cast<float>(total_lines));
+                    std::clamp(track_h * static_cast<float>(shown_lines) /
+                                   static_cast<float>(total_lines),
+                               std::min(bar_w * 2.0f, track_h), track_h * kScrollThumbMaxFraction);
                 const float span = static_cast<float>(total_lines - shown_lines);
                 const float at = std::clamp(static_cast<float>(scroll_line) / span, 0.0f, 1.0f);
                 const float thumb_top = bar_top + (track_h - thumb_h) * at;
+                // The pending ink, opaque: the thumb does not move, so it has to carry on
+                // contrast what the level meter carries on motion.
                 rt->FillRoundedRectangle(
                     D2D1::RoundedRect(
                         D2D1::RectF(bar_x, thumb_top, bar_x + bar_w, thumb_top + thumb_h), bar_r,
                         bar_r),
-                    brush_unstable.get());
+                    brush_pending.get());
             }
         }
     }
