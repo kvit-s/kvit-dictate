@@ -10,7 +10,11 @@
 
 #include <algorithm>
 
+#include <cctype>
+#include <fstream>
+#include "util/json.h"
 #include "util/log.h"
+#include "util/wav.h"
 
 namespace kd::asrd {
 namespace {
@@ -582,6 +586,94 @@ void SessionServer::fail_fatal(proto::ErrorCode code, const std::string& msg) {
 
 // ─── The decode thread ──────────────────────────────────────────────────────────────────────
 
+// ─── When a hypothesis has taken something back ─────────────────────────────────────────────
+
+bool keeps_published_words(std::string_view prev, std::string_view next) {
+    // Tokenise on anything that is not a letter or a digit, lowercasing as we go. That folds away
+    // exactly the two things this backend revises harmlessly — case and punctuation — and nothing
+    // else. An apostrophe is a separator too, so "I'm" is {"i","m"}: a contraction the model later
+    // spells out is not a retraction, and one it swallows into a different word is.
+    const auto tokens = [](std::string_view v) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (const char c : v) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            if (std::isalnum(u)) {
+                cur.push_back(static_cast<char>(std::tolower(u)));
+            } else if (!cur.empty()) {
+                out.push_back(std::move(cur));
+                cur.clear();
+            }
+        }
+        if (!cur.empty()) out.push_back(std::move(cur));
+        return out;
+    };
+
+    const std::vector<std::string> a = tokens(prev);
+    const std::vector<std::string> b = tokens(next);
+    if (a.size() > b.size()) return false;
+    return std::equal(a.begin(), a.end(), b.begin());
+}
+
+void SessionServer::capture_revision(const std::string& text, uint64_t utt, uint64_t seq) {
+    if (cfg_.revision_dir.empty()) return;
+
+    std::string prev;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (!have_last_text_) return;
+        prev = last_text_;
+    }
+    if (prev.empty() || keeps_published_words(prev, text)) return;
+
+    const std::vector<int16_t>& window = backend_.last_window();
+    if (window.empty()) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(cfg_.revision_dir, ec);
+    if (ec) {
+        KD_LOG_WARN("could not create %s for a revision capture: %s",
+                    cfg_.revision_dir.string().c_str(), ec.message().c_str());
+        return;
+    }
+
+    std::string sid;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        sid = session_id_;
+    }
+    char stem[128];
+    std::snprintf(stem, sizeof(stem), "%s-u%llu-s%llu", sid.c_str(),
+                  static_cast<unsigned long long>(utt), static_cast<unsigned long long>(seq));
+
+    // The audio first: if only one of the pair survives a full disk, the recording is the half
+    // that cannot be reconstructed from anywhere else.
+    const std::filesystem::path wav = cfg_.revision_dir / (std::string(stem) + ".wav");
+    if (!wav::write_pcm16(wav, window.data(), window.size())) {
+        KD_LOG_WARN("could not write %s", wav.string().c_str());
+        return;
+    }
+
+    json::Value m = json::Value::object();
+    m.set("session", json::Value::string(sid));
+    m.set("utterance_id", json::Value::number(static_cast<int64_t>(utt)));
+    m.set("seq", json::Value::number(static_cast<int64_t>(seq)));
+    m.set("audio_samples", json::Value::number(static_cast<int64_t>(window.size())));
+    m.set("audio_ms", json::Value::number(static_cast<int64_t>(window.size() * 1000u / 16000u)));
+    // Both texts, because the diff is the finding: what the user had already read, and what
+    // replaced it. A capture with only the second could not show what was taken away.
+    m.set("previous", json::Value::string(prev));
+    m.set("revised", json::Value::string(text));
+
+    std::ofstream meta(cfg_.revision_dir / (std::string(stem) + ".json"),
+                       std::ios::binary | std::ios::trunc);
+    if (meta) meta << json::serialize(m) << "\n";
+
+    KD_LOG_WARN("a hypothesis retracted published words; wrote %s (%llu ms of audio)",
+                wav.filename().string().c_str(),
+                static_cast<unsigned long long>(window.size() * 1000u / 16000u));
+}
+
 // ─── Decoding, and surviving a decode that does not come back ──────────────────────────────
 
 Status SessionServer::decode_once(bool finalize, Transcription& out) {
@@ -768,6 +860,9 @@ void SessionServer::worker() {
                         changed = !have_last_text_ || text != last_text_ ||
                                   stable != last_stable_;
                     }
+                    // Before the emit, while `last_text_` is still the hypothesis the user has
+                    // and `backend_.last_window()` is still the audio that produced this one.
+                    if (changed) capture_revision(text, utt, seq_ + 1);
                     if (changed) emit_partial(text, stable);
                 }
 

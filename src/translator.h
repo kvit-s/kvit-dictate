@@ -75,6 +75,14 @@ struct TranslatorSpec {
     bool live_preview = true;
 
     uint32_t endpoint_silence_ms = 1500;
+
+    // Passed through as `--revision-dir` when non-empty. The translator writes the audio behind
+    // any hypothesis that retracts words it has already published there — see
+    // `SessionServerConfig::revision_dir` for why the Client's own corpus cannot capture that.
+    //
+    // A path, and only a path: the same rule the block at the end of `build_command_line` states
+    // about `--service` and `--model`. Nothing the user types becomes an *argument*.
+    std::filesystem::path revision_dir;
 };
 
 // One supervised `kvit-asrd.exe`. Not copyable; owns a job object, a process and two threads.

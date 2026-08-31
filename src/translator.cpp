@@ -188,6 +188,11 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     append_quoted_arg(cmd, L"--endpoint-silence-ms");
     append_quoted_arg(cmd, std::to_wstring(spec.endpoint_silence_ms));
 
+    if (!spec.revision_dir.empty()) {
+        append_quoted_arg(cmd, L"--revision-dir");
+        append_quoted_arg(cmd, spec.revision_dir.wstring());
+    }
+
     // The parent always passes its own pid. The job object is the real guarantee; this watch is
     // the backup for the case where the child somehow ends up outside the job.
     append_quoted_arg(cmd, L"--parent-pid");

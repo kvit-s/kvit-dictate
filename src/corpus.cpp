@@ -18,53 +18,13 @@
 #include <vector>
 
 #include "util/log.h"
+#include "util/wav.h"
 
 namespace kd {
 namespace {
 
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint16_t kChannels = 1;
-constexpr uint16_t kBitsPerSample = 16;
-constexpr size_t kWavHeaderBytes = 44;
-
-// The two little-endian fields a WAV header carries twice over: RIFF's total size at byte 4 and
-// `data`'s payload size at byte 40. Both are written as zero up front and rewritten in place.
-constexpr long kRiffSizeOffset = 4;
-constexpr long kDataSizeOffset = 40;
-
-void put_u32(unsigned char* p, uint32_t v) {
-    p[0] = static_cast<unsigned char>(v & 0xFF);
-    p[1] = static_cast<unsigned char>((v >> 8) & 0xFF);
-    p[2] = static_cast<unsigned char>((v >> 16) & 0xFF);
-    p[3] = static_cast<unsigned char>((v >> 24) & 0xFF);
-}
-
-void put_u16(unsigned char* p, uint16_t v) {
-    p[0] = static_cast<unsigned char>(v & 0xFF);
-    p[1] = static_cast<unsigned char>((v >> 8) & 0xFF);
-}
-
-// A canonical 44-byte PCM header with both size fields left at zero. Nothing here depends on the
-// eventual length, which is the whole point: the file is valid from its first byte and the sizes
-// are corrected as it grows.
-std::array<unsigned char, kWavHeaderBytes> wav_header() {
-    std::array<unsigned char, kWavHeaderBytes> h{};
-    const uint32_t byte_rate = kSampleRate * kChannels * (kBitsPerSample / 8);
-    const uint16_t block_align = kChannels * (kBitsPerSample / 8);
-    std::memcpy(h.data() + 0, "RIFF", 4);
-    put_u32(h.data() + 4, 0);  // patched
-    std::memcpy(h.data() + 8, "WAVEfmt ", 8);
-    put_u32(h.data() + 16, 16);  // PCM fmt chunk size
-    put_u16(h.data() + 20, 1);   // WAVE_FORMAT_PCM
-    put_u16(h.data() + 22, kChannels);
-    put_u32(h.data() + 24, kSampleRate);
-    put_u32(h.data() + 28, byte_rate);
-    put_u16(h.data() + 32, block_align);
-    put_u16(h.data() + 34, kBitsPerSample);
-    std::memcpy(h.data() + 36, "data", 4);
-    put_u32(h.data() + 40, 0);  // patched
-    return h;
-}
 
 std::string stamp_now() {
     const std::time_t t = std::time(nullptr);
@@ -196,6 +156,10 @@ void prune_store(const std::filesystem::path& root, const CorpusConfig& cfg) {
     for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
         if (ec) break;
         if (!e.is_directory(ec)) continue;
+        // Session directories only. `revisions/` sits alongside them and holds one-utterance
+        // clips from the translator; walking it as if it were a session would let the pruner
+        // delete the whole of it in one step the first time the store crossed its bound.
+        if (e.path().filename() == "revisions") continue;
         const auto wt = std::filesystem::last_write_time(e.path(), ec);
         if (ec) continue;
         const auto age = std::chrono::duration_cast<std::chrono::hours>(now - wt).count() / 24;
@@ -262,7 +226,7 @@ Status Corpus::open(const CorpusConfig& cfg, std::string_view session_id,
     if (_wfopen_s(&f, wav_path.wstring().c_str(), L"wb+") != 0 || f == nullptr) {
         return Status{StatusCode::Unavailable, "could not open " + wav_path.string()};
     }
-    const auto h = wav_header();
+    const auto h = wav::header(kSampleRate, kChannels, 0);
     if (std::fwrite(h.data(), 1, h.size(), f) != h.size()) {
         std::fclose(f);
         return Status{StatusCode::Unavailable, "could not write the WAV header"};
@@ -317,12 +281,12 @@ void Corpus::flush_sizes() {
     std::fflush(impl_->wav);
     const long here = std::ftell(impl_->wav);
 
-    put_u32(buf, static_cast<uint32_t>(kWavHeaderBytes - 8 + data_bytes));
-    std::fseek(impl_->wav, kRiffSizeOffset, SEEK_SET);
+    wav::put_u32_le(buf, static_cast<uint32_t>(wav::kHeaderBytes - 8 + data_bytes));
+    std::fseek(impl_->wav, wav::kRiffSizeOffset, SEEK_SET);
     std::fwrite(buf, 1, 4, impl_->wav);
 
-    put_u32(buf, static_cast<uint32_t>(data_bytes));
-    std::fseek(impl_->wav, kDataSizeOffset, SEEK_SET);
+    wav::put_u32_le(buf, static_cast<uint32_t>(data_bytes));
+    std::fseek(impl_->wav, wav::kDataSizeOffset, SEEK_SET);
     std::fwrite(buf, 1, 4, impl_->wav);
 
     std::fseek(impl_->wav, here, SEEK_SET);

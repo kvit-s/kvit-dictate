@@ -976,6 +976,12 @@ kd::Result<std::wstring> App::resolve_server_url() {
     spec.model = settings_.server.model;
     spec.live_preview = settings_.server.live_preview;
     spec.endpoint_silence_ms = settings_.session.endpoint_silence_ms;
+    // Revision capture rides with the corpus: it is the same collection, and the same consent.
+    // Its own subdirectory, so a `revisions/` full of one-utterance clips never gets mistaken
+    // for a session and walked by the pruner as if it were one.
+    if (settings_.corpus.enabled && !settings_.corpus.dir.empty()) {
+        spec.revision_dir = settings_.corpus.dir / "revisions";
+    }
 
     const kd::Result<std::string> url = translator_.start(spec);
     if (!url) return url.status();

@@ -211,6 +211,9 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     backend_cfg.finalize_only = cfg.finalize_only;
     backend_cfg.vad_gate = cfg.vad_gate;
     OpenAiBackend backend(backend_cfg);
+    // Only when there is somewhere to write it: the capture keeps a copy of every posted window,
+    // which is the whole utterance on every hop, and nobody should pay that to produce nothing.
+    backend.set_capture_window(!cfg.revision_dir.empty());
 
     const ULONGLONG load_started = GetTickCount64();
     if (const Status st = backend.load(); !st.ok()) {
@@ -251,6 +254,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     // nothing, so there is no mark to contradict and everything still commits at the `final`.
     session_cfg.emit_partials = !cfg.finalize_only;
     session_cfg.publish_stable_partials = false;
+    session_cfg.revision_dir = cfg.revision_dir;
     session_cfg.hostile_stability = cfg.hostile_stability;
 
     SessionServer session(backend, session_cfg, sink);

@@ -51,6 +51,7 @@
 // utterance rather than as a dropped frame.
 
 #include <atomic>
+#include <filesystem>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -119,6 +120,25 @@ struct SessionServerConfig {
     // ERROR on every use, and deliberately **not reachable from backend options** — a backend
     // must never be able to authorise its own protocol violations.
     bool hostile_stability = false;
+
+    // ── Revision capture (corpus.h's blind spot) ────────────────────────────────────────────
+    //
+    // Where to write the audio behind a hypothesis that *retracted words it had already shown
+    // the user*. Empty disables it, which is the default and the shipped behaviour.
+    //
+    // This exists because the client-side corpus cannot answer the question it was built for.
+    // It records the audio the Client sends; this backend re-decodes a **VAD-gated** buffer
+    // assembled from `SpeechStart`/`Audio` items, so non-speech frames never reach
+    // `backend_.feed` and the bytes actually posted are a spliced waveform no slice of the
+    // client's recording reproduces. Measured 2026-08-31: a hop revised "So I'm trying to check
+    // how the dictation capture works" to "Some trying to check how the dictation capture
+    // works", that worse text is what reached the document, and **no** reconstruction from the
+    // client's WAV could produce it — not the full file, not any onset, not any amount of
+    // trailing silence, and the same model was deterministic across repeats. The input that
+    // caused it existed only here, and was overwritten by the next hop.
+    //
+    // So the rule is: when a hypothesis takes words back, write down exactly what produced it.
+    std::filesystem::path revision_dir;
 };
 
 // One session per connection (§7.2). Sessions do not nest and are not concurrent; the socket is
@@ -164,6 +184,9 @@ private:
     // Book-keeping for a round trip that did not come back. Returns true when the session has
     // to be failed — which is the *last* resort, not the first. Decode thread only.
     [[nodiscard]] bool on_decode_failure(bool finalize, bool published, const Status& st);
+    // Write the posted audio and both hypotheses when `text` retracts words `last_text_` had
+    // already published. Decode thread only; never fails the session.
+    void capture_revision(const std::string& text, uint64_t utt, uint64_t seq);
     void request_work(bool hop, bool finalize, bool stop);
     // Wait for the decode thread to go idle, bounded. Called before an utterance boundary so a
     // new utterance cannot start on top of a decode still running for the previous one.
@@ -234,5 +257,21 @@ private:
 
     std::vector<VadItem> items_;  // scratch for on_audio, so it does not allocate per frame
 };
+
+// ─── When a hypothesis has taken something back ─────────────────────────────────────────────
+//
+// True when `next` still says everything `prev` said, in order — so `prev` may be *extended* and
+// may be re-punctuated or re-cased freely, and neither counts.
+//
+// Comparing the strings directly is the wrong test and would fire constantly: this backend
+// re-decodes from scratch every hop, so it re-cases the opening word and inserts punctuation the
+// moment it can see where the sentence ended. `the quick brown fox jumps` becoming `The quick
+// brown fox, jumps over` is the model doing its job. `So I'm trying to check` becoming `Some
+// trying to check` is not — a word the user watched arrive is gone.
+//
+// So the comparison is on words with punctuation and case removed: `prev`'s tokens must be a
+// prefix of `next`'s. Pure, and tested, because "which revisions are worth recording" is a
+// judgement that decides how much audio ends up on the user's disk.
+[[nodiscard]] bool keeps_published_words(std::string_view prev, std::string_view next);
 
 }  // namespace kd::asrd

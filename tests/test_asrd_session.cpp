@@ -1322,3 +1322,44 @@ KD_TEST(asrd_session, a_failed_flush_closes_the_utterance_with_the_last_partial)
     KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
     KD_CHECK_GT(stub.transcribe_requests(), 1);
 }
+
+// ─── keeps_published_words: which revisions are worth recording ─────────────────────────────
+//
+// The judgement this encodes decides how much audio lands on the user's disk, so it is asserted
+// rather than left to a code reading. The rule: `next` must still say everything `prev` said, in
+// order, ignoring case and punctuation.
+
+KD_TEST(asrd_session, an_extension_is_not_a_retraction) {
+    KD_CHECK(kd::asrd::keeps_published_words("the quick brown fox",
+                                             "the quick brown fox jumps over"));
+    KD_CHECK(kd::asrd::keeps_published_words("", "anything at all"));
+    KD_CHECK(kd::asrd::keeps_published_words("same", "same"));
+}
+
+KD_TEST(asrd_session, recasing_and_repunctuating_are_not_retractions) {
+    // What this backend does on every hop once it can see where the sentence ended. If these
+    // counted, the capture would fire on nearly every utterance and record the whole session.
+    KD_CHECK(kd::asrd::keeps_published_words("the quick brown fox jumps",
+                                             "The quick brown fox, jumps over the lazy dog."));
+    KD_CHECK(kd::asrd::keeps_published_words("so i was thinking we", "So I was thinking, we"));
+}
+
+KD_TEST(asrd_session, a_word_the_user_already_read_going_missing_is_a_retraction) {
+    // Measured 2026-08-31, and the reason this capture exists: the words were right at 6.3 s and
+    // wrong at 7.4 s, and the worse text is what reached the document.
+    KD_CHECK(!kd::asrd::keeps_published_words(
+        "So I'm trying to check how the dictation capture works.",
+        "Some trying to check how the dictation capture works."));
+    // Truncation counts too — a hypothesis that got shorter has taken something back.
+    KD_CHECK(!kd::asrd::keeps_published_words("one two three four", "one two three"));
+    // And a substitution in the middle, however small.
+    KD_CHECK(!kd::asrd::keeps_published_words("give me the config", "gives me the config"));
+}
+
+KD_TEST(asrd_session, a_contraction_spelled_out_is_not_a_retraction) {
+    // An apostrophe is a separator, so "I'm" tokenises as {i, m}. A model that later writes "I
+    // am" has said the same two words and taken nothing back; one that swallows them into a
+    // different word has.
+    KD_CHECK(kd::asrd::keeps_published_words("I'm going", "I m going too"));
+    KD_CHECK(!kd::asrd::keeps_published_words("I'm going", "Im going"));
+}

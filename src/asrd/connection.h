@@ -16,6 +16,7 @@
 //
 // `main.cpp` keeps the command line, the listener and the process lifetime, and nothing else.
 
+#include <filesystem>
 #include <cstdint>
 #include <string>
 
@@ -44,6 +45,11 @@ struct TranslatorConfig {
     StabilityParams stability;
     bool hostile_stability = false;
     uint32_t http_timeout_ms = 30000;
+
+    // session_server.h `SessionServerConfig::revision_dir` — where to write the audio behind a
+    // hypothesis that retracted words it had already shown the user. Empty disables it, and
+    // empty is the default: the Client passes a path only when the user has enabled the corpus.
+    std::filesystem::path revision_dir;
 };
 
 // Serve one connection until it ends. Returns a process exit code, which matters only for the

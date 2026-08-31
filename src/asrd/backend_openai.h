@@ -269,6 +269,15 @@ public:
     [[nodiscard]] const std::string& model() const noexcept { return cfg_.model; }
     [[nodiscard]] uint64_t audio_ms() const;
     [[nodiscard]] uint32_t hop_ms() const noexcept { return driver_.hop_ms(); }
+
+    // Keep a copy of the audio each `transcribe` actually posts, so a caller that later decides
+    // the answer was interesting can write down what produced it.
+    //
+    // Opt-in because it is a copy of the whole utterance on every hop, and because only one
+    // caller wants it: the revision capture in session_server.cpp. Off, this costs nothing.
+    void set_capture_window(bool on) { capture_window_ = on; }
+    // Valid until the next `transcribe`. Empty when capture is off or nothing has been posted.
+    [[nodiscard]] const std::vector<int16_t>& last_window() const noexcept { return last_window_; }
     [[nodiscard]] bool finalize_only() const noexcept { return cfg_.finalize_only; }
     [[nodiscard]] uint64_t requests() const noexcept { return requests_; }
     [[nodiscard]] uint64_t vad_skipped() const noexcept { return vad_skipped_; }
@@ -293,6 +302,8 @@ private:
     // call deliberately happens *outside* it, which is the whole reason the two threads exist.
     mutable std::mutex driver_mutex_;
     PseudoStreamingDriver driver_;
+    bool capture_window_ = false;
+    std::vector<int16_t> last_window_;
 
     bool vad_unavailable_ = false;  // latched after the first refusal, so it is logged once
     bool oversize_warned_ = false;  // likewise: a buffer past any plausible utterance length

@@ -23,6 +23,7 @@
 
 #define KD_LOG_MODULE "asrd"
 
+#include <filesystem>
 #include <windows.h>
 
 #include <atomic>
@@ -206,6 +207,15 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
                 return false;
             }
             (a == "--finalize-only" ? opt.translator.finalize_only : opt.translator.vad_gate) = value;
+            continue;
+        }
+        if (a == "--revision-dir") {
+            // Where to write the audio behind a hypothesis that took back words the user had
+            // already read. See SessionServerConfig::revision_dir for why the Client's own
+            // corpus cannot capture this.
+            const std::string v = next(a.c_str());
+            if (exit_code != 0) return false;
+            opt.translator.revision_dir = std::filesystem::path(v);
             continue;
         }
         if (a == "--endpoint-silence-ms" || a == "--stability-n" || a == "--stability-m" ||

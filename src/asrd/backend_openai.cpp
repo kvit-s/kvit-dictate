@@ -348,6 +348,10 @@ Status OpenAiBackend::transcribe(bool force, Transcription& out) {
         if (!driver_.take_window(force, window)) return Status::success();
     }
 
+    // Before the POST, because the point of keeping it is to have the input that produced the
+    // output — and `window` is moved from by nothing below, so this is the same buffer.
+    if (capture_window_) last_window_ = window;
+
     if (window.size() > kAbsurdAudioSamples && !oversize_warned_) {
         // Nothing is dropped and nothing is stitched — this is a diagnostic, not a policy. The
         // buffer is bounded by `VadConfig`'s soft cut and its stopwatch, and `connection.cpp`

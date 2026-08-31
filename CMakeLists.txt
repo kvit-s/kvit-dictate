@@ -159,6 +159,7 @@ set(KD_WIRE_HEADERS
     src/protocol.h
     src/util/clock.h
     src/util/json.h
+    src/util/wav.h
     src/util/log.h
     src/util/result.h
     src/util/utf8.h
