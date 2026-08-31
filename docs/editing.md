@@ -417,6 +417,11 @@ Unchanged in mechanism: `App::flush_deferred_commits` injects `deferred_` in one
 revalidating the target, and falls back to the clipboard when the target has gone. The only
 difference is that `deferred_` has been edited.
 
+On Enter, the visible compose buffer is dismissed immediately and the overlay collapses to its
+compact `Finishing...` status before injection starts. The in-memory buffer is not cleared: it
+remains the source for the one injection, and a late final hypothesis can still be appended to it
+without making the transcript reappear over the text being typed into the target.
+
 **In particular there is no focus restoration step, because focus never went anywhere** — §4.6 has
 the argument. Nothing in this feature may add one: `injector.cpp` never restores focus precisely
 because `SendInput` types into whatever *is* focused, and a design that moves focus away and back

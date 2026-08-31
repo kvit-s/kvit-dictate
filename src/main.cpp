@@ -2524,7 +2524,29 @@ void App::end_dictation(kd::LocalEvent why) {
     // take a moment, so the grace is generous, but it is finite and it is logged when it expires.
     finalize_deadline_ms_ = clock_.now_ms() + kFinalizeGraceMs;
     set_tray_state(kd::OverlayState::Finalizing);
-    if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Finalizing);
+    if (overlay_ != nullptr) {
+        // A finish gesture is the user's approval of the compose buffer. From this point on the
+        // text belongs in the target, not in a second, expanded copy over the target while
+        // SendInput types it. (Esc has already emptied `edit_` above.)
+        // Clear only the overlay: `edit_` remains intact and is still the source of truth for
+        // flush_deferred_commits(). A final hypothesis or a late normalizer reply can still grow
+        // that buffer after this transition, so render_preview() also refuses to repopulate the
+        // preview while `finalizing_` is true.
+        overlay_->clear_hint();
+        overlay_->set_edit_view(false, 0, 0, 0);
+        overlay_->set_text({}, {});
+        overlay_->set_input_level(0.0f);
+        overlay_->set_transcriber_lag(0);
+        overlay_->set_click_through(true);
+        overlay_->set_state(kd::OverlayState::Finalizing);
+
+        // Rendering normally happens on the 50 ms tick. The final response can already be queued,
+        // though, and injection is synchronous on this UI thread; waiting for the tick would leave
+        // the old transcript visible for the whole injection. Paint the compact "Finishing..."
+        // indicator before any final response is allowed to start that work.
+        overlay_->render();
+        publish_pill_rect();
+    }
 }
 
 // docs/editing.md §7.4 and plan.md §1.6: what the pill says about the microphone, once per
@@ -2597,6 +2619,16 @@ void App::publish_listening_state() {
 
 void App::render_preview(std::string_view tail) {
     if (overlay_ == nullptr) return;
+
+    // Once the user has committed, keep the overlay collapsed to its finalizing status. The last
+    // `final` and any normalizer result arrive after end_dictation() by design; both pass through
+    // here before the composed buffer is injected, and neither should resurrect the transcript
+    // the user just dismissed. This affects display only — perform_commit still appends those
+    // bytes to `edit_`, and finish_dictation() still injects the complete buffer.
+    if (finalizing_) {
+        overlay_->set_text({}, {});
+        return;
+    }
 
     // The overlay's two colours mean "settled" (opaque) and "still moving" (60% alpha), and under
     // a deferred cadence that maps onto something real for the first time: everything already
