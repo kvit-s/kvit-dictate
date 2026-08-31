@@ -1211,3 +1211,92 @@ KD_TEST(asrd_session, live_preview_publishes_no_mark_so_a_late_revision_cannot_t
     KD_INFO("live preview: " + std::to_string(partials.size()) + " partial(s), last text \"" +
             partials.back().text + "\"");
 }
+
+// ─── A blip is not the end of the session ───────────────────────────────────────────────────
+//
+// Measured on 2026-08-31, four minutes into a real dictation: one `WinHttpReceiveResponse
+// failed` on a hop took the whole session down, and because the Client runs
+// `Cadence::EndOfSession`, its `stopped` handler typed 1659 buffered bytes into the user's
+// editor mid-word. The speaker was still talking. Nothing about their words had gone wrong —
+// the far end had dropped one connection.
+//
+// So the rule the two cases below fix in place: a preview hop that does not come back costs a
+// preview, and a flush that does not come back costs at most the revision between the last
+// partial and the final. Neither costs the session.
+
+KD_TEST(asrd_session, a_transient_failure_on_a_hop_does_not_end_the_session) {
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    // Two good hypotheses, then a dropped connection, then the model comes back. The audio for
+    // the failed hop is still in the backend's buffer — `PseudoStreamingDriver` never erases
+    // from the front — so the reply after it covers everything the failed one would have.
+    stub.set_transcribe_script({
+        {200, R"({"text":"the quick brown"})"},
+        {200, R"({"text":"the quick brown fox"})"},
+        {500, R"({"detail":"upstream reset the connection"})"},
+        {200, R"({"text":"the quick brown fox jumps over"})"},
+        {200, R"({"text":"The quick brown fox jumps over the lazy dog."})"},
+    });
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.finalize_only = false;  // hops only exist under live preview
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(8000, 1200)));
+
+    // The failure reached the log and nothing else. No `error`, no early `stopped`, and the
+    // utterance still closes exactly once.
+    for (const kd::proto::ErrorMsg& e : seen.of<kd::proto::ErrorMsg>()) {
+        KD_INFO("unexpected error: " + e.msg);
+    }
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+    KD_CHECK_EQ(seen.of<kd::proto::FinalMsg>().size(), size_t{1});
+    KD_CHECK_GT(stub.transcribe_requests(), 3);
+
+    const auto finals = seen.of<kd::proto::FinalMsg>();
+    KD_REQUIRE_GT(finals.size(), size_t{0});
+    // And the words the hop would have carried are in it, because the next request re-decoded
+    // the same audio rather than resuming after it.
+    KD_CHECK(finals[0].text.find("brown fox") != std::string::npos);
+}
+
+KD_TEST(asrd_session, a_failed_flush_closes_the_utterance_with_the_last_partial) {
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    // One good hop, and then the far end stays down — the last reply in a script repeats — so
+    // every request after it fails, the flush among them. §6.2 still owes the Client one `final`
+    // for an id it has already seen a partial under, and the honest thing to close it with is
+    // the last hypothesis the user actually watched arrive in the pill. The alternative —
+    // dropping it — deletes words they had already read.
+    //
+    // Deliberately one success and then nothing: which request happens to be the flush depends
+    // on how the hops coalesce against a POST already in flight (§2.1), so a script that tried
+    // to place the failure *at* the flush would be timing the test rather than testing it.
+    stub.set_transcribe_script({
+        {200, R"({"text":"the quick brown fox jumps over the lazy dog"})"},
+        {500, R"({"detail":"still down"})"},
+    });
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.finalize_only = false;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    // Short enough that the failures that follow stay well inside kMaxDecodeFailures, long
+    // enough that the first hop is certainly a hop and not the flush.
+    KD_REQUIRE(run_session(harness, seen, one_utterance(3000, 1200)));
+
+    const auto partials = seen.of<kd::proto::PartialMsg>();
+    KD_REQUIRE_GT(partials.size(), size_t{0});
+
+    const auto finals = seen.of<kd::proto::FinalMsg>();
+    KD_REQUIRE_EQ(finals.size(), size_t{1});
+    KD_CHECK_EQ(finals[0].text, partials.back().text);
+    // And no `error`, and therefore no `stopped(reason=error)` — which is the message that used
+    // to make the Client empty a whole session's buffer into the document mid-sentence.
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+    KD_CHECK_GT(stub.transcribe_requests(), 1);
+}

@@ -158,6 +158,12 @@ public:
 
 private:
     void worker();
+    // One decode, with the retries a *flush* is worth and a hop is not. Decode thread only.
+    // Resets the consecutive-failure count on success, so the two below are one mechanism.
+    [[nodiscard]] Status decode_once(bool finalize, Transcription& out);
+    // Book-keeping for a round trip that did not come back. Returns true when the session has
+    // to be failed — which is the *last* resort, not the first. Decode thread only.
+    [[nodiscard]] bool on_decode_failure(bool finalize, bool published, const Status& st);
     void request_work(bool hop, bool finalize, bool stop);
     // Wait for the decode thread to go idle, bounded. Called before an utterance boundary so a
     // new utterance cannot start on top of a decode still running for the previous one.
@@ -211,6 +217,20 @@ private:
     std::string last_text_;
     bool have_last_text_ = false;
     uint64_t last_stable_ = 0;
+
+    // How many round trips in a row have failed. Decode thread only, so it needs no lock.
+    //
+    // This exists because one failure used to end the session. A `decode_failed` is written as
+    // "the model misbehaved on this utterance", and for a model that is handed a recording and
+    // returns a string that reading is right — but the failure this actually sees is almost
+    // always the *transport*: a dropped keep-alive, a connection reset, a service that was busy
+    // for a moment. The speaker is mid-sentence and none of that is about their words.
+    //
+    // Ending the session there is not a graceful degradation, because under
+    // `Cadence::EndOfSession` the Client's `stopped` handler flushes a whole session's buffer
+    // into the document. Measured on 2026-08-31: a single `WinHttpReceiveResponse failed` typed
+    // 1659 bytes into the user's editor mid-word, four minutes into a dictation.
+    uint32_t decode_failures_ = 0;
 
     std::vector<VadItem> items_;  // scratch for on_audio, so it does not allocate per frame
 };

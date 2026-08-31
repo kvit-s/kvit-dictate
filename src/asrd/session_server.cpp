@@ -23,6 +23,26 @@ constexpr uint32_t kBytesPerSample = 2;
 // utterance boundary is the least of the problems.
 constexpr auto kIdleWait = std::chrono::seconds(60);
 
+// ─── What a failed round trip costs, and therefore what it is worth retrying ───────────────
+//
+// A **hop** is a preview. Its audio is still in the backend's buffer — `PseudoStreamingDriver`
+// never erases from the front — so the next hop re-POSTs the same recording plus whatever
+// arrived since, about a second later. Retrying one immediately would put a second request on a
+// service that has just shown it is struggling, to buy a preview that is about to be superseded
+// anyway. So: no retry, skip it, say so once.
+//
+// A **flush** is the utterance. Nothing comes after it to cover for it, so this is the round
+// trip worth paying for. Three attempts a quarter-second apart is short next to the finalize
+// grace on the Client (5 s) and long enough to outlast a connection reset.
+constexpr uint32_t kFlushAttempts = 3;
+constexpr auto kFlushRetryPause = std::chrono::milliseconds(250);
+
+// When the service really is gone, ending the session beats leaving the user talking into
+// nothing: their buffer reaches the document instead of being carried by a session that can no
+// longer transcribe. Eight consecutive failures is several seconds of hops — far past a reset,
+// nowhere near a pause for breath.
+constexpr uint32_t kMaxDecodeFailures = 8;
+
 proto::Message stopped_message(const std::string& session_id, const char* reason) {
     proto::StoppedMsg m;
     m.session_id = session_id;
@@ -562,6 +582,67 @@ void SessionServer::fail_fatal(proto::ErrorCode code, const std::string& msg) {
 
 // ─── The decode thread ──────────────────────────────────────────────────────────────────────
 
+// ─── Decoding, and surviving a decode that does not come back ──────────────────────────────
+
+Status SessionServer::decode_once(bool finalize, Transcription& out) {
+    const uint32_t attempts = finalize ? kFlushAttempts : 1u;
+    Status st = Status::success();
+    for (uint32_t attempt = 1; attempt <= attempts; ++attempt) {
+        st = backend_.transcribe(finalize, out);
+        if (st.ok()) {
+            decode_failures_ = 0;
+            return st;
+        }
+        {
+            // A `cancel` closes the in-flight request handle, so the error we are holding may
+            // simply be that. Retrying it would re-POST audio the user asked to throw away.
+            std::lock_guard<std::mutex> guard(m_);
+            if (terminal_ || cancelled_) return st;
+        }
+        if (attempt < attempts) {
+            KD_LOG_WARN("the flush did not come back (%s); retrying, attempt %u of %u",
+                        st.message().c_str(), attempt + 1, attempts);
+            std::unique_lock<std::mutex> lock(m_);
+            // Waiting on the condition variable rather than sleeping: a `cancel` or a teardown
+            // arriving during the pause must not sit out the whole quarter second.
+            work_cv_.wait_for(lock, kFlushRetryPause, [this] { return quit_ || cancelled_ || terminal_; });
+            if (quit_ || cancelled_ || terminal_) return st;
+        }
+    }
+    return st;
+}
+
+bool SessionServer::on_decode_failure(bool finalize, bool published, const Status& st) {
+    ++decode_failures_;
+
+    // The one failure that is not survivable: the utterance is closed, its flush did not come
+    // back after every attempt, and no `partial` ever went out under this id — so there is
+    // nothing on the Client naming what was said, and nothing here to reconstruct it from. That
+    // is finalize-only's every utterance and live preview's first second, and in both the words
+    // are simply gone. Saying so is the only honest move; continuing would silently drop speech,
+    // which is the failure this project is least willing to accept.
+    if (finalize && !published) {
+        KD_LOG_ERROR("the flush failed (%s) and no partial was ever published for this "
+                     "utterance, so nothing names what was said; failing the session",
+                     st.message().c_str());
+        return true;
+    }
+
+    // Everything else is survivable, and staying alive is worth something: under
+    // `Cadence::EndOfSession` the Client turns a `stopped` into a whole session's buffer landing
+    // in the document, so a session that ends on a blip ends mid-sentence.
+    if (decode_failures_ >= kMaxDecodeFailures) {
+        KD_LOG_ERROR("%u decodes in a row failed (last: %s); ending the session so the Client can "
+                     "put what it has into the document",
+                     decode_failures_, st.message().c_str());
+        return true;
+    }
+    KD_LOG_WARN("%s failed (%s); the session continues — %u consecutive, %u ends it",
+                finalize ? "a flush" : "a preview hop", st.message().c_str(), decode_failures_,
+                kMaxDecodeFailures);
+    return false;
+}
+
 void SessionServer::worker() {
     std::unique_lock<std::mutex> lock(m_);
     for (;;) {
@@ -594,7 +675,7 @@ void SessionServer::worker() {
 
         if (hop || finalize) {
             Transcription tr;
-            const Status st = backend_.transcribe(finalize, tr);
+            const Status st = decode_once(finalize, tr);
             std::string text = tr.text;
             const bool have = tr.have_text;
 
@@ -609,10 +690,34 @@ void SessionServer::worker() {
                 KD_LOG_DEBUG("dropping a decode result for utterance %llu; the session moved on",
                              static_cast<unsigned long long>(utt));
             } else if (!st.ok()) {
-                // §11.3: a backend fault with a session open is `decode_failed`, non-fatal —
-                // the model misbehaved on this utterance, the process is fine, and the next
-                // session may well work.
-                fail_session(proto::ErrorCode::decode_failed, st.message());
+                // A failed round trip is not, by itself, a failed session. See
+                // on_decode_failure() for which ones are.
+                std::string fallback;
+                bool published = false;
+                {
+                    std::lock_guard<std::mutex> guard(m_);
+                    published = have_last_text_;
+                    fallback = last_text_;
+                }
+                if (on_decode_failure(finalize, published, st)) {
+                    fail_session(proto::ErrorCode::decode_failed, st.message());
+                } else if (finalize) {
+                    // The utterance still owes the Client exactly one `final` (§6.2), because a
+                    // `partial` went out under this id — that is what `published` said. The last
+                    // hypothesis the user actually watched arrive in the pill is the honest
+                    // thing to close it with; dropping it would delete words they had read.
+                    uint64_t stable = 0;
+                    Violation v;
+                    if (stability_.finalize(fallback, stable, v)) {
+                        KD_LOG_WARN(
+                            "the flush for utterance %llu did not come back; closing it with the "
+                            "last hypothesis the Client already has (%zu bytes)",
+                            static_cast<unsigned long long>(utt), fallback.size());
+                        emit_final(fallback, stable);
+                    } else {
+                        fail_session(proto::ErrorCode::decode_failed, v.to_wire_message());
+                    }
+                }
             } else if (finalize) {
                 bool published = false;
                 {
