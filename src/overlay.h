@@ -271,15 +271,22 @@ public:
     // rate does not repaint the pill on microphone noise.
     void set_input_level(float level01);
 
-    // No `partial` or `final` has arrived for this long while the microphone is open, in
-    // milliseconds; 0 when text is flowing normally or there is nothing to wait for. Past a
-    // threshold the pill says so in its note line.
+    // How far behind the preview is **while the speaker is still talking**, in milliseconds; 0
+    // whenever there is nothing worth mentioning. Past a threshold the pill says so in its note
+    // line.
     //
     // Deliberately separate from `set_state`: the session is not in a *different* state — the
     // microphone is open and the words are coming — it is a latency the user is entitled to see
     // instead of inferring from a preview that stopped moving. A batch model re-decodes the whole
     // open utterance on every hop, so this grows with the sentence and is at its worst exactly
     // when the speaker is furthest from the last thing they saw.
+    //
+    // **"While still talking" is the caller's job and is load-bearing.** Measured as plain time
+    // since the last text, this fires on every ordinary pause — the endpointer takes
+    // `endpoint_silence_ms` to notice you stopped and the flush then re-decodes the utterance, so
+    // the words always land seconds after your last syllable, entirely correctly. A pill that
+    // announced a stalled transcriber there would be wrong every single time the user paused.
+    // See `App::publish_listening_state`.
     void set_transcriber_lag(uint64_t lag_ms);
 
     // Position. An absent anchor means "no usable estimate", which drives the fallback the

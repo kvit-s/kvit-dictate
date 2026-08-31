@@ -403,8 +403,17 @@ bool attach(kd::IpcClient& client, Observed& seen, const std::string& url) {
     return client.send_control(kd::proto::Message::of(hello)).ok();
 }
 
+// `pace_ms` waits that long after each half-second of audio is drained, which is the difference
+// between a test that measures the *policy* and one that measures the machine it ran on.
+//
+// A hop that fires while a POST is in flight replaces the pending work rather than queueing it
+// (§2.1), so how many hops an utterance produces depends on how fast the audio arrives relative
+// to a round trip. Pushed at memory speed, eight seconds of PCM can collapse into two requests —
+// which is fine for a case that only needs *a* partial, and fatal for one that needs to watch the
+// tracker's behaviour across several. Pacing costs wall-clock time, so it is opt-in per case
+// rather than the default.
 bool run_session(TranslatorHarness& harness, Observed& seen, const std::vector<int16_t>& pcm,
-                 bool cancel_instead_of_stop = false, int settle_ms = 6000) {
+                 bool cancel_instead_of_stop = false, int settle_ms = 6000, int pace_ms = 0) {
     kd::IpcClient client;
     if (!attach(client, seen, harness.url())) return false;
     if (!seen.wait_for([&] { return seen.ready || seen.dead || seen.disconnected; })) return false;
@@ -438,6 +447,9 @@ bool run_session(TranslatorHarness& harness, Observed& seen, const std::vector<i
         if (since_drain >= kDrainEvery) {
             since_drain = 0;
             if (!client.flush_audio(5000).ok()) return false;
+            if (pace_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
+            }
         }
     }
 
@@ -1182,7 +1194,10 @@ KD_TEST(asrd_session, live_preview_publishes_no_mark_so_a_late_revision_cannot_t
     KD_REQUIRE(harness.start());
 
     Observed seen;
-    KD_REQUIRE(run_session(harness, seen, one_utterance(8000, 1200)));
+    // Paced, because this case is about what the tracker does across *several* hypotheses and
+    // an unpaced feed collapses the utterance into two requests on a loaded machine. Without
+    // this the case failed intermittently on the assertion below — never on the mark itself.
+    KD_REQUIRE(run_session(harness, seen, one_utterance(8000, 1200), false, 6000, 200));
 
     const auto partials = seen.of<kd::proto::PartialMsg>();
     // Two, not one: with a single hypothesis the tracker has no common prefix to publish and

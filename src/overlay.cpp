@@ -376,6 +376,17 @@ constexpr float kScrollThumbMaxFraction = 0.72f;
 // speaker has been talking into a preview that has not moved for long enough to wonder whether
 // anything is on, and the honest answer — it is listening, the words have not come back — is
 // better than leaving them to guess from a dot.
+//
+// **The caller decides whether the wait is worth mentioning, not this file.** The first version
+// measured lag as "time since the last text arrived" and nothing else, which made it fire on
+// every ordinary pause: stop speaking, the endpointer spends `endpoint_silence_ms` deciding you
+// have stopped, the flush re-decodes the whole utterance, and the words land three to five
+// seconds after your last syllable. Every one of those seconds counted as lag, so the pill said
+// it was waiting on the transcriber at the exact moment the transcriber was doing its job on
+// schedule. Reported as "why is it waiting on transcriber when I pause talking — that message
+// doesn't make much sense". It doesn't. `App::publish_listening_state` now reports a lag only
+// while the speaker is actually mid-speech, which is the only state in which a late preview is
+// something they can act on.
 constexpr uint64_t kLagNoteMs = 4000;
 
 // A caret is a solid 1-DIP bar and does not blink (docs/editing.md §7.1). overlay.h is explicit
@@ -1160,9 +1171,9 @@ HRESULT OverlayCore::paint_once() {
         // `state`, because the session is not in a different state and the microphone has not
         // done anything wrong — see set_transcriber_lag(). The seconds are in it because "5s"
         // and "20s" call for different reactions from the speaker.
-        std::string line = "â³ heard you â waiting on the transcriber (";
+        std::string line = "still transcribing, ";
         line += std::to_string(transcriber_lag_ms / 1000);
-        line += "s)";
+        line += "s behind";
         note = utf8::to_utf16_or_empty(line);
     } else if (em != OverlayMode::StatusOnly && state != OverlayState::Idle &&
                state != OverlayState::Listening && state != OverlayState::Speaking) {

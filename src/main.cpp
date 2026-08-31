@@ -115,6 +115,12 @@ constexpr uint64_t kScrollRepinMs = 6000;
 // second is far inside the gap between utterances.
 constexpr uint64_t kRecoverySaveMs = 1000;
 
+// How long after the last voiced frame the speaker still counts as mid-speech, for the one
+// decision that depends on it: whether a late preview is worth mentioning. Two seconds spans the
+// gap between two sentences of a continuing passage and expires well inside a real pause — which
+// is shorter than `endpoint_silence_ms`, so the note is gone before the endpointer even fires.
+constexpr uint64_t kSpeechRecentMs = 2000;
+
 // `scheme://host:port` out of a URL, lowercased, or empty when there is no authority to take.
 // Used for one question only: are the rewriter and the speech service the same machine, and
 // therefore competing for it? See App::pump_normalize.
@@ -573,6 +579,10 @@ private:
     // consumed by the tick, so a burst of edits costs one write rather than one write each.
     bool recovery_dirty_ = false;
     uint64_t recovery_saved_ms_ = 0;
+
+    // When the microphone last heard a voice. Only publish_listening_state() reads it, to decide
+    // whether a late preview is something the speaker is actually waiting on.
+    uint64_t last_speech_ms_ = 0;
 
     // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
     // Read only by pump_normalize(), and only when the rewriter is on the same host.
@@ -2324,6 +2334,7 @@ void App::begin_dictation() {
     // kLagNoteMs from activation before it can complain, rather than opening on a caption
     // inherited from the previous session's last utterance.
     last_text_ms_ = clock_.now_ms();
+    last_speech_ms_ = 0;
     input_level_.store(0.0f, std::memory_order_relaxed);
     scroll_touched_ms_ = 0;
     asr_utterance_open_ = false;
@@ -2502,14 +2513,26 @@ void App::publish_listening_state() {
         overlay_->set_state(want);
     }
 
-    // How long the pill has had nothing new to show. `last_text_ms_` is stamped by every
-    // `partial` or `final` that carried text, so this is the age of the newest words the user
-    // has actually seen — which under a batch model behind a hop is the number that grows with
-    // the sentence and is worst exactly when they are furthest from it.
+    // How long the pill has had nothing new to show — but only while the speaker is mid-speech.
+    //
+    // The first version reported the age of the newest text and nothing else, and so it fired on
+    // every ordinary pause. Stop talking and three things happen in order, all of them correct:
+    // the endpointer spends `endpoint_silence_ms` (1500 ms here) deciding you have stopped, the
+    // flush re-decodes the whole utterance, and the `final` lands three to five seconds after
+    // your last syllable. Every one of those seconds counted as lag, so the pill announced it was
+    // waiting on the transcriber at precisely the moment the transcriber was on schedule.
+    // Reported as "why is it waiting on transcriber when I pause talking — that message doesn't
+    // make much sense". It doesn't.
+    //
+    // The note is only worth showing in the state the complaint it answers describes: *talking*
+    // and seeing nothing. Once the speaker stops, the words are coming and no caption helps.
+    // `kSpeechRecentMs` is the grace after the last voiced frame — long enough to span the gap
+    // between two sentences of a continuing passage, short enough that a real pause clears it.
     const uint64_t now = clock_.now_ms();
-    overlay_->set_transcriber_lag(last_text_ms_ == 0 || now <= last_text_ms_
-                                      ? uint64_t{0}
-                                      : now - last_text_ms_);
+    if (speaking) last_speech_ms_ = now;
+    const bool mid_speech = last_speech_ms_ != 0 && now - last_speech_ms_ <= kSpeechRecentMs;
+    const bool stale = last_text_ms_ != 0 && now > last_text_ms_;
+    overlay_->set_transcriber_lag(mid_speech && stale ? now - last_text_ms_ : uint64_t{0});
 }
 
 void App::render_preview(std::string_view tail) {
