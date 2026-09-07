@@ -371,6 +371,8 @@ private:
     // Empties the compose buffer into the document, or onto the clipboard when the target is
     // gone. Safe to call with nothing buffered: it returns having done nothing.
     void flush_deferred_commits(const char* why);
+    // Type the closing half of the dictation marker (settings.h, TextAffix), if one is owed.
+    void close_affix(const char* why);
     // What the overlay should be showing right now, given the cadence. `tail` is the engine's
     // unstable text for the utterance in progress.
     void render_preview(std::string_view tail);
@@ -599,6 +601,12 @@ private:
     // the worse of the two mistakes, and so would its opposite.
     kd::Corpus corpus_;
     bool corpus_skip_ = false;
+
+    // The opening half of the dictation marker has been typed into this session's target and
+    // the closing half has not (settings.h, TextAffix). Only ever true under a streaming
+    // cadence: `Cadence::EndOfSession` has the whole text at once and wraps it in one step, in
+    // flush_deferred_commits(), so it never opens anything it has to remember to close.
+    bool affix_open_ = false;
 
     // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
     // Read only by pump_normalize(), and only when the rewriter is on the same host.
@@ -1943,6 +1951,17 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     // land. It used to pass an empty Rect, which fails every capture — "capture region is empty"
     // on every injection — so commit differencing never ran once and the anchor could never do
     // better than the caret or the last click.
+    // The marker's opening half (settings.h, TextAffix) rides along with the session's first
+    // injected op rather than going in as an injection of its own: one SendInput instead of two,
+    // and no window between them in which a focus change could leave a bare "[dictated: " in the
+    // document with nothing behind it. Inserted at 0, ahead of `leading_space`, so the marker is
+    // genuinely first. finish_dictation() then owes the closing half — that is what `affix_open_`
+    // records, and it is set even for a prefix-only marker so an empty suffix costs nothing.
+    if (!affix_open_ && settings_.affix.active()) {
+        text.insert(0, settings_.affix.prefix);
+        affix_open_ = true;
+    }
+
     const bool framed = anchor_ != nullptr && submit_before_frame();
     const kd::InjectResult res = injector_->inject(*target_, text);
     if (framed) anchor_->submit_after_frame(text);
@@ -2299,6 +2318,10 @@ void App::begin_dictation() {
         return;
     }
     target_ = captured.value();
+    // A new target, so nothing is owed to the old one. finish_dictation() clears this on the
+    // path every session ends through; this is the belt to that braces, and it matters because
+    // the flag decides whether a "]" gets typed into a window that never saw a "[".
+    affix_open_ = false;
 
     // The per-application policy, which decides *how* we type into this target and whether we
     // type into it at all. docs/supported-targets.md is where these come from: they are
@@ -3021,6 +3044,10 @@ void App::recover_previous_session() {
         return;
     }
 
+    // Wrapped exactly as flush_deferred_commits would have wrapped it, so what the user pastes
+    // is what the document would have received had the session ended normally.
+    text = settings_.affix.wrap(text);
+
     // The clipboard, and the tray, because that is already this program's idiom for "there is
     // text and nowhere to put it" — flush_deferred_commits does exactly this when injection
     // fails, and a second mechanism for the same situation would be one more thing to learn.
@@ -3049,7 +3076,14 @@ void App::flush_deferred_commits(const char* why) {
     // out and leaves the buffer empty in one step, which is the same rule the previous
     // `text.swap(deferred_)` enforced and the reason it is a single call rather than a read
     // followed by a clear.
-    const std::string text = edit_.take();
+    // The marker (settings.h, TextAffix) goes on *here*, and this is the only place it can go
+    // on for this cadence. The buffer is what the compose pill showed the user and what the
+    // rewriter was handed; a marker living in it would be editable by Backspace and would be
+    // sent to the rewriter as if it were something somebody had said. This line is the single
+    // step between that buffer and the document, so the buffer stays the user's words and the
+    // marker is added on the way out — including on the clipboard fallback below, so a failed
+    // injection offers exactly the text the document would have received.
+    const std::string text = settings_.affix.wrap(edit_.take());
 
     // The target has to be revalidated here for the same reason perform_commit revalidates:
     // SendInput types into whatever is focused *now*, not into the window we were aiming at.
@@ -3084,6 +3118,33 @@ void App::flush_deferred_commits(const char* why) {
     }
 }
 
+void App::close_affix(const char* why) {
+    if (!affix_open_) return;
+    // Cleared first and unconditionally: whatever happens below, this session owes nothing more,
+    // and a flag left set would put this session's "]" at the front of the next one.
+    affix_open_ = false;
+    if (settings_.affix.suffix.empty()) return;
+
+    // Revalidated for the same reason every other injection revalidates: SendInput types into
+    // whatever is focused now. A closing bracket in the wrong window is a small mess, but it is
+    // still a mess, and there is no way to put it where it belonged once focus has moved.
+    if (!target_.has_value() || !kd::validate_target(*target_)) {
+        KD_LOG_WARN("the target is gone (%s); \"%s\" was typed in and its closing \"%s\" was "
+                    "not",
+                    why, settings_.affix.prefix.c_str(), settings_.affix.suffix.c_str());
+        return;
+    }
+    const kd::InjectResult res = injector_->inject(*target_, settings_.affix.suffix);
+    if (res.status != kd::InjectStatus::Ok) {
+        // Not escalated to the tray. The words themselves reached the document — that is the
+        // part worth interrupting somebody over — and this is punctuation they can type.
+        KD_LOG_WARN("could not type the closing \"%s\": %s", settings_.affix.suffix.c_str(),
+                    kd::to_string(res.status));
+        return;
+    }
+    if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
+}
+
 // The session is over: `stopped` arrived, the child went away, or the grace expired.
 void App::finish_dictation(const char* why) {
     if (!finalizing_ && !target_.has_value()) return;
@@ -3106,6 +3167,10 @@ void App::finish_dictation(const char* why) {
     corpus_skip_ = false;
 
     flush_deferred_commits(why);
+    // The marker's closing half, before target_ is cleared below and on the same one path.
+    // Deliberately reached by the abort paths too: an unclosed "[dictated: " sitting in
+    // somebody's document is worse than a marker around a session that ended early.
+    close_affix(why);
     finalizing_ = false;
     finalize_deadline_ms_ = 0;
 

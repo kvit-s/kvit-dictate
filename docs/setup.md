@@ -256,6 +256,41 @@ than guessing, and the settings file is refused at load with the field named.
 
 ---
 
+## 3.2 Marking the text as dictated (optional, off by default)
+
+**Settings → Injection → Wrap the dictated text.** Two boxes, `Before` and `After`, both empty by
+default. Whatever is in them goes around what you said on its way into the document:
+
+| Before | After | You say | The document gets |
+|---|---|---|---|
+| `[dictated: ` | `]` | open teh sesson file | `[dictated: open teh sesson file]` |
+| `(voice) ` | | open teh sesson file | `(voice) open teh sesson file` |
+
+It is for one situation, and it is a good one: dictating into a coding agent. No recogniser gets
+every project noun right, `context_terms` only reaches the ones you thought to list, and the
+clean-up in §3.1 fixes fillers and punctuation rather than terms. But the reader is an LLM, and an
+LLM is very good at working out what you meant **once it knows it is reading speech**. So instead
+of trying to make the transcript exact, the marker tells the reader that it is not.
+
+Some details that are decisions rather than accidents:
+
+* **The marker is not in the pill.** Under the `end-of-session` cadence the pill shows your words
+  and only your words, so Backspace cannot eat half a bracket and the clean-up in §3.1 is never
+  handed a `[dictated:` to rewrite into prose. It is added in the one step between the pill and
+  the document.
+* **An empty session gets nothing.** If you say nothing, no marker is typed.
+* **The closing half is typed even when the session is cut short** — a lost target, a stability
+  violation, Esc — because an unclosed `[dictated: ` in your document is worse than a marker
+  around a sentence that ended early. The one case it cannot cover is focus moving to another
+  window before the session ends; the log says so when that happens.
+* **The clipboard fallback carries it too.** If injection fails and the text lands on the
+  clipboard instead, what you paste is what the document would have received.
+
+Trailing and leading spaces are kept exactly as you type them — `[dictated: ` ends in one on
+purpose. Each box holds up to 512 bytes.
+
+---
+
 ## 4. Putting a server you already run behind the protocol
 
 The protocol is published (`docs/protocol.md`, Apache-2.0) precisely so this is possible without

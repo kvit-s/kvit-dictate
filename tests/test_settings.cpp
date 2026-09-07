@@ -73,6 +73,11 @@ kd::Settings unusual() {
     s.context_terms = {"llama.cpp", "Qwen3", "WASAPI"};
     s.send_context = true;
 
+    // The dictation marker. The trailing space in the prefix is the point of the field, so it is
+    // in the fixture: a round trip that trimmed it would run "[dictated:" into the first word.
+    s.affix.prefix = "[dictated: ";
+    s.affix.suffix = "]";
+
     // The cadence above is end-of-session, which is the only one under which this may be on.
     s.normalizer.enabled = true;
     s.normalizer.url = "http://strixhalo.lan:10301/v1/text/normalize";
@@ -152,6 +157,8 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(out.start_with_windows, in.start_with_windows);
     KD_CHECK_EQ(out.context_terms.size(), in.context_terms.size());
     KD_CHECK_EQ(out.send_context, in.send_context);
+    KD_CHECK_EQ(out.affix.prefix, in.affix.prefix);
+    KD_CHECK_EQ(out.affix.suffix, in.affix.suffix);
 
     KD_CHECK_EQ(out.normalizer.enabled, in.normalizer.enabled);
     KD_CHECK_EQ(out.normalizer.url, in.normalizer.url);
@@ -184,6 +191,64 @@ KD_TEST(settings, defaults_round_trip_and_validate) {
     KD_REQUIRE(ok);
     KD_CHECK(out.validate().is_ok());
     KD_CHECK_EQ(kd::serialize_settings(out), kd::serialize_settings(s));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The dictation marker (settings.h, TextAffix)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(settings, the_marker_goes_around_the_dictated_text) {
+    kd::TextAffix a;
+    a.prefix = "[dictated: ";
+    a.suffix = "]";
+    KD_CHECK(a.active());
+    KD_CHECK_EQ(a.wrap("fix teh typo"), std::string("[dictated: fix teh typo]"));
+}
+
+KD_TEST(settings, an_empty_dictation_gets_no_marker) {
+    // The failure this prevents: a session that committed nothing delivering a bare
+    // "[dictated: ]" — a marker announcing text that is not there.
+    kd::TextAffix a;
+    a.prefix = "[dictated: ";
+    a.suffix = "]";
+    KD_CHECK_EQ(a.wrap(""), std::string(""));
+}
+
+KD_TEST(settings, no_marker_means_the_text_is_untouched) {
+    const kd::TextAffix none;
+    KD_CHECK(!none.active());
+    KD_CHECK_EQ(none.wrap("open the session file"), std::string("open the session file"));
+
+    // A prefix alone is a legal marker — a leading tag with nothing to close — and `active()`
+    // has to say so, because that is what makes finish_dictation() skip an empty suffix rather
+    // than skip the whole feature.
+    kd::TextAffix prefix_only;
+    prefix_only.prefix = "(voice) ";
+    KD_CHECK(prefix_only.active());
+    KD_CHECK_EQ(prefix_only.wrap("hello"), std::string("(voice) hello"));
+}
+
+KD_TEST(settings, an_oversized_marker_is_rejected_rather_than_truncated) {
+    // settings.cpp: truncating would type half a marker into the document — an unclosed bracket
+    // is exactly what the suffix exists to prevent — with nothing to tell the user why.
+    kd::Settings s;
+    s.affix.prefix = std::string(kd::kMaxAffixBytes + 1, 'x');
+    s.normalise();
+    KD_CHECK(!s.validate().is_ok());
+
+    s.affix.prefix = std::string(kd::kMaxAffixBytes, 'x');
+    KD_CHECK(s.validate().is_ok());
+
+    s.affix.suffix = std::string(kd::kMaxAffixBytes + 1, 'y');
+    KD_CHECK(!s.validate().is_ok());
+}
+
+KD_TEST(settings, the_marker_survives_a_file_that_predates_it) {
+    // Every settings.json already on disk has no "affix" block. It must read as "no marker",
+    // not as an error and not as a default somebody has to go and turn off.
+    kd::Result<kd::Settings> parsed = kd::parse_settings("{\"schema\": 1}");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(!parsed.value().affix.active());
 }
 
 KD_TEST(settings, an_empty_object_is_a_first_run_not_an_error) {

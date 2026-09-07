@@ -832,6 +832,8 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,
 //     "context":   { "send": true, "terms": [ "llama.cpp", "Qwen3" ] },
+//     "affix":     { "prefix": "[dictated: ", "suffix": "]" },  // put around the text, empty by
+//                                                              // default; applied at injection
 //     "normalizer":{ "enabled": false,                     // normalizer.h; off by default
 //                    "url": "http://strixhalo.lan:10301/v1/text/normalize",
 //                    "timeout_ms": 3000, "max_bytes": 4000,
@@ -843,6 +845,19 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 // both. The nesting is deliberate: plan.md §1.4 separates eligibility from cadence, and a file in
 // which `cadence` sits inside `stability` invites exactly the merge the plan spent a revision
 // undoing.
+
+std::string TextAffix::wrap(std::string_view dictated) const {
+    // Nothing said, nothing wrapped. The alternative — emitting "[dictated: ]" for a session
+    // that produced no words — puts a marker into the document announcing text that is not
+    // there, which is worse than the empty injection this program already does nothing about.
+    if (dictated.empty()) return std::string{dictated};
+    std::string out;
+    out.reserve(prefix.size() + dictated.size() + suffix.size());
+    out += prefix;
+    out += dictated;
+    out += suffix;
+    return out;
+}
 
 void Settings::normalise() {
     // corpus.h: an enabled corpus with no directory would refuse every session at `open`. Give
@@ -1027,6 +1042,16 @@ Status Settings::validate() const {
 
     if (hotkey.vk == 0) {
         return Status{StatusCode::InvalidArgument, "hotkey: no key is bound"};
+    }
+
+    // Bounded rather than clamped, because a marker that was silently truncated would be typed
+    // into the document half-written — an unclosed bracket is exactly the failure the suffix
+    // exists to avoid — and the user would have no way to tell why.
+    if (affix.prefix.size() > kMaxAffixBytes || affix.suffix.size() > kMaxAffixBytes) {
+        return Status{StatusCode::InvalidArgument,
+                      "affix.prefix and affix.suffix are limited to " +
+                          std::to_string(kMaxAffixBytes) + " bytes each; this text is typed "
+                          "into the document on every session"};
     }
 
     // normalizer.h owns its own rules; this is the one call site. The cadence is passed in
@@ -1323,6 +1348,12 @@ std::string serialize_settings(const Settings& s) {
         put_bool(o, "send", s.send_context);
         put_strings(o, "terms", s.context_terms);
         root.set("context", std::move(o));
+    }
+    {
+        json::Value o = json::Value::object();
+        put_str(o, "prefix", s.affix.prefix);
+        put_str(o, "suffix", s.affix.suffix);
+        root.set("affix", std::move(o));
     }
     {
         json::Value o = json::Value::object();
@@ -1671,6 +1702,15 @@ Result<Settings> parse_settings(std::string_view json_text) {
         if (o.failed()) return Status{StatusCode::Malformed, o.error()};
     }
 
+    if (const json::Value* v = root.find("affix")) {
+        Obj o(*v, "settings.affix");
+        o.str_opt("prefix", s.affix.prefix);
+        o.str_opt("suffix", s.affix.suffix);
+        if (o.failed()) return Status{StatusCode::Malformed, o.error()};
+        // The length bound is Settings::validate()'s, reached at the end of this function, so
+        // there is one rule in one place rather than a second opinion here.
+    }
+
     if (const json::Value* v = root.find("normalizer")) {
         Obj o(*v, "settings.normalizer");
         o.bool_opt("enabled", s.normalizer.enabled);
@@ -1779,6 +1819,10 @@ enum : int {
     kIdStartup,
     kIdSendContext,
     kIdContextTerms,
+    // The dictation marker (settings.h, TextAffix). Two boxes rather than one, because the
+    // motivating marker is a bracket and a bracket has two ends.
+    kIdAffixPrefix,
+    kIdAffixSuffix,
     kIdEditingEnabled,
     kIdEditingMouse,
     kIdEditingForeign,
@@ -3063,6 +3107,10 @@ void load_controls(HWND dlg, DialogState& st) {
     // Context.
     CheckDlgButton(dlg, kIdSendContext, s.send_context ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdContextTerms), terms_to_text(s.context_terms).c_str());
+
+    // The marker.
+    SetWindowTextW(GetDlgItem(dlg, kIdAffixPrefix), wide(s.affix.prefix).c_str());
+    SetWindowTextW(GetDlgItem(dlg, kIdAffixSuffix), wide(s.affix.suffix).c_str());
 }
 
 // Read every control back. Returns false with the offending control focused and a message box
@@ -3270,6 +3318,11 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     s.send_context = IsDlgButtonChecked(dlg, kIdSendContext) == BST_CHECKED;
     s.context_terms = terms_from_text(get_text(GetDlgItem(dlg, kIdContextTerms)));
 
+    // Taken verbatim, leading and trailing spaces included: "[dictated: " ends in one on
+    // purpose, and trimming it would run the marker into the first word.
+    s.affix.prefix = narrow(get_text(GetDlgItem(dlg, kIdAffixPrefix)));
+    s.affix.suffix = narrow(get_text(GetDlgItem(dlg, kIdAffixSuffix)));
+
     s.normalise();
     Status valid = s.validate();
     if (!valid.is_ok()) {
@@ -3439,6 +3492,15 @@ void build_controls(HWND dlg, DialogState& st) {
         c.note(L"process.exe = sendinput | clipboard [, ctrl-shift-v] [, unsupported]", 2);
         c.multiline(kIdAppPolicies, 110);
 
+        // Here rather than on the compose-buffer page, which is the other place it could
+        // plausibly live: everything on that page is conditional on the end-of-session cadence
+        // (normalise() forces it off otherwise), and this works under every cadence. It belongs
+        // with the other question about what actually arrives in the document.
+        c.section(L"Wrap the dictated text");
+        c.note(L"Goes around what you said on its way into the document. Leave both empty "
+               L"for none. Mainly useful when the reader is a coding agent.", 3);
+        set_cue(c.label_edit(L"Before", kIdAffixPrefix), L"[dictated: ");
+        set_cue(c.label_edit(L"After", kIdAffixSuffix), L"]");
     }
 
     // ── Page 3: overlay, privacy, vocabulary ────────────────────────────────────────────────

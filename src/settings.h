@@ -267,6 +267,51 @@ std::string validate_speech_service_url(std::string_view url);
 //                                 ambiguous case this whole enum exists to disambiguate.
 ServerMode migrate_server_mode(std::string_view url) noexcept;
 
+// ─── The dictation marker ───────────────────────────────────────────────────────────────────
+//
+// Text put around what was dictated, on its way into the document: prefix + words + suffix.
+//
+// It exists for one use, and the use explains the shape. Dictating into a coding agent, nobody
+// speaks a proper noun the recogniser has never heard and gets it back right — `context_terms`
+// helps, the rewriter helps a little, and neither of them fixes the tail. But the reader is an
+// LLM, which is very good at working out what was meant *if it knows it is reading speech*. So
+// rather than making the transcript exact, the marker tells the reader it is approximate:
+//
+//     prefix "[dictated: "  suffix "]"   ->   [dictated: open teh sesson file and fix the typo]
+//
+// Both halves are free text and either may be empty. A prefix alone is a leading tag; both
+// together are a wrapper, which is what a bracket needs and why this is not one field.
+//
+// ─── Where it is applied, and where it is deliberately not ──────────────────────────────────
+//
+// **At injection time, never in the buffer.** Under `Cadence::EndOfSession` the dictated text
+// lives in `EditBuffer`, which is what the compose pill shows and what the rewriter rewrites; a
+// marker stored there would be editable by Backspace, would be sent to the rewriter as if it
+// were speech, and would come back rewritten into prose. So the buffer holds the user's words
+// and only their words, and `App::flush_deferred_commits` wraps on the way out — including on
+// the clipboard fallback, so a failed injection offers exactly the text the document would have
+// received. Under the streaming cadences the prefix rides along with the first committed op and
+// the suffix is injected once, by `App::finish_dictation`, on the one path every session ends
+// through.
+//
+// A session that committed nothing is wrapped in nothing: an empty dictation must not deliver a
+// bare "[dictated: ]".
+struct TextAffix {
+    std::string prefix;
+    std::string suffix;
+
+    [[nodiscard]] bool active() const { return !prefix.empty() || !suffix.empty(); }
+
+    // `dictated` with the marker around it, for the paths that have the whole text at once.
+    // Returns `dictated` untouched when it is empty, or when there is no marker to add.
+    [[nodiscard]] std::string wrap(std::string_view dictated) const;
+};
+
+// Per field. Generous — a marker is a phrase, and someone will want a sentence of instructions
+// in it — but bounded, because this text is injected into a document on every session and a
+// settings file that carried a megabyte of it would type a megabyte.
+inline constexpr size_t kMaxAffixBytes = 512;
+
 struct Settings {
     int schema = kSettingsSchema;
 
@@ -357,6 +402,11 @@ struct Settings {
     CorpusConfig corpus;
 
     bool start_with_windows = false;
+
+    // Put around the dictated text on its way into the document. Empty by default: the marker
+    // is useful to a reader that knows what to do with it and is noise to every other one, so
+    // it is opt-in rather than a default anybody has to notice and turn off.
+    TextAffix affix;
 
     // Vocabulary hints sent with `start` (docs/protocol.md §6.1). Kept separate from
     // SessionConfig::context so that the settings file is the single source and the session
