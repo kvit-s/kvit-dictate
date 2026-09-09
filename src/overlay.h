@@ -395,9 +395,14 @@ public:
     // or type it again — and a third would be a menu. The caller decides which apply from the
     // method it used and the clipboard state it got back; this only draws what it is given.
     //
+    // **Labels only, with nothing written above them.** There was a line of explanatory text
+    // here and it earned none of the space it took: the buttons say what they do, and the pill
+    // is sitting on top of the document the user is trying to read to decide whether to press
+    // one. A sentence that has to be read first is the wrong shape for that.
+    //
     // Showing actions makes the pill clickable (WS_EX_TRANSPARENT is dropped) and keeps it up
     // after the session has ended. `clear_actions` puts both back.
-    void set_actions(std::string_view prompt, const std::vector<std::string>& labels);
+    void set_actions(const std::vector<std::string>& labels);
     void clear_actions();
     [[nodiscard]] bool has_actions() const noexcept;
 

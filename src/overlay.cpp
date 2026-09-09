@@ -816,10 +816,9 @@ struct OverlayCore {
         return px >= mic_left && px < mic_right && py >= mic_top && py < mic_bottom;
     }
 
-    // overlay.h, "Post-submission actions". At most two labels and the line above them; the
-    // rectangles are filled in by the paint that drew them, in DIPs relative to the pill's
-    // top-left, and cleared by the paint that did not.
-    std::string action_prompt;
+    // overlay.h, "Post-submission actions". At most two labels; the rectangles are filled in by
+    // the paint that drew them, in DIPs relative to the pill's top-left, and cleared by the
+    // paint that did not.
     std::vector<std::string> actions;
     struct ButtonRect {
         float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f;
@@ -1432,23 +1431,9 @@ HRESULT OverlayCore::paint_once() {
                                    : 0.0f;
     const float mic_h = mic_layout ? mic_metrics.height + kMicButtonPadDip : 0.0f;
 
-    // The post-submission prompt and its buttons (overlay.h). Measured with the same note format
-    // and the same padding as the microphone button, so the two read as the same kind of control
-    // in the rare frame that could show both.
-    ComRef<IDWriteTextLayout> prompt_layout;
-    DWRITE_TEXT_METRICS prompt_metrics{};
-    if (!actions.empty() && !action_prompt.empty()) {
-        const std::wstring line = utf8::to_utf16_or_empty(action_prompt);
-        if (!line.empty() &&
-            SUCCEEDED(dwrite->CreateTextLayout(line.c_str(), static_cast<UINT32>(line.size()),
-                                               format_note.get(), max_text_w, 4096.0f,
-                                               prompt_layout.put()))) {
-            if (FAILED(prompt_layout->GetMetrics(&prompt_metrics))) prompt_layout.reset();
-        }
-    }
-    const float prompt_w = prompt_layout ? prompt_metrics.widthIncludingTrailingWhitespace : 0.0f;
-    const float prompt_h = prompt_layout ? prompt_metrics.height : 0.0f;
-
+    // The post-submission buttons (overlay.h). Measured with the same note format and the same
+    // padding as the microphone button, so the two read as the same kind of control in the rare
+    // frame that could show both.
     std::vector<ComRef<IDWriteTextLayout>> act_layouts;
     std::vector<float> act_w;
     float act_h = 0.0f;
@@ -1493,14 +1478,17 @@ HRESULT OverlayCore::paint_once() {
     const float legend_h = legend_layout ? legend_metrics.height : 0.0f;
 
     const float measured_w =
-        std::max(std::max(std::max(std::max(std::max(body_w, note_w), mic_w), legend_w), prompt_w),
-                 act_row_w);
-    const float content_w = (mode == OverlayMode::FloatingPill && measured_w > 0.0f)
-                                ? max_text_w
-                                : measured_w;
+        std::max(std::max(std::max(std::max(body_w, note_w), mic_w), legend_w), act_row_w);
+    // The floating pill holds a fixed width while it has text, so a growing transcript does not
+    // make the window breathe on every partial. That reasoning ends with the session: once the
+    // text has gone into the document and only the buttons are left, a full-width pill is a
+    // rectangle of nothing sitting on top of what was just typed — which is precisely the thing
+    // the user wants to look at to decide whether the buttons are needed.
+    const bool full_width = mode == OverlayMode::FloatingPill && measured_w > 0.0f &&
+                            (actions.empty() || body_layout);
+    const float content_w = full_width ? max_text_w : measured_w;
     const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f) +
                             (mic_layout ? gap + mic_h : 0.0f) +
-                            (prompt_layout ? gap + prompt_h : 0.0f) +
                             (act_layouts.empty() ? 0.0f : gap + act_h) +
                             (legend_layout ? gap + legend_h : 0.0f);
 
@@ -1751,16 +1739,11 @@ HRESULT OverlayCore::paint_once() {
                            mic_layout.get(), brush_pending.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
-    // The post-submission prompt and buttons, below the microphone button and above the legend.
-    // The rectangles are recorded here and nowhere else: a hit test that computed its own layout
+    // The post-submission buttons, below the microphone button and above the legend. The
+    // rectangles are recorded here and nowhere else: a hit test that computed its own layout
     // would be a second implementation of this arithmetic, free to disagree with what was drawn.
     action_rects.clear();
-    const float prompt_y = mic_y + (mic_layout ? mic_h + gap : 0.0f);
-    if (prompt_layout && brush_unstable) {
-        rt->DrawTextLayout(D2D1::Point2F(text_x, prompt_y), prompt_layout.get(),
-                           brush_unstable.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-    }
-    const float act_y = prompt_y + (prompt_layout ? prompt_h + gap : 0.0f);
+    const float act_y = mic_y + (mic_layout ? mic_h + gap : 0.0f);
     if (!act_layouts.empty() && brush_border && brush_pending) {
         float x = text_x;
         for (size_t i = 0; i < act_layouts.size(); ++i) {
@@ -2404,16 +2387,15 @@ bool Overlay::hit_test_mic_button(int32_t x, int32_t y) const {
     return impl_->point_in_mic(x, y);
 }
 
-void Overlay::set_actions(std::string_view prompt, const std::vector<std::string>& labels) {
+void Overlay::set_actions(const std::vector<std::string>& labels) {
     // At most two: overlay.h says why, and truncating here rather than asserting keeps a caller
     // that grows a third from losing the two that matter.
     std::vector<std::string> kept(labels.begin(),
                                   labels.begin() + static_cast<ptrdiff_t>(std::min<size_t>(
                                                        labels.size(), 2)));
-    if (impl_->actions == kept && impl_->action_prompt == prompt) {
+    if (impl_->actions == kept) {
         return;
     }
-    impl_->action_prompt.assign(prompt);
     impl_->actions = std::move(kept);
     // The pill has to take clicks for the buttons to mean anything. Dropped back by
     // clear_actions, never here — a caller that set actions twice would otherwise be the reason
@@ -2426,11 +2408,10 @@ void Overlay::set_actions(std::string_view prompt, const std::vector<std::string
 }
 
 void Overlay::clear_actions() {
-    if (impl_->actions.empty() && impl_->action_prompt.empty()) {
+    if (impl_->actions.empty()) {
         return;
     }
     impl_->actions.clear();
-    impl_->action_prompt.clear();
     impl_->action_rects.clear();
     // Back to click-through unless something else is holding it open. main.cpp re-asserts this
     // from composing() on every tick, so the worst case of guessing wrong here is one frame.

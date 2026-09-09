@@ -3163,10 +3163,10 @@ void App::begin_review(const std::string& text, const kd::InjectResult& res) {
     // click that goes somewhere else, because the pill never takes focus and this process is not
     // the foreground one.
     if (hotkey_ != nullptr) hotkey_->set_review_open(true);
-    // Deliberately not a question. The program cannot tell whether the text arrived and the user
-    // is already looking at the document, so asking would tax every session that worked to serve
-    // the few that did not. The line says what is on offer; the absence of a click is the answer.
-    overlay_->set_actions("If that did not land:", labels);
+    // Buttons and nothing else. There was a line of explanatory text above them and it earned
+    // none of the room it took: the pill is sitting on top of the document the user has to read
+    // in order to decide whether to press anything, and the labels already say what they do.
+    overlay_->set_actions(labels);
 }
 
 void App::end_review(const char* why) {
