@@ -669,12 +669,30 @@ FilterOutcome InputFilter::on_event(const InputEvent& e) {
     }
 
     switch (e.kind) {
-        case InputEvent::Kind::KeyDown: return on_key_event(e, true);
-        case InputEvent::Kind::KeyUp: return on_key_event(e, false);
+        case InputEvent::Kind::KeyDown: out = on_key_event(e, true); break;
+        case InputEvent::Kind::KeyUp: out = on_key_event(e, false); break;
         case InputEvent::Kind::MouseDown:
         case InputEvent::Kind::MouseUp:
         case InputEvent::Kind::MouseWheel:
-        case InputEvent::Kind::MouseMove: return on_mouse_event(e);
+        case InputEvent::Kind::MouseMove: out = on_mouse_event(e); break;
+    }
+
+    // ── Rule 0.25: the post-submission pill is an offer, and a keystroke is not an answer ────
+    //
+    // **After the delegation, not before it.** The branches above return their own outcome and
+    // discard the one built here, so a flag set earlier reached nobody — which is how the first
+    // version of this shipped: the pill closed on a click and sat there through any amount of
+    // typing. Set here it survives every path, including the ones that swallow the key for the
+    // compose buffer, and including the hotkey itself.
+    //
+    // Key-down only. A key-up is the tail of a press that either already dismissed the pill or
+    // happened before it opened — dismissing on one would close it on the release of the very
+    // hotkey that produced it, before the user had seen it.
+    //
+    // The mouse half lives in on_mouse_event instead, because it needs the pill rectangle: a
+    // click inside the pill is how the buttons are pressed and must not dismiss anything.
+    if (review_open_ && e.kind == InputEvent::Kind::KeyDown) {
+        out.dismiss_review = true;
     }
     return out;
 }
@@ -985,6 +1003,13 @@ FilterOutcome InputFilter::on_mouse_event(const InputEvent& e) {
             // Left button only. A right-click opens a context menu and a middle-click pastes,
             // and neither is a caret placement — they fall through and end the session, which is
             // what they meant before the pill was clickable and still do.
+            // A click outside the pill dismisses the offer; a click inside it does not, because
+            // that is how the buttons are pressed. The pill's own WM_LBUTTONDOWN decides whether
+            // it landed on a button — this hook only has to avoid closing the pill out from
+            // under the click that is about to be dispatched to it.
+            if (review_open_ && !point_in_pill(e.x, e.y)) {
+                out.dismiss_review = true;
+            }
             if (e.left_button && composing() && editing_.mouse && point_in_pill(e.x, e.y)) {
                 pill_dragging_ = true;
                 out.pill_pointer = true;
@@ -1050,6 +1075,8 @@ bool InputFilter::composing() const noexcept {
 }
 
 bool InputFilter::editing_active() const noexcept { return editing_active_; }
+
+void InputFilter::set_review_open(bool open) noexcept { review_open_ = open; }
 
 void InputFilter::set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept {
     pill_left_ = left;
@@ -1217,6 +1244,10 @@ struct HookRuntime {
     std::atomic<int32_t> pill_right{0};
     std::atomic<int32_t> pill_bottom{0};
 
+    // overlay.h's post-submission pill. Published the same way the rectangle above is, and read
+    // on both hook paths, because either kind of input closes it.
+    std::atomic<bool> review_open{false};
+
     // ── The last left click, as a seqlock ────────────────────────────────────────────────────
     //
     // The click's x, y and time do not fit in a PostMessage's two parameters, so they live in a
@@ -1356,6 +1387,7 @@ void deliver(HookRuntime* rt, const FilterOutcome& o, const InputEvent& e) noexc
         write_click(rt, e.x, e.y, e.time_ms);
         post_to_owner(rt, HotkeyPost::LeftClick, 0);
     }
+    if (o.dismiss_review) post_to_owner(rt, HotkeyPost::DismissReview, 0);
 }
 
 LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam) {
@@ -1396,6 +1428,7 @@ LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam) {
     // the decision — the filter is where the comparison lives so that a stale stamp can be
     // injected in a unit test without a hung thread.
     rt->filter.note_ui_heartbeat(rt->ui_heartbeat.load(std::memory_order_relaxed));
+    rt->filter.set_review_open(rt->review_open.load(std::memory_order_relaxed));
 
     const FilterOutcome o = rt->filter.on_event(e);
     deliver(rt, o, e);
@@ -1460,6 +1493,7 @@ LRESULT CALLBACK mouse_proc(int code, WPARAM wparam, LPARAM lparam) {
                              rt->pill_top.load(std::memory_order_relaxed),
                              rt->pill_right.load(std::memory_order_relaxed),
                              rt->pill_bottom.load(std::memory_order_relaxed));
+    rt->filter.set_review_open(rt->review_open.load(std::memory_order_relaxed));
 
     const FilterOutcome o = rt->filter.on_event(e);
     deliver(rt, o, e);
@@ -1701,6 +1735,10 @@ void HotkeyManager::note_session_started() {
     PostThreadMessageW(rt->thread_id.load(std::memory_order_acquire), kHookMsgSessionStarted, 0, 0);
 }
 
+void HotkeyManager::set_review_open(bool open) noexcept {
+    impl_->rt.review_open.store(open, std::memory_order_relaxed);
+}
+
 void HotkeyManager::set_pill_rect(int32_t left, int32_t top, int32_t right,
                                   int32_t bottom) noexcept {
     HookRuntime* rt = &impl_->rt;
@@ -1761,6 +1799,9 @@ bool dispatch_hotkey_message(uint32_t msg, uintptr_t wparam, intptr_t lparam) {
         case HotkeyPost::Commit: rt->listener->on_commit(); break;
         case HotkeyPost::Edit:
             rt->listener->on_edit(unpack_edit_post(static_cast<uint64_t>(lparam)));
+            break;
+        case HotkeyPost::DismissReview:
+            rt->listener->on_dismiss_review();
             break;
         case HotkeyPost::FailedOpen:
             KD_LOG_WARN(

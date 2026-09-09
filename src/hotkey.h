@@ -343,6 +343,15 @@ struct FilterOutcome {
     int32_t pill_y = 0;
     int32_t pill_wheel = 0;
 
+    // The post-submission pill is up (overlay.h) and the user has just done something else —
+    // pressed a key, or clicked anywhere but the pill. It is an offer, not a dialog, so anything
+    // that is plainly not an answer to it dismisses it.
+    //
+    // **Never swallows.** The keystroke or click belongs to whatever the user was doing; this
+    // only notices it went past. That is the same rule the mouse hook already follows for
+    // stop-on-input, and it is why this is a separate flag rather than a branch inside one.
+    bool dismiss_review = false;
+
     bool click_captured = false;  // a left click worth caching as anchor source B
     bool click_invalidated = false;  // wheel: scrolling moves the caret with no click
     bool suppress_start_menu = false;  // inject the VK_CONTROL tap before the Win key-up
@@ -452,6 +461,11 @@ public:
     // value the tests supply and the product may not, where the symptom of a missing publisher
     // is a mouse that silently reverts to ending the session, with a green suite.
     void set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept;
+
+    // Whether the post-submission pill is up. While it is, a keystroke or a click outside the
+    // pill sets FilterOutcome::dismiss_review. Off by default and off again the moment the
+    // pill closes, so the ordinary idle path costs one predictable branch.
+    void set_review_open(bool open) noexcept;
     [[nodiscard]] bool point_in_pill(int32_t x, int32_t y) const noexcept;
 
     // Pure decision. No allocation, no syscall, bounded work — safe to call from the hook.
@@ -521,6 +535,7 @@ private:
     uint32_t ui_behind_ms_ = 0;   // how far behind it was when it tripped, for the log
     bool editing_active_ = false;
     int32_t pill_left_ = 0, pill_top_ = 0, pill_right_ = 0, pill_bottom_ = 0;
+    bool review_open_ = false;
     bool pill_dragging_ = false;  // a button-down landed in the pill and has not been released
     uintptr_t injection_mark_ = 0;
     bool session_active_ = false;
@@ -581,6 +596,9 @@ public:
     // Wheel invalidates the cached click: scrolling moves the caret with no click.
     virtual void on_wheel() = 0;
 
+    // Any real input arrived while the post-submission pill was up. See FilterOutcome above.
+    virtual void on_dismiss_review() = 0;
+
     // The hook was removed by Windows or failed to install. Surfaced rather than swallowed,
     // because the symptom otherwise is "the hotkey stopped working" with no explanation.
     virtual void on_hook_lost() = 0;
@@ -617,6 +635,7 @@ enum class HotkeyPost : uint32_t {
     ForeignKey,      // lParam: vk | (mods << 16)
     PillPointer,     // lParam: pack_pill_post()
     FailedOpen,      // the fail-open latch tripped; lParam: how many ms behind the UI thread was
+    DismissReview,   // any real input while the post-submission pill is up (overlay.h)
 };
 
 
@@ -683,6 +702,11 @@ public:
     // resized it (docs/editing.md §5.2). An empty rectangle unpublishes it, which is what a
     // hidden pill means and what every session must end with.
     void set_pill_rect(int32_t left, int32_t top, int32_t right, int32_t bottom) noexcept;
+
+    // Whether the post-submission pill is up. While it is, a keystroke or a click outside the
+    // pill sets FilterOutcome::dismiss_review. Off by default and off again the moment the
+    // pill closes, so the ordinary idle path costs one predictable branch.
+    void set_review_open(bool open) noexcept;
 
     [[nodiscard]] bool is_running() const noexcept;
 

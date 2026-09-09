@@ -1413,6 +1413,71 @@ KD_TEST(hotkey, any_click_stops_a_running_session_and_a_left_one_is_still_cached
     KD_CHECK(o.click_captured);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  The post-submission pill dismisses itself (overlay.h, FilterOutcome::dismiss_review)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+KD_TEST(hotkey, nothing_dismisses_a_review_that_is_not_open) {
+    kd::InputFilter f;
+    KD_CHECK(!f.on_event(kdown(kd::vk::kY, 100)).dismiss_review);
+    KD_CHECK(!f.on_event(mdown(true, 5, 5, 200)).dismiss_review);
+}
+
+KD_TEST(hotkey, any_keystroke_dismisses_the_review) {
+    kd::InputFilter f;
+    f.set_review_open(true);
+    // No session is running: this is the state the pill lives in, after one has ended.
+    const kd::FilterOutcome o = f.on_event(kdown(kd::vk::kY, 100));
+    KD_CHECK(o.dismiss_review);
+    // Never swallowed. The keystroke belongs to whatever the user was doing; the pill only
+    // notices it went past, exactly as stop-on-input observes a click without eating it.
+    KD_CHECK(!o.swallow);
+}
+
+KD_TEST(hotkey, a_key_release_does_not_dismiss_the_review) {
+    // The hotkey that produced the pill is still physically down when it opens. Dismissing on a
+    // key-up would close it on that release, before the user had seen it.
+    kd::InputFilter f;
+    f.set_review_open(true);
+    InputEvent up = kdown(kd::vk::kY, 100);
+    up.kind = InputEvent::Kind::KeyUp;
+    KD_CHECK(!f.on_event(up).dismiss_review);
+}
+
+KD_TEST(hotkey, our_own_injected_input_never_dismisses_the_review) {
+    // "Type it again" injects from inside the pill's own handler. If our synthetic keystrokes
+    // dismissed the review, the first character of the retype would close the pill that asked
+    // for it — the same shape as plan.md 1.8's rule for stop-on-input.
+    kd::InputFilter f;
+    f.set_review_open(true);
+    InputEvent e = kdown(kd::vk::kA, 100);
+    e.injected = true;
+    KD_CHECK(!f.on_event(e).dismiss_review);
+}
+
+KD_TEST(hotkey, a_click_outside_the_pill_dismisses_and_one_inside_does_not) {
+    kd::InputFilter f;
+    f.set_review_open(true);
+    f.set_pill_rect(100, 100, 300, 160);
+
+    // Inside: this is how the buttons are pressed. Closing here would destroy the review before
+    // the click that is about to be dispatched to the pill's own window could act on it.
+    KD_CHECK(!f.on_event(mdown(true, 150, 130, 300)).dismiss_review);
+
+    // Outside, and either button — a right-click somewhere else is just as plainly not an answer
+    // to the offer as a left one.
+    KD_CHECK(f.on_event(mdown(true, 500, 500, 400)).dismiss_review);
+    KD_CHECK(f.on_event(mdown(false, 500, 500, 500)).dismiss_review);
+}
+
+KD_TEST(hotkey, closing_the_review_stops_the_dismissals) {
+    kd::InputFilter f;
+    f.set_review_open(true);
+    KD_CHECK(f.on_event(kdown(kd::vk::kY, 100)).dismiss_review);
+    f.set_review_open(false);
+    KD_CHECK(!f.on_event(kdown(kd::vk::kY, 200)).dismiss_review);
+}
+
 KD_TEST(hotkey, injected_mouse_events_neither_stop_nor_cache) {
     // LLMHF_INJECTED — our own clipboard-paste chord and any accessibility tool. plan.md §1.8:
     // "Our own SendInput traffic must never stop the session producing it."

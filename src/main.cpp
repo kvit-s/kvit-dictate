@@ -208,6 +208,7 @@ struct HookNote {
         ResumeDictation, // the hotkey while editing: reopen it (§3.3)
         ForeignKey,      // §4.4's Ignore class: name the key in the pill and do nothing
         PillPointer,     // the mouse inside the pill (§5.2)
+        DismissReview,   // any real input while the post-submission pill is up (overlay.h)
     };
     Kind kind = Kind::Activate;
     kd::StopInputReason reason = kd::StopInputReason::Keystroke;
@@ -316,6 +317,7 @@ public:
         post_hook(n);
     }
     void on_wheel() override { post_hook(HookNote{HookNote::Kind::Wheel}); }
+    void on_dismiss_review() override { post_hook(HookNote{HookNote::Kind::DismissReview}); }
     void on_hook_lost() override { post_hook(HookNote{HookNote::Kind::HookLost}); }
 
     // ── IAudioSink (WASAPI thread — post only) ──────────────────────────────────────────────
@@ -1603,6 +1605,9 @@ void App::drain_hook_queue() {
                 // plan.md §1.5 source B. Cached even when no session is running, because the
                 // click that matters is the one BEFORE the hotkey.
                 if (anchor_ != nullptr) anchor_->set_last_click({n.x, n.y}, n.window, n.time_ms);
+                break;
+            case HookNote::Kind::DismissReview:
+                end_review("the user did something else");
                 break;
             case HookNote::Kind::Wheel:
                 // Scrolling moves the caret with no click, so the cached point is now a lie.
@@ -3149,6 +3154,11 @@ void App::begin_review(const std::string& text, const kd::InjectResult& res) {
     }
 
     review_ = std::move(r);
+    // The hook has to know, or the pill can only ever be closed by moving focus — which was the
+    // first thing anybody who used it reported. It is the only path that sees a keystroke or a
+    // click that goes somewhere else, because the pill never takes focus and this process is not
+    // the foreground one.
+    if (hotkey_ != nullptr) hotkey_->set_review_open(true);
     // Deliberately not a question. The program cannot tell whether the text arrived and the user
     // is already looking at the document, so asking would tax every session that worked to serve
     // the few that did not. The line says what is on offer; the absence of a click is the answer.
@@ -3160,7 +3170,18 @@ void App::end_review(const char* why) {
     KD_LOG_DEBUG("the post-submission pill closed: %s", why);
     review_.reset();
     review_actions_.clear();
-    if (overlay_ != nullptr) overlay_->clear_actions();
+    if (hotkey_ != nullptr) hotkey_->set_review_open(false);
+    if (overlay_ != nullptr) {
+        overlay_->clear_actions();
+        // **And hide it.** finish_dictation skips its own hide() while a review is up, so this
+        // is the other half of that skip and the only thing that ever runs it. Without this the
+        // pill lost its buttons and then sat there empty for the rest of the process's life,
+        // which is exactly what the first person to use it saw.
+        overlay_->hide();
+        // The pill is gone, so the hook must stop believing there is one to click inside — the
+        // same reason finish_dictation publishes an empty rectangle after its own hide().
+        publish_pill_rect();
+    }
 }
 
 void App::apply_review_action(size_t index) {
