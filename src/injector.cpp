@@ -100,7 +100,7 @@ size_t clipboard_backup_lost_format_count(const ClipboardBackup* b) noexcept;
 
 bool clipboard_save(ClipboardBackup* b, ClipboardGuardState& st, uint32_t* os_error);
 bool clipboard_set_utf8(std::string_view utf8, ClipboardGuardState& st, uint32_t* os_error);
-void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st);
+void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring_view ours);
 
 uintptr_t clipboard_owner_window();
 
@@ -916,25 +916,72 @@ bool clipboard_set_utf8(std::string_view utf8, ClipboardGuardState& st, uint32_t
 // itself — has put something there since, and overwriting it with a snapshot taken before our own
 // injection would destroy work the user did in between. Leaving our dictated text on the
 // clipboard is the lesser harm and is what plan.md §1.7 chooses.
-void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st) {
+// Does the clipboard still hold exactly this text? **Called with the clipboard already open**,
+// because its one caller is in the middle of deciding whether to empty it and reopening between
+// the question and the answer would put a window back into the race the question is about.
+//
+// A pointer comparison would be wrong: a clipboard manager that re-publishes our string hands
+// back a different handle holding the same characters, and that is the case this exists to call
+// "still ours".
+bool clipboard_text_equals(std::wstring_view ours) {
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h == nullptr) return false;
+    const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(h));
+    if (p == nullptr) return false;
+    const size_t units = GlobalSize(h) / sizeof(wchar_t);
+    size_t len = 0;
+    while (len < units && p[len] != L'\0') ++len;
+    const bool same = std::wstring_view(p, len) == ours;
+    GlobalUnlock(h);
+    return same;
+}
+
+void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring_view ours) {
     st.restored = false;
     st.skipped_because_changed = false;
     if (b == nullptr || !b->saved) return;
 
     const uint32_t now = static_cast<uint32_t>(GetClipboardSequenceNumber());
-    if (now != st.sequence_at_set) {
-        st.skipped_because_changed = true;
-        KD_LOG_INFO("clipboard changed under us (seq %u -> %u); leaving it alone",
-                    st.sequence_at_set, now);
-        return;
-    }
+    const bool moved = now != st.sequence_at_set;
 
     if (!open_clipboard_with_retry(nullptr)) return;
     ClipboardCloser closer;
     closer.open = true;
 
-    // Safe to empty: the sequence check above proves the clipboard still holds exactly what we
-    // put there, so the only thing destroyed here is our own text.
+    // ─── The sequence number is necessary and not sufficient ────────────────────────────────
+    //
+    // plan.md §1.7 asks us to restore "only if we still own the state we set", and the sequence
+    // number was the whole test. It is the right question asked too coarsely: it counts *every*
+    // modification, including ones that leave our own text sitting there unchanged.
+    //
+    // Two things do that routinely, and between them they cover most machines. A clipboard
+    // manager — Ditto, Windows' own Win+V history, a cloud-clipboard sync — wakes on our write,
+    // reads it, and re-publishes normalised formats. And Windows synthesises CF_TEXT,
+    // CF_OEMTEXT and CF_LOCALE from CF_UNICODETEXT on demand, which is itself a modification.
+    // Measured here on 2026-09-09 with Ditto running: the counter moved by exactly six between
+    // the set and the restore, on *every* clipboard injection, so the guard fired every time and
+    // the user's own clipboard was never once put back. The setting silently became "kvit-dictate
+    // takes your clipboard", which is precisely the outcome the guard exists to prevent.
+    //
+    // So the sequence number now decides only whether to look. What decides the answer is
+    // whether CF_UNICODETEXT still holds the string we put there: if it does, nothing the user
+    // would miss has arrived, whoever bumped the counter, and restoring destroys only our own
+    // text. If it does not, somebody really did copy something and it stays.
+    if (moved && !clipboard_text_equals(ours)) {
+        st.skipped_because_changed = true;
+        KD_LOG_INFO("clipboard changed under us (seq %u -> %u) and no longer holds our text; "
+                    "leaving it alone",
+                    st.sequence_at_set, now);
+        return;
+    }
+    if (moved) {
+        KD_LOG_DEBUG("clipboard sequence moved (%u -> %u) but the text is still ours — a "
+                     "clipboard manager or a synthesised format; restoring",
+                     st.sequence_at_set, now);
+    }
+
+    // Safe to empty: the checks above prove the clipboard still holds exactly what we put there,
+    // so the only thing destroyed here is our own text.
     if (EmptyClipboard() == FALSE) return;
 
     for (const SavedFormat& sf : b->formats) {
@@ -1452,11 +1499,18 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
         return finish(InjectStatus::ClipboardUnavailable);
     }
 
+    // What we just published, in the form the clipboard holds it, so each restore below can ask
+    // whether the clipboard is still ours rather than trusting the sequence number alone.
+    // Converted once: utf8::to_utf16 is the only crossing of that boundary (util/utf8.h), and
+    // clipboard_set_utf8 has already proved this string converts.
+    std::wstring ours;
+    (void)utf8::to_utf16(utf8_text, ours, nullptr);
+
     // Revalidate as late as possible: everything above took milliseconds during which the user
     // could have alt-tabbed, and a paste chord sent into the wrong window pastes our whole text
     // at once rather than one wrong character.
     if (!validate_target(target)) {
-        injector_detail::clipboard_restore(backup.p, last_clipboard);
+        injector_detail::clipboard_restore(backup.p, last_clipboard, ours);
         r.detail = "target changed before the paste chord";
         return finish(InjectStatus::TargetChanged);
     }
@@ -1483,7 +1537,7 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
         r.os_error = GetLastError();
         r.detail = "paste chord: SendInput accepted " + std::to_string(sent) + " of " +
                    std::to_string(want) + " events";
-        injector_detail::clipboard_restore(backup.p, last_clipboard);
+        injector_detail::clipboard_restore(backup.p, last_clipboard, ours);
         return finish(InjectStatus::PasteChordRejected);
     }
 
@@ -1501,7 +1555,7 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
     const uint32_t settle_ms = cfg.paste_settle_ms > 500u ? 500u : cfg.paste_settle_ms;
     sleeper.wait_us(settle_ms * 1000u);
 
-    injector_detail::clipboard_restore(backup.p, last_clipboard);
+    injector_detail::clipboard_restore(backup.p, last_clipboard, ours);
 
     // ─── What Ok means here, honestly ───────────────────────────────────────────────────────
     //

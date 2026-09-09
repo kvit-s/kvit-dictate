@@ -101,7 +101,7 @@ size_t clipboard_backup_lost_format_count(const ClipboardBackup* b) noexcept;
 
 bool clipboard_save(ClipboardBackup* b, ClipboardGuardState& st, uint32_t* os_error);
 bool clipboard_set_utf8(std::string_view utf8, ClipboardGuardState& st, uint32_t* os_error);
-void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st);
+void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring_view ours);
 
 uintptr_t clipboard_owner_window();
 
@@ -764,7 +764,10 @@ public:
         }
         ClipboardGuardState st = state_;
         st.sequence_at_set = static_cast<uint32_t>(GetClipboardSequenceNumber());
-        kd::injector_detail::clipboard_restore(backup_, st);
+        // Empty, and it is never read: re-stamping the sequence above makes `moved` false, so
+        // the content check is skipped. That is the point — this is the harness putting the
+        // machine back the way it found it, not the module deciding whether it may.
+        kd::injector_detail::clipboard_restore(backup_, st, {});
         kd::injector_detail::clipboard_backup_destroy(backup_);
     }
     ClipboardScope(const ClipboardScope&) = delete;
@@ -835,7 +838,7 @@ KD_TEST(injector, clipboard_round_trip_restores_the_previous_contents) {
     KD_CHECK(present);
     KD_CHECK(now == L"dictated é text \U0001F600");
 
-    kd::injector_detail::clipboard_restore(backup.get(), st);
+    kd::injector_detail::clipboard_restore(backup.get(), st, L"dictated é text 😀");
     KD_CHECK(st.restored);
     KD_CHECK(!st.skipped_because_changed);
 
@@ -866,7 +869,7 @@ KD_TEST(injector, clipboard_restore_is_skipped_when_the_sequence_moved) {
     KD_REQUIRE(set_raw_text(L"THE USER COPIED THIS"));
     KD_CHECK_NE(static_cast<uint32_t>(GetClipboardSequenceNumber()), seq_at_set);
 
-    kd::injector_detail::clipboard_restore(backup.get(), st);
+    kd::injector_detail::clipboard_restore(backup.get(), st, L"our dictated text");
 
     KD_CHECK(st.skipped_because_changed);
     KD_CHECK(!st.restored);
@@ -880,6 +883,45 @@ KD_TEST(injector, clipboard_restore_is_skipped_when_the_sequence_moved) {
     KD_CHECK(now == L"THE USER COPIED THIS");
     KD_CHECK(now != L"contents from before the injection");
     KD_CHECK(now != L"our dictated text");
+}
+
+KD_TEST(injector, a_sequence_bump_that_left_our_text_alone_still_restores) {
+    // The case that made the guard useless on a real machine. A clipboard manager (Ditto here,
+    // Windows' own Win+V history elsewhere) wakes on our write, reads it, and re-publishes it —
+    // and Windows synthesises CF_TEXT/CF_OEMTEXT/CF_LOCALE from CF_UNICODETEXT besides. Every
+    // one of those bumps the sequence number while leaving our own string sitting there.
+    // Measured 2026-09-09: +6 on every single clipboard injection, so the guard fired every time
+    // and the user's clipboard was never once put back.
+    //
+    // The sequence number now decides only whether to look. What decides the answer is whether
+    // the clipboard still holds our text.
+    ClipboardScope scope;
+    KD_REQUIRE(scope.ok());
+
+    KD_REQUIRE(set_raw_text(L"the user's own copy"));
+
+    Backup backup;
+    ClipboardGuardState st;
+    KD_REQUIRE(save_with_retry(backup.get(), st));
+    KD_REQUIRE(st.had_previous);
+
+    KD_REQUIRE(set_with_retry("our dictated text", st));
+    const uint32_t seq_at_set = st.sequence_at_set;
+
+    // Re-publish the *same* string, exactly as a clipboard manager does. A different handle, the
+    // same characters — which is why the check compares content and not the handle.
+    KD_REQUIRE(set_raw_text(L"our dictated text"));
+    KD_CHECK_NE(static_cast<uint32_t>(GetClipboardSequenceNumber()), seq_at_set);
+
+    kd::injector_detail::clipboard_restore(backup.get(), st, L"our dictated text");
+    KD_CHECK(st.restored);
+    KD_CHECK(!st.skipped_because_changed);
+
+    std::wstring now;
+    bool present = false;
+    KD_REQUIRE(get_raw_text(now, present));
+    KD_CHECK(present);
+    KD_CHECK(now == L"the user's own copy");
 }
 
 KD_TEST(injector, clipboard_set_records_the_sequence_after_closing) {
@@ -925,7 +967,8 @@ KD_TEST(injector, clipboard_restore_onto_an_empty_clipboard_leaves_it_empty) {
     KD_CHECK_EQ(kd::injector_detail::clipboard_backup_format_count(backup.get()), size_t{0});
 
     KD_REQUIRE(set_with_retry("text that must not survive the restore", st));
-    kd::injector_detail::clipboard_restore(backup.get(), st);
+    kd::injector_detail::clipboard_restore(backup.get(), st,
+                                           L"text that must not survive the restore");
     KD_CHECK(st.restored);
     KD_CHECK(!st.skipped_because_changed);
 
@@ -946,7 +989,7 @@ KD_TEST(injector, clipboard_restore_without_a_save_does_nothing) {
     Backup backup;  // created, never saved into
     ClipboardGuardState st;
     st.sequence_at_set = static_cast<uint32_t>(GetClipboardSequenceNumber());
-    kd::injector_detail::clipboard_restore(backup.get(), st);
+    kd::injector_detail::clipboard_restore(backup.get(), st, L"untouched");
     KD_CHECK(!st.restored);
     KD_CHECK(!st.skipped_because_changed);
 
@@ -958,7 +1001,7 @@ KD_TEST(injector, clipboard_restore_without_a_save_does_nothing) {
 
     // And a null backup must be survivable rather than a crash in an error path.
     ClipboardGuardState st2;
-    kd::injector_detail::clipboard_restore(nullptr, st2);
+    kd::injector_detail::clipboard_restore(nullptr, st2, L"untouched");
     KD_CHECK(!st2.restored);
 }
 
@@ -981,7 +1024,7 @@ KD_TEST(injector, clipboard_save_preserves_multiple_formats) {
             std::to_string(kd::injector_detail::clipboard_backup_lost_format_count(backup.get())));
 
     KD_REQUIRE(set_with_retry("ours", st));
-    kd::injector_detail::clipboard_restore(backup.get(), st);
+    kd::injector_detail::clipboard_restore(backup.get(), st, L"ours");
     KD_REQUIRE(st.restored);
 
     std::wstring now;
