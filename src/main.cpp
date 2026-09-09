@@ -3139,22 +3139,28 @@ void App::begin_review(const std::string& text, const kd::InjectResult& res) {
                           (injector_->last_clipboard_state().skipped_because_changed ||
                            !injector_->last_clipboard_state().restored);
 
+    // One label for both retries, deliberately. "Type it again" and "Copy and paste" named the
+    // *mechanism*, which is ours to worry about and not the user's — and they named it wrongly
+    // often enough to be confusing, since which one appears depends on what already ran. The
+    // user's question is only ever "that did not work, try something else", so the button says
+    // that and the code picks whichever method has not been tried yet.
+    static constexpr const char* kSendAnotherWay = "Send another way";
     review_actions_.clear();
     std::vector<std::string> labels;
     if (r.text_on_clipboard) {
-        // Nothing to offer but the retype: the text is already where "Copy" would put it.
+        // Nothing to offer but the retry: the text is already where "Copy" would put it.
         review_actions_.push_back(ReviewAction::TypeAgain);
-        labels.emplace_back("Type it again");
+        labels.emplace_back(kSendAnotherWay);
     } else if (r.method == kd::InjectMethod::Clipboard) {
         review_actions_.push_back(ReviewAction::Copy);
         labels.emplace_back("Copy");
         review_actions_.push_back(ReviewAction::TypeAgain);
-        labels.emplace_back("Type it again");
+        labels.emplace_back(kSendAnotherWay);
     } else {
         review_actions_.push_back(ReviewAction::Copy);
         labels.emplace_back("Copy");
         review_actions_.push_back(ReviewAction::CopyAndPaste);
-        labels.emplace_back("Copy and paste");
+        labels.emplace_back(kSendAnotherWay);
     }
 
     review_ = std::move(r);
@@ -3163,9 +3169,11 @@ void App::begin_review(const std::string& text, const kd::InjectResult& res) {
     // click that goes somewhere else, because the pill never takes focus and this process is not
     // the foreground one.
     if (hotkey_ != nullptr) hotkey_->set_review_open(true);
-    // Buttons and nothing else. There was a line of explanatory text above them and it earned
-    // none of the room it took: the pill is sitting on top of the document the user has to read
-    // in order to decide whether to press anything, and the labels already say what they do.
+    // The condition, in four words, above the buttons — through set_hint because that line is
+    // already measured and drawn, so this costs no layout of its own. It names what the user is
+    // being asked to look for. An earlier version said "If that did not land:", which described
+    // the mechanism in a word nobody outside this codebase uses.
+    overlay_->set_hint("Text didn't arrive?");
     overlay_->set_actions(labels);
 }
 
@@ -3176,6 +3184,7 @@ void App::end_review(const char* why) {
     review_actions_.clear();
     if (hotkey_ != nullptr) hotkey_->set_review_open(false);
     if (overlay_ != nullptr) {
+        overlay_->clear_hint();
         overlay_->clear_actions();
         // **And hide it.** finish_dictation skips its own hide() while a review is up, so this
         // is the other half of that skip and the only thing that ever runs it. Without this the
@@ -3589,7 +3598,9 @@ void App::finish_dictation(const char* why) {
     editing_began_ms_ = 0;
     hint_expires_ms_ = 0;
     if (overlay_ != nullptr) {
-        overlay_->clear_hint();
+        // Not while a review is up: flush_deferred_commits ran earlier in this function and the
+        // hint it set is the review's own line. end_review clears it.
+        if (!review_.has_value()) overlay_->clear_hint();
         overlay_->set_edit_view(false, 0, 0, 0);
         overlay_->scroll_to_bottom();
         overlay_->set_text({}, {});
