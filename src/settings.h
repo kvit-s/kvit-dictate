@@ -395,6 +395,22 @@ struct Settings {
     // makes an on-disk copy the only recovery there can be, and why this defaults to on.
     bool crash_recovery = true;
 
+    // Keep the text of the most recent *delivered* submission, so there is something to hand
+    // back when injection reported success and the document got nothing.
+    //
+    // **This is an amendment to §1.9, and it is written here rather than assumed.** §1.9 says no
+    // transcripts persisted by default, and `crash_recovery` above is allowed past it because it
+    // holds only undelivered text and deletes itself on delivery. This one outlives delivery, so
+    // it is a persisted transcript — of exactly one utterance, overwritten by the next, never
+    // appended to. What buys it the default is that the failure it covers is *silent*: the
+    // clipboard path returns Ok when the paste chord was accepted, which an application that
+    // binds Ctrl+V elsewhere produces identically with nothing inserted (injector.cpp says so at
+    // the return). Before this, `clear_recovery` deleted the only copy at exactly that moment.
+    //
+    // A user who wants §1.9 read strictly turns this off and loses only the recovery, not the
+    // dictation. The corpus below is the setting for keeping *everything*, and it stays off.
+    bool keep_last_submission = true;
+
     // corpus.h — the dictation corpus: audio plus the hypothesis timeline, kept so a different
     // model can be asked the same question later. **Off unless the user turned it on**, which is
     // the opposite of `crash_recovery` above and for a reason: this one is durable, accumulating

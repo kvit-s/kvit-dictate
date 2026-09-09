@@ -390,6 +390,14 @@ Win-key hack) · `Ctrl+Win+Space` · right `Ctrl` / right `Alt` / `CapsLock`.
 
 - **No transcripts or audio persisted by default.** Diagnostic logging of recognised text is
   opt-in, retention-bounded, and off in release builds.
+  - Two named exceptions, both bounded and both listed here rather than discovered in the code.
+    `privacy.crash_recovery` holds only text that has *not* reached the document and deletes
+    itself the moment it does. `privacy.keep_last_submission` holds the most recent delivered
+    dictation — exactly one, overwritten by the next, never appended to — because injection
+    reporting success is not evidence the text arrived: the clipboard path returns `Ok` when the
+    paste chord was accepted, which an application that binds `Ctrl+V` elsewhere produces
+    identically with nothing inserted. Before it, the only copy was deleted at that exact moment.
+    Both default on; either can be switched off without affecting dictation itself.
 - **No network access during dictation.** No telemetry, no cloud fallback, no model
   auto-download at runtime. Model fetching is an explicit, separate, user-initiated action.
 - Benchmark artifacts under `bench/results/` may contain corpus text; the corpus itself and any

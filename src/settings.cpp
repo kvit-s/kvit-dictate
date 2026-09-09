@@ -826,6 +826,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "audio_device_id": "",
 //     "privacy":   { "log_level": "info", "diagnostics_file_enabled": false,
 //                    "crash_recovery": true,
+//                    "keep_last_submission": true,
 //                    "corpus": { "enabled": false, "dir": "", "max_bytes": 8589934592,
 //                                "max_age_days": 60 },
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
@@ -1326,6 +1327,7 @@ std::string serialize_settings(const Settings& s) {
         put_str(o, "log_level", log::to_string(s.log_level));
         put_bool(o, "diagnostics_file_enabled", s.diagnostics_file_enabled);
         put_bool(o, "crash_recovery", s.crash_recovery);
+        put_bool(o, "keep_last_submission", s.keep_last_submission);
         json::Value c = json::Value::object();
         put_bool(c, "enabled", s.corpus.enabled);
         put_str(c, "dir", path_to_utf8(s.corpus.dir));
@@ -1662,6 +1664,7 @@ Result<Settings> parse_settings(std::string_view json_text) {
         o.str_opt("log_level", level);
         o.bool_opt("diagnostics_file_enabled", s.diagnostics_file_enabled);
         o.bool_opt("crash_recovery", s.crash_recovery);
+        o.bool_opt("keep_last_submission", s.keep_last_submission);
         if (const json::Value* cv = v->find("corpus")) {
             Obj c(*cv, "settings.privacy.corpus");
             c.bool_opt("enabled", s.corpus.enabled);
@@ -1817,6 +1820,7 @@ enum : int {
     kIdTranscriptKb,
     kIdTranscriptDays,
     kIdStartup,
+    kIdKeepLast,
     kIdSendContext,
     kIdContextTerms,
     // The dictation marker (settings.h, TextAffix). Two boxes rather than one, because the
@@ -3103,6 +3107,8 @@ void load_controls(HWND dlg, DialogState& st) {
     EnableWindow(GetDlgItem(dlg, kIdTranscriptKb), s.transcript.enabled);
     EnableWindow(GetDlgItem(dlg, kIdTranscriptDays), s.transcript.enabled);
     CheckDlgButton(dlg, kIdStartup, s.start_with_windows ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdKeepLast,
+                   s.keep_last_submission ? BST_CHECKED : BST_UNCHECKED);
 
     // Context.
     CheckDlgButton(dlg, kIdSendContext, s.send_context ? BST_CHECKED : BST_UNCHECKED);
@@ -3314,6 +3320,7 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         s.transcript.max_age_days = static_cast<uint32_t>(n);
     }
     s.start_with_windows = IsDlgButtonChecked(dlg, kIdStartup) == BST_CHECKED;
+    s.keep_last_submission = IsDlgButtonChecked(dlg, kIdKeepLast) == BST_CHECKED;
 
     s.send_context = IsDlgButtonChecked(dlg, kIdSendContext) == BST_CHECKED;
     s.context_terms = terms_from_text(get_text(GetDlgItem(dlg, kIdContextTerms)));
@@ -3534,6 +3541,8 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Log recognised text to a transcript file (off by default)", kIdTranscript);
         c.label_edit(L"Transcript retention: size (KB)", kIdTranscriptKb, ES_NUMBER);
         c.label_edit(L"Transcript retention: age (days)", kIdTranscriptDays, ES_NUMBER);
+        c.check(L"Keep the last dictation so it can be recovered (tray → Copy the last dictation)",
+                kIdKeepLast);
         c.check(L"Start kvit-dictate with Windows", kIdStartup);
 
         c.section(L"Vocabulary context");

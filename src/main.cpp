@@ -188,6 +188,10 @@ constexpr UINT kMenuQuit = 103;
 constexpr UINT kMenuCorpusSkip = 104;
 constexpr UINT kMenuCorpusOpen = 105;
 
+// Hands back the text of the most recent delivered submission. The one control that answers
+// "it said it typed it and the document is empty" — see settings.h, keep_last_submission.
+constexpr UINT kMenuCopyLast = 106;
+
 const wchar_t kWindowClass[] = L"kvit-dictate-message-window";
 const wchar_t kSingleInstanceMutex[] = L"Local\\kvit-dictate-single-instance";
 
@@ -386,6 +390,14 @@ private:
     // excluded from screen capture — so nothing outside this process can see the buffer, and any
     // end that is not `finish_dictation` destroys it.
     [[nodiscard]] static std::filesystem::path recovery_path();
+
+    // The last *delivered* submission, kept past delivery so it can be recovered when injection
+    // reported success and nothing arrived. Separate file from recover.txt on purpose: that one
+    // means "this text never got out" and its presence at startup is itself the signal, and
+    // folding a delivered copy into it would make every launch claim a lost session.
+    [[nodiscard]] static std::filesystem::path last_submission_path();
+    void save_last_submission(std::string_view text);
+    [[nodiscard]] bool load_last_submission(std::string& out) const;
     // Write the buffer, atomically. Nothing is ever appended: the file holds the current buffer
     // or it does not exist.
     void save_recovery();
@@ -589,6 +601,11 @@ private:
     // The buffer has changed since it was last written to disk. Set at every mutation site and
     // consumed by the tick, so a burst of edits costs one write rather than one write each.
     bool recovery_dirty_ = false;
+    // Everything this session actually put into the document, accumulated so the streaming
+    // cadences have a "last dictation" worth recovering. Under Cadence::EndOfSession the whole
+    // text arrives as one flush and this stays empty; under Immediate it is the only way to get
+    // back a session rather than its last word.
+    std::string session_delivered_;
     uint64_t recovery_saved_ms_ = 0;
 
     // When the microphone last heard a voice. Only publish_listening_state() reads it, to decide
@@ -1406,6 +1423,26 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                                   SW_SHOWNORMAL);
                     return 0;
                 }
+                case kMenuCopyLast: {
+                    std::string text;
+                    if (!load_last_submission(text)) {
+                        KD_LOG_WARN("there is no last dictation to copy");
+                        return 0;
+                    }
+                    // set_clipboard_text, not the clipboard injection method: that one restores
+                    // the previous contents once the paste has settled, which is the opposite of
+                    // what is wanted here. injector.h keeps the two entry points separate for
+                    // exactly this caller.
+                    if (kd::set_clipboard_text(text)) {
+                        KD_LOG_INFO("the last dictation (%zu bytes) is on the clipboard",
+                                    text.size());
+                    } else {
+                        KD_LOG_ERROR("could not reach the clipboard; %s holds the only copy",
+                                     last_submission_path().string().c_str());
+                        set_tray_state(kd::OverlayState::Error);
+                    }
+                    return 0;
+                }
                 case kMenuSettings:
                     PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
                     return 0;
@@ -1982,6 +2019,8 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
                            : kd::OverlayState::Error);
         return;
     }
+
+    session_delivered_ += text;
 
     // Source A again, which anchor.h asks for "at session start **and after each commit**". The
     // caret has just moved — we moved it — and a caret anchor goes stale after
@@ -3024,6 +3063,53 @@ void App::save_recovery() {
     KD_LOG_DEBUG("recovery copy written: %zu bytes", edit_.size());
 }
 
+std::filesystem::path App::last_submission_path() {
+    return kd::default_settings_path().parent_path() / "last-dictation.txt";
+}
+
+void App::save_last_submission(std::string_view text) {
+    if (!settings_.keep_last_submission || text.empty()) return;
+
+    // Same write-to-temporary-and-move as save_recovery, for a weaker reason: nothing is racing
+    // to read this one. It is here because a truncated last-dictation.txt would be worse than no
+    // file at all — the whole point of it is to be the copy you fall back on, and a fallback that
+    // can be half a sentence is not one.
+    const std::filesystem::path final_path = last_submission_path();
+    std::filesystem::path tmp = final_path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            KD_LOG_WARN("could not open %s; this dictation will not be recoverable",
+                        tmp.string().c_str());
+            return;
+        }
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.flush();
+        if (!out) {
+            KD_LOG_WARN("the last-dictation copy could not be written");
+            return;
+        }
+    }
+    if (MoveFileExW(tmp.wstring().c_str(), final_path.wstring().c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        KD_LOG_WARN("could not replace %s (error %lu)", final_path.string().c_str(),
+                    GetLastError());
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    KD_LOG_DEBUG("last-dictation copy written: %zu bytes", text.size());
+}
+
+bool App::load_last_submission(std::string& out) const {
+    out.clear();
+    std::ifstream in(last_submission_path(), std::ios::binary);
+    if (!in) return false;
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return !out.empty();
+}
+
 void App::clear_recovery(const char* why) {
     recovery_dirty_ = false;
     std::error_code ec;
@@ -3111,6 +3197,10 @@ void App::flush_deferred_commits(const char* why) {
                             ? 0ull
                             : static_cast<unsigned long long>(res.bytes_injected) * 1000000ull /
                                   res.elapsed_us);
+            // Before clear_recovery, which is about to delete the only other copy. Injection
+            // reporting Ok is not the same as the text having arrived — the clipboard path says
+            // so explicitly at its return — so this is the copy that survives that gap.
+            save_last_submission(text);
             clear_recovery("the text reached the document");
             if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
             return;
@@ -3185,6 +3275,13 @@ void App::finish_dictation(const char* why) {
     corpus_skip_ = false;
 
     flush_deferred_commits(why);
+    // The streaming cadences never reach flush_deferred_commits with anything in hand, so their
+    // copy is saved here from what perform_commit accumulated. Ordered after the flush so that
+    // under end-of-session the flush's own save wins and this one finds nothing to do.
+    if (!session_delivered_.empty()) {
+        save_last_submission(session_delivered_);
+        session_delivered_.clear();
+    }
     // The marker's closing half, before target_ is cleared below and on the same one path.
     // Deliberately reached by the abort paths too: an unclosed "[dictated: " sitting in
     // somebody's document is worse than a marker around a session that ended early.
@@ -3618,6 +3715,16 @@ void App::show_tray_menu() {
         AppendMenuW(menu, MF_STRING, kMenuCorpusOpen, L"Open the corpus folder");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    // Present whenever there is something to hand back, absent otherwise — rather than always
+    // present and greyed. A permanently disabled item invites the question "why can I never click
+    // this"; an item that appears the first time it can do something answers it by existing.
+    if (settings_.keep_last_submission) {
+        std::string ignored;
+        if (load_last_submission(ignored)) {
+            AppendMenuW(menu, MF_STRING, kMenuCopyLast, L"Copy the last dictation");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+    }
     AppendMenuW(menu, MF_STRING, kMenuSettings, L"Settings…");
     AppendMenuW(menu, MF_STRING, kMenuOpenLogs, L"Open settings folder");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
