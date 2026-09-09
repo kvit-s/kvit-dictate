@@ -816,6 +816,38 @@ struct OverlayCore {
         return px >= mic_left && px < mic_right && py >= mic_top && py < mic_bottom;
     }
 
+    // overlay.h, "Post-submission actions". At most two labels and the line above them; the
+    // rectangles are filled in by the paint that drew them, in DIPs relative to the pill's
+    // top-left, and cleared by the paint that did not.
+    std::string action_prompt;
+    std::vector<std::string> actions;
+    struct ButtonRect {
+        float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f;
+    };
+    std::vector<ButtonRect> action_rects;
+    uintptr_t action_target = 0;
+    uint32_t action_message = 0;
+
+    // Same arithmetic as point_in_mic, over a list rather than one rectangle. Kept separate
+    // rather than generalised: the mic button's emptiness means "not editing", and folding the
+    // two would put that meaning somewhere it does not belong.
+    [[nodiscard]] bool point_in_action(int32_t x, int32_t y, size_t& index) const noexcept {
+        const float scale =
+            static_cast<float>(hit_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+        if (scale <= 0.0f) return false;
+        const float px = static_cast<float>(x) / scale;
+        const float py = static_cast<float>(y) / scale;
+        for (size_t i = 0; i < action_rects.size(); ++i) {
+            const ButtonRect& b = action_rects[i];
+            if (b.right <= b.left || b.bottom <= b.top) continue;
+            if (px >= b.left && px < b.right && py >= b.top && py < b.bottom) {
+                index = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // docs/editing.md §5.1. False for the whole of a normal session and true only while a
     // composing session is running; WS_EX_NOACTIVATE is untouched either way.
     bool click_through = true;
@@ -1107,6 +1139,13 @@ bool OverlayCore::has_anything_to_show() const noexcept {
     if (mode == OverlayMode::Hidden) {
         return false;
     }
+    // Before every other test, including the Idle one below. The whole point of the action
+    // buttons is that they outlive the session that produced them: by the time they are offered
+    // the state has gone back to Idle and there is no text left in the buffer, so any rule that
+    // asked "is something happening" would hide the one thing still worth showing.
+    if (!actions.empty()) {
+        return true;
+    }
     if (violation || state == OverlayState::Warning || state == OverlayState::Unsupported ||
         state == OverlayState::Error || state == OverlayState::ModelLoading) {
         return true;
@@ -1393,6 +1432,45 @@ HRESULT OverlayCore::paint_once() {
                                    : 0.0f;
     const float mic_h = mic_layout ? mic_metrics.height + kMicButtonPadDip : 0.0f;
 
+    // The post-submission prompt and its buttons (overlay.h). Measured with the same note format
+    // and the same padding as the microphone button, so the two read as the same kind of control
+    // in the rare frame that could show both.
+    ComRef<IDWriteTextLayout> prompt_layout;
+    DWRITE_TEXT_METRICS prompt_metrics{};
+    if (!actions.empty() && !action_prompt.empty()) {
+        const std::wstring line = utf8::to_utf16_or_empty(action_prompt);
+        if (!line.empty() &&
+            SUCCEEDED(dwrite->CreateTextLayout(line.c_str(), static_cast<UINT32>(line.size()),
+                                               format_note.get(), max_text_w, 4096.0f,
+                                               prompt_layout.put()))) {
+            if (FAILED(prompt_layout->GetMetrics(&prompt_metrics))) prompt_layout.reset();
+        }
+    }
+    const float prompt_w = prompt_layout ? prompt_metrics.widthIncludingTrailingWhitespace : 0.0f;
+    const float prompt_h = prompt_layout ? prompt_metrics.height : 0.0f;
+
+    std::vector<ComRef<IDWriteTextLayout>> act_layouts;
+    std::vector<float> act_w;
+    float act_h = 0.0f;
+    for (const std::string& label : actions) {
+        const std::wstring w = utf8::to_utf16_or_empty(label);
+        ComRef<IDWriteTextLayout> l;
+        DWRITE_TEXT_METRICS m{};
+        if (w.empty() ||
+            FAILED(dwrite->CreateTextLayout(w.c_str(), static_cast<UINT32>(w.size()),
+                                            format_note.get(), max_text_w, 4096.0f, l.put())) ||
+            FAILED(l->GetMetrics(&m))) {
+            continue;  // a label that will not lay out is dropped rather than drawn as a gap
+        }
+        act_w.push_back(m.widthIncludingTrailingWhitespace + kMicButtonPadDip * 2.0f);
+        act_h = std::max(act_h, m.height + kMicButtonPadDip);
+        act_layouts.push_back(std::move(l));
+    }
+    float act_row_w = 0.0f;
+    for (size_t i = 0; i < act_w.size(); ++i) {
+        act_row_w += act_w[i] + (i != 0 ? kMicButtonPadDip : 0.0f);
+    }
+
     // The key legend (docs/editing.md §7.5), on the bottom line — **the pill only**. StatusOnly
     // has nothing to steer with the keys; Inline is a label attached to a caret, sized to get out
     // of the way, and a standing two-line legend there would make it the largest thing on the
@@ -1414,12 +1492,16 @@ HRESULT OverlayCore::paint_once() {
         legend_layout ? legend_metrics.widthIncludingTrailingWhitespace : 0.0f;
     const float legend_h = legend_layout ? legend_metrics.height : 0.0f;
 
-    const float measured_w = std::max(std::max(std::max(body_w, note_w), mic_w), legend_w);
+    const float measured_w =
+        std::max(std::max(std::max(std::max(std::max(body_w, note_w), mic_w), legend_w), prompt_w),
+                 act_row_w);
     const float content_w = (mode == OverlayMode::FloatingPill && measured_w > 0.0f)
                                 ? max_text_w
                                 : measured_w;
     const float content_h = body_h + (note_layout ? (body_layout ? gap : 0.0f) + note_h : 0.0f) +
                             (mic_layout ? gap + mic_h : 0.0f) +
+                            (prompt_layout ? gap + prompt_h : 0.0f) +
+                            (act_layouts.empty() ? 0.0f : gap + act_h) +
                             (legend_layout ? gap + legend_h : 0.0f);
 
     // A minimum height so a bare status dot still reads as a control and not as a speck.
@@ -1669,12 +1751,48 @@ HRESULT OverlayCore::paint_once() {
                            mic_layout.get(), brush_pending.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
 
+    // The post-submission prompt and buttons, below the microphone button and above the legend.
+    // The rectangles are recorded here and nowhere else: a hit test that computed its own layout
+    // would be a second implementation of this arithmetic, free to disagree with what was drawn.
+    action_rects.clear();
+    const float prompt_y = mic_y + (mic_layout ? mic_h + gap : 0.0f);
+    if (prompt_layout && brush_unstable) {
+        rt->DrawTextLayout(D2D1::Point2F(text_x, prompt_y), prompt_layout.get(),
+                           brush_unstable.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    const float act_y = prompt_y + (prompt_layout ? prompt_h + gap : 0.0f);
+    if (!act_layouts.empty() && brush_border && brush_pending) {
+        float x = text_x;
+        for (size_t i = 0; i < act_layouts.size(); ++i) {
+            ButtonRect b;
+            b.left = x;
+            b.top = act_y;
+            b.right = x + act_w[i];
+            b.bottom = act_y + act_h;
+            action_rects.push_back(b);
+
+            const D2D1_ROUNDED_RECT button =
+                D2D1::RoundedRect(D2D1::RectF(b.left, b.top, b.right, b.bottom), 4.0f, 4.0f);
+            const D2D1_COLOR_F was = brush_border->GetColor();
+            brush_border->SetColor(argb(kMicButtonFill[painting_dark ? 1 : 0]));
+            rt->FillRoundedRectangle(button, brush_border.get());
+            brush_border->SetColor(was);
+            rt->DrawRoundedRectangle(button, brush_border.get(), 1.0f);
+
+            rt->DrawTextLayout(D2D1::Point2F(b.left + kMicButtonPadDip,
+                                             b.top + kMicButtonPadDip * 0.5f),
+                               act_layouts[i].get(), brush_pending.get(),
+                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+            x = b.right + kMicButtonPadDip;
+        }
+    }
+
     if (legend_layout && brush_unstable) {
         // Last line, below everything including the button, and in the unstable brush — the
         // dimmest thing the style defines. It is standing information rather than a message: it
         // must be readable when looked for and must not compete with the words the user is
         // dictating, which is the one way a permanent legend can go wrong.
-        const float legend_y = mic_y + (mic_layout ? mic_h + gap : 0.0f);
+        const float legend_y = act_y + (act_layouts.empty() ? 0.0f : act_h + gap);
         rt->DrawTextLayout(D2D1::Point2F(text_x, legend_y), legend_layout.get(),
                            brush_unstable.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
@@ -1809,6 +1927,18 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             // Client coordinates of a per-monitor-DPI-aware window are physical pixels measured
             // from the client origin, which for this borderless window is the pill's top-left —
             // exactly the units point_in_mic and hit_test_text take.
+            size_t action_index = 0;
+            if (core->point_in_action(pt.x, pt.y, action_index)) {
+                // A hand over an action button for the same reason as over the microphone: it is
+                // the only thing that says the pill can be clicked. This is checked first because
+                // while actions are up there is no compose buffer under them to place a caret in.
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            if (!core->actions.empty()) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
             const bool over_mic = core->point_in_mic(pt.x, pt.y);
             // A hand for the button, because it acts on a click; an I-beam everywhere else,
             // because everywhere else *is* the compose buffer and a click there places the caret.
@@ -1816,6 +1946,28 @@ LRESULT CALLBACK overlay_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             // a bespoke microphone cursor that would have to be drawn and would say less.
             SetCursor(LoadCursorW(nullptr, over_mic ? IDC_HAND : IDC_IBEAM));
             return TRUE;
+        }
+
+        case WM_LBUTTONDOWN: {
+            // The compose buffer's own mouse handling comes through the low-level hook, because
+            // it has to see clicks *outside* the pill as well (docs/editing.md §5.2). These
+            // buttons need only the inside, and the window is already not click-through while
+            // they are up, so the ordinary message is the whole mechanism — no hook state, and
+            // nothing to leave switched on after the pill goes away.
+            size_t index = 0;
+            if (core->action_target != 0 && core->action_message != 0 &&
+                core->point_in_action(static_cast<int32_t>(static_cast<int16_t>(LOWORD(lparam))),
+                                      static_cast<int32_t>(static_cast<int16_t>(HIWORD(lparam))),
+                                      index)) {
+                // Posted, never sent: the handler injects text and can open a dialog, and doing
+                // either inside this window procedure would re-enter the message loop underneath
+                // a paint. WS_EX_NOACTIVATE and MA_NOACTIVATE above mean the target keeps focus
+                // across this click, which is what makes "type it again" possible at all.
+                PostMessageW(reinterpret_cast<HWND>(core->action_target), core->action_message,
+                             static_cast<WPARAM>(index), 0);
+                return 0;
+            }
+            break;
         }
 
         case WM_ERASEBKGND:
@@ -2250,6 +2402,52 @@ bool Overlay::hit_test_text(int32_t x, int32_t y, size_t& offset) const {
 
 bool Overlay::hit_test_mic_button(int32_t x, int32_t y) const {
     return impl_->point_in_mic(x, y);
+}
+
+void Overlay::set_actions(std::string_view prompt, const std::vector<std::string>& labels) {
+    // At most two: overlay.h says why, and truncating here rather than asserting keeps a caller
+    // that grows a third from losing the two that matter.
+    std::vector<std::string> kept(labels.begin(),
+                                  labels.begin() + static_cast<ptrdiff_t>(std::min<size_t>(
+                                                       labels.size(), 2)));
+    if (impl_->actions == kept && impl_->action_prompt == prompt) {
+        return;
+    }
+    impl_->action_prompt.assign(prompt);
+    impl_->actions = std::move(kept);
+    // The pill has to take clicks for the buttons to mean anything. Dropped back by
+    // clear_actions, never here — a caller that set actions twice would otherwise be the reason
+    // a composing session went click-through mid-edit.
+    if (!impl_->actions.empty()) {
+        set_click_through(false);
+    }
+    impl_->dirty = true;
+    impl_->render();
+}
+
+void Overlay::clear_actions() {
+    if (impl_->actions.empty() && impl_->action_prompt.empty()) {
+        return;
+    }
+    impl_->actions.clear();
+    impl_->action_prompt.clear();
+    impl_->action_rects.clear();
+    // Back to click-through unless something else is holding it open. main.cpp re-asserts this
+    // from composing() on every tick, so the worst case of guessing wrong here is one frame.
+    set_click_through(true);
+    impl_->dirty = true;
+    impl_->render();
+}
+
+bool Overlay::has_actions() const noexcept { return !impl_->actions.empty(); }
+
+bool Overlay::hit_test_action(int32_t x, int32_t y, size_t& index) const {
+    return impl_->point_in_action(x, y, index);
+}
+
+void Overlay::set_action_target(uintptr_t hwnd, uint32_t message) noexcept {
+    impl_->action_target = hwnd;
+    impl_->action_message = message;
 }
 
 void Overlay::clear_violation() {

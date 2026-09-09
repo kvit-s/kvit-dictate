@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ctime>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -76,6 +77,8 @@ constexpr UINT kMsgHotkeyQueue = WM_APP + 4;
 constexpr UINT kMsgTray        = WM_APP + 5;
 constexpr UINT kMsgShowSettings = WM_APP + 6;
 constexpr UINT kMsgNormalized  = WM_APP + 7;
+// The pill's post-submission buttons, posted from overlay_wndproc with the index in wParam.
+constexpr UINT kMsgPillAction  = WM_APP + 8;
 
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
@@ -606,6 +609,34 @@ private:
     // text arrives as one flush and this stays empty; under Immediate it is the only way to get
     // back a session rather than its last word.
     std::string session_delivered_;
+
+    // ── The post-submission review (overlay.h, "Post-submission actions") ───────────────────
+    //
+    // What the last session put into the document, kept alive past the session so the pill can
+    // offer to recover it. The clipboard flag is the interesting one: after the clipboard method
+    // runs, our text is normally *gone* from the clipboard — inject_via_clipboard restores the
+    // previous contents once the paste has settled — so "it is already pasteable" is true only
+    // when ClipboardGuardState says the restore was skipped.
+    enum class ReviewAction : uint8_t {
+        Copy,          // put it on the clipboard and leave it there
+        TypeAgain,     // SendInput, because the clipboard path is what just failed
+        CopyAndPaste,  // clipboard, because SendInput is what just failed
+    };
+    struct Review {
+        std::string text;
+        kd::InjectMethod method = kd::InjectMethod::SendInput;
+        bool text_on_clipboard = false;
+        kd::TargetIdentity target{};
+        std::string process_name;
+    };
+    std::optional<Review> review_;
+    std::vector<ReviewAction> review_actions_;
+
+    void begin_review(const std::string& text, const kd::InjectResult& res);
+    void end_review(const char* why);
+    void apply_review_action(size_t index);
+    void remember_app_policy(kd::InjectMethod worked, const char* why);
+    void save_settings_now(const char* why);
     uint64_t recovery_saved_ms_ = 0;
 
     // When the microphone last heard a voice. Only publish_listening_state() reads it, to decide
@@ -839,6 +870,9 @@ bool App::startup() {
         // No anchor yet, so this resolves to the configured fallback rather than Inline. That is
         // the contract in anchor.h: current_fallback() is consulted when current() is absent.
         apply_overlay_mode();
+        // Where the pill posts a click on a post-submission button. Set once, here, so the
+        // overlay never has to know what an App is.
+        overlay_->set_action_target(reinterpret_cast<uintptr_t>(hwnd_), kMsgPillAction);
     }
 
     screen_capture_ = kd::anchor::make_bitblt_capture(true);
@@ -1240,6 +1274,12 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             drain_normalize_queue();
             return 0;
 
+        case kMsgPillAction:
+            // Posted by overlay_wndproc so the work lands here, on the message loop, rather than
+            // inside the overlay's own WM_LBUTTONDOWN. It injects text and writes settings.
+            apply_review_action(static_cast<size_t>(wp));
+            return 0;
+
         case kMsgIpcQueue:
             drain_ipc_queue();
             return 0;
@@ -1305,6 +1345,14 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     reconnect_at_ms_ = 0;
                     KD_LOG_INFO("reconnecting to %s", settings_.server.url.c_str());
                     connect_server();
+                }
+                // The review pill goes away when focus leaves the window its text went into.
+                // Not on a timer: the user is being offered a recovery for text they may still be
+                // reading, and a countdown would make that a race. Focus moving is the honest
+                // signal that they are done with that document, and it is also the moment
+                // "Type it again" stops being safe to offer.
+                if (review_.has_value() && !kd::validate_target(review_->target)) {
+                    end_review("focus left the target");
                 }
                 // docs/editing.md §4.4's hint, expired on the tick that already exists.
                 if (hint_expires_ms_ != 0 && clock_.now_ms() >= hint_expires_ms_) {
@@ -2487,7 +2535,8 @@ void App::begin_dictation() {
         // composing session**, so that a click meant for the pill lands on the pill instead of
         // moving the target's caret. WS_EX_NOACTIVATE stays set, which is what keeps the target
         // foreground and `validate_target` passing.
-        overlay_->set_click_through(!(composing() && settings_.editing.mouse));
+        overlay_->set_click_through(!(composing() && settings_.editing.mouse) &&
+                                    !review_.has_value());
     }
     push_edit_view();
 
@@ -2606,7 +2655,7 @@ void App::end_dictation(kd::LocalEvent why) {
         overlay_->set_text({}, {});
         overlay_->set_input_level(0.0f);
         overlay_->set_transcriber_lag(0);
-        overlay_->set_click_through(true);
+        overlay_->set_click_through(!review_.has_value());
         overlay_->set_state(kd::OverlayState::Finalizing);
 
         // Rendering normally happens on the 50 ms tick. The final response can already be queued,
@@ -3063,6 +3112,194 @@ void App::save_recovery() {
     KD_LOG_DEBUG("recovery copy written: %zu bytes", edit_.size());
 }
 
+// ─── The post-submission review ─────────────────────────────────────────────────────────────
+
+void App::begin_review(const std::string& text, const kd::InjectResult& res) {
+    if (text.empty() || !target_.has_value() || overlay_ == nullptr) return;
+    if (res.status != kd::InjectStatus::Ok) return;  // a failure already says so in the tray
+
+    Review r;
+    r.text = text;
+    r.method = injector_->config().method;
+    r.target = *target_;
+    r.process_name = target_->process_name;
+    // Our text survives on the clipboard only when the restore did not happen: either the user
+    // copied something mid-paste (sequence number moved) or the clipboard could not be reopened.
+    // injector.cpp reports both, and in both cases what is sitting there now is ours.
+    r.text_on_clipboard = r.method == kd::InjectMethod::Clipboard &&
+                          (injector_->last_clipboard_state().skipped_because_changed ||
+                           !injector_->last_clipboard_state().restored);
+
+    review_actions_.clear();
+    std::vector<std::string> labels;
+    if (r.text_on_clipboard) {
+        // Nothing to offer but the retype: the text is already where "Copy" would put it.
+        review_actions_.push_back(ReviewAction::TypeAgain);
+        labels.emplace_back("Type it again");
+    } else if (r.method == kd::InjectMethod::Clipboard) {
+        review_actions_.push_back(ReviewAction::Copy);
+        labels.emplace_back("Copy");
+        review_actions_.push_back(ReviewAction::TypeAgain);
+        labels.emplace_back("Type it again");
+    } else {
+        review_actions_.push_back(ReviewAction::Copy);
+        labels.emplace_back("Copy");
+        review_actions_.push_back(ReviewAction::CopyAndPaste);
+        labels.emplace_back("Copy and paste");
+    }
+
+    review_ = std::move(r);
+    // Deliberately not a question. The program cannot tell whether the text arrived and the user
+    // is already looking at the document, so asking would tax every session that worked to serve
+    // the few that did not. The line says what is on offer; the absence of a click is the answer.
+    overlay_->set_actions("If that did not land:", labels);
+}
+
+void App::end_review(const char* why) {
+    if (!review_.has_value()) return;
+    KD_LOG_DEBUG("the post-submission pill closed: %s", why);
+    review_.reset();
+    review_actions_.clear();
+    if (overlay_ != nullptr) overlay_->clear_actions();
+}
+
+void App::apply_review_action(size_t index) {
+    if (!review_.has_value() || index >= review_actions_.size()) return;
+    const ReviewAction action = review_actions_[index];
+    // Copied out before anything can clear it: every branch below ends the review, and the
+    // clipboard and injection calls both run long enough for a tick to land in between.
+    const Review r = *review_;
+
+    switch (action) {
+        case ReviewAction::Copy:
+            // set_clipboard_text, not the clipboard injection method — that one restores the
+            // previous contents, which is the opposite of what a recovery wants. injector.h keeps
+            // the two entry points apart for this caller.
+            if (kd::set_clipboard_text(r.text)) {
+                KD_LOG_INFO("the last dictation (%zu bytes) is on the clipboard", r.text.size());
+            } else {
+                KD_LOG_ERROR("could not reach the clipboard; %s holds the only copy",
+                             last_submission_path().string().c_str());
+                set_tray_state(kd::OverlayState::Error);
+            }
+            end_review("copied");
+            return;
+
+        case ReviewAction::TypeAgain:
+        case ReviewAction::CopyAndPaste: {
+            const bool retype = action == ReviewAction::TypeAgain;
+            const kd::InjectMethod other =
+                retype ? kd::InjectMethod::SendInput : kd::InjectMethod::Clipboard;
+
+            if (!kd::validate_target(r.target)) {
+                // The button is only drawn while the target is still foreground, but a window can
+                // move between the paint and the click. Falling back to the clipboard rather than
+                // refusing: the user asked for their text back, and this still gives it to them.
+                KD_LOG_WARN("the target moved before the retry; copying instead of typing");
+                kd::set_clipboard_text(r.text);
+                end_review("the target moved");
+                return;
+            }
+
+            if (!retype) {
+                // Put it on the clipboard *first*, deliberately. inject() will snapshot the
+                // clipboard, set our text, paste and restore — and because the snapshot it
+                // restores is now our own text, a paste that silently does nothing still leaves
+                // the text sitting there to be pasted by hand. A recovery that can fail closed
+                // is not a recovery.
+                kd::set_clipboard_text(r.text);
+            }
+
+            kd::InjectConfig cfg = injector_->config();
+            cfg.method = other;
+            injector_->set_config(cfg);
+            const kd::InjectResult res = injector_->inject(r.target, r.text);
+            injector_->set_config(settings_.inject);
+
+            if (res.status != kd::InjectStatus::Ok) {
+                KD_LOG_ERROR("the retry with %s failed: %s", kd::to_string(other),
+                             kd::to_string(res.status));
+                kd::set_clipboard_text(r.text);
+                set_tray_state(kd::OverlayState::Error);
+                end_review("the retry failed");
+                return;
+            }
+
+            KD_LOG_INFO("retried %zu bytes with %s", r.text.size(), kd::to_string(other));
+            // The click is the evidence, and it is evidence of a *negative*: the user is saying
+            // the default did not work here. Whether this retry worked is not observable either
+            // — Ok means the same thing it meant the first time — so the policy is written from
+            // what was reported, and its note says so.
+            remember_app_policy(other, retype ? "paced SendInput was reported not to arrive"
+                                              : "the paste chord was reported not to arrive");
+            end_review("retried");
+            return;
+        }
+    }
+}
+
+void App::save_settings_now(const char* why) {
+    if (const kd::Status st = kd::save_settings(settings_, kd::default_settings_path());
+        !st.ok()) {
+        // No message box: this runs from a click on the pill, and a modal dialog over a recovery
+        // the user is in the middle of would be the wrong place to learn about a disk error. The
+        // policy is in effect for this run either way; the log says it will not survive a restart.
+        KD_LOG_ERROR("%s but could not be saved: %s", why, st.message().c_str());
+        return;
+    }
+    KD_LOG_DEBUG("settings saved: %s", why);
+}
+
+void App::remember_app_policy(kd::InjectMethod worked, const char* why) {
+    if (!review_.has_value() || review_->process_name.empty()) return;
+    const std::string exe = review_->process_name;
+
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    char day[16] = {};
+    std::strftime(day, sizeof(day), "%Y-%m-%d", &tm);
+
+    std::string note = "learned from the pill ";
+    note += day;
+    note += ": ";
+    note += why;
+
+    // Through find_app_policy rather than a comparison written here, so that "which entry does
+    // this executable match" has one answer — the same one the injector uses when it picks the
+    // method at session start. A second matching rule is how a policy comes to be learned onto an
+    // entry that is not the one being applied.
+    if (const kd::AppPolicy* found = kd::find_app_policy(settings_.app_policies, exe)) {
+        kd::AppPolicy& p =
+            settings_.app_policies[static_cast<size_t>(found - settings_.app_policies.data())];
+        if (p.method == worked) return;  // already says this; nothing to write and nothing to log
+        // A hand-written note is the only record of why somebody chose that method. Keeping it
+        // ahead of ours costs one line and is the difference between a settings file that
+        // remembers its own reasoning and one that overwrites it with today's guess.
+        if (!p.note.empty()) {
+            note += " (was ";
+            note += kd::to_string(p.method);
+            note += "; ";
+            note += p.note;
+            note += ")";
+        }
+        p.method = worked;
+        p.note = note;
+        p.supported = true;
+        save_settings_now("a per-app injection policy was learned");
+        KD_LOG_INFO("%s now defaults to %s: %s", exe.c_str(), kd::to_string(worked), why);
+        return;
+    }
+
+    kd::AppPolicy p;
+    p.process_name = exe;
+    p.method = worked;
+    p.note = note;
+    settings_.app_policies.push_back(std::move(p));
+    save_settings_now("a per-app injection policy was learned");
+    KD_LOG_INFO("%s now defaults to %s: %s", exe.c_str(), kd::to_string(worked), why);
+}
+
 std::filesystem::path App::last_submission_path() {
     return kd::default_settings_path().parent_path() / "last-dictation.txt";
 }
@@ -3202,6 +3439,9 @@ void App::flush_deferred_commits(const char* why) {
             // so explicitly at its return — so this is the copy that survives that gap.
             save_last_submission(text);
             clear_recovery("the text reached the document");
+            // Offered here rather than in finish_dictation: this is the one place that knows both
+            // what was delivered and which mechanism delivered it, while target_ is still set.
+            begin_review(text, res);
             if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
             return;
         }
@@ -3334,8 +3574,15 @@ void App::finish_dictation(const char* why) {
         // and the user's only recovery is to restart the process — the same shape as the
         // `note_session_ended()` bug in progress.md §8, and the one this file has already been
         // bitten by once.
-        overlay_->set_click_through(true);
-        overlay_->hide();
+        overlay_->set_click_through(!review_.has_value());
+        // Kept up when a review is offered — that is the whole point of it, and set_text above
+        // has already emptied the pill of everything except the prompt and its buttons. The
+        // click-through line above is what makes the difference safe: a pill that outlives its
+        // session while still transparent would be invisible and inert, and one that outlives it
+        // while opaque and *unclickable* would eat clicks meant for the document.
+        if (!review_.has_value()) {
+            overlay_->hide();
+        }
     }
     // The pill is gone, so the hook must stop believing there is one to click inside. Without
     // this the last session's rectangle would keep absorbing clicks from the mouse filter's

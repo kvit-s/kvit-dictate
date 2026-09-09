@@ -69,6 +69,7 @@ kd::Settings unusual() {
     // Flipped away from its default so the round trip proves the field is written and read,
     // rather than proving that two defaults agree.
     s.crash_recovery = false;
+    s.keep_last_submission = false;
     s.start_with_windows = true;
     s.context_terms = {"llama.cpp", "Qwen3", "WASAPI"};
     s.send_context = true;
@@ -154,6 +155,7 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(static_cast<int>(out.log_level), static_cast<int>(in.log_level));
     KD_CHECK_EQ(out.diagnostics_file_enabled, in.diagnostics_file_enabled);
     KD_CHECK_EQ(out.crash_recovery, in.crash_recovery);
+    KD_CHECK_EQ(out.keep_last_submission, in.keep_last_submission);
     KD_CHECK_EQ(out.start_with_windows, in.start_with_windows);
     KD_CHECK_EQ(out.context_terms.size(), in.context_terms.size());
     KD_CHECK_EQ(out.send_context, in.send_context);
@@ -764,4 +766,22 @@ KD_TEST(settings, crash_recovery_defaults_on_and_survives_a_file_that_predates_i
     const kd::Result<kd::Settings> loaded = kd::parse_settings(older);
     KD_REQUIRE(static_cast<bool>(loaded));
     KD_CHECK(loaded->crash_recovery);
+}
+
+// settings.h `privacy.keep_last_submission`, and plan.md §1.9's second named exception. It keeps
+// a *delivered* dictation, which is a persisted transcript, so the default is asserted here for
+// the same reason the one above is: it points away from §1.9's "off", and the argument for it —
+// that the clipboard path reports Ok when nothing arrived, so the failure it covers is silent —
+// lives in a comment that a refactor is free to delete. This test is not.
+KD_TEST(settings, keeping_the_last_dictation_defaults_on_and_survives_an_older_file) {
+    const kd::Settings fresh;
+    KD_CHECK(fresh.keep_last_submission);
+
+    const char* older = R"({"schema":1,"privacy":{"log_level":"info","crash_recovery":false}})";
+    const kd::Result<kd::Settings> loaded = kd::parse_settings(older);
+    KD_REQUIRE(static_cast<bool>(loaded));
+    KD_CHECK(loaded->keep_last_submission);
+    // Independent of its neighbour: switching one off must not switch the other off, which is
+    // exactly the mistake a shared "privacy is off" flag would make.
+    KD_CHECK(!loaded->crash_recovery);
 }

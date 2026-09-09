@@ -60,6 +60,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "anchor.h"
 #include "util/result.h"
@@ -380,6 +381,35 @@ public:
     // True when the point is over the microphone button — the one control that says what it does
     // without anyone having to remember a key (§13 stage 3), drawn only while editing.
     [[nodiscard]] bool hit_test_mic_button(int32_t x, int32_t y) const;
+
+    // ── Post-submission actions ─────────────────────────────────────────────────────────────
+    //
+    // The buttons the pill offers after a session has delivered its text, when the program has
+    // said the injection succeeded and only the user can see whether it did. injector.h is blunt
+    // about why they have to exist: the clipboard method returns Ok once the paste chord is
+    // accepted, and "an application that binds Ctrl+V to something else, or that ignores it
+    // entirely, produces this same result with no text inserted". There is no signal that would
+    // separate those, so the recovery is offered rather than triggered.
+    //
+    // At most two, because there are only two useful answers — put it somewhere I can paste it,
+    // or type it again — and a third would be a menu. The caller decides which apply from the
+    // method it used and the clipboard state it got back; this only draws what it is given.
+    //
+    // Showing actions makes the pill clickable (WS_EX_TRANSPARENT is dropped) and keeps it up
+    // after the session has ended. `clear_actions` puts both back.
+    void set_actions(std::string_view prompt, const std::vector<std::string>& labels);
+    void clear_actions();
+    [[nodiscard]] bool has_actions() const noexcept;
+
+    // Which button the point is over, in the same physical-pixel client coordinates as
+    // hit_test_text. False when it is over none of them.
+    [[nodiscard]] bool hit_test_action(int32_t x, int32_t y, size_t& index) const;
+
+    // Where to post a click. The overlay posts `message` to `hwnd` with the button index in
+    // wParam. A window handle rather than a callback because the click arrives on the UI thread
+    // inside a window procedure, and the handlers it runs put up dialogs and inject text — work
+    // that must not happen inside somebody else's WM_LBUTTONDOWN.
+    void set_action_target(uintptr_t hwnd, uint32_t message) noexcept;
 
     // ── Presentation ────────────────────────────────────────────────────────────────────────
 
