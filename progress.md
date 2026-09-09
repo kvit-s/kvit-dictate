@@ -1,6 +1,7 @@
 # progress — kvit-dictate
 
-Written 2026-08-21. Commit `e800028` on `main`.
+Written 2026-08-21; §3e and the 2026-09-09 entries in §6 and §8 added then. Commit `ea8d22f`
+on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks),
 `docs/supported-targets.md` (measurements + open questions §9) and
@@ -53,6 +54,10 @@ strixhalo's ≈550 ms) and its API is experimental. §3d has the whole thing.
   one sentence while the pixel-diff estimator's 0.66–0.90 was correctly rejected in favour of it.
 * **The floating pill**, as the low-confidence fallback, bottom-centre of the target's monitor.
 * **Refusals**: password fields refuse before injecting.
+* **The post-submission pill** (§3e): it appears after a session, the buttons act, it dismisses on
+  a keystroke or an outside click, and it shrinks to the width of its buttons instead of lying
+  across the text that was just typed. Every one of those was found by the operator using it —
+  three of them were defects in the first build of it.
 * **Four targets characterised** (observations, not measurements — `docs/supported-targets.md`
   §5.10): Notepad3 clean; Win11 Notepad garbles paced `SendInput`; VS Code's terminal clean;
   Windows Terminal detected as a console, text lands, overlay degrades to the pill.
@@ -62,14 +67,23 @@ strixhalo's ≈550 ms) and its API is experimental. §3d has the whole thing.
 ```
 cmake --preset windows-msvc-debug
 cmake --build build-windows-msvc-debug --config Debug
-build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 331 tests / 36005 checks
-cd build-windows-msvc-debug && ctest -C Debug          # 15 suites, none disabled
+build-windows-msvc-debug\bin\Debug\kd_tests.exe        # 648 tests / 39116 checks
+cd build-windows-msvc-debug && ctest -C Debug          # 27 suites, none disabled
 
 python -m unittest discover -s server/tests -t server  # 419 tests   (from the repo root)
 python -m unittest discover -s bench/tests  -t .       # 129 tests   (from the repo root)
 ```
 
 Use `C:\Python312\python.exe`. The `python` on PATH in Git Bash is a conda 3.9 and will fail.
+`kd_tests.asrd_session` flakes under load — `partials.size() > 1` in the live-preview test — and
+a rerun clears it. Seen once on 2026-09-09; it is a race in the test, not the product.
+
+The installed build is rebuilt and reinstalled with `packaging/windows/build-release.ps1`
+(**pwsh 7 only** — `powershell.exe` mangles its UTF-8 and reports parse errors that are not
+there), then `dist\kvit-dictate-1.0.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`. Stop
+the running instance first: `CloseApplications=yes` cannot close it with message boxes suppressed,
+and the installer exits **5** having done nothing.
+
 Kill any running `kvit-dictate.exe` before rebuilding — it holds the link output *and* the
 single-instance mutex, so a stale one produces `LNK1168` **and** a new instance that exits
 immediately, which is two symptoms of one cause.
@@ -358,6 +372,81 @@ not `StopContinuousRecognition()` — is the end-of-stream signal and what compl
 
 ---
 
+## 3e. Delivery is unobservable, so the user is the witness — 2026-09-09
+
+**`inject()` returning `Ok` is not evidence the text arrived**, and the clipboard method is where
+that gap is widest: `inject_via_clipboard` returns `Ok` once the paste chord has been *accepted by
+the input system*, which an application that binds `Ctrl+V` elsewhere — or ignores it — produces
+identically with an empty document. The comment at its return has always said so. Nothing acted on
+it.
+
+That mattered because `clear_recovery` deleted the on-disk copy at exactly that moment. The one
+failure that leaves no trace was also the one where the last copy was thrown away.
+
+What now exists:
+
+* **`privacy.keep_last_submission`** (default on) keeps the delivered text in `last-dictation.txt`
+  — one dictation, overwritten by the next, never appended to. The tray grows **"Copy the last
+  dictation"** whenever there is one. That tray item is the point: `recover.txt` was always in the
+  folder the tray already opens and was never *there*, because delivery deleted it. Under the
+  streaming cadences `perform_commit` accumulates and `finish_dictation` saves, or their "last
+  dictation" would be the last word.
+* **This is a persisted transcript, so plan.md §1.9 now names it** as its second exception beside
+  `crash_recovery`, rather than leaving the argument in a comment.
+* **A post-submission pill.** After a session it stays up showing **"Text didn't arrive?"** over at
+  most two buttons: **Copy**, and **Send another way**. Which are offered is decided from the
+  method that actually ran and from `ClipboardGuardState` — after a clipboard injection our text is
+  normally *gone* from the clipboard, so **Copy** is still needed; only when the restore was
+  skipped is the retry offered alone.
+* **One label for both retries, on purpose.** "Type it again" and "Copy and paste" named the
+  mechanism, and which appeared depended on what had already run, so one question wore two labels.
+  The code still picks whichever method is untried; the button stops narrating it.
+* **Clicks arrive through the overlay's own `WM_LBUTTONDOWN`**, not the low-level hook the compose
+  buffer uses — the hook's pill handling is gated on `composing()`, false by then. `WS_EX_NOACTIVATE`
+  means the target keeps focus across the click, which is the only reason a retype can work at all.
+* **`FilterOutcome::dismiss_review`** closes it on any real key-down or any click outside the pill.
+  Four things deliberately do not close it: a click *inside* it (that is how the buttons are
+  pressed), a key-*up* (the hotkey that produced it is still down when it opens), our own injected
+  input (the first character of a retype would dismiss the pill that asked for it), and anything at
+  all when no review is open.
+* **A retry writes the per-app policy**, dated, noting which method was *reported* failing. It is
+  not evidence the retry worked — that is as unobservable as the first attempt — and the note does
+  not claim it is. A hand-written note on an existing entry is carried into the new one; it is the
+  only record of why somebody chose that method.
+
+**Verified by a human**: the pill appears, the buttons work, dismissal works, the width shrinks to
+the buttons. **Not verified**: the clipboard guard below, and no `app_policies` entry has yet been
+written by a retry.
+
+### The clipboard guard restored nothing, ever
+
+plan.md §1.7 asks that the clipboard be restored "only if we still own the state we set", and
+`GetClipboardSequenceNumber` was the whole test. Measured on this machine: `clipboard changed under
+us (seq X -> X+6)` on **every** clipboard injection, always the same six, inside the 60 ms between
+the set and the restore. The guard fired every time, the snapshot was never once put back, and the
+clipboard method quietly meant *"kvit-dictate keeps your clipboard"* — the precise outcome the
+guard exists to prevent.
+
+**What produces those six is unidentified.** Two candidates were probed and neither reproduced it:
+a running Ditto did not move the counter at all in the 560 ms after a clipboard write, and forcing
+synthesis of `CF_TEXT`/`CF_OEMTEXT`/`CF_LOCALE` moved it by zero. Both were plausible; both are
+wrong. The fix does not rest on knowing the answer — the sequence number now decides only whether
+to *look*, and what decides the answer is whether `CF_UNICODETEXT` still holds the string we
+published. Compared by content, not by handle, because anything re-publishing our string hands back
+a different `HGLOBAL` with the same characters. The two outcomes log differently, so the next real
+paste says which happened.
+
+### And injection is timed now
+
+`InjectResult::elapsed_us` was filled in on every path and read by nobody (§8). It is logged at the
+deferred flush with the resulting rate. This answered a real question — *"why does applying start
+slow and speed up?"* — with the honest answer that it does not, on our side: pacing is a fixed 32
+chars per `SendInput` and a fixed 1000 µs gap, bounded at about 60 ms for a 2000-character flush,
+so anything the user watches after that is the receiving window draining its input queue. Measured
+since: 335–700 chars/s into real targets under `sendinput`, and 1800–4550 chars/s under `clipboard`.
+
+---
+
 ## 4. Also true, and smaller
 
 * **The local endpointer stays as it is, and that is now a decision rather than a default.**
@@ -522,13 +611,21 @@ Actually next:
    it is a real one — a silent fallback would swap a 550 ms model for a 3 s one without saying so,
    which is its own kind of wrong. Also still true: strixhalo serves *both* transcription and VAD,
    so the qwen entries have two dependencies on it, not one.
-4. **Two clipboard paths have still never executed.** The injection policy for `notepad.exe`, where
-   the open question is whether the clipboard is restored afterwards; and the new
-   `set_clipboard_text` rescue for a deferred buffer whose target has gone (§3c), which is
-   deliberately the one that does *not* restore.
-5. **`settings.cpp` has no tests at all.** Noticed while adding `Cadence::EndOfSession`: the
-   round-trip was verified by starting the app and watching it not complain. That is a real gap in
-   a 1900-line file that parses and writes the user's configuration.
+4. **Confirm the clipboard is restored after a paste** — one paste-method dictation, then read the
+   log (§3e). This used to read "two clipboard paths have never executed"; the injection path has
+   since run many times and the answer to *"is the clipboard restored afterwards"* was **no, never**,
+   for a reason that is fixed but unverified. The two outcomes now log differently, so a single
+   dictation settles it. Still genuinely unexecuted: the `set_clipboard_text` rescue for a deferred
+   buffer whose target has gone (§3c), which is deliberately the one that does *not* restore.
+4b. **Find what bumps the clipboard sequence by six** (§3e). Not blocking — the content check is
+   correct whatever the answer — but an unexplained, perfectly repeatable +6 in a 60 ms window is
+   the kind of thing that turns out to matter somewhere else. Ditto and format synthesis are both
+   ruled out by measurement.
+5. **`settings.cpp`'s tests exist now and this item was stale.** `tests/test_settings.cpp` covers
+   the round trip field by field, the fixed point, the defaults and the affix rules. What is still
+   untested is the *dialog*: every control is read and written by hand in a 1900-line file, and two
+   defects found on 2026-09-09 by looking at it — a checkbox wired to nothing, and a list that
+   word-wrapped one rule into three — were both invisible to the suite.
 
 ---
 
@@ -578,6 +675,30 @@ A green suite said otherwise the whole time, because the tests raised the event 
 the shape to watch for: a test that supplies the input the product never supplies is testing a
 function the product does not compute. Fixed by deriving the event from the sidecar's own
 `partial`/`final` text — the component that owns the VAD — rather than adding a second detector.
+
+**2026-09-09, three at once, and the third is a new variant.** A session spent on the injection
+path turned up two more of the plain kind and one that a green suite could not have caught:
+
+* **`InjectResult::elapsed_us`** was computed on every path through `injector.cpp`, and the header
+  said it "feeds the UI/commit-delay term of plan.md §3 Phase 2 item 4". `grep` found no reader
+  outside the file that wrote it. So when the operator asked why applying a long dictation starts
+  slow, the measurement that answers it had been taken thousands of times and discarded every time.
+* **`paste_ctrl_shift_v_default`** was serialised, parsed, drawn as a checkbox, and read back out
+  of the dialog — and consulted by nothing. `settings.h` recorded the gap honestly in a comment
+  *and* claimed the value seeded new per-app policies, which it also did not. A control that
+  changes no behaviour is worse than an absent one, because it looks like it works.
+* **The new variant: a flag set on an object the caller throws away.** `FilterOutcome::dismiss_review`
+  was set in `InputFilter::on_event` before the `switch` that delegates to `on_key_event` — which
+  returns *its own* outcome. The write went to a local nobody read. Not "implemented on one side
+  and never called": called correctly, computed correctly, and dropped in the four lines between.
+  It shipped, and the symptom was exactly what the operator reported — the pill dismissed on a
+  click and sat through any amount of typing. The mouse half worked because it happened to be
+  written inside `on_mouse_event`, on the far side of the same delegation.
+
+The habit that catches the first two is §8's own: **check which entry points the product calls.**
+The third needs a different one — *follow the value to its reader*, not just the call to its
+definition — and it is the reason the tests for it assert the flag on the value `on_event`
+**returns** rather than on anything inside it.
 
 Earlier instances:
 
