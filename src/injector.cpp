@@ -1466,7 +1466,11 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
     // window class and the executable name, and which a caller applying an AppPolicy override
     // (AppPolicy::use_ctrl_shift_v) can set before calling. See the module report: the cleaner
     // home for this is a field on InjectConfig.
-    injector_detail::build_paste_chord(target.is_console, sample_stuck_modifiers(),
+    // OR, not override: the detection stands on its own and the setting only raises the floor.
+    // A user who ticks the global box has said "this machine's terminals want the longer chord";
+    // a target detect_console already recognised wanted it either way.
+    injector_detail::build_paste_chord(target.is_console || cfg.paste_ctrl_shift_v,
+                                       sample_stuck_modifiers(),
                                        injection_mark().extra_info, events);
 
     inputs.resize(events.size());

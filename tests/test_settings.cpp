@@ -773,6 +773,21 @@ KD_TEST(settings, crash_recovery_defaults_on_and_survives_a_file_that_predates_i
 // the same reason the one above is: it points away from §1.9's "off", and the argument for it —
 // that the clipboard path reports Ok when nothing arrived, so the failure it covers is silent —
 // lives in a comment that a refactor is free to delete. This test is not.
+// The global paste chord reaches the injector. It was persisted, shown in the dialog and read
+// by nothing for as long as it existed, so what is asserted here is the wiring rather than the
+// value: a checkbox nobody consults is worse than no checkbox, because it looks like a control.
+KD_TEST(settings, the_global_paste_chord_default_reaches_the_inject_config) {
+    kd::Settings s;
+    KD_CHECK(!s.paste_ctrl_shift_v_default);
+    KD_CHECK(!s.inject.paste_ctrl_shift_v);
+
+    s.paste_ctrl_shift_v_default = true;
+    bool ok = false;
+    const kd::Settings out = round_trip(s, ok);
+    KD_REQUIRE(ok);
+    KD_CHECK(out.paste_ctrl_shift_v_default);
+}
+
 KD_TEST(settings, keeping_the_last_dictation_defaults_on_and_survives_an_older_file) {
     const kd::Settings fresh;
     KD_CHECK(fresh.keep_last_submission);

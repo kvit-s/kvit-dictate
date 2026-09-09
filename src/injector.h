@@ -208,6 +208,15 @@ struct InjectConfig {
     // Clipboard path: how long to wait for the target to consume the paste before restoring.
     uint32_t paste_settle_ms = 60;
 
+    // Send Ctrl+Shift+V rather than Ctrl+V, for every target rather than only the detected ones.
+    //
+    // Consoles are already found by TargetIdentity::is_console, and the two are OR'd: this raises
+    // the floor, it does not replace the detection. It exists for the terminal that detection
+    // misses, when the user would rather not write a per-app policy for it — and it is a blunt
+    // instrument, because in most non-terminal applications Ctrl+Shift+V means "paste without
+    // formatting" and in some it means nothing at all.
+    bool paste_ctrl_shift_v = false;
+
     // Refuse rather than degrade. Both default true; both are settings a user can see.
     bool refuse_password_fields = true;
     bool refuse_elevated_targets = true;

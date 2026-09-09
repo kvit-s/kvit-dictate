@@ -340,9 +340,9 @@ struct Settings {
     // additionally detected through TargetIdentity::is_console. This is only the default applied
     // to a target with no policy of its own.
     //
-    // GAP, recorded rather than hidden: InjectConfig has no corresponding field, so the injector
-    // cannot currently read this. It is persisted, shown in the dialog, and used to seed new
-    // per-app policies. Wiring it fully needs one bool on InjectConfig.
+    // Copied into InjectConfig::paste_ctrl_shift_v at session start, where the injector ORs it
+    // with TargetIdentity::is_console. It was persisted, shown in the dialog and read by nothing
+    // at all for as long as it existed — a checkbox that changed no behaviour.
     bool paste_ctrl_shift_v_default = false;
 
     // docs/editing.md §12 — the pill as a compose buffer. `editing.enabled` is forced off by

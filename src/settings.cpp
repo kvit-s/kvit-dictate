@@ -2114,11 +2114,15 @@ struct Cursor {
         return h;
     }
 
-    HWND multiline(int id, int logical_height) {
-        HWND h = add(L"EDIT", L"",
-                     WS_TABSTOP | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_WANTRETURN |
-                         ES_AUTOVSCROLL,
-                     logical_height, id, WS_EX_CLIENTEDGE);
+    // `wrap` false gives one entry per visible line, scrolling sideways instead of folding a
+    // long line into what looks like several entries. That distinction is invisible in a list of
+    // vocabulary terms and load-bearing in a list of policies, where every line is a rule and a
+    // wrapped comment reads as three broken rules.
+    HWND multiline(int id, int logical_height, bool wrap = true) {
+        DWORD style = WS_TABSTOP | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_WANTRETURN |
+                      ES_AUTOVSCROLL;
+        if (!wrap) style |= WS_HSCROLL | ES_AUTOHSCROLL;
+        HWND h = add(L"EDIT", L"", style, logical_height, id, WS_EX_CLIENTEDGE);
         gap(6);
         return h;
     }
@@ -3486,7 +3490,8 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"SendInput: characters per batch (0 = one batch)", kIdCharsBatch, ES_NUMBER);
         c.label_edit(L"SendInput: delay between batches (microseconds)", kIdBatchDelay, ES_NUMBER);
         c.label_edit(L"Clipboard: settle time before restoring (ms)", kIdPasteSettle, ES_NUMBER);
-        c.check(L"Default paste chord is Ctrl+Shift+V (terminals)", kIdPasteChord);
+        c.check(L"Paste with Ctrl+Shift+V everywhere, not only in detected terminals",
+                kIdPasteChord);
         c.check(L"Refuse to type into password fields", kIdRefusePassword);
         c.check(L"Refuse elevated targets (UIPI cannot be worked around)", kIdRefuseElevated);
 
@@ -3497,7 +3502,7 @@ void build_controls(HWND dlg, DialogState& st) {
         Cursor c{dlg, inst, &st, 3, col2_x, top, top, col_w};
         c.section(L"Per-app injection policy");
         c.note(L"process.exe = sendinput | clipboard [, ctrl-shift-v] [, unsupported]", 2);
-        c.multiline(kIdAppPolicies, 110);
+        c.multiline(kIdAppPolicies, 110, /*wrap=*/false);
 
         // Here rather than on the compose-buffer page, which is the other place it could
         // plausibly live: everything on that page is conditional on the end-of-session cadence

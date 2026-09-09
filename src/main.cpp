@@ -2427,6 +2427,10 @@ void App::begin_dictation() {
     // measurements, not guesses, and this is the mechanism the matrix's tiers are declared
     // through. find_app_policy() existed, was tested, and had never been called.
     kd::InjectConfig inject_cfg = settings_.inject;
+    // The global paste-chord default, which lives on Settings rather than InjectConfig because
+    // it is a preference and not a mechanism. Applied before the per-app policy below, so a
+    // policy can still be the more specific answer.
+    inject_cfg.paste_ctrl_shift_v = settings_.paste_ctrl_shift_v_default;
     if (const kd::AppPolicy* p =
             kd::find_app_policy(settings_.app_policies, target_->process_name)) {
         if (!p->supported) {
