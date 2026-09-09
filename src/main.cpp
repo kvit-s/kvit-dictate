@@ -1966,6 +1966,13 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     const kd::InjectResult res = injector_->inject(*target_, text);
     if (framed) anchor_->submit_after_frame(text);
 
+    // Debug rather than info: under the streaming cadences this runs once per committed word,
+    // and the number is only interesting in aggregate. It is the same measurement the deferred
+    // flush logs at info — how long the UI thread spent inside SendInput — kept here so the two
+    // cadences can be compared against each other rather than only against intuition.
+    KD_LOG_DEBUG("injected %zu bytes in %llu us", text.size(),
+                 static_cast<unsigned long long>(res.elapsed_us));
+
     if (res.status != kd::InjectStatus::Ok) {
         // Injection success is decided here, by the mechanism that performed it — never inferred
         // from pixels (plan.md §1.5).
@@ -3092,7 +3099,18 @@ void App::flush_deferred_commits(const char* why) {
     if (target_.has_value() && kd::validate_target(*target_)) {
         const kd::InjectResult res = injector_->inject(*target_, text);
         if (res.status == kd::InjectStatus::Ok) {
-            KD_LOG_INFO("flushed %zu deferred bytes on %s", text.size(), why);
+            // The elapsed time is logged, and it is the whole reason this line carries a number
+            // at all: under end-of-session a whole dictation arrives as one injection, the user
+            // watches it appear character by character, and the only way to tell our pacing from
+            // the target's own drain rate afterwards is to know how long *we* were busy. Anything
+            // the user saw after this many microseconds was the receiving application catching
+            // up, not this program still typing.
+            KD_LOG_INFO("flushed %zu deferred bytes on %s in %llu us (%llu chars/s from here)",
+                        text.size(), why, static_cast<unsigned long long>(res.elapsed_us),
+                        res.elapsed_us == 0
+                            ? 0ull
+                            : static_cast<unsigned long long>(res.bytes_injected) * 1000000ull /
+                                  res.elapsed_us);
             clear_recovery("the text reached the document");
             if (anchor_ != nullptr) anchor_->refresh_caret(target_->focus);
             return;
