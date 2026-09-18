@@ -101,13 +101,11 @@ size_t clipboard_backup_lost_format_count(const ClipboardBackup* b) noexcept;
 
 bool clipboard_save(ClipboardBackup* b, ClipboardGuardState& st, uint32_t* os_error);
 bool clipboard_set_utf8(std::string_view utf8, ClipboardGuardState& st, uint32_t* os_error);
-bool clipboard_set_delayed(std::string_view utf8, std::wstring& out_utf16,
-                           ClipboardGuardState& st, uint32_t* os_error);
 void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring_view ours);
 
 void paste_watch_arm(ClipboardBackup* backup, std::wstring text, ClipboardGuardState* report_to,
-                     uint32_t sequence_at_set, uint32_t target_pid, uint32_t settle_ms,
-                     uint32_t fallback_ms);
+                     uint32_t sequence_at_set, uint32_t delay_ms);
+uint32_t restore_delay_ms(uint32_t configured_ms) noexcept;
 ClipboardBackup* paste_watch_adopt();
 void paste_watch_cancel(const char* why);
 bool paste_watch_run_now(const char* why, bool may_defer);
@@ -1227,16 +1225,16 @@ KD_TEST(injector, empty_text_injection_is_a_no_op_success) {
 
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
-//  The deferred restore — delayed rendering and the "the target took it" signal
+//  The deferred restore
 // ════════════════════════════════════════════════════════════════════════════════════════════
 //
-// What these can and cannot reach. The signal under test is "a *different* process asked Windows
-// for our text", and a test has no different process to be. So the tests below play the target
-// by reading the clipboard from this one, and set the watch's target pid accordingly: equal to
-// our own pid where the case is "the target read it", and a pid that is not ours where the case
-// is "somebody else did". That exercises every branch of the attribution except the one thing no
-// unit test can produce — a real Electron paste — which is measured in docs/supported-targets.md
-// instead.
+// What these can and cannot reach. The thing that broke was a *time*: the restore ran 60 ms after
+// the chord, before the target had read what it was pasting. A test cannot produce an Electron
+// paste, and no unit test can prove a wait is long enough for one — that is measured against real
+// applications in docs/supported-targets.md. What is testable, and what these cover, is that the
+// wait exists, that nothing shortens it, that the ownership gate still governs the moment it
+// expires, and that every other path through the watch leaves the user's clipboard where they
+// would expect to find it.
 
 namespace {
 
@@ -1254,16 +1252,15 @@ bool pump_until(F done, DWORD budget_ms) {
     }
 }
 
-// Arms the watch the way inject_via_clipboard does, minus the chord: snapshot, publish
-// delay-rendered, hand both to the watch. Returns false if the clipboard was unreachable, which
-// on a developer machine is a busy clipboard rather than a bug.
+// Arms the watch the way inject_via_clipboard does, minus the chord: snapshot, publish, hand both
+// to the watch. Returns false if the clipboard was unreachable, which on a developer machine is a
+// busy clipboard rather than a bug.
 //
 // The snapshot is created here and **belongs to the watch** from the moment it is armed — the
 // same ownership transfer inject_via_clipboard makes with backup.release(). A test that also
 // held it in a RAII wrapper would free it twice, so `out_backup` hands the pointer back only
 // for the one test that has to recognise it again.
-bool arm_paste(ClipboardGuardState& st, std::string_view text, uint32_t target_pid,
-               uint32_t settle_ms, uint32_t fallback_ms,
+bool arm_paste(ClipboardGuardState& st, std::string_view text, uint32_t delay_ms,
                kd::injector_detail::ClipboardBackup** out_backup = nullptr) {
     kd::injector_detail::ClipboardBackup* b = kd::injector_detail::clipboard_backup_create();
     if (out_backup != nullptr) *out_backup = b;
@@ -1271,22 +1268,13 @@ bool arm_paste(ClipboardGuardState& st, std::string_view text, uint32_t target_p
         kd::injector_detail::clipboard_backup_destroy(b);
         return false;
     }
-    std::wstring ours;
-    bool set = false;
-    for (int i = 0; i < kOuterAttempts; ++i) {
-        if (kd::injector_detail::clipboard_set_delayed(text, ours, st, nullptr)) {
-            set = true;
-            break;
-        }
-        drain_messages();
-        Sleep(5);
-    }
-    if (!set) {
+    if (!set_with_retry(text, st)) {
         kd::injector_detail::clipboard_backup_destroy(b);
         return false;
     }
-    kd::injector_detail::paste_watch_arm(b, std::move(ours), &st, st.sequence_at_set, target_pid,
-                                         settle_ms, fallback_ms);
+    std::wstring ours;
+    (void)kd::utf8::to_utf16(text, ours, nullptr);
+    kd::injector_detail::paste_watch_arm(b, std::move(ours), &st, st.sequence_at_set, delay_ms);
     return true;
 }
 
@@ -1298,10 +1286,10 @@ struct WatchGuard {
 
 }  // namespace
 
-KD_TEST(injector, delayed_text_is_rendered_only_when_somebody_asks_for_it) {
-    // The mechanism in one test: nothing is on the clipboard until a reader wants it, and what
-    // the reader gets is exactly what was published — including the astral character, which is
-    // the thing a UTF-16 slip in render_block() would mangle.
+KD_TEST(injector, the_restore_does_not_run_in_the_window_that_broke) {
+    // The bug, as a test. 60 ms after the chord the clipboard used to go back, whether or not the
+    // target had read it, and an Electron paste is routinely slower than that. Nothing may
+    // shorten the wait to anything near it again.
     ClipboardScope scope;
     KD_REQUIRE(scope.ok());
 
@@ -1309,83 +1297,64 @@ KD_TEST(injector, delayed_text_is_rendered_only_when_somebody_asks_for_it) {
 
     ClipboardGuardState st;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "dictated \xC3\xA9 text \xF0\x9F\x98\x80",
-                         GetCurrentProcessId(), 10, 60000));
+    KD_REQUIRE(arm_paste(st, "our dictated text", 60000));
     KD_CHECK(st.restore_pending);
     KD_CHECK(!st.restored);
-    KD_CHECK(!st.target_read_it);
 
-    // Published, but as an offer rather than as data.
-    KD_CHECK(IsClipboardFormatAvailable(CF_UNICODETEXT) != FALSE);
-    KD_CHECK_EQ(reinterpret_cast<uintptr_t>(GetClipboardOwner()),
-                kd::injector_detail::clipboard_owner_window());
+    // Two and a half times the old window, pumping throughout, and our text is still there for
+    // the target to find.
+    KD_CHECK(!pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 150));
+    KD_CHECK(st.restore_pending);
+    KD_CHECK(!st.restored);
 
     std::wstring now;
     bool present = false;
     KD_REQUIRE(get_raw_text(now, present));
     KD_CHECK(present);
-    KD_CHECK(now == L"dictated é text \U0001F600");
-}
-
-KD_TEST(injector, nothing_restores_while_nobody_reads) {
-    // The failure this replaced was a stopwatch: 60 ms after the chord, the clipboard went back
-    // whether or not the target had got there. Time alone must no longer be able to do that.
-    ClipboardScope scope;
-    KD_REQUIRE(scope.ok());
-
-    KD_REQUIRE(set_raw_text(L"the user's own copy"));
-
-    ClipboardGuardState st;
-    WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "our dictated text", GetCurrentProcessId(), 10, 60000));
-
-    // Two and a half times the old settle window, and nothing may have happened yet. (A
-    // clipboard manager reading our text during this is fine and is not the target: this asserts
-    // only that no restore ran.)
-    KD_CHECK(!pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 150));
-    KD_CHECK(st.restore_pending);
-    KD_CHECK(!st.restored);
-}
-
-KD_TEST(injector, a_read_by_the_target_is_what_schedules_the_restore) {
-    // The whole point: the read is what starts the clock, and when the clock runs out the user's
-    // clipboard is back.
-    //
-    // Read immediately, on purpose. Only the *first* render request reaches us — after we answer
-    // one, the data is real and Windows serves everyone else without a word — so a clipboard
-    // manager that gets there before this line takes the signal this test is about. It needs a
-    // message-loop turn to do that and we do not give it one, which is enough on this machine
-    // and is the same race the mechanism itself documents.
-    ClipboardScope scope;
-    KD_REQUIRE(scope.ok());
-
-    KD_REQUIRE(set_raw_text(L"the user's own copy"));
-
-    ClipboardGuardState st;
-    WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    // A fallback far beyond the test's patience: a restore here happened because of the read,
-    // which is the claim being made.
-    KD_REQUIRE(arm_paste(st, "our dictated text", GetCurrentProcessId(), 10, 60000));
-
-    std::wstring now;
-    bool present = false;
-    KD_REQUIRE(get_raw_text(now, present));  // the target pastes
     KD_CHECK(now == L"our dictated text");
-    KD_CHECK(st.target_read_it);
+}
+
+KD_TEST(injector, the_wait_is_floored_at_something_a_slow_target_can_survive) {
+    // inject.paste_settle_ms is a number in a settings file that predates knowing what it had to
+    // be. 60 is the value the bug was made of, so it is raised rather than honoured; a value
+    // above the floor is the user's business and is left alone.
+    KD_CHECK_EQ(kd::injector_detail::restore_delay_ms(0), kd::injector_detail::restore_delay_ms(60));
+    KD_CHECK_GT(kd::injector_detail::restore_delay_ms(60), 60u);
+    KD_CHECK_EQ(kd::injector_detail::restore_delay_ms(3000), 3000u);
+    // And the shipped default is not the floor: it is the value chosen for a loaded Electron
+    // paste, which is what the reports were about.
+    kd::InjectConfig cfg;
+    KD_CHECK_GT(cfg.paste_settle_ms, kd::injector_detail::restore_delay_ms(60));
+}
+
+KD_TEST(injector, the_restore_runs_when_the_wait_expires) {
+    // The other half: it is deferred, not abandoned. The user's clipboard comes back on its own,
+    // from the message loop, with nobody having asked.
+    ClipboardScope scope;
+    KD_REQUIRE(scope.ok());
+
+    KD_REQUIRE(set_raw_text(L"the user's own copy"));
+
+    ClipboardGuardState st;
+    WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
+    KD_REQUIRE(arm_paste(st, "our dictated text", 30));
 
     KD_REQUIRE(pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 2000));
     KD_CHECK(st.restored);
     KD_CHECK(!st.restore_pending);
     KD_CHECK(!st.skipped_because_changed);
 
+    std::wstring now;
+    bool present = false;
     KD_REQUIRE(get_raw_text(now, present));
     KD_CHECK(present);
     KD_CHECK(now == L"the user's own copy");
 }
 
-KD_TEST(injector, a_read_by_somebody_else_does_not_schedule_the_restore) {
-    // A clipboard manager reading our write is not the target pasting it. Attributing its read
-    // to the target would restore early, which is the bug the whole mechanism exists to fix.
+KD_TEST(injector, nothing_restores_while_the_thread_does_not_pump) {
+    // Stated because it is the one obligation this design puts on its caller (injector.h): the
+    // restore is a WM_TIMER, and a caller that stops pumping keeps the user's clipboard until it
+    // pumps again or flushes. App::shutdown and the probe's exit path both flush for this reason.
     ClipboardScope scope;
     KD_REQUIRE(scope.ok());
 
@@ -1393,43 +1362,14 @@ KD_TEST(injector, a_read_by_somebody_else_does_not_schedule_the_restore) {
 
     ClipboardGuardState st;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    // A pid that is not ours, so this process reading stands in for the clipboard manager.
-    const uint32_t not_us = GetCurrentProcessId() ^ 0x4000u;
-    KD_REQUIRE(arm_paste(st, "our dictated text", not_us, 10, 60000));
+    KD_REQUIRE(arm_paste(st, "our dictated text", 20));
 
-    std::wstring now;
-    bool present = false;
-    KD_REQUIRE(get_raw_text(now, present));
-    KD_CHECK(now == L"our dictated text");  // it is still served — we do not withhold the data
-    KD_CHECK(!st.target_read_it);
-
-    // And the watch is still waiting for its fallback rather than counting down to a restore.
-    KD_CHECK(!pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 200));
-    KD_CHECK(st.restore_pending);
-}
-
-KD_TEST(injector, the_fallback_restores_a_paste_nobody_ever_reads) {
-    // Ctrl+V bound to something else, or ignored: no render request ever arrives. The user's
-    // clipboard still has to come back, and bounded by something a person would not notice as
-    // "it kept my clipboard".
-    ClipboardScope scope;
-    KD_REQUIRE(scope.ok());
-
-    KD_REQUIRE(set_raw_text(L"the user's own copy"));
-
-    ClipboardGuardState st;
-    WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "text nobody asks for", GetCurrentProcessId(), 10, 30));
+    Sleep(150);  // no pumping: three times the wait, and nothing happens
+    KD_CHECK(kd::injector_detail::paste_watch_active());
+    KD_CHECK(!st.restored);
 
     KD_REQUIRE(pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 2000));
     KD_CHECK(st.restored);
-    KD_CHECK(!st.target_read_it);  // honestly reported: the chord may have gone nowhere
-
-    std::wstring now;
-    bool present = false;
-    KD_REQUIRE(get_raw_text(now, present));
-    KD_CHECK(present);
-    KD_CHECK(now == L"the user's own copy");
 }
 
 KD_TEST(injector, a_second_paste_carries_the_first_snapshot_forward) {
@@ -1445,7 +1385,7 @@ KD_TEST(injector, a_second_paste_carries_the_first_snapshot_forward) {
     ClipboardGuardState st2;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
     kd::injector_detail::ClipboardBackup* first = nullptr;
-    KD_REQUIRE(arm_paste(st1, "the first utterance", GetCurrentProcessId(), 10, 60000, &first));
+    KD_REQUIRE(arm_paste(st1, "the first utterance", 60000, &first));
 
     kd::injector_detail::ClipboardBackup* adopted = kd::injector_detail::paste_watch_adopt();
     KD_CHECK_EQ(reinterpret_cast<uintptr_t>(adopted), reinterpret_cast<uintptr_t>(first));
@@ -1454,19 +1394,10 @@ KD_TEST(injector, a_second_paste_carries_the_first_snapshot_forward) {
 
     // The second paste arms with the snapshot it inherited, and restoring it puts back what the
     // user had before the *first* one.
+    KD_REQUIRE(set_with_retry("the second utterance", st2));
     std::wstring ours;
-    bool published = false;
-    for (int i = 0; i < kOuterAttempts && !published; ++i) {
-        published = kd::injector_detail::clipboard_set_delayed("the second utterance", ours, st2,
-                                                               nullptr);
-        if (!published) {
-            drain_messages();
-            Sleep(5);
-        }
-    }
-    KD_REQUIRE(published);
-    kd::injector_detail::paste_watch_arm(adopted, std::move(ours), &st2, st2.sequence_at_set,
-                                         GetCurrentProcessId(), 10, 30);
+    (void)kd::utf8::to_utf16("the second utterance", ours, nullptr);
+    kd::injector_detail::paste_watch_arm(adopted, std::move(ours), &st2, st2.sequence_at_set, 30);
 
     KD_REQUIRE(pump_until([] { return !kd::injector_detail::paste_watch_active(); }, 2000));
     KD_CHECK(st2.restored);
@@ -1489,7 +1420,7 @@ KD_TEST(injector, copying_the_last_dictation_abandons_a_pending_restore) {
 
     ClipboardGuardState st;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "the dictation", GetCurrentProcessId(), 10, 30));
+    KD_REQUIRE(arm_paste(st, "the dictation", 30));
 
     KD_REQUIRE(copy_with_retry("the dictation"));
     KD_CHECK(!kd::injector_detail::paste_watch_active());
@@ -1516,7 +1447,7 @@ KD_TEST(injector, a_copy_during_the_paste_is_left_alone) {
 
     ClipboardGuardState st;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "our dictated text", GetCurrentProcessId(), 10, 30));
+    KD_REQUIRE(arm_paste(st, "our dictated text", 30));
 
     KD_REQUIRE(set_raw_text(L"THE USER COPIED THIS"));
 
@@ -1541,8 +1472,7 @@ KD_TEST(injector, the_restore_can_be_forced_for_a_process_on_its_way_out) {
 
     ClipboardGuardState st;
     WatchGuard guard;  // declared last, so it is destroyed first and never writes into a dead st
-    KD_REQUIRE(arm_paste(st, "text mid-paste at shutdown", GetCurrentProcessId(),
-                         10, 60000));
+    KD_REQUIRE(arm_paste(st, "text mid-paste at shutdown", 60000));
 
     KD_CHECK(kd::finish_pending_clipboard_restore());
     KD_CHECK(st.restored);

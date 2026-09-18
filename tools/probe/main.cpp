@@ -191,6 +191,19 @@ bool parse_target_state(const std::string& json_text, TargetState& out);
 // `baseline` is the caret before the injection. As in settle_target, waiting for movement to STOP
 // is wrong on its own: two reads taken before the target has drained anything agree perfectly.
 // Wait for it to start first.
+// Dispatch whatever is waiting, and why a measurement harness has to.
+//
+// The clipboard method's restore is deferred: it puts the operator's own clipboard back from a
+// WM_TIMER (injector.h), and a tool that injects and then sleeps in a polling loop would never
+// let it run. So every wait in this tool pumps, and the exit path flushes whatever is left.
+void pump_messages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 bool settle_caret(kd::anchor::ICaretProvider& caret, uintptr_t window,
                   const kd::anchor::Rect& baseline, bool have_baseline, kd::anchor::Rect& out,
                   int timeout_ms) {
@@ -232,6 +245,7 @@ bool settle_caret(kd::anchor::ICaretProvider& caret, uintptr_t window,
             }
             return false;
         }
+        pump_messages();
         Sleep(40);
     }
 }
@@ -275,6 +289,7 @@ bool settle_target(SideChannel& sc, TargetState& out, int timeout_ms, int64_t ba
             }
             return false;
         }
+        pump_messages();
         Sleep(40);
     }
 }
@@ -1005,6 +1020,24 @@ int main(int argc, char** argv) {
             inject_result = injector.inject(target, text);
             const ULONGLONG t1 = GetTickCount64();
 
+            // The clipboard method returns with our text still on the clipboard and the restore
+            // waiting on a timer. Wait it out here rather than reporting a state in flight: how
+            // long our text really sat on the clipboard is the number this whole mechanism is
+            // about, and a measurement tool that did not print it would be hiding the subject.
+            if (method == "clipboard") {
+                const ULONGLONG until = GetTickCount64() + 6000;
+                while (GetTickCount64() < until &&
+                       injector.last_clipboard_state().restore_pending) {
+                    pump_messages();
+                    Sleep(5);
+                }
+                const kd::ClipboardGuardState& g = injector.last_clipboard_state();
+                std::printf("  clipboard: on_clipboard_ms=%u restore_pending=%d restored=%d "
+                            "left_alone=%d\n",
+                            g.on_clipboard_ms, g.restore_pending ? 1 : 0, g.restored ? 1 : 0,
+                            g.skipped_because_changed ? 1 : 0);
+            }
+
             kd::json::Value inj = kd::json::Value::object();
             inj.set("method", kd::json::Value::string(method));
             inj.set("text_id", kd::json::Value::string(text_label));
@@ -1080,12 +1113,17 @@ int main(int argc, char** argv) {
         // and the diff then describes a partial repaint. --settle-ms N waits N ms before the
         // first capture, so that reading can be tested rather than assumed. Default 0: it does
         // not change what any previous record measured.
-        if (settle_ms > 0) Sleep(static_cast<DWORD>(settle_ms));
+        if (settle_ms > 0) {
+            pump_messages();
+            Sleep(static_cast<DWORD>(settle_ms));
+            pump_messages();
+        }
 
         kd::anchor::DiffResult diff;
         int polls = 0;
         std::vector<uint8_t> after_pixels;
         for (; polls < 20; ++polls) {
+            pump_messages();
             Sleep(25);
             auto a = capture->capture(region);
             if (!a) break;
@@ -1410,5 +1448,11 @@ int main(int argc, char** argv) {
     }
 
     if (use_side_channel) side_channel.query("log-visual:on");
+    // The clipboard method's restore is deferred and this process is about to stop pumping. A
+    // measurement run must not be the reason the operator's clipboard never came back.
+    if (kd::finish_pending_clipboard_restore()) {
+        std::printf("  clipboard: a paste was still outstanding; the previous contents were put "
+                    "back before exit\n");
+    }
     return 0;
 }

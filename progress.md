@@ -1,7 +1,7 @@
 # progress — kvit-dictate
 
-Written 2026-08-21; §3e and the 2026-09-09 entries in §6 and §8 added then. Commit `ea8d22f`
-on `main`.
+Written 2026-08-21; §3e and the 2026-09-09 entries in §6 and §8 added then, and the 2026-09-17
+entry in §3e with it. Commit `41ef07e` on `main`.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks),
 `docs/supported-targets.md` (measurements + open questions §9) and
@@ -436,6 +436,67 @@ published. Compared by content, not by handle, because anything re-publishing ou
 a different `HGLOBAL` with the same characters. The two outcomes log differently, so the next real
 paste says which happened.
 
+### The guard was fixed, and that made a race visible — 2026-09-17
+
+Fixing the guard above made the restore *real* for the first time, and what it uncovered was worse
+than what it fixed: **the paste started delivering the user's previous clipboard contents instead
+of the dictation.** Reported by the user, who had been working around it for a week — every one of
+the seven "copy last dictation to the clipboard" presses in the logs is after 2026-09-09 17:31, and
+there is not one in the twelve days before it. That timestamp is the first run of the build
+carrying `ea8d22f`.
+
+The restore was a stopwatch: 60 ms after the paste chord, put the user's clipboard back, whether
+or not the target had read ours yet. VS Code is Electron; its `Ctrl+V` crosses into the renderer
+process and comes back before anything touches the clipboard, and under load that round trip is
+routinely slower than 60 ms. The comment above the sleep had already said what would happen —
+*"restoring immediately would hand it the previous contents"* — and 60 ms was the same guess with
+a smaller number. Before `ea8d22f` the guard skipped every restore, so the race existed and was
+invisible: our text simply stayed on the clipboard.
+
+**The restore now runs from a `WM_TIMER`, not a sleep**, and waits `inject.paste_settle_ms` — now
+1200 ms by default and floored at 400, because 60 is the value the bug was made of rather than a
+preference anyone expressed. Deferring it is what makes the longer wait free: nothing blocks the
+UI thread, so the wait costs only that the user's own clipboard is displaced for about a second,
+during which the ownership check still protects anything they copy. Measured end to end against
+`tools/testtarget`: five of five pastes verbatim, `on_clipboard_ms` between 1203 and 1218.
+
+**Delayed rendering was built first, and rejected by measurement.** Publishing `CF_UNICODETEXT`
+with a null handle makes Windows ask for the bytes with `WM_RENDERFORMAT` at the moment a reader
+wants them, which is the completion signal the clipboard API otherwise lacks — restore when the
+*target* asks, not when a clock says so. Against a plain Win32 `EDIT` control it produced **no
+paste at all**: the control logged `WM_PASTE` and inserted nothing. The diagnostics named the
+reason — `renders=1 last_requester_pid=26180`, which is **Ditto**, the clipboard manager running
+on this machine. Only the first render request reaches the owner, Ditto answers it every time, and
+the target's own read lands in whatever state Ditto leaves behind. The cost is not a late restore,
+it is a lost paste. Real bytes are served by Windows from a handle that is already there, whatever
+our process is doing and whoever else is listening. **Do not reintroduce delayed rendering without
+re-running that measurement.**
+
+That also answers §6.4b, which had been looking for what bumps the sequence number by six: Ditto is
+on this machine and is demonstrably in the middle of every clipboard write we make. It did not
+reproduce under the earlier probe because that probe watched the counter after a write rather than
+asking who was reading.
+
+Smaller things that had to be handled rather than discovered:
+
+* **A second injection adopts the first one's snapshot** instead of taking a new one, which would
+  snapshot our own dictation and faithfully restore *that*. `main.cpp` injects twice in a row
+  routinely — the deferred flush, then the suffix — so this is the ordinary path.
+* **`set_clipboard_text` abandons a pending restore.** It is the recovery copy; a timer wiping it
+  a second after the user asked for it is the whole failure it exists to prevent.
+* **The post-submission pill reads `restore_pending`** — our text is on the clipboard at that
+  instant and will not be shortly, so **Copy** is still offered.
+* **`App::shutdown` runs the restore before the message loop stops**, and `tools/probe` does the
+  same at exit. A `WM_TIMER` that never fires would mean keeping the user's clipboard.
+* **A restore that cannot open the clipboard is retried** — five attempts, 60 ms apart — rather
+  than abandoned. The deferred design has somewhere to put a second attempt; the blocking one did
+  not. A busy clipboard produced exactly this failure once while the tests were being written.
+* **`paste_settle_ms` used to be clamped to 500 ms in silence** although `settings.cpp` accepts
+  0..5000. Nothing is clamped now, and raising a value below the floor is logged.
+
+**Verified**: the end-to-end measurement above, and the suite. **Not verified by a human in the
+product yet**: a real dictation into VS Code, which is the report this came from.
+
 ### And injection is timed now
 
 `InjectResult::elapsed_us` was filled in on every path and read by nobody (§8). It is logged at the
@@ -611,16 +672,17 @@ Actually next:
    it is a real one — a silent fallback would swap a 550 ms model for a 3 s one without saying so,
    which is its own kind of wrong. Also still true: strixhalo serves *both* transcription and VAD,
    so the qwen entries have two dependencies on it, not one.
-4. **Confirm the clipboard is restored after a paste** — one paste-method dictation, then read the
-   log (§3e). This used to read "two clipboard paths have never executed"; the injection path has
-   since run many times and the answer to *"is the clipboard restored afterwards"* was **no, never**,
-   for a reason that is fixed but unverified. The two outcomes now log differently, so a single
-   dictation settles it. Still genuinely unexecuted: the `set_clipboard_text` rescue for a deferred
-   buffer whose target has gone (§3c), which is deliberately the one that does *not* restore.
-4b. **Find what bumps the clipboard sequence by six** (§3e). Not blocking — the content check is
-   correct whatever the answer — but an unexplained, perfectly repeatable +6 in a 60 ms window is
-   the kind of thing that turns out to matter somewhere else. Ditto and format synthesis are both
-   ruled out by measurement.
+4. **Dictate into VS Code with the paste method and read the log** (§3e). The restore is measured
+   working against `tools/testtarget` and the log now prints `deferred clipboard restore ran after
+   N ms`, but the report this fix came from was a real dictation into Code, and only a real
+   dictation into Code closes it. What to look for: the dictated text arriving (not the previous
+   clipboard item), and one restore line per injection with `restored=1`. Still genuinely
+   unexecuted: the `set_clipboard_text` rescue for a deferred buffer whose target has gone (§3c),
+   which is deliberately the one that does *not* restore.
+4b. **~~Find what bumps the clipboard sequence by six~~ — answered 2026-09-17.** Ditto. It reads
+   every clipboard write this machine makes; the delayed-rendering experiment in §3e caught it in
+   the act, by process id, as the first and only answerer of a render request. The earlier probe
+   missed it because it watched the counter after a write instead of asking who was reading.
 5. **`settings.cpp`'s tests exist now and this item was stale.** `tests/test_settings.cpp` covers
    the round trip field by field, the fixed point, the defaults and the affix rules. What is still
    untested is the *dialog*: every control is read and written by hand in a 1900-line file, and two
