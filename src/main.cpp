@@ -3135,9 +3135,15 @@ void App::begin_review(const std::string& text, const kd::InjectResult& res) {
     // Our text survives on the clipboard only when the restore did not happen: either the user
     // copied something mid-paste (sequence number moved) or the clipboard could not be reopened.
     // injector.cpp reports both, and in both cases what is sitting there now is ours.
-    r.text_on_clipboard = r.method == kd::InjectMethod::Clipboard &&
-                          (injector_->last_clipboard_state().skipped_because_changed ||
-                           !injector_->last_clipboard_state().restored);
+    //
+    // `restore_pending` is the third answer and it is the usual one, because the restore now
+    // waits for the target to read the text (injector.h) and this pill goes up first. Our text
+    // is on the clipboard at this instant and will not be in a moment, so the honest answer for
+    // a button the user reads and then decides about is "no" — and "Copy" is offered, which is
+    // what a user whose paste went astray wanted from it anyway.
+    const kd::ClipboardGuardState& guard = injector_->last_clipboard_state();
+    r.text_on_clipboard = r.method == kd::InjectMethod::Clipboard && !guard.restore_pending &&
+                          (guard.skipped_because_changed || !guard.restored);
 
     // One label for both retries, deliberately. "Type it again" and "Copy and paste" named the
     // *mechanism*, which is ours to worry about and not the user's — and they named it wrongly
@@ -4029,6 +4035,15 @@ void App::shutdown() {
     static bool done = false;
     if (done) return;
     done = true;
+
+    // Before the message loop stops, because after it the deferred restore's timer never fires
+    // again and the user is left holding our dictation instead of whatever they had copied.
+    // Says so in the log rather than doing it silently: this is the clipboard changing under
+    // someone at the moment the program disappears, and it should be findable afterwards.
+    if (kd::finish_pending_clipboard_restore()) {
+        KD_LOG_INFO("a clipboard paste was still outstanding at shutdown; the previous clipboard "
+                    "contents were put back now rather than never");
+    }
 
     KillTimer(hwnd_, kTickTimer);
     KillTimer(hwnd_, kHeartbeatTimer);

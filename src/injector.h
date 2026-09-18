@@ -167,6 +167,12 @@ bool set_clipboard_text(std::string_view utf8);
 // ordinary insertion. That keeps one insertion path rather than two. UI thread only.
 bool get_clipboard_text(std::string& out);
 
+// Run any deferred clipboard restore now instead of when its timer fires, and return whether one
+// was outstanding. Call it on the way out of the process: a pending restore whose timer never
+// gets dispatched leaves the user's clipboard holding our dictation, which is the failure the
+// restore exists to prevent. Safe to call when nothing is pending. UI thread only.
+bool finish_pending_clipboard_restore();
+
 // ─── Self-injection marking ─────────────────────────────────────────────────────────────────
 //
 // The handshake between this module and the hooks. Before injecting, the injector publishes a
@@ -188,11 +194,39 @@ const InjectionMark& injection_mark();
 // GetClipboardSequenceNumber against the value recorded at set time. If the user or another app
 // changed the clipboard meanwhile, **leave it alone** — silently overwriting a user's copy is
 // worse than leaving our text there. plan.md §7 gates on this.
+//
+// ─── The restore is deferred, and why ───────────────────────────────────────────────────────
+//
+// The restore does not happen inside inject(). A target reads the clipboard asynchronously when
+// it processes our Ctrl+V, so a restore on a fixed timer is a race with an application we do not
+// control — and it is a race we lost: on this machine, VS Code (Electron, whose paste crosses a
+// process boundary into the renderer and back) routinely read the clipboard later than the 60 ms
+// we waited, and pasted the *previous* clipboard contents. Reported 2026-09-17, mechanism in
+// docs/supported-targets.md.
+//
+// So the clipboard path publishes its text through **delayed rendering** — CF_UNICODETEXT with a
+// null handle — and Windows asks us for the data with WM_RENDERFORMAT at the moment a reader
+// actually wants it. That is the completion signal the timer was standing in for. The restore is
+// scheduled `paste_settle_ms` after the *target process* asks, and after a fixed fallback
+// timeout for a target that never asks at all.
+//
+// The consequence for callers: when inject() returns, `restore_pending` is usually true and
+// `restored` is not yet meaningful. A caller that needs to know whether our text is still on the
+// clipboard must treat pending as "it is about to be taken back".
 struct ClipboardGuardState {
     uint32_t sequence_at_set = 0;
     bool had_previous = false;
     bool restored = false;
     bool skipped_because_changed = false;  // the honest outcome; surfaced in diagnostics
+
+    // A restore is scheduled and has not run yet. Our text is on the clipboard *now* and will not
+    // be in a moment; see above.
+    bool restore_pending = false;
+
+    // The target process asked Windows for our text — the paste was consumed, rather than the
+    // chord going into an application that ignores Ctrl+V. The one honest injection-succeeded
+    // signal this module has ever had; false when the restore ran on the fallback timeout.
+    bool target_read_it = false;
 };
 
 // ─── Configuration ──────────────────────────────────────────────────────────────────────────
@@ -205,7 +239,10 @@ struct InjectConfig {
     uint32_t chars_per_batch = 32;
     uint32_t inter_batch_delay_us = 1000;
 
-    // Clipboard path: how long to wait for the target to consume the paste before restoring.
+    // Clipboard path: how long to wait *after the target has read our text* before putting the
+    // user's clipboard back. Not a guess at how long a paste takes — that is what WM_RENDERFORMAT
+    // now answers (see ClipboardGuardState) — only a grace period for a reader that holds the
+    // handle a moment longer than it holds the clipboard open.
     uint32_t paste_settle_ms = 60;
 
     // Send Ctrl+Shift+V rather than Ctrl+V, for every target rather than only the detected ones.

@@ -100,7 +100,21 @@ size_t clipboard_backup_lost_format_count(const ClipboardBackup* b) noexcept;
 
 bool clipboard_save(ClipboardBackup* b, ClipboardGuardState& st, uint32_t* os_error);
 bool clipboard_set_utf8(std::string_view utf8, ClipboardGuardState& st, uint32_t* os_error);
+bool clipboard_set_delayed(std::string_view utf8, std::wstring& out_utf16,
+                           ClipboardGuardState& st, uint32_t* os_error);
 void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring_view ours);
+
+// The deferred restore: armed when a paste goes out, disarmed by whichever comes first — the
+// target reading our text, the fallback timeout, a second paste, or a caller that wants our text
+// to stay on the clipboard. See "Delayed rendering" below.
+void paste_watch_arm(ClipboardBackup* backup, std::wstring text, ClipboardGuardState* report_to,
+                     uint32_t sequence_at_set, uint32_t target_pid, uint32_t settle_ms,
+                     uint32_t fallback_ms);
+ClipboardBackup* paste_watch_adopt();
+void paste_watch_cancel(const char* why);
+bool paste_watch_run_now(const char* why, bool may_defer);
+bool paste_watch_active();
+void paste_watch_forget_reporter(const ClipboardGuardState* st);
 
 uintptr_t clipboard_owner_window();
 
@@ -687,13 +701,24 @@ void build_paste_chord(bool ctrl_shift_v, uint32_t stuck_mods, uintptr_t extra,
 
 // ─── Clipboard ──────────────────────────────────────────────────────────────────────────────
 
+// Defined with the delayed-rendering machinery at the end of this section, because that is what
+// it is for: WM_RENDERFORMAT, WM_DESTROYCLIPBOARD and the deferred restore's timer all arrive at
+// the window below.
+LRESULT CALLBACK owner_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+
 // The window that owns the clipboard while we hold it.
 //
 // OpenClipboard(NULL) looks simpler and is a trap: MSDN's EmptyClipboard documentation states
 // that opening with a NULL window sets the clipboard owner to NULL, "which causes
 // SetClipboardData to fail". So a real HWND is required. A message-only window is the smallest
 // one that works — WM_RENDERFORMAT and WM_DESTROYCLIPBOARD are sent directly to the owner, not
-// broadcast, so HWND_MESSAGE costs us nothing (and we do not use delayed rendering anyway).
+// broadcast, so HWND_MESSAGE costs us nothing.
+//
+// It carries a real window procedure rather than DefWindowProcW because the delayed-rendering
+// signal arrives there, and because the deferred restore's timer hangs on this window — which
+// means the restore happens only while the UI thread is pumping messages. That is the same
+// thread this module is confined to, and finish_pending_clipboard_restore() covers the exit path
+// where the pump stops.
 //
 // Deliberately never destroyed: DestroyWindow must be called on the creating thread, and static
 // destruction gives no such guarantee. The kernel reclaims it at process exit. Creating it lazily
@@ -705,7 +730,7 @@ uintptr_t clipboard_owner_window() {
         HINSTANCE inst = GetModuleHandleW(nullptr);
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = DefWindowProcW;
+        wc.lpfnWndProc = owner_wndproc;
         wc.hInstance = inst;
         wc.lpszClassName = kClass;
         // ERROR_CLASS_ALREADY_EXISTS is fine and expected if this ever runs twice.
@@ -1004,6 +1029,421 @@ void clipboard_restore(ClipboardBackup* b, ClipboardGuardState& st, std::wstring
     st.restored = true;
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Delayed rendering — the only honest "the target took it" signal
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The clipboard path used to publish its text, send Ctrl+V, sleep a fixed `paste_settle_ms` and
+// put the user's clipboard back. That sleep was a guess at how long *someone else's* application
+// takes to process a keystroke, and on this machine the guess was wrong daily: VS Code is
+// Electron, its Ctrl+V crosses into the renderer process and back before anything reads the
+// clipboard, and that round trip is regularly slower than 60 ms under load. The restore won the
+// race and Code pasted the **previous** clipboard contents — reported 2026-09-17, and the logs
+// date its first appearance to the day the restore started actually happening (ea8d22f). Before
+// that the ownership guard skipped every restore, so the race was there and invisible.
+//
+// The clipboard API has no "the paste completed" notification. It has one thing close enough:
+// publish CF_UNICODETEXT with a **null handle**, and Windows asks us for the bytes — with
+// WM_RENDERFORMAT — at the moment a reader wants them. A reader asking is a reader reading. The
+// restore is scheduled from that message instead of from a stopwatch, and `paste_settle_ms`
+// stops being a bet on the target and becomes what its name always claimed: a short grace after
+// the target has the text.
+//
+// Three things this does not promise, each a smaller failure than the one it replaces:
+//
+//   * **The first renderer wins.** Once we answer WM_RENDERFORMAT the data is real and every
+//     later reader is served by Windows without telling us. A clipboard manager that pounces on
+//     our write — Ditto and Win+V both do; the sequence number moves by exactly six here on
+//     every injection — can therefore take our one signal. We do not mistake it for the target
+//     (the requester's process id is compared against the target's), but after it the target's
+//     own read is invisible and kRestoreFallbackMs is what restores. That is a *late* restore,
+//     which costs nothing, rather than an early one, which costs the paste.
+//   * **A target may never read at all**, having Ctrl+V bound elsewhere or ignoring it. The
+//     fallback bounds how long the user's clipboard stays displaced in that case.
+//   * **WM_RENDERFORMAT is a SendMessage into our UI thread**, so a target pasting while that
+//     thread is busy waits for us. The handler does no I/O and makes no clipboard call beyond
+//     the one SetClipboardData it exists for.
+
+struct PendingPaste {
+    ClipboardBackup* backup = nullptr;  // the user's clipboard, owned until the restore runs
+    std::wstring text;                  // what we published: rendered on demand, compared later
+    ClipboardGuardState* report_to = nullptr;  // the caller's diagnostics, updated in place
+    uint32_t sequence_at_set = 0;
+    uint32_t target_pid = 0;
+    uint32_t settle_ms = 60;
+    uint32_t attempts = 0;  // restores tried; a busy clipboard is worth coming back for
+    bool active = false;
+    bool timer_running = false;
+    bool we_are_emptying = false;  // tells the handlers our own restore from somebody else's copy
+};
+
+// How long to wait for a target that never asks for the text — because it ignores Ctrl+V, or
+// because a clipboard manager answered the render request in its place and the target's own read
+// is therefore invisible to us. Long enough to cover a loaded Electron paste by a wide margin,
+// short enough that a user who copies something else does not have to wonder where it went.
+//
+// Passed to paste_watch_arm() rather than read from inside it, so that the tests can exercise
+// the fallback without the suite spending a second and a half waiting for real time to pass.
+constexpr uint32_t kRestoreFallbackMs = 1200;
+
+namespace {
+
+PendingPaste& pending_paste() {
+    static PendingPaste p;
+    return p;
+}
+
+constexpr UINT_PTR kRestoreTimerId = 1;
+
+// A restore that cannot open the clipboard used to be the end of it: the user's contents stayed
+// lost and the log said so. Another process holding the clipboard for a few dozen milliseconds
+// is ordinary — clipboard managers, Office, RDP bridges — and the deferred design has somewhere
+// to put a second attempt, which the blocking one did not.
+constexpr uint32_t kMaxRestoreAttempts = 5;
+constexpr uint32_t kRestoreRetryMs = 60;
+
+void arm_restore_timer(uint32_t ms) {
+    HWND h = reinterpret_cast<HWND>(clipboard_owner_window());
+    if (h == nullptr) return;
+    // USER_TIMER_MINIMUM is 10 ms and SetTimer rounds up to it silently; saying so here stops a
+    // paste_settle_ms of 0 from reading as "restore synchronously".
+    if (ms < USER_TIMER_MINIMUM) ms = USER_TIMER_MINIMUM;
+    if (SetTimer(h, kRestoreTimerId, ms, nullptr) == 0) {
+        // With no timer, nothing would ever put the clipboard back — the failure this whole
+        // mechanism exists to prevent. Restoring now is the worse paste and the better
+        // clipboard, and it is exactly what the fixed sleep used to do.
+        KD_LOG_ERROR("clipboard restore timer could not be set (err=%lu); restoring now",
+                     static_cast<unsigned long>(GetLastError()));
+        pending_paste().timer_running = false;
+        paste_watch_run_now("the restore timer could not be set", false);
+        return;
+    }
+    pending_paste().timer_running = true;
+}
+
+void cancel_restore_timer() {
+    PendingPaste& p = pending_paste();
+    if (!p.timer_running) return;
+    HWND h = reinterpret_cast<HWND>(clipboard_owner_window());
+    if (h != nullptr) KillTimer(h, kRestoreTimerId);
+    p.timer_running = false;
+}
+
+// The bytes for one text format, in the encoding that format means. CF_TEXT and CF_OEMTEXT are
+// converted rather than refused: which of the three Windows asks us to render is its choice, not
+// the reader's, and answering only CF_UNICODETEXT would leave an ANSI reader with nothing.
+HGLOBAL render_block(UINT fmt, const std::wstring& w) {
+    if (fmt == CF_UNICODETEXT) {
+        const size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h == nullptr) return nullptr;
+        void* dst = GlobalLock(h);
+        if (dst == nullptr) {
+            GlobalFree(h);
+            return nullptr;
+        }
+        std::memcpy(dst, w.c_str(), bytes);
+        GlobalUnlock(h);
+        return h;
+    }
+    if (fmt != CF_TEXT && fmt != CF_OEMTEXT) return nullptr;
+
+    const UINT cp = (fmt == CF_TEXT) ? CP_ACP : CP_OEMCP;
+    const int need = WideCharToMultiByte(cp, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0,
+                                         nullptr, nullptr);
+    if (need < 0) return nullptr;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(need) + 1);
+    if (h == nullptr) return nullptr;
+    char* dst = static_cast<char*>(GlobalLock(h));
+    if (dst == nullptr) {
+        GlobalFree(h);
+        return nullptr;
+    }
+    if (need > 0) {
+        WideCharToMultiByte(cp, 0, w.c_str(), static_cast<int>(w.size()), dst, need, nullptr,
+                            nullptr);
+    }
+    dst[need] = '\0';
+    GlobalUnlock(h);
+    return h;
+}
+
+// Who is asking? A reader holds the clipboard open for the duration of its GetClipboardData, so
+// GetOpenClipboardWindow names it. Returns 0 when the reader opened the clipboard with a null
+// window, which is legal for reading — and which counts as "not the target", because guessing
+// the other way restores early and that is the bug this exists to fix.
+uint32_t clipboard_requester_pid() {
+    HWND requester = GetOpenClipboardWindow();
+    if (requester == nullptr) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(requester, &pid);
+    return static_cast<uint32_t>(pid);
+}
+
+void on_render_format(UINT fmt) {
+    PendingPaste& p = pending_paste();
+    if (!p.active) return;
+
+    HGLOBAL block = render_block(fmt, p.text);
+    if (block == nullptr) return;
+    // No OpenClipboard here, deliberately: MSDN is explicit that an owner responding to
+    // WM_RENDERFORMAT must not open the clipboard — the requester already has it open.
+    if (SetClipboardData(fmt, block) == nullptr) {
+        GlobalFree(block);  // ownership transfers only on success
+        return;
+    }
+
+    const uint32_t pid = clipboard_requester_pid();
+    if (p.target_pid != 0 && pid == p.target_pid) {
+        if (p.report_to != nullptr) p.report_to->target_read_it = true;
+        KD_LOG_DEBUG("the target (pid %u) read the pasted text; restoring the clipboard in %u ms",
+                     pid, p.settle_ms);
+        arm_restore_timer(p.settle_ms);
+        return;
+    }
+    KD_LOG_DEBUG("clipboard format %u rendered for pid %u, which is not the target (pid %u) — "
+                 "waiting for the fallback rather than restoring on somebody else's read",
+                 fmt, pid, p.target_pid);
+}
+
+// Sent to a clipboard owner whose window is going away while it still owes data. Ours is never
+// destroyed before the process ends, so this is the disorderly exit: render, so that what the
+// user pastes next is our text rather than nothing. finish_pending_clipboard_restore() is the
+// orderly one, and it puts the user's own clipboard back instead.
+void on_render_all_formats() {
+    PendingPaste& p = pending_paste();
+    if (!p.active || p.we_are_emptying) return;
+    HWND owner = reinterpret_cast<HWND>(clipboard_owner_window());
+    if (!open_clipboard_with_retry(nullptr)) return;
+    ClipboardCloser closer;
+    closer.open = true;
+    if (GetClipboardOwner() != owner) return;
+    HGLOBAL block = render_block(CF_UNICODETEXT, p.text);
+    if (block == nullptr) return;
+    if (SetClipboardData(CF_UNICODETEXT, block) == nullptr) GlobalFree(block);
+}
+
+// Somebody emptied the clipboard. Not necessarily the user copying something — a clipboard
+// manager re-publishing our own string does exactly this — which is why nothing is cancelled
+// here. The restore's content check decides whether what is there now is ours, and it runs
+// whether this message arrived or not.
+void on_destroy_clipboard() {
+    PendingPaste& p = pending_paste();
+    if (!p.active || p.we_are_emptying) return;
+    KD_LOG_DEBUG("another application took ownership of the clipboard while our paste was "
+                 "outstanding; the restore will compare contents before touching it");
+}
+
+}  // namespace
+
+LRESULT CALLBACK owner_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_RENDERFORMAT:
+            on_render_format(static_cast<UINT>(wp));
+            return 0;
+        case WM_RENDERALLFORMATS:
+            on_render_all_formats();
+            return 0;
+        case WM_DESTROYCLIPBOARD:
+            on_destroy_clipboard();
+            return 0;
+        case WM_TIMER:
+            if (wp == kRestoreTimerId) {
+                cancel_restore_timer();
+                paste_watch_run_now("the target did not read our text in time", true);
+                return 0;
+            }
+            break;
+        default:
+            break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// Publish `utf8` as a delay-rendered CF_UNICODETEXT. The UTF-16 form is handed back rather than
+// thrown away: the ownership check at restore time compares against it, and converting twice
+// would be two chances to disagree with what is on the clipboard.
+//
+// Windows synthesises CF_TEXT / CF_OEMTEXT / CF_LOCALE from CF_UNICODETEXT for readers that ask
+// for them, delay-rendered or not, so publishing the Unicode form alone still serves an ANSI
+// target — and render_block() above answers whichever of the three we are asked for.
+bool clipboard_set_delayed(std::string_view utf8, std::wstring& out_utf16,
+                           ClipboardGuardState& st, uint32_t* os_error) {
+    st.restored = false;
+    st.skipped_because_changed = false;
+    st.restore_pending = false;
+    st.target_read_it = false;
+    st.sequence_at_set = 0;
+
+    if (!utf8::to_utf16(utf8, out_utf16, nullptr)) {
+        if (os_error != nullptr) *os_error = ERROR_NO_UNICODE_TRANSLATION;
+        return false;
+    }
+
+    {
+        if (!open_clipboard_with_retry(os_error)) return false;
+        ClipboardCloser closer;
+        closer.open = true;
+        if (EmptyClipboard() == FALSE) {
+            if (os_error != nullptr) *os_error = GetLastError();
+            return false;
+        }
+        // A null handle is the delayed-rendering request, and it makes the return value useless
+        // as a success test: SetClipboardData returns NULL on this path whether it worked or
+        // not. GetLastError is the only answer available, so the error state is cleared first.
+        SetLastError(ERROR_SUCCESS);
+        SetClipboardData(CF_UNICODETEXT, nullptr);
+        const DWORD err = GetLastError();
+        if (err != ERROR_SUCCESS) {
+            if (os_error != nullptr) *os_error = err;
+            return false;
+        }
+    }  // CloseClipboard happens here — the sequence number must be read *after* it
+
+    st.sequence_at_set = static_cast<uint32_t>(GetClipboardSequenceNumber());
+    return true;
+}
+
+bool paste_watch_active() { return pending_paste().active; }
+
+// Take ownership of the snapshot and start the clock. From here the restore belongs to the
+// message loop: WM_RENDERFORMAT from the target shortens the wait to `settle_ms`, and the
+// fallback covers every target that never asks.
+void paste_watch_arm(ClipboardBackup* backup, std::wstring text, ClipboardGuardState* report_to,
+                     uint32_t sequence_at_set, uint32_t target_pid, uint32_t settle_ms,
+                     uint32_t fallback_ms) {
+    PendingPaste& p = pending_paste();
+    // Arming over a live watch would leak the earlier snapshot and, worse, lose the only copy of
+    // the user's clipboard. inject_via_clipboard adopts instead; reaching here with one
+    // outstanding is a bug in a caller, so it is logged rather than smoothed over.
+    if (p.active) {
+        KD_LOG_WARN("a clipboard paste was armed while another was still outstanding; the older "
+                    "snapshot is being dropped");
+        clipboard_backup_destroy(p.backup);
+        if (p.report_to != nullptr) p.report_to->restore_pending = false;
+        cancel_restore_timer();
+        p = PendingPaste{};
+    }
+
+    p.backup = backup;
+    p.text = std::move(text);
+    p.report_to = report_to;
+    p.sequence_at_set = sequence_at_set;
+    p.target_pid = target_pid;
+    p.settle_ms = settle_ms;
+    p.active = true;
+    if (report_to != nullptr) report_to->restore_pending = true;
+    arm_restore_timer(fallback_ms);
+}
+
+namespace {
+
+// One attempt. Returns false only for the one failure worth coming back for: the clipboard could
+// not be opened, so nothing was decided and nothing was touched. A restore that ran, and a
+// restore deliberately skipped because the contents are no longer ours, are both "settled".
+bool try_restore_once(PendingPaste& p, ClipboardGuardState& st) {
+    // `active` deliberately stays true across this. clipboard_restore may call GetClipboardData
+    // to compare contents, and on a clipboard nobody has rendered yet that comes straight back
+    // to on_render_format — which must answer with our text, or the comparison would conclude
+    // the clipboard is not ours and refuse to put the user's back.
+    p.we_are_emptying = true;
+    clipboard_restore(p.backup, st, p.text);
+    p.we_are_emptying = false;
+    return st.restored || st.skipped_because_changed;
+}
+
+}  // namespace
+
+// Run the restore now: from the timer, from a caller on its way out, or from a failure that left
+// nothing else to run it. Returns whether there was anything to do.
+//
+// `may_defer` says whether a busy clipboard can be retried from the message loop. It cannot when
+// the caller is on its way out of the process — there will be no more timers — so that path
+// spends a little real time on its retries instead, and a few hundred milliseconds at shutdown
+// is worth the user's clipboard.
+bool paste_watch_run_now(const char* why, bool may_defer) {
+    PendingPaste& p = pending_paste();
+    if (!p.active) return false;
+    cancel_restore_timer();
+
+    ClipboardGuardState scratch;
+    ClipboardGuardState& st = (p.report_to != nullptr) ? *p.report_to : scratch;
+    st.sequence_at_set = p.sequence_at_set;
+
+    ++p.attempts;
+    bool settled = try_restore_once(p, st);
+
+    if (!settled && may_defer && p.attempts < kMaxRestoreAttempts) {
+        KD_LOG_DEBUG("the clipboard could not be opened to restore it (attempt %u); trying again "
+                     "in %u ms",
+                     p.attempts, kRestoreRetryMs);
+        arm_restore_timer(kRestoreRetryMs);
+        return true;  // still outstanding, and still ours to finish
+    }
+    while (!settled && !may_defer && p.attempts < kMaxRestoreAttempts) {
+        Sleep(kRestoreRetryMs);
+        ++p.attempts;
+        settled = try_restore_once(p, st);
+    }
+
+    st.restore_pending = false;
+    if (!settled) {
+        // Said plainly, because from the user's side this is "the program kept my clipboard".
+        KD_LOG_WARN("the clipboard could not be opened to restore it after %u attempts; the "
+                    "dictated text is still on it",
+                    p.attempts);
+    }
+    KD_LOG_DEBUG("deferred clipboard restore ran (%s): restored=%d left_alone=%d target_read=%d "
+                 "attempts=%u",
+                 why, st.restored ? 1 : 0, st.skipped_because_changed ? 1 : 0,
+                 st.target_read_it ? 1 : 0, p.attempts);
+
+    clipboard_backup_destroy(p.backup);
+    p = PendingPaste{};
+    return true;
+}
+
+// Hand the snapshot to a second paste that started before the first one was put back. The user's
+// clipboard is what is in that snapshot — taking a fresh one here would snapshot *our own*
+// dictation and then "restore" it, which is how a second utterance in one session would leave
+// the first one's text on the clipboard for good. main.cpp injects twice in a row routinely (a
+// deferred flush and then the suffix), so this is the ordinary path, not the exotic one.
+ClipboardBackup* paste_watch_adopt() {
+    PendingPaste& p = pending_paste();
+    if (!p.active) return nullptr;
+    cancel_restore_timer();
+    ClipboardBackup* b = p.backup;
+    if (p.report_to != nullptr) p.report_to->restore_pending = false;
+    p = PendingPaste{};
+    KD_LOG_DEBUG("a second paste began before the first restore; the snapshot carries over");
+    return b;
+}
+
+// Abandon the restore and leave our text where it is. For the one caller that means it:
+// set_clipboard_text(), whose whole purpose is to put a dictation on the clipboard and keep it
+// there. Running the pending restore instead would wipe the recovery copy a moment after the
+// user asked for it.
+void paste_watch_cancel(const char* why) {
+    PendingPaste& p = pending_paste();
+    if (!p.active) return;
+    cancel_restore_timer();
+    if (p.report_to != nullptr) {
+        p.report_to->restore_pending = false;
+        p.report_to->skipped_because_changed = true;  // our text is on the clipboard, on purpose
+    }
+    clipboard_backup_destroy(p.backup);
+    p = PendingPaste{};
+    KD_LOG_DEBUG("the deferred clipboard restore was abandoned: %s", why);
+}
+
+// The diagnostics block a pending restore reports into is about to stop existing. Restore now
+// rather than write to freed memory later — and rather than silently keep the user's clipboard.
+void paste_watch_forget_reporter(const ClipboardGuardState* st) {
+    PendingPaste& p = pending_paste();
+    if (!p.active || p.report_to != st) return;
+    paste_watch_run_now("the injector was destroyed with a paste outstanding", false);
+}
+
 }  // namespace injector_detail
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1164,6 +1604,11 @@ bool get_clipboard_text(std::string& out) {
 
 bool set_clipboard_text(std::string_view utf8) {
     if (utf8.empty()) return false;
+    // A restore outstanding from a paste a moment ago would fire seconds from now and wipe what
+    // this call is putting there — which is the recovery copy, reached by a user who has already
+    // watched one mechanism fail. Abandoning it is the whole intent of this entry point.
+    injector_detail::paste_watch_cancel("the last dictation was copied to the clipboard on "
+                                        "purpose");
     // The guard state is required by the shared helper and discarded here: it exists to decide
     // whether a later *restore* is safe, and this path never restores. See the header.
     ClipboardGuardState ignored;
@@ -1171,6 +1616,10 @@ bool set_clipboard_text(std::string_view utf8) {
     if (injector_detail::clipboard_set_utf8(utf8, ignored, &os_error)) return true;
     KD_LOG_WARN("clipboard rescue failed: os_error=%lu", static_cast<unsigned long>(os_error));
     return false;
+}
+
+bool finish_pending_clipboard_restore() {
+    return injector_detail::paste_watch_run_now("the process is shutting down", false);
 }
 
 bool secure_desktop_active() {
@@ -1249,6 +1698,11 @@ const InjectionMark& injection_mark() {
 //  Injector
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
+// The grace after the target reads, capped: it is a courtesy to a slow reader, not a window for
+// anything, and a mis-set value should not leave the user's clipboard displaced for seconds.
+// settings.cpp accepts 0..5000 for the field; anything above this is clamped and said so.
+constexpr uint32_t kMaxSettleMs = 500;
+
 struct Injector::Impl {
     InjectConfig cfg;
     ClipboardGuardState last_clipboard;
@@ -1282,9 +1736,21 @@ Injector::Injector(InjectConfig cfg) : impl_(new Impl()) {
                 impl_->cfg.inter_batch_delay_us, impl_->cfg.paste_settle_ms,
                 impl_->sleeper.high_resolution() ? 1 : 0, session_is_attached_to_console() ? 1 : 0,
                 to_string(injector_detail::current_process_integrity()));
+    // The settings file accepts a wider range than the clipboard path will honour. It used to
+    // clamp in silence, so a user who set 1000 got 500 and had no way to find that out.
+    if (impl_->cfg.paste_settle_ms > kMaxSettleMs) {
+        KD_LOG_WARN("inject.paste_settle_ms is %u ms; the clipboard path clamps it to %u",
+                    impl_->cfg.paste_settle_ms, kMaxSettleMs);
+    }
 }
 
-Injector::~Injector() { delete impl_; }
+Injector::~Injector() {
+    // A deferred restore reports into impl_->last_clipboard. Running it now is the only way that
+    // pointer is never stale, and it is also the right thing for the user: an injector going
+    // away with a paste outstanding must not take the clipboard with it.
+    injector_detail::paste_watch_forget_reporter(&impl_->last_clipboard);
+    delete impl_;
+}
 
 const InjectConfig& Injector::config() const noexcept { return impl_->cfg; }
 
@@ -1477,39 +1943,56 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
 
     last_clipboard = ClipboardGuardState{};
 
-    // Owned for the whole function so every early return still frees the snapshot.
+    // Owned for the whole function so every early return still frees the snapshot, and released
+    // to the deferred restore on the one path that arms it.
     struct BackupHolder {
-        injector_detail::ClipboardBackup* p = injector_detail::clipboard_backup_create();
+        injector_detail::ClipboardBackup* p = nullptr;
+        explicit BackupHolder(injector_detail::ClipboardBackup* adopted)
+            : p(adopted != nullptr ? adopted : injector_detail::clipboard_backup_create()) {}
         ~BackupHolder() { injector_detail::clipboard_backup_destroy(p); }
-        BackupHolder() = default;
+        injector_detail::ClipboardBackup* release() {
+            injector_detail::ClipboardBackup* q = p;
+            p = nullptr;
+            return q;
+        }
         BackupHolder(const BackupHolder&) = delete;
         BackupHolder& operator=(const BackupHolder&) = delete;
-    } backup;
+    };
+
+    // A paste whose restore has not run yet still has the user's clipboard in its snapshot, and
+    // our own dictation on the clipboard. Snapshotting now would preserve *that* — which is how
+    // the second of two injections in one session (main.cpp flushes, then injects the suffix)
+    // would end up "restoring" the first one's text and keeping it for good.
+    injector_detail::ClipboardBackup* adopted = injector_detail::paste_watch_adopt();
+    BackupHolder backup(adopted);
 
     uint32_t err = 0;
-    if (!injector_detail::clipboard_save(backup.p, last_clipboard, &err)) {
+    if (adopted != nullptr) {
+        last_clipboard.had_previous =
+            injector_detail::clipboard_backup_format_count(backup.p) != 0;
+    } else if (!injector_detail::clipboard_save(backup.p, last_clipboard, &err)) {
         r.os_error = err;
         r.detail = "could not open the clipboard to snapshot it";
         return finish(InjectStatus::ClipboardUnavailable);
     }
 
-    if (!injector_detail::clipboard_set_utf8(utf8_text, last_clipboard, &err)) {
+    // Delay-rendered, so that the target asking Windows for the bytes is the signal that says
+    // when the restore may safely run. `ours` comes back in the form the clipboard holds it, so
+    // the ownership check compares against exactly what was published rather than converting a
+    // second time and giving the two conversions a chance to disagree.
+    std::wstring ours;
+    if (!injector_detail::clipboard_set_delayed(utf8_text, ours, last_clipboard, &err)) {
         r.os_error = err;
         r.detail = "could not place text on the clipboard";
         return finish(InjectStatus::ClipboardUnavailable);
     }
 
-    // What we just published, in the form the clipboard holds it, so each restore below can ask
-    // whether the clipboard is still ours rather than trusting the sequence number alone.
-    // Converted once: utf8::to_utf16 is the only crossing of that boundary (util/utf8.h), and
-    // clipboard_set_utf8 has already proved this string converts.
-    std::wstring ours;
-    (void)utf8::to_utf16(utf8_text, ours, nullptr);
-
     // Revalidate as late as possible: everything above took milliseconds during which the user
     // could have alt-tabbed, and a paste chord sent into the wrong window pastes our whole text
     // at once rather than one wrong character.
     if (!validate_target(target)) {
+        // Restored inline rather than deferred: no chord went out, so there is nobody to wait
+        // for and no reason to leave the user's clipboard displaced for a second and a half.
         injector_detail::clipboard_restore(backup.p, last_clipboard, ours);
         r.detail = "target changed before the paste chord";
         return finish(InjectStatus::TargetChanged);
@@ -1541,21 +2024,21 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
         return finish(InjectStatus::PasteChordRejected);
     }
 
-    // ─── Waiting for the paste, and why this blocks ─────────────────────────────────────────
+    // ─── Handing the restore to the message loop ────────────────────────────────────────────
     //
-    // The target reads the clipboard asynchronously when it processes our Ctrl+V, so restoring
-    // immediately would hand it the *previous* contents. There is no completion signal to wait
-    // on — the clipboard API offers none, and anchor.h is forbidden from supplying an injection
-    // verdict from pixels (plan.md §1.5).
+    // This used to block here for paste_settle_ms and then restore, which was a guess at how
+    // long the target takes to process a keystroke it has not even received yet. The guess lost:
+    // see the delayed-rendering section above, and the VS Code pastes it silently turned into
+    // the user's previous clipboard contents.
     //
-    // So this is the one place in the module that blocks the message loop, for paste_settle_ms.
-    // It is capped so a mis-set setting cannot freeze the UI. If 60 ms proves visible, the right
-    // fix is a deferred restore on a timer — the ownership check still runs at restore time
-    // either way, it is just harder to reason about spread across two callbacks.
-    const uint32_t settle_ms = cfg.paste_settle_ms > 500u ? 500u : cfg.paste_settle_ms;
-    sleeper.wait_us(settle_ms * 1000u);
-
-    injector_detail::clipboard_restore(backup.p, last_clipboard, ours);
+    // Nothing is waited for now. The watch below restores when the target has actually read the
+    // text, or when the fallback timeout says it never will, and both run on the UI thread from
+    // its own message loop — so a long paste no longer stalls the overlay either.
+    const uint32_t settle_ms = cfg.paste_settle_ms > kMaxSettleMs ? kMaxSettleMs
+                                                                  : cfg.paste_settle_ms;
+    injector_detail::paste_watch_arm(backup.release(), std::move(ours), &last_clipboard,
+                                     last_clipboard.sequence_at_set, target.process_id, settle_ms,
+                                     injector_detail::kRestoreFallbackMs);
 
     // ─── What Ok means here, honestly ───────────────────────────────────────────────────────
     //
@@ -1567,11 +2050,10 @@ InjectResult Injector::Impl::inject_via_clipboard(const TargetIdentity& target,
     // actually consume the chord is a measured fact recorded in docs/supported-targets.md, not
     // something guessed at run time.
     r.bytes_injected = utf8_text.size();
-    if (last_clipboard.skipped_because_changed) {
-        r.detail = "clipboard changed under us; left as-is (our text remains on it)";
-    } else if (!last_clipboard.restored) {
-        r.detail = "clipboard restore could not open the clipboard; our text remains on it";
-    }
+    // Nothing is said here about the clipboard's fate: at this instant our text is still on it
+    // and the restore has not run. ClipboardGuardState::restore_pending is the honest answer for
+    // a caller asking "is my dictation sitting on the clipboard?", and it says "not for long".
+    r.detail = "clipboard restore deferred until the target reads the text";
     return finish(InjectStatus::Ok);
 }
 
