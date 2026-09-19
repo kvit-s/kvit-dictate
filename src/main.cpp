@@ -83,6 +83,28 @@ constexpr UINT kMsgPillAction  = WM_APP + 8;
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
 
+// The seam between the pill's two halves (docs/editing.md §3), in the one place that decides
+// where it is.
+//
+// The overlay concatenates settled text and unstable tail with no separator of its own, and
+// committed text never ends in whitespace — plan.md §1.4 holds an utterance's trailing space back
+// so `CommitOp::leading_space` can add it exactly once, on the side that knows a boundary
+// happened. Without a space put back here the pill reads "…the configand restart".
+//
+// It is one function because it has two callers that must never disagree: render_preview() draws
+// the join and settle_pending_tail() commits it (§3.3). If they drifted, the buffer would take
+// text the user had not been shown — which is the exact promise that section is built on. Note
+// what is unaffected either way: the space that reaches the *document* still comes from
+// `leading_space`, so neither caller can double it.
+void join_settled_and_tail(std::string_view settled, std::string_view tail, bool separate,
+                           std::string& out) {
+    out.clear();
+    out.reserve(settled.size() + tail.size() + 1);
+    out += settled;
+    if (separate) out.push_back(' ');
+    out += tail;
+}
+
 // docs/editing.md §10.1's heartbeat, on a timer of its own with a TIMERPROC rather than a window.
 //
 // The stamp in App::run() below is not enough, and the way it was not enough is worth keeping:
@@ -362,6 +384,14 @@ private:
 
     void apply_edit(const kd::EditPost& p);
     void begin_editing();      // §3.2: the microphone closes, at the device
+    // docs/editing.md §3.3. The pill's unstable tail becomes settled text, now, on the user's
+    // gesture rather than on a round trip. Returns false when there was nothing on screen to
+    // settle, which is the one case that still has to wait for a `final`.
+    bool settle_pending_tail();
+    // True for a message belonging to an utterance settle_pending_tail() has already decided
+    // the text of. The client owns that text now; the recogniser's opinion of it arrives too
+    // late to be anything but a duplicate.
+    [[nodiscard]] bool utterance_is_abandoned(uint64_t utterance_id) const;
     void resume_dictation();   // §3.3: it reopens, the caret moves to the end
     void show_foreign_key_hint(uint32_t vk, uint32_t mods);
     void apply_pill_pointer(const kd::PillPost& p);
@@ -661,6 +691,21 @@ private:
     // Is the recogniser mid-utterance? True from a `partial` until the `final` that closes it.
     // Read only by pump_normalize(), and only when the rewriter is on the same host.
     bool asr_utterance_open_ = false;
+
+    // ── What is on screen, and who owns it (docs/editing.md §3.3) ───────────────────────────
+    //
+    // The engine's unstable tail as the pill last drew it, and the utterance it belongs to. Kept
+    // because the pill is the only place this text exists — the engine recomputes it per
+    // message and `edit_` deliberately does not hold it — and settle_pending_tail() has to be
+    // able to answer "what does the screen say" without a round trip.
+    std::string pending_tail_;
+    uint64_t pending_tail_utterance_ = 0;
+
+    // The highest utterance whose text the user has already been given. Zero means none. Every
+    // `partial` and `final` at or below it is dropped: its words are in `edit_` under the user's
+    // hand, and applying the recogniser's later opinion of them would either duplicate the text
+    // or rewrite what they are in the middle of correcting.
+    uint64_t abandoned_utterance_ = 0;
     // Do `normalizer.url` and `server.url` name the same host and port? Resolved once at
     // startup; see pump_normalize() for what it gates.
     bool rewriter_shares_the_speech_host_ = false;
@@ -1857,13 +1902,30 @@ void App::apply_text(const kd::proto::Message& m) {
     // Set before perform_commit, not after: that call reaches pump_normalize() on the deferred
     // path, and a flag updated afterwards would be describing the previous message.
     corpus_note_text(m);
+    // The corpus records what the recogniser produced and is asked first, above the drop below:
+    // a hypothesis the client declined to use is still a hypothesis the model made, and a corpus
+    // that only kept the ones we happened to want could not be used to judge the ones we did not.
     if (const auto* p = m.get_if<kd::proto::PartialMsg>()) {
+        if (utterance_is_abandoned(p->utterance_id)) return;
         asr_utterance_open_ = true;
+        pending_tail_utterance_ = p->utterance_id;
         perform_commit(commit_->on_partial(*p));
     } else if (const auto* f = m.get_if<kd::proto::FinalMsg>()) {
+        if (utterance_is_abandoned(f->utterance_id)) return;
         asr_utterance_open_ = false;
+        pending_tail_utterance_ = f->utterance_id;
         perform_commit(commit_->on_final(*f));
     }
+}
+
+bool App::utterance_is_abandoned(uint64_t utterance_id) const {
+    if (abandoned_utterance_ == 0 || utterance_id > abandoned_utterance_) return false;
+    // At DEBUG and not WARN: this is the design working, not a fault. It fires once or twice per
+    // edit — the `final` the §3.3 `discontinuity` asked for, and any `partial` that was already
+    // on the wire when the user pressed the key.
+    KD_LOG_DEBUG("dropping text for utterance %llu: the user already has it",
+                 static_cast<unsigned long long>(utterance_id));
+    return true;
 }
 
 // The rectangle source C captures, and whether there is one worth capturing.
@@ -1978,6 +2040,10 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         return;
     }
 
+    // What the pill is about to say, kept for settle_pending_tail(). The engine recomputes this
+    // from scratch on every message and hands it over by value, so unless it is caught here the
+    // only copy of the words the user is looking at is inside a DirectWrite layout.
+    pending_tail_.assign(r.pending_text);
     render_preview(r.pending_text);
 
     if (!r.op.has_value() || r.op->text.empty()) return;
@@ -2014,11 +2080,13 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         //
         // Whether the caret goes with it is the one thing that depends on which half of the
         // session we are in. While dictating it does — the text arrived because the user asked
-        // for it. While *editing* it must not: §3.3's `discontinuity` closes the open utterance
-        // at the moment the edit key lands, so this `final` is the tail the user pressed that key
-        // to go and fix, and it arrives a few hundred milliseconds later with them already aiming
-        // at a word. Taking the caret to the end of it would be §14's retracted failure — a caret
-        // moving out from under someone mid-correction — arriving by a different road.
+        // for it. While *editing* it must not, and this line is reached while editing in exactly
+        // one configuration: `server.live_preview` off, so the pill had no tail for
+        // settle_pending_tail() to hand over and this `final` is the first sight of those words.
+        // It lands a few hundred milliseconds after the user started aiming at something, and
+        // taking the caret to the end of it would be §14's retracted failure — a caret moving out
+        // from under someone mid-correction — arriving by a different road. With live preview on,
+        // §3.3 has already abandoned this utterance and apply_text() never gets here.
         edit_.append(text, editing_ ? kd::EditBuffer::Caret::Keep : kd::EditBuffer::Caret::Follow);
         recovery_dirty_ = true;
         if (editing_) {
@@ -2199,6 +2267,62 @@ void App::apply_edit(const kd::EditPost& p) {
     render_preview({});
 }
 
+// docs/editing.md §3.3. The tail the pill is drawing in grey becomes the user's text, now.
+//
+// The first version of this waited for the recogniser instead: it closed the utterance with a
+// `discontinuity` and let the resulting `final` land in the buffer a few hundred milliseconds
+// later. That is the wrong architecture and the reason is the gesture's own meaning. Pressing an
+// arrow key says "stop, I want to fix that" — and the answer to it cannot be "wait, the machine
+// is still deciding what you said". Worse, the text the user was aiming at would arrive slightly
+// different from the text they had read, and the buffer would grow under their hand while they
+// were in it.
+//
+// So the round trip is abandoned rather than awaited. Under `Cadence::EndOfSession` nothing has
+// been injected — the document is untouched and `plan.md` §1.4's invariant has nothing to say
+// here (docs/editing.md §2: compose-then-commit makes it trivially true) — so the only question
+// is which text the user gets, and the only defensible answer is the text they were reading.
+// §3.1 already licenses this: `CommitEngine` stays the authority on what the model said and
+// `edit_` becomes the authority on what the user wants typed, and nothing reconciles them.
+//
+// The `discontinuity` still goes out, because the Server has to reset its decoder: its
+// hypotheses are cumulative, so without it the resumed utterance would re-include every word
+// just settled here. The `final` it produces is decoded and then dropped
+// (`utterance_is_abandoned`). That is one wasted decode on a machine that has just gone idle,
+// and the protocol has no "close this utterance and do not tell me" to avoid it with — a poor
+// trade to fix with a wire change, and a cheap one to pay.
+//
+// Returns false when the pill had no tail. That is not a failure: with `server.live_preview`
+// off the recogniser publishes one `final` per utterance and nothing in between, so there is
+// genuinely nothing on screen to settle and the round trip is the only source of those words.
+// That case still waits, and perform_commit()'s `Caret::Keep` is what keeps the wait bearable.
+bool App::settle_pending_tail() {
+    if (pending_tail_.empty()) return false;
+
+    // The separator render_preview() draws between the two halves, made real. The engine holds
+    // back an utterance's trailing whitespace so `CommitOp::leading_space` can add it exactly
+    // once, so the settled half never ends in a space and the two would otherwise run together:
+    // the pill said "…the config and restart" and the buffer would say "…the configand restart".
+    // Committing what was on screen means committing the space that was on screen too.
+    std::string text;
+    join_settled_and_tail(std::string_view{}, pending_tail_, !edit_.empty(), text);
+
+    // Caret::Follow, and safely: this runs inside begin_editing(), before the keystroke that got
+    // us here has been applied, so there is no caret of the user's to move out from under.
+    edit_.append(text, kd::EditBuffer::Caret::Follow);
+    recovery_dirty_ = true;
+    // Settled as spoken rather than queued: the rewriter has just been stood down for this
+    // session, and `normalize_settled_bytes_` indexes the buffer, so these bytes still have to
+    // be accounted for or every later chunk's offset is short by their length.
+    normalize_settled_bytes_ += text.size();
+
+    abandoned_utterance_ = pending_tail_utterance_;
+    KD_LOG_INFO("settled %zu bytes of unstable tail for utterance %llu on the edit gesture; "
+                "the rest of that round trip is abandoned",
+                text.size(), static_cast<unsigned long long>(abandoned_utterance_));
+    pending_tail_.clear();
+    return true;
+}
+
 void App::begin_editing() {
     if (!composing() || editing_) return;
 
@@ -2225,21 +2349,36 @@ void App::begin_editing() {
         audio_running_ = false;
     }
 
-    // §3.3, and §16's sixth open question. The utterance in progress is flushed rather than
-    // abandoned: the user pressed an arrow key to go and fix something they just said, and the
-    // thing they just said had better be editable by the time they get there.
+    // §3.3, and §16's sixth open question. The user pressed an arrow key to go and fix something
+    // they just said, and the thing they just said had better be editable by the time they get
+    // there — which means *now*, not one round trip from now. settle_pending_tail() hands them
+    // the pill's grey tail on the spot and abandons the rest of that round trip; its comment
+    // carries the argument.
+    const bool settled = settle_pending_tail();
+
+    // The Server still has to be told, and told before anything else can be sent: the session
+    // machine raises FlushPendingAudio **and writes a `discontinuity`**, which is the message
+    // that closes an utterance without ending the session and resets the decoder with it.
+    // session.cpp's EditingBegan has the full reason.
     //
-    // The session machine raises FlushPendingAudio **and writes a `discontinuity`** — the flush
-    // alone drains our own audio queue and tells the Server nothing, which is why the tail used
-    // to sit in the pill greyed out until Enter. session.cpp's EditingBegan has the full reason.
-    // The `final` that follows lands in the settled region through the ordinary commit path, and
-    // perform_commit() leaves the caret alone when it does.
+    // Both branches need it, for different halves of it. When the tail was settled the reset is
+    // the point — hypotheses are cumulative, so a Server that kept the utterance open would
+    // repeat every settled word on resume. When it was not (no live preview, so nothing was on
+    // screen), the `final` it produces is the only copy of those words, and without the
+    // `discontinuity` the Server's endpointer never fires at all, because §3.2 has just closed
+    // the microphone and no further audio arrives for it to hear silence in.
     if (session_ != nullptr) apply(session_->on_local(kd::LocalEvent::EditingBegan));
+    if (!settled) {
+        KD_LOG_DEBUG("nothing on screen to settle; the utterance's `final` is still to come");
+    }
 
     KD_LOG_INFO("editing: the microphone is closed and the pill has the keyboard");
     set_tray_state(kd::OverlayState::Editing);
     if (overlay_ != nullptr) overlay_->set_state(kd::OverlayState::Editing);
-    push_edit_view();
+    // With an empty tail, because there is no longer one: either it just became settled text or
+    // there never was one. render_preview() pushes the caret and the selection with the text it
+    // indexes, which is why this replaces the bare push_edit_view() that used to be here.
+    render_preview({});
 }
 
 void App::resume_dictation() {
@@ -2532,6 +2671,12 @@ void App::begin_dictation() {
     editing_ = false;
     editing_began_ms_ = 0;
     hint_expires_ms_ = 0;
+    // Utterance ids restart at 1 with the session (docs/protocol.md §7.3), so a mark left over
+    // from the previous one would drop the first utterance of this one on the floor. All three
+    // are session-scoped and all three are cleared here, together, for that reason.
+    pending_tail_.clear();
+    pending_tail_utterance_ = 0;
+    abandoned_utterance_ = 0;
     // The transcriber's lag is measured from the newest words the user has seen, and at this
     // instant that is "none yet, and none owed": stamping now means the pill waits a whole
     // kLagNoteMs from activation before it can complain, rather than opening on a caption
@@ -2788,15 +2933,12 @@ void App::render_preview(std::string_view tail) {
             push_edit_view();
             return;
         }
-        // The overlay concatenates its two halves with no separator, and committed text never
-        // ends in whitespace (plan.md §1.4 holds it back so `CommitOp::leading_space` can add it
-        // exactly once). Without this the preview reads "…the configand restart". Display only:
-        // the space that actually reaches the document still comes from `leading_space`, so this
-        // cannot double it.
+        // The separator, from the one function that decides where it goes. Read
+        // join_settled_and_tail() for why there is a space at all; read it *here* because
+        // settle_pending_tail() commits what this line displays, and a join that differed
+        // between the two would commit text the user had not been shown.
         std::string settled;
-        settled.reserve(edit_.size() + 1);
-        settled += edit_.text();
-        settled.push_back(' ');
+        join_settled_and_tail(edit_.text(), std::string_view{}, true, settled);
         overlay_->set_text(settled, tail);
         push_edit_view();
         return;

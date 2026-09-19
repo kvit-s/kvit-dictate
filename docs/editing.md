@@ -162,40 +162,65 @@ So the state is real: capture stops, the tray and the pill say so, and the mic l
 
 ### 3.3 Suspending mid-utterance, and resuming
 
-**If an utterance is open when the edit key arrives**, it is flushed rather than abandoned. The
-user pressed an arrow key to go and fix something they just said; the thing they just said had
-better be editable by the time they get there. No protocol change — this is the endpoint path,
-reached by a gesture instead of by a timer.
+**If an utterance is open when the edit key arrives, the tail on screen becomes the user's text
+immediately, and the rest of that round trip is abandoned.** The user pressed an arrow key to go
+and fix something they just said; the thing they just said had better be editable by the time they
+get there — which means *now*.
 
-This paragraph used to say that `Effect::FlushPendingAudio` (which already exists, for `stop`)
-was the whole mechanism, and **that was wrong in the way that matters.** `FlushPendingAudio`
-drains the *Client's own outbound audio queue* (`ipc_client.h`) and says nothing to the Server,
-and the Server closes an utterance on silence in the audio it receives, on `discontinuity`, or on
-`stop` (`asrd/session_server.h`). §3.2 has just closed the microphone, so no further audio
+This section used to say something else twice, and both are worth keeping because the second
+mistake is the interesting one.
+
+**First it said `Effect::FlushPendingAudio` was the whole mechanism, and that was simply wrong.**
+The flush drains the *Client's own outbound audio queue* (`ipc_client.h`) and says nothing to the
+Server, and the Server closes an utterance on silence in the audio it receives, on `discontinuity`,
+or on `stop` (`asrd/session_server.h`). §3.2 has just closed the microphone, so no further audio
 arrives, so the Server's endpointer never fires. The tail stayed a `partial` — rendered at 60%
 alpha, with the caret clamped below it — until Enter sent `stop`. The one region the user pressed
-the key to reach was the one region they could not touch, which is the exact opposite of what this
-section promised.
+the key to reach was the one region they could not touch.
 
-So the flush is followed by a **`discontinuity`** (`gap_ms = 0`, `reason = "editing"`). That is
-the message that closes an utterance without ending the session (docs/protocol.md §6.1, and
-`VadEndpointer::notify_discontinuity`: "a decoder reset and an utterance boundary happen together,
-or the wire contract is violated"), and it is also simply true — the stream has a gap here, it
-starts now, and §6.1's `gap_ms = 0` means "duration unknown", which is the honest value for a gap
-that is not over yet. The measured duration follows on the resume `discontinuity` below, so the
-Server's audio timeline still adds up to wall time. It is sent whenever a session is open rather
-than only when the Client thinks an utterance is — that flag is the Client VAD's opinion and the
-Server's endpointer is an independent one, and which of two VADs won a race must not decide
-whether the user can edit what they just said.
+**Then it fixed that by waiting for the recogniser, and that is the wrong architecture.** Closing
+the utterance properly and letting the resulting `final` land in the settled region is correct in
+every mechanical sense and still answers the gesture wrongly. Pressing an arrow key means "stop, I
+want to fix that", and the reply to it cannot be "wait, the machine is still deciding what you
+said". It also costs the user the thing a compose buffer is for: the words that arrive are not
+quite the words they read — a batch model re-cases the opening word and inserts the punctuation it
+was unsure of — so the buffer changes shape under a hand that is already in it.
 
-**The `final` now arrives *during* editing, which §1's caret rule did not allow for.** `append()`
-takes the caret to the end of the new text, and §14 retracted a design that moved the caret out
-from under a user mid-correction. So `EditBuffer::append` takes a `Caret` policy: `Follow` while
-dictating, because the text arrived because the user asked for it, and `Keep` while editing,
-because this text arrives on its own a few hundred milliseconds after they started aiming at a
-word. The text lands at the end either way — §1's invariant is untouched — and appending only
-grows the tail, so the caret, the selection anchor and the rewriter's offsets all still mean what
-they meant.
+So the round trip is **abandoned, not awaited**. `App::settle_pending_tail()` appends the engine's
+`pending_text`, exactly as the pill was drawing it and with the separating space the pill was
+drawing too, and marks that utterance as the user's. Every later `partial` and `final` for it is
+dropped (`App::utterance_is_abandoned`). What the user was reading is what the user gets to edit.
+
+Nothing about `plan.md` §1.4 is bent to do this. Under `Cadence::EndOfSession` not one byte has
+been injected, so there is no committed prefix to contradict — §2 above is exactly this argument,
+that compose-then-commit makes the invariant trivially true — and the only question left is which
+text the user is handed. §3.1 already settled who decides: `CommitEngine` is the authority on what
+the model said, `App`'s buffer is the authority on what the user wants typed, and nothing
+reconciles them.
+
+**The `discontinuity` is still sent** (`gap_ms = 0`, `reason = "editing"`), because the Server has
+to reset its decoder: hypotheses are cumulative (docs/protocol.md §8.1), so a Server that kept the
+utterance open would repeat every word just settled here in the first hypothesis after the resume.
+It is also simply true — the stream has a gap, it starts now, and §6.1's `gap_ms = 0` means
+"duration unknown", which is the honest value for a gap that is not over yet; the measured length
+follows on the resume `discontinuity` below, so the Server's timeline still adds up to wall time.
+It is sent whenever a session is open rather than only when the Client thinks an utterance is:
+that flag is the Client VAD's opinion, the Server runs its own, and which of two VADs won a race
+must not decide anything the user can see. The `final` it produces is decoded and thrown away —
+one wasted decode on a machine that has just gone idle, and the protocol has no "close this
+utterance and do not tell me" to avoid it with.
+
+**One configuration still waits, and it is the one where nothing is on screen.** With
+`server.live_preview` off the recogniser publishes one `final` per utterance and nothing in
+between (`SessionServerConfig::emit_partials`), so there is no tail to settle and the round trip
+is the only source of those words. `settle_pending_tail()` returns false, nothing is abandoned,
+and the `final` lands in the buffer mid-edit — which §1's caret rule had no answer for, because
+`append()` took the caret to the end of the new text and §14 retracted a design that moved the
+caret out from under a user mid-correction. So `EditBuffer::append` takes a `Caret` policy:
+`Follow` while dictating, because the text arrived because the user asked for it, and `Keep` on
+this one path. The text lands at the end either way — §1's invariant is untouched — and appending
+only grows the tail, so the caret, the selection anchor and the rewriter's offsets all still mean
+what they meant.
 
 **Resuming is an explicit gesture**, because a closed microphone cannot notice that you want to
 talk to it:

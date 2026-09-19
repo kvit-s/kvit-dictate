@@ -153,13 +153,15 @@ public:
     // the mic open and snapped the caret on speech onset, which moved the caret out from under a
     // user mid-correction; §14 records the retraction.
     //
-    // `Keep` is for the one arrival that is *not* the user asking: the `final` for the utterance
-    // that was open when editing began (§3.3). That text is the whole reason they pressed the key
-    // — it lands a few hundred milliseconds into their edit, by which time they are already
-    // aiming at a word — and dragging the caret to the end of it would be §14's retracted
-    // failure arriving by a different road. So the text lands and the caret stays where the user
-    // put it. Nothing else has to move with it: appending only grows the tail, so every existing
-    // offset — caret, anchor, and the rewriter's — still means what it meant.
+    // `Keep` is for the one arrival that is *not* the user asking. Normally §3.3 settles the tail
+    // on the edit gesture itself and abandons what the recogniser says afterwards, so nothing
+    // lands mid-edit at all — but with live preview off there is no tail to settle, and that
+    // utterance's `final` is the first sight of those words. It arrives a few hundred
+    // milliseconds into the user's edit, by which time they are already aiming at a word, and
+    // dragging the caret to the end of it would be §14's retracted failure arriving by a
+    // different road. So the text lands and the caret stays where the user put it. Nothing else
+    // has to move with it: appending only grows the tail, so every existing offset — caret,
+    // anchor, and the rewriter's — still means what it meant.
     enum class Caret : uint8_t {
         Follow,  // to the end, behind the new text — the user asked to dictate
         Keep,    // exactly where it is — a late `final` arriving mid-edit

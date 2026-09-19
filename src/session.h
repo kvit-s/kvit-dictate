@@ -161,12 +161,12 @@ enum class LocalEvent : uint8_t {
     // is which timers are armed, which is the smallest thing that can express "the user is
     // present but not speaking".
 
-    // The first edit key closed the microphone. The utterance in progress is flushed rather than
-    // abandoned (§3.3): the user pressed an arrow key to go and fix something they just said,
-    // and the thing they just said had better be editable by the time they get there. That takes
-    // a `discontinuity` on the wire and not merely FlushPendingAudio — session.cpp's handler has
-    // the whole reason, and it is the difference between the tail being editable and it sitting
-    // in the pill greyed out until Enter.
+    // The first edit key closed the microphone. The Client hands the user the tail the pill was
+    // drawing and abandons the rest of that round trip (§3.3, App::settle_pending_tail) — the
+    // answer to "stop, I want to fix that" cannot be "wait". What this machine owes the Server is
+    // the other half: a `discontinuity`, not merely FlushPendingAudio, because its hypotheses are
+    // cumulative and a Server left mid-utterance repeats every settled word on the resume.
+    // session.cpp's handler has the whole reason.
     //
     // It also **pauses the session-silence timer**, and §9 is emphatic that this is a decision
     // rather than a preference. That timer measures how long a session survives *with no speech*;
