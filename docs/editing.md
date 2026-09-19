@@ -162,12 +162,40 @@ So the state is real: capture stops, the tray and the pill say so, and the mic l
 
 ### 3.3 Suspending mid-utterance, and resuming
 
-**If an utterance is open when the edit key arrives**, it is flushed rather than abandoned:
-`Effect::FlushPendingAudio` (which already exists, for `stop`) pushes what has been captured, the
-sidecar finishes decoding it, and the resulting `final` joins the settled region. The user pressed
-an arrow key to go and fix something they just said; the thing they just said had better be
-editable by the time they get there. No protocol change — this is the endpoint path, reached by a
-gesture instead of by a timer.
+**If an utterance is open when the edit key arrives**, it is flushed rather than abandoned. The
+user pressed an arrow key to go and fix something they just said; the thing they just said had
+better be editable by the time they get there. No protocol change — this is the endpoint path,
+reached by a gesture instead of by a timer.
+
+This paragraph used to say that `Effect::FlushPendingAudio` (which already exists, for `stop`)
+was the whole mechanism, and **that was wrong in the way that matters.** `FlushPendingAudio`
+drains the *Client's own outbound audio queue* (`ipc_client.h`) and says nothing to the Server,
+and the Server closes an utterance on silence in the audio it receives, on `discontinuity`, or on
+`stop` (`asrd/session_server.h`). §3.2 has just closed the microphone, so no further audio
+arrives, so the Server's endpointer never fires. The tail stayed a `partial` — rendered at 60%
+alpha, with the caret clamped below it — until Enter sent `stop`. The one region the user pressed
+the key to reach was the one region they could not touch, which is the exact opposite of what this
+section promised.
+
+So the flush is followed by a **`discontinuity`** (`gap_ms = 0`, `reason = "editing"`). That is
+the message that closes an utterance without ending the session (docs/protocol.md §6.1, and
+`VadEndpointer::notify_discontinuity`: "a decoder reset and an utterance boundary happen together,
+or the wire contract is violated"), and it is also simply true — the stream has a gap here, it
+starts now, and §6.1's `gap_ms = 0` means "duration unknown", which is the honest value for a gap
+that is not over yet. The measured duration follows on the resume `discontinuity` below, so the
+Server's audio timeline still adds up to wall time. It is sent whenever a session is open rather
+than only when the Client thinks an utterance is — that flag is the Client VAD's opinion and the
+Server's endpointer is an independent one, and which of two VADs won a race must not decide
+whether the user can edit what they just said.
+
+**The `final` now arrives *during* editing, which §1's caret rule did not allow for.** `append()`
+takes the caret to the end of the new text, and §14 retracted a design that moved the caret out
+from under a user mid-correction. So `EditBuffer::append` takes a `Caret` policy: `Follow` while
+dictating, because the text arrived because the user asked for it, and `Keep` while editing,
+because this text arrives on its own a few hundred milliseconds after they started aiming at a
+word. The text lands at the end either way — §1's invariant is untouched — and appending only
+grows the tail, so the caret, the selection anchor and the rewriter's offsets all still mean what
+they meant.
 
 **Resuming is an explicit gesture**, because a closed microphone cannot notice that you want to
 talk to it:

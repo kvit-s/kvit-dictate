@@ -242,7 +242,9 @@ KD_TEST(session, editing_disarms_the_session_silence_timer) {
     start_session(m);
 
     m.on_local(LocalEvent::SpeechDetected);
-    KD_CHECK_EQ(m.on_local(LocalEvent::EditingBegan).verdict, Verdict::Accept);
+    // Sent, not Accept: §3.3's `discontinuity` goes out with it. See
+    // `editing_closes_the_open_utterance_on_the_wire` below for what it is for.
+    KD_CHECK_EQ(m.on_local(LocalEvent::EditingBegan).verdict, Verdict::Sent);
 
     clock.advance(60000);
     KD_CHECK_EQ(m.on_tick().verdict, Verdict::Accept);
@@ -320,19 +322,91 @@ KD_TEST(session, an_open_utterance_is_flushed_when_editing_begins) {
 
     // No `stop`, no `cancel`: the session is still the user's and the microphone closing is not
     // the session ending.
-    KD_CHECK(out.to_send.empty());
+    KD_CHECK(!sends(out, proto::MessageType::Stop));
+    KD_CHECK(!sends(out, proto::MessageType::Cancel));
     KD_CHECK_EQ(m.state(), proto::ConnState::Running);
 }
 
-KD_TEST(session, editing_with_no_open_utterance_flushes_nothing) {
+KD_TEST(session, editing_closes_the_open_utterance_on_the_wire) {
+    // The regression this test exists for: FlushPendingAudio was the *only* thing EditingBegan
+    // produced, and it drains the Client's own audio queue without saying anything to the Server.
+    // The Server closes an utterance on silence in the audio it receives, on `discontinuity` or
+    // on `stop` — and §3.2 has just closed the microphone, so no more audio arrives and its
+    // endpointer never fires. The tail stayed a `partial`, greyed out and below the caret clamp,
+    // until Enter sent `stop`: the one region the user pressed the key to reach was the one
+    // region they could not touch.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    const std::string sid = start_session(m);
+
+    m.on_local(LocalEvent::SpeechDetected);
+    const auto out = m.on_local(LocalEvent::EditingBegan);
+
+    KD_REQUIRE_EQ(out.verdict, Verdict::Sent);
+    KD_REQUIRE_EQ(out.to_send.size(), size_t{1});
+    KD_REQUIRE_EQ(out.to_send[0].type(), proto::MessageType::Discontinuity);
+    const auto* d = out.to_send[0].get_if<proto::DiscontinuityMsg>();
+    KD_REQUIRE(d != nullptr);
+    KD_CHECK_EQ(d->session_id, sid);
+    // docs/protocol.md §6.1: zero is "duration unknown", which is the honest value for a gap
+    // that starts here and is not over. The measured length follows on DictationResumed.
+    KD_CHECK_EQ(d->gap_ms, int64_t{0});
+    KD_REQUIRE(d->reason.has_value());
+    KD_CHECK_EQ(*d->reason, std::string("editing"));
+
+    // §6.3's ordering: the audio owed for this session is flushed before the control frame that
+    // follows it, so positional attribution still holds.
+    KD_CHECK(out.has_effect(Effect::FlushPendingAudio));
+}
+
+KD_TEST(session, editing_closes_the_utterance_even_after_the_local_endpoint_fired) {
+    // `utterance_open` is the *Client* VAD's opinion; the Server's endpointer is an independent
+    // one. They disagree exactly in the window where the local endpoint timer has fired and the
+    // Server's `final` is still in flight — and which of the two won that race must not be what
+    // decides whether the user can edit what they just said. So the `discontinuity` goes out
+    // whenever a session is open, not only when the Client thinks an utterance is.
     kd::ManualClock clock(1000);
     kd::SessionMachine m(clock, kd::SessionConfig{});
     bring_to_idle(m);
     start_session(m);
 
+    m.on_local(LocalEvent::SpeechDetected);
+    m.on_local(LocalEvent::EndpointSilence);
+    KD_REQUIRE(!m.utterance_open());
+
     const auto out = m.on_local(LocalEvent::EditingBegan);
-    KD_CHECK(!out.has_effect(Effect::FlushPendingAudio));
-    KD_CHECK_EQ(out.verdict, Verdict::Accept);
+    KD_CHECK_EQ(out.verdict, Verdict::Sent);
+    KD_CHECK(sends(out, proto::MessageType::Discontinuity));
+    // Counted once, by the endpoint that actually closed it. The second close is not a second
+    // utterance.
+    KD_CHECK_EQ(m.utterances_completed(), uint64_t{1});
+}
+
+KD_TEST(session, editing_closes_the_utterance_even_with_no_local_speech_at_all) {
+    // This test used to assert the opposite — no open utterance, so no flush and nothing sent —
+    // and that shape is precisely the bug: it let the *Client* VAD's `utterance_open` decide
+    // whether the Server was told anything, when the Server runs its own endpointer with its own
+    // thresholds and can have an utterance open where we never saw speech at all.
+    //
+    // A `discontinuity` with nothing to close is a no-op at the far end
+    // (`VadEndpointer::close_utterance` returns immediately when none is open) and costs one
+    // small control frame. A missing one costs the user the ability to edit what they just said.
+    // The rule is therefore the simple one: a session is open, so the Server is told the stream
+    // has a gap.
+    kd::ManualClock clock(1000);
+    kd::SessionMachine m(clock, kd::SessionConfig{});
+    bring_to_idle(m);
+    start_session(m);
+    KD_REQUIRE(!m.utterance_open());
+
+    const auto out = m.on_local(LocalEvent::EditingBegan);
+    KD_CHECK_EQ(out.verdict, Verdict::Sent);
+    KD_CHECK(sends(out, proto::MessageType::Discontinuity));
+    KD_CHECK(out.has_effect(Effect::FlushPendingAudio));
+    // Nothing was open, so nothing was completed: the frame is a statement about the audio
+    // stream, not an invented utterance boundary.
+    KD_CHECK_EQ(m.utterances_completed(), uint64_t{0});
 }
 
 KD_TEST(session, the_editing_events_are_inert_outside_a_running_session) {

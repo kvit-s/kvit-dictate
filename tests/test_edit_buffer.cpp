@@ -247,6 +247,44 @@ KD_TEST(edit_buffer, appending_while_a_selection_is_active_drops_it_and_lands_at
     KD_CHECK_EQ(b.caret(), b.size());
 }
 
+KD_TEST(edit_buffer, a_final_arriving_mid_edit_lands_at_the_end_and_leaves_the_caret_alone) {
+    // docs/editing.md §3.3. The `discontinuity` sent when editing begins closes the open
+    // utterance, so its `final` arrives a few hundred milliseconds *into* the user's edit — by
+    // which time they are already aiming at a word. §14 retracted a design that moved the caret
+    // out from under a user mid-correction; Caret::Keep is what stops this path becoming the same
+    // failure by a different road.
+    kd::EditBuffer b;
+    b.set_text("the model said this much already");
+    b.set_caret(4, false);
+    b.set_caret(9, true);  // "model" selected — the user is about to retype it
+    KD_REQUIRE_EQ(b.selected_text(), std::string("model"));
+
+    b.append(" and this is the tail it was still decoding",
+             kd::EditBuffer::Caret::Keep);
+
+    KD_CHECK_EQ(b.text(), std::string("the model said this much already and this is the tail it "
+                                      "was still decoding"));
+    // §1's invariant holds — the text landed at the end, not at the caret — and the selection
+    // still spans exactly the graphemes it spanned, because appending only grows the tail.
+    KD_CHECK_EQ(b.caret(), size_t{9});
+    KD_CHECK_EQ(b.anchor(), size_t{4});
+    KD_CHECK_EQ(b.selected_text(), std::string("model"));
+}
+
+KD_TEST(edit_buffer, keeping_the_caret_does_not_disturb_an_edit_that_follows) {
+    // The caret is still usable after the late `final`: the next keystroke acts where the user
+    // left it, not at the end of text they never asked to be taken to.
+    kd::EditBuffer b;
+    b.set_text("hello wrold");
+    b.set_caret(11, false);
+    b.append(" and more", kd::EditBuffer::Caret::Keep);
+    KD_REQUIRE_EQ(b.caret(), size_t{11});
+
+    b.apply(cmd(kd::EditOp::Backspace));
+    KD_CHECK_EQ(b.text(), std::string("hello wrol and more"));
+    KD_CHECK_EQ(b.caret(), size_t{10});
+}
+
 KD_TEST(edit_buffer, appending_after_an_edit_does_not_reinstate_what_was_deleted) {
     kd::EditBuffer b;
     b.set_text("hello wrold");

@@ -807,21 +807,47 @@ SessionMachine::Outcome SessionMachine::on_local(LocalEvent e) {
                 return out;
             }
             // docs/editing.md §3.3. An utterance that is open when the edit key arrives is
-            // flushed, not abandoned: FlushPendingAudio pushes what has been captured, the
-            // sidecar finishes decoding it, and the resulting `final` joins the settled region —
-            // where the user can edit it, which is the whole reason they pressed the key.
+            // flushed, not abandoned: the user pressed an arrow key to go and fix something they
+            // just said, and the thing they just said had better be editable by the time they get
+            // there.
             //
-            // No protocol change and no new state: this is the endpoint path, reached by a
-            // gesture instead of by a timer.
-            if (s.utterance_open) {
+            // **FlushPendingAudio alone never did that, and for a long time it was all that was
+            // sent.** It drains our own outbound audio queue and nothing else (ipc_client.h); it
+            // says nothing to the Server, which closes an utterance on silence *in the audio it
+            // receives*, on `discontinuity`, or on `stop` (asrd/session_server.h's state
+            // machine). The microphone has just been closed, so no further audio arrives, so the
+            // Server's endpointer never fires — and the tail stayed a `partial`, rendered grey and
+            // uneditable in the pill, until Enter sent `stop`. The one region the user pressed the
+            // key to reach was the one region they could not touch.
+            //
+            // `discontinuity` is the message that closes an utterance *without* ending the
+            // session (docs §6.1, and `VadEndpointer::notify_discontinuity`: "a decoder reset and
+            // an utterance boundary happen together, or the wire contract is violated"). It is
+            // also simply true — the stream has a gap here and it starts now — and `gap_ms = 0`
+            // is §6.1's "duration unknown", which is the honest value for a gap that is not over.
+            // DictationResumed sends the measured duration on its own `discontinuity`, so the
+            // Server's audio timeline still adds up to wall time.
+            //
+            // Sent whenever a session is open rather than only when `utterance_open`, because
+            // that flag is *our* VAD's opinion and the Server's endpointer is an independent one.
+            // They disagree exactly when the local endpoint timer has fired and the Server's
+            // `final` is still in flight — and which of two VADs won a race must not be what
+            // decides whether the user can edit what they just said.
+            const bool open = !s.session_id.empty();
+            if (open) {
                 out.effects.push_back(Effect::FlushPendingAudio);
-                s.close_utterance();
+                proto::DiscontinuityMsg d;
+                d.session_id = s.session_id;
+                d.gap_ms = 0;  // §6.1: duration unknown — the gap starts here and has not ended
+                d.reason = std::string("editing");
+                out.to_send.push_back(proto::Message::of(std::move(d)));
             }
+            if (s.utterance_open) s.close_utterance();
             s.editing = true;
             // Both timers stop. The endpoint timer has nothing left to end; the session timer is
             // measuring silence into a microphone that is about to be closed (§9).
             out.effects.push_back(Effect::StopTimers);
-            out.verdict = Verdict::Accept;
+            out.verdict = open ? Verdict::Sent : Verdict::Accept;
             return out;
         }
 

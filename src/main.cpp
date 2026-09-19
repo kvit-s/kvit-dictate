@@ -2010,14 +2010,30 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
     // nothing injected the document has not changed and the caret has not moved, so submitting a
     // before/after frame pair would ask the estimator to find a change that does not exist.
     if (settings_.stability.cadence == kd::Cadence::EndOfSession) {
-        // §1's invariant: dictation only ever appends. EditBuffer::append() puts the text at the
-        // end and takes the caret with it — which is safe here, and only here, because §3.2
-        // closes the microphone at the first edit key, so the only way speech reaches this line
-        // is after the user's own resume gesture.
-        edit_.append(text);
+        // §1's invariant: dictation only ever appends, at the end, never at the caret.
+        //
+        // Whether the caret goes with it is the one thing that depends on which half of the
+        // session we are in. While dictating it does — the text arrived because the user asked
+        // for it. While *editing* it must not: §3.3's `discontinuity` closes the open utterance
+        // at the moment the edit key lands, so this `final` is the tail the user pressed that key
+        // to go and fix, and it arrives a few hundred milliseconds later with them already aiming
+        // at a word. Taking the caret to the end of it would be §14's retracted failure — a caret
+        // moving out from under someone mid-correction — arriving by a different road.
+        edit_.append(text, editing_ ? kd::EditBuffer::Caret::Keep : kd::EditBuffer::Caret::Follow);
         recovery_dirty_ = true;
-        // Queued as its own unit of rewriting, at the offset it just landed on.
-        normalize_chunks_.push_back(text);
+        if (editing_) {
+            // begin_editing() stood the rewriter down for this session, so this chunk is never
+            // going to be rewritten — but `normalize_settled_bytes_` indexes the buffer, so the
+            // bytes still have to be accounted for. Settling them as spoken is the only option
+            // that is right twice: a chunk left in the queue would be rewritten over the user's
+            // corrections the moment they resumed, and a chunk dropped without this line would
+            // leave every later chunk's offset short by its length, so every later rewrite would
+            // fail the "the chunk is no longer at offset" check in drain_normalize_queue().
+            normalize_settled_bytes_ += text.size();
+        } else {
+            // Queued as its own unit of rewriting, at the offset it just landed on.
+            normalize_chunks_.push_back(text);
+        }
         KD_LOG_DEBUG("deferred %zu bytes (%zu buffered) — cadence is end-of-session",
                      text.size(), edit_.size());
         // At an utterance boundary, which is the one moment in a session when both machines are
@@ -2209,11 +2225,15 @@ void App::begin_editing() {
         audio_running_ = false;
     }
 
-    // §3.3, and §16's sixth open question. An utterance that was open when the edit key arrived
-    // is flushed rather than abandoned: the user pressed an arrow key to go and fix something
-    // they just said, and the thing they just said had better be editable by the time they get
-    // there. The session machine raises FlushPendingAudio; the `final` it produces lands in the
-    // settled region through the ordinary commit path.
+    // §3.3, and §16's sixth open question. The utterance in progress is flushed rather than
+    // abandoned: the user pressed an arrow key to go and fix something they just said, and the
+    // thing they just said had better be editable by the time they get there.
+    //
+    // The session machine raises FlushPendingAudio **and writes a `discontinuity`** — the flush
+    // alone drains our own audio queue and tells the Server nothing, which is why the tail used
+    // to sit in the pill greyed out until Enter. session.cpp's EditingBegan has the full reason.
+    // The `final` that follows lands in the settled region through the ordinary commit path, and
+    // perform_commit() leaves the caret alone when it does.
     if (session_ != nullptr) apply(session_->on_local(kd::LocalEvent::EditingBegan));
 
     KD_LOG_INFO("editing: the microphone is closed and the pill has the keyboard");

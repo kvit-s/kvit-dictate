@@ -107,9 +107,16 @@ std::string EditBuffer::take() {
     return out;
 }
 
-void EditBuffer::append(std::string_view t) {
+void EditBuffer::append(std::string_view t, Caret caret) {
     if (t.empty()) return;
     text_.append(t);
+    if (caret == Caret::Keep) {
+        // The caret and the anchor are offsets into a prefix this call did not touch, so they
+        // still point at the same graphemes and the selection still spans the same text. Only the
+        // remembered column has to go: Down from here now has a further line to reach.
+        desired_column_valid_ = false;
+        return;
+    }
     caret_ = text_.size();
     anchor_ = caret_;
     desired_column_valid_ = false;

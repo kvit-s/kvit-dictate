@@ -140,17 +140,33 @@ public:
     // the same comment).
     [[nodiscard]] std::string take();
 
-    // Dictation. docs/editing.md §1's invariant, in one function:
+    // What happens to the caret when the model's text lands at the end of the buffer.
+    //
+    // `Follow` is docs/editing.md §1's invariant, in one word:
     //
     //   > **After any edit, dictation only ever appends.** New speech is never inserted at the
     //   > caret. It lands at the end of the buffer, and the caret moves there to meet it.
     //
-    // The caret move is safe here — and only here — because §3.2 closes the microphone at the
-    // first edit key, so the only way speech can arrive is after the user has made the explicit
+    // The caret move is safe when the text arrives because the user asked for it: §3.2 closes the
+    // microphone at the first edit key, so speech reaches the buffer only after the explicit
     // resume gesture that means "I am going to talk now". An earlier revision of the design kept
     // the mic open and snapped the caret on speech onset, which moved the caret out from under a
     // user mid-correction; §14 records the retraction.
-    void append(std::string_view t);
+    //
+    // `Keep` is for the one arrival that is *not* the user asking: the `final` for the utterance
+    // that was open when editing began (§3.3). That text is the whole reason they pressed the key
+    // — it lands a few hundred milliseconds into their edit, by which time they are already
+    // aiming at a word — and dragging the caret to the end of it would be §14's retracted
+    // failure arriving by a different road. So the text lands and the caret stays where the user
+    // put it. Nothing else has to move with it: appending only grows the tail, so every existing
+    // offset — caret, anchor, and the rewriter's — still means what it meant.
+    enum class Caret : uint8_t {
+        Follow,  // to the end, behind the new text — the user asked to dictate
+        Keep,    // exactly where it is — a late `final` arriving mid-edit
+    };
+
+    // Dictation. See `Caret` above for which of the two this is and why.
+    void append(std::string_view t, Caret caret = Caret::Follow);
 
     // Replace the whole buffer. Caret to the end, selection dropped.
     void set_text(std::string_view t);
