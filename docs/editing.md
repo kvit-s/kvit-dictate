@@ -191,6 +191,20 @@ So the round trip is **abandoned, not awaited**. `App::settle_pending_tail()` ap
 drawing too, and marks that utterance as the user's. Every later `partial` and `final` for it is
 dropped (`App::utterance_is_abandoned`). What the user was reading is what the user gets to edit.
 
+**Abandonment has two halves, and the first version shipped with one of them.** Silencing the
+wire is not enough, because the recogniser is not the only thing still holding an opinion about
+that utterance: `CommitEngine` has it open too, and `App::run()`'s 50 ms tick asks it for a
+cadence flush whether or not a message arrived. So within one tick it handed the same bytes back
+as `pending_text` and the pill drew a grey duplicate under the copy it had just settled, and
+within `hold_ms_t` step 5's dwell matured on the clock alone — it needs no new hypothesis, and
+during editing there are none — and those bytes were appended to the buffer a *second* time, for
+real, bound for the document at Enter. Reported as "that part gets committed, but there is a
+duplicate uncommitted shown". `settle_pending_tail()` now calls `CommitEngine::abandon_utterance`
+as well, which closes the utterance without a `final` and takes the hypothesis window, the
+candidate and its dwell timers with it. The two calls are deliberately one line apart: the engine
+may stop producing bytes for an utterance only once someone else has taken responsibility for
+them, and the line above is where the buffer did.
+
 Nothing about `plan.md` §1.4 is bent to do this. Under `Cadence::EndOfSession` not one byte has
 been injected, so there is no committed prefix to contradict — §2 above is exactly this argument,
 that compose-then-commit makes the invariant trivially true — and the only question left is which

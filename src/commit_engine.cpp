@@ -564,11 +564,16 @@ void CommitEngine::begin_session(std::string_view session_id) {
 
 void CommitEngine::begin_utterance(uint64_t utterance_id) { impl_->clear_utterance(utterance_id); }
 
-void CommitEngine::end_session() {
+void CommitEngine::abandon_utterance() {
     // Deliberately does NOT touch `committed` or the counters: committed text stays in the
     // user's document (that is the invariant), and docs/protocol.md §10.3 step 2 says the
     // unstable tail is lost, which is the honest outcome. Only the machinery that could produce
     // a *further* op is torn down.
+    //
+    // `utterance_open` is what makes this stick rather than merely tidy. on_tick() returns an
+    // empty Result while it is false, so a caller that has taken the tail for itself stops being
+    // offered it back on every cadence tick — and step 5's dwell, which matures on the clock
+    // alone and needs no new hypothesis to move it, can no longer promote a single byte of it.
     Impl& s = *impl_;
     s.utterance_open = false;
     s.window.clear();
@@ -577,6 +582,8 @@ void CommitEngine::end_session() {
     s.candidate.clear();
     s.checkpoints.clear();
 }
+
+void CommitEngine::end_session() { abandon_utterance(); }
 
 void CommitEngine::reset() {
     // Counters survive: they are per-backend/per-configuration accumulations across sessions

@@ -254,9 +254,22 @@ public:
     // for previous utterances stays in the ICER accounting.
     void begin_utterance(uint64_t utterance_id);
 
-    // End of session or connection. Does NOT retract anything: committed text stays in the
-    // user's document, which is the invariant, and §10.3 step 2 says the unstable tail is lost
-    // and that is the honest outcome.
+    // The Client has taken the open utterance's unstable tail and handed it to the user, so the
+    // engine's opinion of that utterance is now history (docs/editing.md §3.3). This closes it
+    // without a `final`: the hypothesis window, the candidate and its dwell timers all go, and
+    // with them every route by which `on_tick()` could still emit an op for those bytes or hand
+    // `pending_text` back for text the user is already editing.
+    //
+    // Nothing is retracted and nothing is reconciled. `committed_text()` goes on saying what the
+    // engine committed and the counters keep their totals — docs/editing.md §3.1 is explicit
+    // that the two authorities are allowed to disagree, and this is only the call that stops the
+    // engine arguing its side into a buffer that has moved on.
+    void abandon_utterance();
+
+    // End of session or connection. The same teardown as abandon_utterance(), for the same
+    // reason: it retracts nothing, because committed text stays in the user's document (that is
+    // the invariant) and §10.3 step 2 says the unstable tail is lost, which is the honest
+    // outcome.
     void end_session();
 
     void reset();

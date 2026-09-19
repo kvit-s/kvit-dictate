@@ -533,6 +533,72 @@ KD_TEST(commit_engine, dwell_does_not_starve_continuous_speech) {
     KD_CHECK_EQ(d.engine().committed_text(), "hello world");
 }
 
+// ─── Abandonment: the Client takes the tail (docs/editing.md §3.3) ──────────────────────────
+
+KD_TEST(commit_engine, abandoning_an_utterance_stops_the_dwell_committing_its_tail) {
+    // The regression behind "that part gets committed, but there is a duplicate uncommitted
+    // shown". On the edit gesture App::settle_pending_tail() appends the pill's unstable tail to
+    // its own buffer and drops every later message for that utterance, so the `final` never
+    // reaches the engine — and silencing the wire turns out to be only half of it. The engine's
+    // utterance was still open, step 5's dwell matures on the clock with no new hypothesis
+    // needed, and App::run()'s 50 ms tick asks for a flush whether or not anything arrived. So
+    // the same bytes came back as `pending_text` under the settled copy, and then as an op that
+    // appended them to the buffer a second time.
+    Driver d(local_params(/*m=*/0, /*t=*/200));
+
+    d.partial("open the config and restart");
+    d.partial("open the config and restart");
+    KD_REQUIRE_EQ(d.engine().committed_text(), "");
+    KD_REQUIRE_EQ(d.tick().pending_text, "open the config and restart");
+
+    // The edit key: the Client has those words now.
+    d.engine().abandon_utterance();
+
+    // Well past T, and past it with no new hypothesis — which is precisely the case the dwell
+    // exists to fire in, and the reason closing the utterance is the only thing that stops it.
+    d.advance(5000);
+    const CommitEngine::Result r = d.tick();
+    KD_CHECK(!r.op.has_value());
+    KD_CHECK(r.pending_text.empty());
+    KD_CHECK_EQ(d.engine().eligible_prefix(), uint64_t{0});
+    KD_CHECK_EQ(d.engine().committed_text(), "");
+}
+
+KD_TEST(commit_engine, a_new_utterance_after_an_abandoned_one_commits_normally) {
+    // Resuming dictation after an edit. The engine was closed mid-utterance with no `final`, and
+    // the boundary the product actually takes is the id change the engine detects for itself
+    // (see leading_space_survives_an_unannounced_utterance_change below) — so that path has to
+    // pick up from a *closed* utterance as readily as from an open one, and carry
+    // `session_has_committed` across it so the resumed words land after a space.
+    Driver d(local_params(/*m=*/0));
+
+    d.partial("first part here");
+    d.partial("first part here");
+    KD_REQUIRE_EQ(d.engine().committed_text(), "first part");
+
+    d.engine().abandon_utterance();
+
+    CommitOp op{};
+    bool got = false;
+    for (int i = 0; i < 2; ++i) {
+        kd::proto::PartialMsg m;
+        m.session_id = "s7";
+        m.utterance_id = 2;
+        m.seq = 90 + i;
+        m.text = "second part here";
+        const CommitEngine::Result r = d.engine().on_partial(m);
+        KD_REQUIRE(r.ok());
+        if (r.op.has_value()) {
+            op = *r.op;
+            got = true;
+        }
+    }
+    KD_REQUIRE(got);
+    KD_CHECK_EQ(op.text, "second part");
+    KD_CHECK_EQ(op.utterance_offset, uint64_t{0});
+    KD_CHECK(op.leading_space);
+}
+
 // ─── Step 4: never a partial word, never a trailing space ───────────────────────────────────
 
 KD_TEST(commit_engine, partial_word_is_never_committed) {
@@ -606,8 +672,8 @@ KD_TEST(commit_engine, utterance_boundary_resets_everything) {
 
 KD_TEST(commit_engine, leading_space_survives_an_unannounced_utterance_change) {
     // `utterance_boundary_resets_everything` above drives `begin_utterance()`, which **no owner
-    // calls**: src/main.cpp only ever calls on_partial / on_final / on_tick / reset(). So the
-    // boundary the product actually takes is the id-change-detected-by-the-engine path, and this
+    // calls**: src/main.cpp only ever calls on_partial / on_final / on_tick /
+    // abandon_utterance / reset(). So the boundary the product actually takes is the id-change-detected-by-the-engine path, and this
     // pins that it preserves `session_has_committed`.
     //
     // Honest scope: this test passes with or without the fix that accompanied it — the engine was

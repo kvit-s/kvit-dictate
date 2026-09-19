@@ -2291,6 +2291,11 @@ void App::apply_edit(const kd::EditPost& p) {
 // and the protocol has no "close this utterance and do not tell me" to avoid it with — a poor
 // trade to fix with a wire change, and a cheap one to pay.
 //
+// Abandoning has two halves and both are below, because the recogniser is not the only thing
+// still holding an opinion about this utterance: `utterance_is_abandoned` silences the wire, and
+// `CommitEngine::abandon_utterance` silences the cadence tick. Leaving the second one out is
+// what the duplicate the user saw was made of.
+//
 // Returns false when the pill had no tail. That is not a failure: with `server.live_preview`
 // off the recogniser publishes one `final` per utterance and nothing in between, so there is
 // genuinely nothing on screen to settle and the round trip is the only source of those words.
@@ -2316,6 +2321,21 @@ bool App::settle_pending_tail() {
     normalize_settled_bytes_ += text.size();
 
     abandoned_utterance_ = pending_tail_utterance_;
+
+    // And the local engine is told, because dropping the wire messages in apply_text() is only
+    // half of abandoning an utterance. CommitEngine still had this one open, and App::run()'s
+    // 50 ms tick asks it for a cadence flush regardless of whether anything arrived: within one
+    // tick it handed the very same bytes back as `pending_text`, so the pill drew the settled
+    // copy and a grey duplicate of it underneath, and within `hold_ms_t` step 5's dwell matured
+    // on the clock alone — no new hypothesis needed — and perform_commit() appended a second
+    // copy to the buffer for real. Reported as "that part gets committed, but there is a
+    // duplicate uncommitted shown", which is those two symptoms in the order they appear.
+    //
+    // It belongs here rather than in begin_editing(): the engine may stop producing bytes for an
+    // utterance only once someone else has taken responsibility for them, and the line above is
+    // where that happened.
+    if (commit_ != nullptr) commit_->abandon_utterance();
+
     KD_LOG_INFO("settled %zu bytes of unstable tail for utterance %llu on the edit gesture; "
                 "the rest of that round trip is abandoned",
                 text.size(), static_cast<unsigned long long>(abandoned_utterance_));
