@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "harness": "kvit-dictate/bench/ab_service.py",
+  "manifest": {
+    "schema_version": 1,
+    "harness": "kvit-dictate/bench/ab_service.py",
+    "metrics_versions": {
+      "metrics": "metrics-1",
+      "normaliser": "norm-1",
+      "terms": "terms-1",
+      "grapheme": "utf8-approx-1/unspecified-pending-protocol-md-14.2"
+    },
+    "started": "2026-09-20T12:31:47",
+    "finished": "2026-09-20T12:35:00",
+    "corpus_root": "H:\\kvit-corpus",
+    "services": [
+      {
+        "name": "qwen",
+        "base_url": "http://strixhalo.lan:10301",
+        "model": "Qwen/Qwen3-ASR-1.7B",
+        "language": "en"
+      },
+      {
+        "name": "r2t2",
+        "base_url": "http://192.168.138.186:10311",
+        "model": "netease-youdao/Confucius4-R2T2",
+        "language": "en"
+      }
+    ],
+    "incumbent": "qwen",
+    "coverage_caps": {
+      "sessions_in_corpus": 745,
+      "skipped_wrong_service": 0,
+      "service_filter": null,
+      "sessions_sampled": 200,
+      "sampling": "uniform over sessions without replacement, seed=7",
+      "duration_window_ms": [
+        600,
+        60000
+      ],
+      "endpoint_silence_ms": 1500.0,
+      "nonspeech_min_ms": 1500,
+      "speech_clips": 396,
+      "nonspeech_clips": 65,
+      "dropped_outside_duration_window": 0
+    },
+    "request_errors": 0,
+    "note": "The corpus has no written reference. Nothing in this run is WER-against-truth. Cross-service numbers are DIVERGENCE and are symmetric."
+  },
+  "clips": {
+    "speech": 396,
+    "nonspeech": 65
+  },
+  "reproduction": {
+    "what": "per session: the incumbent (qwen) replayed over the re-segmented recording, scored against the text it committed live",
+    "sessions": 197,
+    "sessions_word_identical": 107,
+    "rate": 0.9719,
+    "wer_normalised_vs_shipped": 0.0281,
+    "wer_raw_vs_shipped": 0.0683,
+    "worst_sessions": [
+      [
+        "20260901-031950-s39",
+        1.0
+      ],
+      [
+        "20260903-010516-s207",
+        1.0
+      ],
+      [
+        "20260910-041944-s22",
+        0.5
+      ],
+      [
+        "20260902-031404-s68",
+        0.2857142857142857
+      ],
+      [
+        "20260910-005227-s31",
+        0.26666666666666666
+      ]
+    ]
+  },
+  "per_service": {
+    "qwen": {
+      "errors": 0,
+      "empty": 0,
+      "truncated": 0,
+      "latency_ms": {
+        "n": 396,
+        "mean": 228.4,
+        "p50": 191.8,
+        "p90": 399.9,
+        "p99": 488.3,
+        "max": 1291.4
+      },
+      "rtf": {
+        "n": 396,
+        "mean": 0.0221,
+        "p50": 0.0187,
+        "p90": 0.0344,
+        "p99": 0.0557,
+        "max": 0.1975
+      },
+      "words": 8324,
+      "nonspeech": {
+        "clips": 65,
+        "hallucinated": 65,
+        "rate": 1.0
+      }
+    },
+    "r2t2": {
+      "errors": 0,
+      "empty": 10,
+      "truncated": 11,
+      "latency_ms": {
+        "n": 396,
+        "mean": 215.9,
+        "p50": 187.8,
+        "p90": 378.2,
+        "p99": 468.0,
+        "max": 538.4
+      },
+      "rtf": {
+        "n": 396,
+        "mean": 0.0205,
+        "p50": 0.018,
+        "p90": 0.0325,
+        "p99": 0.0467,
+        "max": 0.0664
+      },
+      "words": 8159,
+      "nonspeech": {
+        "clips": 65,
+        "hallucinated": 3,
+        "rate": 0.0462
+      }
+    }
+  },
+  "divergence_all": {
+    "n": 396,
+    "identical": 86,
+    "identical_normalised": 204,
+    "wer_raw": 0.1224,
+    "wer_normalised": 0.0547,
+    "cer_raw": 0.0473,
+    "cer_normalised": 0.0318
+  },
+  "divergence_excluding_truncated": {
+    "n": 385,
+    "identical": 86,
+    "identical_normalised": 204,
+    "wer_raw": 0.1213,
+    "wer_normalised": 0.0513,
+    "cer_raw": 0.0457,
+    "cer_normalised": 0.03
+  },
+  "truncation": {
+    "service": "r2t2",
+    "clips": 11,
+    "rate": 0.0278,
+    "words_lost_vs_incumbent": {
+      "n": 11,
+      "mean": 2.3,
+      "p50": 2.0,
+      "p90": 5.0,
+      "p99": 6.8,
+      "max": 7.0
+    },
+    "note": "a truncated answer is a MISSING one, not a wrong one; the fix is a flush on the service side, not a different model"
+  }
+}

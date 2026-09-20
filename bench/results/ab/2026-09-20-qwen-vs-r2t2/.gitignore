@@ -1,0 +1,6 @@
+# Written by bench/ab_service.py. Everything here but the aggregate contains verbatim
+# transcripts of real dictation (plan.md 1.9). Do not add exceptions to this file.
+*
+!.gitignore
+!*.aggregate.json
+!*.aggregate.csv
