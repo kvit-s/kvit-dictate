@@ -120,6 +120,15 @@ inline constexpr const char* kDefaultLanguage = "en";
 inline constexpr const char* kTranscriptionsPath = "/v1/audio/transcriptions";
 inline constexpr const char* kVadPath = "/v1/audio/vad";
 
+// The endpoint's cap on the `prompt` field, measured 2026-09-20: 4096 bytes is accepted, 4097
+// is refused with `form field 'prompt' is too long` and HTTP 400.
+//
+// The client's own limits are looser — docs/protocol.md §6.1 allows 256 terms of 128 bytes, so
+// 32 KB — which means a legal `start.context` can exceed what the server will take. The join
+// below truncates rather than letting the request fail, because a vocabulary list one term too
+// long must not cost the user the whole utterance.
+inline constexpr size_t kMaxPromptBytes = 4096;
+
 struct OpenAiBackendConfig {
     std::string base_url;                    // no trailing slash; validated by the caller
     std::string model = kDefaultModel;
@@ -205,6 +214,25 @@ struct Segment {
     std::string text;
 };
 
+// ─── Vocabulary hints, joined for the wire ──────────────────────────────────────────────────
+//
+// `start.context` is a list; the endpoint's `prompt` is one string. This joins them with ", "
+// and stops before `max_bytes`, on a term boundary — never mid-term, and never mid-UTF-8, since
+// the terms are copied whole or not at all.
+//
+// Dropping the tail of the list rather than the tail of the string is the whole point. A prompt
+// cut mid-word is a fragment the model will try to make sense of, and biasing a recogniser
+// toward half a word is worse than not biasing it: measured 2026-09-20, a degenerate 4096-byte
+// prompt of one repeated term returned an empty transcript for audio that otherwise transcribes
+// fine, so a bad prompt does not merely fail to help — it can cost the utterance.
+//
+// Pure and free-standing, and tested, for the reason `corpus_prune_set` is: it is the kind of
+// arithmetic whose off-by-one is invisible in a request log and obvious in a table of cases.
+// `dropped` reports how many terms did not fit, so the caller can say so once rather than
+// silently sending less vocabulary than the user configured.
+[[nodiscard]] std::string join_context_prompt(const std::vector<std::string>& terms,
+                                              size_t max_bytes, size_t* dropped = nullptr);
+
 // A cut the model proposed for itself. `committed_text` is the transcript of exactly the first
 // `cut_samples` samples — not an estimate of it, not a prefix matched against it — so a caller
 // may emit that text as final and keep the rest of the audio with no overlap between the two.
@@ -251,6 +279,14 @@ public:
     // Start a new utterance: clears the window, the frozen prefix and the audio clock.
     void reset();
 
+    // The session's vocabulary hints (docs/protocol.md §6.1), sent as `prompt` on every
+    // transcription. Set once at `session_start`; empty restores the unbiased default.
+    //
+    // Session-scoped rather than config-scoped because that is what the protocol makes it: the
+    // terms arrive with `start`, and a connection may serve sessions with different ones.
+    void set_context(const std::vector<std::string>& terms);
+    [[nodiscard]] const std::string& context_prompt() const noexcept { return prompt_; }
+
     // Append gated PCM to the window. Cheap; no network. Returns true when a hop is due.
     bool feed(const int16_t* samples, size_t count);
 
@@ -293,6 +329,7 @@ private:
                             std::vector<Segment>& segments);
 
     OpenAiBackendConfig cfg_;
+    std::string prompt_;  // joined `start.context`; empty means the field is omitted
     HttpUrl transcribe_url_{};
     HttpUrl vad_url_{};
     HttpClient http_;

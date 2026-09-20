@@ -177,15 +177,19 @@ bool SessionServer::on_start(const proto::StartMsg& m) {
         pending_finalize_ = false;
         pending_stop_ = false;
     }
-    // `context` is accepted and ignored: this backend declares context_supported = false in
-    // `ready`, which §6.1 requires of a server that cannot use the hints — silently dropping
-    // them while claiming support is what would corrupt plan.md §4's comparison.
+    // `context` goes to the backend as the endpoint's `prompt` field, which is what
+    // context_supported = true in `ready` now promises. Until 2026-09-20 this was accepted and
+    // dropped, correctly declared unsupported — but the endpoint had honoured `prompt` all
+    // along, so the terms the user maintained in Settings bought them nothing.
+    //
+    // Set before `backend_.reset()` so the first hop of the first utterance already carries it.
+    backend_.set_context(m.context);
     vad_.reset();
     backend_.reset();
     backend_.reset_cancel();
     stability_.reset(0);
-    KD_LOG_INFO("session_start session_id=%s context=%zu", m.session_id.c_str(),
-                m.context.size());
+    KD_LOG_INFO("session_start session_id=%s context=%zu prompt_bytes=%zu",
+                m.session_id.c_str(), m.context.size(), backend_.context_prompt().size());
     return true;
 }
 

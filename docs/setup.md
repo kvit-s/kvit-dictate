@@ -188,6 +188,25 @@ The same check from a command line, which is the useful thing to paste into a bu
 kd_probe --server ws://127.0.0.1:10402/
 ```
 
+### Vocabulary hints
+
+**Settings → Server → Vocabulary.** A list of terms — project names, tools, file extensions —
+sent with every transcription so the recogniser is biased toward them. Against the speech
+service they go on the wire as the endpoint's `prompt` field, and Test reports
+`Vocabulary hints: supported` once it can see a service that takes them.
+
+They are worth measuring rather than assuming. On 255 clips of real dictation
+(`bench/results/ab/2026-09-20-qwen-vocabulary`) a nine-term list reliably fixed the terms it
+named — `Qt UI` became `kvit-ui`, `Piper D` became `Piperd` — and also changed about a fifth of
+everything else, in both directions, which is well past the 2 % the same service varies by on
+its own. So a term you add is not free: it biases the whole decode, not just the word you meant.
+Add the nouns you actually say, keep the list short, and take one out if it is not earning its
+place.
+
+At most 256 terms of 128 bytes each (docs/protocol.md §6.1). The endpoint additionally caps the
+joined list at 4096 bytes; past that the translator drops whole terms from the end rather than
+sending a truncated one, and says how many in the log.
+
 ### If Test fails in speech-service mode
 
 Two things can fail, and the message says which:

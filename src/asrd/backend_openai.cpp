@@ -154,6 +154,18 @@ void OpenAiBackend::reset() {
     driver_.reset();
 }
 
+void OpenAiBackend::set_context(const std::vector<std::string>& terms) {
+    size_t dropped = 0;
+    prompt_ = join_context_prompt(terms, kMaxPromptBytes, &dropped);
+    if (dropped != 0) {
+        KD_LOG_WARN("context: %zu of %zu vocabulary terms did not fit in the endpoint's %zu-byte "
+                    "prompt and were not sent",
+                    dropped, terms.size(), kMaxPromptBytes);
+    }
+    KD_LOG_INFO("context: %zu terms, %zu bytes on the wire", terms.size() - dropped,
+                prompt_.size());
+}
+
 bool OpenAiBackend::feed(const int16_t* samples, size_t count) {
     std::lock_guard<std::mutex> lock(driver_mutex_);
     return driver_.feed(samples, count);
@@ -228,6 +240,11 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
     // returns `text` alone, and both are handled: `segments` simply stays empty and no cut is
     // proposed. Nothing downstream requires it.
     fields.emplace_back("response_format", cfg_.segment_cuts ? "verbose_json" : "json");
+    // Vocabulary hints. The endpoint takes them as `prompt`; `context` is a synonym there, and
+    // `hotwords` and `initial_prompt` are silently ignored, so the name matters — measured
+    // 2026-09-20 against both the Qwen and the R2T2 host. Omitted entirely when empty rather
+    // than sent blank, because an empty prompt is a field the server still has to interpret.
+    if (!prompt_.empty()) fields.emplace_back("prompt", prompt_);
 
     std::string content_type;
     const std::string body =
@@ -287,6 +304,28 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
         }
     }
     return Status::success();
+}
+
+std::string join_context_prompt(const std::vector<std::string>& terms, size_t max_bytes,
+                                size_t* dropped) {
+    static constexpr std::string_view kSep = ", ";
+    std::string out;
+    size_t skipped = 0;
+    for (const std::string& term : terms) {
+        const std::string t = strip(term);
+        if (t.empty()) continue;  // an empty term biases nothing and costs two separator bytes
+        const size_t want = out.empty() ? t.size() : out.size() + kSep.size() + t.size();
+        if (want > max_bytes) {
+            // Keep going rather than stopping: a short term later in the list still fits, and
+            // the user wrote it down for a reason. Order is not priority here.
+            ++skipped;
+            continue;
+        }
+        if (!out.empty()) out += kSep;
+        out += t;
+    }
+    if (dropped != nullptr) *dropped = skipped;
+    return out;
 }
 
 bool propose_segment_cut(const OpenAiBackendConfig& cfg, size_t buffered_samples,

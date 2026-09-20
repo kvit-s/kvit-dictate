@@ -413,3 +413,56 @@ KD_TEST(asrd_backend, the_endpointer_is_what_bounds_the_buffer) {
     KD_CHECK_GT(VadConfig{}.max_utterance_ms, 0.0);
 }
 
+
+// ─── Vocabulary hints on the wire ───────────────────────────────────────────────────────────
+
+KD_TEST(asrd_backend, context_terms_are_joined_for_the_prompt_field) {
+    const std::string out = join_context_prompt({"kvit-ui", "piperd", "heic"}, kMaxPromptBytes);
+    KD_CHECK_EQ(out, std::string("kvit-ui, piperd, heic"));
+}
+
+KD_TEST(asrd_backend, an_empty_vocabulary_sends_no_prompt_at_all) {
+    // Distinct from a blank one: transcribe_batch omits the field when this is empty, because a
+    // blank prompt is still a field the server has to interpret.
+    KD_CHECK(join_context_prompt({}, kMaxPromptBytes).empty());
+    KD_CHECK(join_context_prompt({"", "   ", ""}, kMaxPromptBytes).empty());
+}
+
+KD_TEST(asrd_backend, terms_are_stripped_and_blanks_do_not_leave_stray_separators) {
+    KD_CHECK_EQ(join_context_prompt({"  kvit-ui ", "", " heic"}, kMaxPromptBytes),
+                std::string("kvit-ui, heic"));
+}
+
+KD_TEST(asrd_backend, the_prompt_never_exceeds_the_endpoints_cap) {
+    // The endpoint answers 4097 bytes with HTTP 400, which would cost the whole utterance. The
+    // client's own limit is 256 terms of 128 bytes, so a legal start.context can be 32 KB.
+    std::vector<std::string> many(256, std::string(128, 'x'));
+    const std::string out = join_context_prompt(many, kMaxPromptBytes);
+    KD_CHECK_LE(out.size(), kMaxPromptBytes);
+    KD_CHECK(!out.empty());
+}
+
+KD_TEST(asrd_backend, truncation_is_on_a_term_boundary_and_is_counted) {
+    // Cut mid-term and the model is biased toward half a word, which is worse than no bias.
+    size_t dropped = 0;
+    const std::string a(10, 'a'), b(10, 'b'), c(10, 'c');
+    // Room for "aaa…, bbb…" (22 bytes) but not for a third.
+    const std::string out = join_context_prompt({a, b, c}, 22, &dropped);
+    KD_CHECK_EQ(out, a + ", " + b);
+    KD_CHECK_EQ(dropped, size_t{1});
+}
+
+KD_TEST(asrd_backend, a_short_term_after_an_oversized_one_still_gets_through) {
+    // Order is not priority: skipping the term that does not fit and carrying on sends more of
+    // the user's vocabulary than stopping at the first refusal would.
+    size_t dropped = 0;
+    const std::string out = join_context_prompt({"ab", std::string(100, 'x'), "cd"}, 10, &dropped);
+    KD_CHECK_EQ(out, std::string("ab, cd"));
+    KD_CHECK_EQ(dropped, size_t{1});
+}
+
+KD_TEST(asrd_backend, a_single_term_larger_than_the_cap_is_dropped_not_truncated) {
+    size_t dropped = 0;
+    KD_CHECK(join_context_prompt({std::string(50, 'x')}, 10, &dropped).empty());
+    KD_CHECK_EQ(dropped, size_t{1});
+}

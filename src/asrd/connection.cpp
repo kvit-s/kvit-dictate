@@ -158,7 +158,10 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
         // compiled in.
         info.mode = proto::StreamingMode::PseudoStreaming;
         info.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
-        info.context_supported = false;
+        // The endpoint takes vocabulary hints as `prompt`; `session_server` joins `start.context`
+        // and sends them. Measured 2026-09-20: on the same audio, "Qt UI" becomes "kvit-ui" and
+        // "Piper D" becomes "Piperd" once the terms are on the wire.
+        info.context_supported = true;
         ack.models.push_back(std::move(info));
         if (!sink.send(proto::Message::of(std::move(ack)))) return kExitTransport;
         KD_LOG_INFO("handshake_ok client=%s model=%s",
@@ -230,7 +233,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     // latency numbers in the same column as the native-streaming rows.
     ready.mode = proto::StreamingMode::PseudoStreaming;
     ready.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
-    ready.context_supported = false;
+    ready.context_supported = true;  // see the `hello_ack` above
     if (!sink.send(proto::Message::of(std::move(ready)))) return kExitTransport;
 
     // ── §6 the conversation ─────────────────────────────────────────────────────────────────

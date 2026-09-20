@@ -137,6 +137,14 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         return last_content_type_;
     }
+    // The whole last transcription request, headers and multipart body. Recorded so a test can
+    // assert what actually went on the wire rather than what the client believes it sent —
+    // `context` was declared unsupported and dropped for a month while the field it needed was
+    // one line away, and no test could have noticed.
+    [[nodiscard]] std::string last_transcribe_request() const {
+        std::lock_guard<std::mutex> lock(m_);
+        return last_transcribe_request_;
+    }
 
 private:
     void run() {
@@ -189,6 +197,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_);
             last_body_bytes_ = content_length;
+            if (!is_vad) last_transcribe_request_ = raw;
             if (is_vad) {
                 reply = vad_;
             } else if (!script_.empty()) {
@@ -236,6 +245,7 @@ private:
     bool vad_configured_ = false;
     size_t last_body_bytes_ = 0;
     std::string last_content_type_;
+    std::string last_transcribe_request_;
     std::atomic<int> transcribe_requests_{0};
     std::atomic<int> vad_requests_{0};
 };
@@ -413,7 +423,8 @@ bool attach(kd::IpcClient& client, Observed& seen, const std::string& url) {
 // tracker's behaviour across several. Pacing costs wall-clock time, so it is opt-in per case
 // rather than the default.
 bool run_session(TranslatorHarness& harness, Observed& seen, const std::vector<int16_t>& pcm,
-                 bool cancel_instead_of_stop = false, int settle_ms = 6000, int pace_ms = 0) {
+                 bool cancel_instead_of_stop = false, int settle_ms = 6000, int pace_ms = 0,
+                 const std::vector<std::string>& context = {}) {
     kd::IpcClient client;
     if (!attach(client, seen, harness.url())) return false;
     if (!seen.wait_for([&] { return seen.ready || seen.dead || seen.disconnected; })) return false;
@@ -424,6 +435,10 @@ bool run_session(TranslatorHarness& harness, Observed& seen, const std::vector<i
 
     kd::proto::StartMsg start;
     start.session_id = "s1";
+    if (!context.empty()) {
+        start.context = context;
+        start.context_present = true;
+    }
     if (!client.send_control(kd::proto::Message::of(start)).ok()) return false;
 
     // 20 ms frames, the low end of §6.3's recommended band, because that is what the client's
@@ -1362,4 +1377,68 @@ KD_TEST(asrd_session, a_contraction_spelled_out_is_not_a_retraction) {
     // different word has.
     KD_CHECK(kd::asrd::keeps_published_words("I'm going", "I m going too"));
     KD_CHECK(!kd::asrd::keeps_published_words("I'm going", "Im going"));
+}
+
+// ─── Vocabulary hints reach the endpoint ────────────────────────────────────────────────────
+
+KD_TEST(asrd_session, start_context_is_sent_as_the_prompt_field) {
+    // The regression this pins: from the day the OpenAI backend landed until 2026-09-20,
+    // `start.context` was parsed, logged and thrown away, and `ready` honestly said
+    // context_supported=false. The endpoint had accepted `prompt` the whole time. The user's
+    // Settings → Vocabulary list therefore did nothing, and nothing failed to say so.
+    //
+    // So this asserts the bytes on the wire, not the client's belief about them.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"publish kvit-ui"})"});
+
+    TranslatorHarness harness(config_for(stub));
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(), false, 6000, 0,
+                           {"kvit-ui", "piperd", "heic"}));
+
+    const std::string req = stub.last_transcribe_request();
+    KD_REQUIRE(!req.empty());
+    KD_CHECK(req.find("name=\"prompt\"") != std::string::npos);
+    KD_CHECK(req.find("kvit-ui, piperd, heic") != std::string::npos);
+}
+
+KD_TEST(asrd_session, no_vocabulary_means_no_prompt_field_at_all) {
+    // An empty prompt is still a field the server has to interpret, and the endpoint's own
+    // behaviour with a degenerate one is to return an empty transcript. Omitting it is the
+    // safer default and is what the unbiased baseline in bench/results/ab measured.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"hello"})"});
+
+    TranslatorHarness harness(config_for(stub));
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance()));
+
+    const std::string req = stub.last_transcribe_request();
+    KD_REQUIRE(!req.empty());
+    KD_CHECK(req.find("name=\"prompt\"") == std::string::npos);
+}
+
+KD_TEST(asrd_session, the_translator_now_declares_context_supported) {
+    // §6.1 requires a server that cannot use the hints to say so. Now that it can, it must say
+    // *that* — the client's Test panel reads this field to tell the user whether their
+    // vocabulary is doing anything, and it told them "not supported by this model" for a month.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    TranslatorHarness harness(config_for(stub));
+    KD_REQUIRE(harness.start());
+
+    kd::IpcClient client;
+    Observed seen;
+    KD_REQUIRE(attach(client, seen, harness.url()));
+    KD_REQUIRE(seen.wait_for([&] { return seen.ready || seen.dead || seen.disconnected; }));
+
+    const auto readys = seen.of<kd::proto::ReadyMsg>();
+    KD_REQUIRE_EQ(readys.size(), size_t{1});
+    KD_CHECK(readys[0].context_supported);
 }
