@@ -120,11 +120,17 @@ class Service:
     model: Optional[str] = None
     language: Optional[str] = "en"
     timeout_s: float = 180.0
+    #: Vocabulary hints, sent as the `prompt` form field. Both services on this LAN honour
+    #: `prompt` and `context` identically and ignore `hotwords` and `initial_prompt`, measured
+    #: 2026-09-20. The field exists here so "does the vocabulary the user maintains actually buy
+    #: anything" is a question the harness can answer rather than one settled by one example.
+    prompt: Optional[str] = None
 
     @staticmethod
     def parse(spec: str) -> "Service":
-        """`name=url[,model=...][,language=...]`. The url may not contain a comma, which no URL
-        we care about does; rejecting it here beats a shell-quoting puzzle later."""
+        """`name=url[,model=...][,language=...][,prompt=...]`. The url may not contain a comma,
+        which no URL we care about does; rejecting it here beats a shell-quoting puzzle later.
+        `prompt` may not either, so a term list is given as `prompt@file` instead."""
         name, _, rest = spec.partition("=")
         if not name or not rest:
             raise SystemExit(f"service spec must be name=url[,k=v...]; got {spec!r}")
@@ -135,17 +141,21 @@ class Service:
             k, _, v = p.partition("=")
             kw[k.strip()] = v.strip()
         lang = kw.get("language", "en")
+        prompt = kw.get("prompt") or None
+        if "prompt@" in kw:
+            prompt = Path(kw["prompt@"]).read_text(encoding="utf-8").strip() or None
         return Service(
             name=name.strip(),
             base_url=url,
             model=kw.get("model") or None,
             language=(lang or None) if lang.lower() != "none" else None,
             timeout_s=float(kw.get("timeout_s", 180.0)),
+            prompt=prompt,
         )
 
     def to_dict(self) -> dict:
         return {"name": self.name, "base_url": self.base_url, "model": self.model,
-                "language": self.language}
+                "language": self.language, "prompt": self.prompt}
 
 
 _BOUNDARY = "----kvit-dictate-ab-Xq7Nr2"
@@ -193,7 +203,8 @@ class Answer:
 
 def transcribe(svc: Service, pcm: bytes) -> Answer:
     body, content_type = _multipart(
-        {"model": svc.model, "language": svc.language, "response_format": "json"},
+        {"model": svc.model, "language": svc.language, "response_format": "json",
+         "prompt": svc.prompt},
         "utterance.wav",
         wav_bytes(pcm),
     )

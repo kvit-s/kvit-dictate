@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "harness": "kvit-dictate/bench/ab_service.py",
+  "manifest": {
+    "schema_version": 1,
+    "harness": "kvit-dictate/bench/ab_service.py",
+    "metrics_versions": {
+      "metrics": "metrics-1",
+      "normaliser": "norm-1",
+      "terms": "terms-1",
+      "grapheme": "utf8-approx-1/unspecified-pending-protocol-md-14.2"
+    },
+    "started": "2026-09-20T14:21:55",
+    "finished": "2026-09-20T14:23:54",
+    "corpus_root": "H:\\kvit-corpus",
+    "services": [
+      {
+        "name": "qwen-run1",
+        "base_url": "http://strixhalo.lan:10301",
+        "model": "Qwen/Qwen3-ASR-1.7B",
+        "language": "en",
+        "prompt": null
+      },
+      {
+        "name": "qwen-run2",
+        "base_url": "http://strixhalo.lan:10301",
+        "model": "Qwen/Qwen3-ASR-1.7B",
+        "language": "en",
+        "prompt": null
+      }
+    ],
+    "incumbent": "qwen-run1",
+    "coverage_caps": {
+      "sessions_in_corpus": 757,
+      "skipped_wrong_service": 0,
+      "service_filter": null,
+      "sessions_sampled": 120,
+      "sampling": "uniform over sessions without replacement, seed=11",
+      "duration_window_ms": [
+        600,
+        60000
+      ],
+      "endpoint_silence_ms": 1500.0,
+      "nonspeech_min_ms": 1500,
+      "speech_clips": 259,
+      "nonspeech_clips": 0,
+      "dropped_outside_duration_window": 0
+    },
+    "request_errors": 0,
+    "note": "The corpus has no written reference. Nothing in this run is WER-against-truth. Cross-service numbers are DIVERGENCE and are symmetric."
+  },
+  "clips": {
+    "speech": 259,
+    "nonspeech": 0
+  },
+  "reproduction": {
+    "what": "per session: the incumbent (qwen-run1) replayed over the re-segmented recording, scored against the text it committed live",
+    "sessions": 117,
+    "sessions_word_identical": 54,
+    "rate": 0.9656,
+    "wer_normalised_vs_shipped": 0.0344,
+    "wer_raw_vs_shipped": 0.0952,
+    "worst_sessions": [
+      [
+        "20260912-193433-s91",
+        0.1864406779661017
+      ],
+      [
+        "20260909-033604-s30",
+        0.15384615384615385
+      ],
+      [
+        "20260910-021004-s2",
+        0.14814814814814814
+      ],
+      [
+        "20260902-175024-s179",
+        0.125
+      ],
+      [
+        "20260906-134526-s56",
+        0.12
+      ]
+    ]
+  },
+  "per_service": {
+    "qwen-run1": {
+      "errors": 0,
+      "empty": 0,
+      "truncated": 0,
+      "latency_ms": {
+        "n": 259,
+        "mean": 224.1,
+        "p50": 181.9,
+        "p90": 404.7,
+        "p99": 506.9,
+        "max": 559.7
+      },
+      "rtf": {
+        "n": 259,
+        "mean": 0.0196,
+        "p50": 0.0167,
+        "p90": 0.0319,
+        "p99": 0.0556,
+        "max": 0.0778
+      },
+      "words": 5778
+    },
+    "qwen-run2": {
+      "errors": 0,
+      "empty": 0,
+      "truncated": 0,
+      "latency_ms": {
+        "n": 259,
+        "mean": 224.1,
+        "p50": 188.5,
+        "p90": 390.4,
+        "p99": 486.7,
+        "max": 528.7
+      },
+      "rtf": {
+        "n": 259,
+        "mean": 0.0197,
+        "p50": 0.0171,
+        "p90": 0.0299,
+        "p99": 0.0597,
+        "max": 0.1068
+      },
+      "words": 5782
+    }
+  },
+  "divergence_all": {
+    "n": 259,
+    "identical": 245,
+    "identical_normalised": 253,
+    "wer_raw": 0.004,
+    "wer_normalised": 0.0012,
+    "cer_raw": 0.0012,
+    "cer_normalised": 0.0006
+  },
+  "divergence_excluding_truncated": {
+    "n": 259,
+    "identical": 245,
+    "identical_normalised": 253,
+    "wer_raw": 0.004,
+    "wer_normalised": 0.0012,
+    "cer_raw": 0.0012,
+    "cer_normalised": 0.0006
+  },
+  "truncation": {
+    "service": "qwen-run2",
+    "clips": 0,
+    "rate": 0.0,
+    "words_lost_vs_incumbent": {
+      "n": 0
+    },
+    "note": "a truncated answer is a MISSING one, not a wrong one; the fix is a flush on the service side, not a different model"
+  }
+}

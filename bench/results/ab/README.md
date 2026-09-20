@@ -92,3 +92,58 @@ Which service is more *accurate*. Nobody wrote down what was said, so 171 clips 
 with no way to score them. `adjudicate.md` in the run directory holds the 60 worst
 disagreements with the audio extracted next to them, ready for a human; it is gitignored, and it
 is the only route from here to an accuracy number.
+
+---
+
+## 2026-09-20-qwen-selfconsistency
+
+**The noise floor, which nothing here had measured.** The same service, the same settings, the
+same audio, asked twice: `Qwen/Qwen3-ASR-1.7B` against itself, 120 sessions, 259 clips.
+
+| | |
+|---|---|
+| identical verbatim | 94.6 % |
+| identical after normalising | 97.7 % |
+| normalised word divergence | **0.1 %** |
+| raw word divergence | 0.4 % |
+
+This run exists because a reading of the vocabulary experiment below — that its changes were
+just transcription variability rather than the prompt — could not be refuted without it. It
+turned out to be the wrong explanation, but it was the right question, and the number is worth
+more than the argument: **any divergence under about 2 % of clips, or 0.1 % of words, is this
+service disagreeing with itself.** Every other run in this directory should be read against it.
+
+## 2026-09-20-qwen-vocabulary
+
+Does the vocabulary list the user maintains in Settings buy anything? 120 sessions, 255 clips,
+`Qwen/Qwen3-ASR-1.7B` both sides, nine real terms as the endpoint's `prompt` field against no
+prompt at all.
+
+The prompt changed **21.4 %** of clips — an order of magnitude past the 2.1 % noise floor above,
+and per-clip, **47 of the 50 it changed are otherwise perfectly stable** across two identical
+runs. So the changes are the prompt, not variance.
+
+Six clips gained a term that was not there before: `Qt UI` → `kvit-ui`, `Piper D` → `Piperd`,
+`Qubit coder` → `kvit coder`, `backpack` → `jpeg`. The rest is collateral and runs both ways —
+some false starts resolved better, and `auctioned out` → `optioned out`, `central API` →
+`essential API`, `Quinn is good` → `when is good` got worse. One utterance came back empty that
+had not been.
+
+**The conclusion is not "free accuracy".** A prompt biases the whole decode. It reliably fixes
+the nouns it names, which for a dictation tool used on one's own projects is the thing that
+matters most, and it perturbs about a fifth of everything else in small ways. That is a trade
+worth taking with a short, real list, and a reason not to paste a dictionary in.
+
+## 2026-09-20-r2t2-vocabulary
+
+The same experiment against `netease-youdao/Confucius4-R2T2`, 255 clips. It behaves the same
+way: **22.0 %** of clips changed, against Qwen's 21.4 %.
+
+The reported risk that R2T2 writes the prompt back out instead of a transcript **did not
+materialise** here — 7 empty answers with the terms and 7 without, and 5 491 words returned
+against 5 490. Worth knowing, because a model that echoed its prompt would turn a vocabulary
+list into dropped utterances.
+
+Its truncation rate on this session sample was 5.5–6.7 %, against 2.8 % on the first run's
+sample — a reminder that the truncation figure moves with which sessions are drawn, and that
+the underlying wrapper bug is what wants fixing rather than the number.
