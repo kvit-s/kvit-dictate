@@ -195,6 +195,34 @@ ONNX API (`onnxruntime-genai`) and a second adapter for a size saving that does 
 
 ---
 
+## 4b. Evaluated after this pass — `netease-youdao/Confucius4-R2T2` (2026-09-21)
+
+Not in the table above, and it did not arrive the way the table's rows did: it was not known on
+2026-08-16, the operator stood it up on the LAN himself, and it was compared against the shipping
+service on 396 clips of his own dictation rather than on published claims.
+
+| # | Model id | Licence | Params | Runtime dep | Streaming mode | Published ONNX export | Approx VRAM | Vocab / context biasing |
+|---|---|---|---|---|---|---|---|---|
+| H | `netease-youdao/Confucius4-R2T2` | **not read** — resolve before quoting | 1.7 B — a streaming fine-tune of row F | served over an OpenAI-compatible HTTP wrapper on the LAN; never run locally | native-streaming, append-only via a Longest Stable Prefix objective | not looked for | somewhat under F — *operator's report, not measured* | **yes — the same `prompt` field as F, and measured working** |
+
+Measured rather than estimated, in `bench/results/ab/2026-09-20-qwen-vs-r2t2` and
+`-r2t2-vocabulary`: 3 hallucinations over 65 open-microphone clips against
+Qwen3-ASR-1.7B's 65 of 65; service latency indistinguishable from the incumbent's (216 ms mean
+against 228 ms, on the same LAN and the same GPU queue); 2.8 % of answers truncated at the
+Longest Stable Prefix boundary by a wrapper that never flushed the unstable tail; a vocabulary
+prompt that moves 22.0 % of clips, against 21.4 % for F, and is not echoed back as transcript.
+Technical vocabulary reads better than the incumbent's on the disagreement set, which is a
+direction and not a number — there is still no written reference to score against.
+
+**Not adopted, 2026-09-21, and the host is being decommissioned.** Decent in use and not better
+enough to displace a Qwen instance that is shared with the operator's voice-assistant service and
+is the better model in that role; a fine-tune of the same 1.7 B saves a little VRAM and not
+enough to justify a second resident model. `bench/results/ab/README.md` carries the decision and,
+more importantly, what it deliberately does not claim — the truncation bug was never fixed, so
+this row's accuracy was never measured on a working deployment.
+
+---
+
 ## 5. Findings that change the plan
 
 ### 5.1 The streaming finalist cannot be context-biased

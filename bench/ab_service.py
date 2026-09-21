@@ -65,6 +65,10 @@ Usage
         --sample 150 --seed 7 --out bench/results/ab/<name>
 
     py -3.12 bench/ab_service.py report --out bench/results/ab/<name>
+
+That `r2t2` host was decommissioned on 2026-09-21 — the incumbent stays, for reasons recorded in
+`bench/results/ab/README.md` — so the example is a record of the run whose results are committed
+under `bench/results/ab/`, not an address that still answers.
 """
 
 from __future__ import annotations
@@ -389,7 +393,10 @@ def _session_header(events_path: Path) -> dict:
 #: wrapper does not flush the unstable tail, the text simply stops there. That is a property of
 #: how the service is deployed rather than of the model, so it is counted separately and never
 #: folded into an error rate: a truncated answer is not a mis-recognised one, it is a missing
-#: one, and the fix is a `finish` call on the far side, not a better model.
+#: one, and the fix is a `finish` call on the far side, not a better model. That fix was never
+#: made — the service was retired first — so every R2T2 run under `bench/results/ab/` carries the
+#: mark, and any future streaming service should be checked for the same habit before its numbers
+#: are believed.
 TRUNCATION_MARK = "|"
 
 

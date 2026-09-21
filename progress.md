@@ -1,9 +1,10 @@
 # progress — kvit-dictate
 
 Written 2026-08-21; §3e and the 2026-09-09 entries in §6 and §8 added then, and the 2026-09-17
-entry in §3e with it. Commit `41ef07e` on `main`.
+entry in §3e with it. Commit `41ef07e` on `main`. §4c added 2026-09-21.
 
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks),
+`bench/results/ab/README.md` (the service A/B runs and what was decided from them),
 `docs/supported-targets.md` (measurements + open questions §9) and
 `tools/kvit-speech/README.md` (the local model's measurement record). This file is only: what
 works, what does not, and what to do next.
@@ -525,6 +526,8 @@ since: 335–700 chars/s into real targets under `sendinput`, and 1800–4550 ch
   `"Hi."` — both 5-byte strings, and the log contains two 5-byte commits (2026-08-21 00:12–00:13),
   both of which the operator pressed Esc on. Consistent with hallucination; not proof, since a real
   5-byte word is equally possible. The transcript-log test above is what would settle it.
+  **Counted, 2026-09-20:** handed 65 open-microphone clips from the real corpus, this model
+  invented words on **65 of them** — §4c. It is not a tendency, it is what it does with silence.
 * **Clicking or typing ends a session.** By design (plan.md §1.8). The sequence is: focus the
   target, *then* `Win+Y`, then do not touch the mouse. The log now names the gesture.
 * **`bench/CANDIDATES.md` §4 is contradicted by testing.** It names Nemotron and zipformer as the
@@ -595,6 +598,47 @@ real microphone with a fan or a conversation in the room is the case not covered
 one the docstring's "detects sound, not speech" is really about.
 
 **The client (C++) has no VAD at all**, which was not the design — see §8.
+
+---
+
+## 4c. The service A/B, and the model that is not replacing Qwen — 2026-09-21
+
+`bench/ab_service.py` replays the corpus on H: through two transcription services and compares
+them clip by clip. Three runs are recorded in `bench/results/ab/README.md`, which is where the
+numbers and the caveats live. This is what came of them.
+
+**`netease-youdao/Confucius4-R2T2` was stood up on the LAN, used, and is not being adopted.** It
+is a streaming fine-tune of the model that ships — Qwen3-ASR-1.7B — trained for append-only
+output, and on 396 clips of real dictation it was decent: service latency indistinguishable from
+the incumbent's, technical vocabulary better by inspection, and **3 hallucinations over 65
+open-microphone clips against the incumbent's 65 of 65.** In use it did the job and never made
+the case for itself.
+
+**The reason it goes is operational, and worth stating plainly so it is not mistaken for a
+quality verdict.** The Qwen instance is not only the dictation model: it is shared with the
+operator's voice-assistant service, and for that service Qwen is the better model, so it is
+resident either way. R2T2 would have been a second resident model for a gain nobody could
+demonstrate — and being a fine-tune of the same 1.7 B it saves a little VRAM, not enough to
+matter. The host is being decommissioned. If the question is ever reopened, this is a good
+service and the note above is the reason it is not running.
+
+**Two things the decision leaves behind.** Its 2.8 % truncation rate was a wrapper that never
+flushed the unstable tail, and the fix was on the far side, so R2T2's accuracy was never measured
+on a working deployment and now will not be; `adjudicate.md`, the only route from divergence to
+an accuracy number, was never scored. And the 65-of-65 figure is §4's `"Yeah."` bullet in its
+measured form: `/v1/audio/vad` on strixhalo (§3b) is not a refinement of the pipeline, it is the
+only thing standing between an invented word and the document.
+
+Two other runs sit in the same directory and are worth carrying:
+
+* **The noise floor**, which nothing here had measured. The incumbent against itself, same audio,
+  same settings: 0.1 % normalised word divergence, 97.7 % of clips identical after normalising.
+  Any divergence under about 2 % of clips is a service disagreeing with itself, and every other
+  comparison should be read against that number.
+* **The vocabulary list earns its place, and is not free.** Nine real terms as the endpoint's
+  `prompt` changed 21.4 % of clips — an order of magnitude past the floor — reliably fixing the
+  nouns it names and perturbing everything else in both directions. Short and real, not a
+  dictionary. `docs/setup.md` says the same thing to the user.
 
 ---
 

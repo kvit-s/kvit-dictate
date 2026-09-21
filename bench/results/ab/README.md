@@ -14,6 +14,43 @@ narrower question against the corpus that does exist — `src/corpus.h`'s captur
 
 ---
 
+## Outcome — the incumbent stays, and the R2T2 host comes down (2026-09-21)
+
+**Decided: `Qwen/Qwen3-ASR-1.7B` on `strixhalo.lan:10301` keeps the dictation traffic, and the
+R2T2 wrapper is being removed from the server.** The three runs below are unchanged; this
+section is what was done with them.
+
+The deciding reason is not in the tables below and should not be read out of them. Used for real
+dictation, R2T2 was **decent** — it did the job, and nothing about using it said "switch". It was
+also not noticeably better than the incumbent, and the incumbent is not only a dictation model on
+this network: the same Qwen instance serves the operator's voice-assistant service, and for that
+service Qwen is the better model. So the choice was one model resident for two products against
+two models resident for one each, with no quality argument for the second. R2T2 is a fine-tune of
+Qwen3-ASR-1.7B, so its footprint is somewhat smaller — the operator's judgement, not a
+measurement here — but only somewhat, and not enough to pay for a second resident model.
+
+**What this does not settle, and the record should not be read as R2T2 failing.**
+
+* It won the one reference-free comparison below that had a clear winner: 3 hallucinations over
+  65 open-microphone clips against the incumbent's 65 of 65.
+* Its truncation (finding 2) was never fixed. The fix was a `finish_streaming_transcribe` call on
+  the far side, and the far side is being taken down, so its accuracy was never measured on a
+  deployment that was working properly.
+* `adjudicate.md` — the only route from divergence to an accuracy number — was never scored and
+  now will not be. It is gitignored; the audio it points at is still in the corpus on H: if this
+  is ever picked up again.
+
+This is a service worth using. The reason it is not running is operational, not quality.
+
+**Two consequences that outlive the decision.** `vad_gate=true` in
+`server/kvit_asr/backends/openai_http.py` stays load-bearing — the model that ships is the one
+that invented words on *every* non-speech clip it was handed, and the gate is the only thing
+between that and the document. And the endpoints named in the manifests below,
+`192.168.138.186:10311` and `strixhalo.lan:10311`, no longer answer: rerunning any R2T2 row here
+means standing the service back up first.
+
+---
+
 ## 2026-09-20-qwen-vs-r2t2
 
 `Qwen/Qwen3-ASR-1.7B` at `strixhalo.lan:10301` (the incumbent — what `settings.json` points at)
