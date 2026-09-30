@@ -47,6 +47,9 @@
 // CryptProtectData and the base64 codec for `server.api_key_dpapi`. WIN32_LEAN_AND_MEAN leaves
 // wincrypt.h out of windows.h, so it is named here.
 #include <wincrypt.h>
+// GetSaveFileNameW/GetOpenFileNameW for "Save settings…" and "Restore settings…"; likewise left
+// out of windows.h by WIN32_LEAN_AND_MEAN.
+#include <commdlg.h>
 #include <commctrl.h>
 #include <shlobj.h>
 #include <uxtheme.h>
@@ -1253,6 +1256,33 @@ Status Settings::validate() const {
 
 // ─── Paths ──────────────────────────────────────────────────────────────────────────────────
 
+std::string suggested_settings_file_name(const Settings& s) {
+    // The host: after the scheme, up to the port, path or query.
+    std::string_view url = s.server.url;
+    if (const size_t scheme = url.find("://"); scheme != std::string_view::npos) {
+        url.remove_prefix(scheme + 3);
+    }
+    if (const size_t at = url.find('@'); at != std::string_view::npos) url.remove_prefix(at + 1);
+    std::string name(url.substr(0, url.find_first_of(":/?#")));
+
+    // The model's last path segment: `qwen/qwen3-asr-1.7b` says the same as `qwen3-asr-1.7b`.
+    std::string_view model = s.server.model;
+    if (const size_t slash = model.find_last_of('/'); slash != std::string_view::npos) {
+        model.remove_prefix(slash + 1);
+    }
+    if (!model.empty()) {
+        if (!name.empty()) name += ' ';
+        name += model;
+    }
+    if (name.empty()) return "settings";
+
+    for (char& c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || std::strchr("<>:\"/\\|?*", c) != nullptr) c = '_';
+    }
+    return name;
+}
+
 std::filesystem::path default_settings_path() {
     std::filesystem::path base = known_folder(FOLDERID_LocalAppData);
     if (base.empty()) return {};
@@ -1988,6 +2018,10 @@ enum : int {
     kIdNormalizerUrl,
     kIdNormalizerTest,
     kIdNormalizerStatus,
+    // Beside "Restore defaults": a copy of the whole dialog to a file, and back. For trying one
+    // speech service after another and being able to return to the one that worked.
+    kIdSaveSnapshot,
+    kIdRestoreSnapshot,
 };
 
 constexpr int kPageCount = 5;
@@ -3015,7 +3049,8 @@ void apply_dialog_theme(HWND dlg, DialogState& st, bool dark) {
     // to be put back explicitly on the way to light, and OK has to be put back as the *default*
     // button specifically, or Enter would stop being the accept key.
     const struct { int id; bool is_default; } push_buttons[] = {
-        {kIdOk, true}, {kIdCancel, false}, {kIdDefaults, false}};
+        {kIdOk, true},           {kIdCancel, false},          {kIdDefaults, false},
+        {kIdSaveSnapshot, false}, {kIdRestoreSnapshot, false}};
     for (const auto& b : push_buttons) {
         HWND h = GetDlgItem(dlg, b.id);
         if (h == nullptr) continue;
@@ -3488,6 +3523,115 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
     return true;
 }
 
+// ─── Save settings… / Restore settings… ─────────────────────────────────────────────────────
+//
+// A saved copy is an ordinary settings.json, written by the same serialiser and read back by the
+// same strict parser as the real one, so there is no second format to drift out of step. It is
+// taken from the *controls*, not from the file on disk: what is saved is what the user is looking
+// at, unapplied edits included. Restoring fills the controls and nothing else: OK applies it and
+// Cancel still means Cancel, exactly as with "Restore defaults".
+//
+// The API key travels as the DPAPI blob settings.json itself holds, so a saved copy brings its
+// key back for this Windows user on this machine and for nobody else (ServerSettings::api_key).
+
+// %LOCALAPPDATA%\kvit-dictate\saved, beside the live file. Only a starting folder: the file
+// dialog goes wherever the user takes it.
+std::filesystem::path snapshot_directory() {
+    const std::filesystem::path live = default_settings_path();
+    return live.empty() ? std::filesystem::path{} : live.parent_path() / L"saved";
+}
+
+// Said in the title bar, because it is the one place visible from every tab — a restore that
+// filled in the Server page while the user was looking at Injection would otherwise look like
+// nothing happened.
+void set_dialog_note(HWND dlg, const std::wstring& note) {
+    SetWindowTextW(dlg, (L"kvit-dictate settings — " + note).c_str());
+}
+
+void save_snapshot(HWND dlg, DialogState& st) {
+    Settings s;
+    if (!read_controls(dlg, st, s)) return;  // it has already said which field is wrong
+
+    const std::filesystem::path dir = snapshot_directory();
+    std::error_code ec;
+    if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+    const std::wstring initial_dir = dir.wstring();
+
+    wchar_t file[MAX_PATH * 2] = {};
+    const std::wstring suggested = wide(suggested_settings_file_name(s));
+    suggested.copy(file, (std::min)(suggested.size(), std::size(file) - 1));
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = dlg;
+    ofn.lpstrFilter = L"Settings (*.json)\0*.json\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(file));
+    ofn.lpstrInitialDir = initial_dir.empty() ? nullptr : initial_dir.c_str();
+    ofn.lpstrDefExt = L"json";
+    ofn.lpstrTitle = L"Save settings";
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return;  // cancelled
+
+    const std::filesystem::path path(file);
+    if (const Status w = save_settings(s, path); !w.ok()) {
+        MessageBoxW(dlg, (L"The settings could not be saved.\r\n\r\n" + wide(w.message())).c_str(),
+                    L"kvit-dictate settings", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    set_dialog_note(dlg, L"saved as " + path.filename().wstring());
+}
+
+void restore_snapshot(HWND dlg, DialogState& st) {
+    const std::filesystem::path dir = snapshot_directory();
+    const std::wstring initial_dir = dir.wstring();
+
+    wchar_t file[MAX_PATH * 2] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = dlg;
+    ofn.lpstrFilter = L"Settings (*.json)\0*.json\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(file));
+    ofn.lpstrInitialDir = initial_dir.empty() ? nullptr : initial_dir.c_str();
+    ofn.lpstrTitle = L"Restore settings";
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;  // cancelled
+
+    const std::filesystem::path path(file);
+    Result<Settings> loaded = load_settings(path);
+    if (!loaded) {
+        // The strict parser's own message, which names the field — the same one a broken
+        // settings.json gets at startup. Nothing in the dialog has changed.
+        MessageBoxW(dlg,
+                    (L"That file could not be used, so nothing was changed.\r\n\r\n" +
+                     wide(loaded.status().message()))
+                        .c_str(),
+                    L"kvit-dictate settings", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    Settings s = std::move(*loaded);
+    // Kept from the running configuration, for "Restore defaults"'s reason: which models.json
+    // entry exists is a fact about this installation, not a preference a file can carry.
+    s.model_id = st.settings.model_id;
+    s.normalise();
+    // parse_settings drops a key it cannot decrypt rather than refusing the file (it logs that),
+    // and here the user is looking: say so, or the first sign is a refused key at Test.
+    const Result<std::string> text = read_file(path, kSettingsMaxBytes);
+    if (s.server.api_key.empty() && text &&
+        text->find("\"api_key_dpapi\"") != std::string::npos) {
+        MessageBoxW(dlg,
+                    L"This file's API key was saved by another Windows user or on another "
+                    L"machine, so it cannot be read here. Everything else was restored; type the "
+                    L"key again on the Server page.",
+                    L"kvit-dictate settings", MB_OK | MB_ICONINFORMATION);
+    }
+    st.settings = std::move(s);
+    load_controls(dlg, st);
+    set_dialog_note(dlg, L"restored from " + path.filename().wstring() +
+                             L" — OK applies it, Cancel keeps what you had");
+}
+
 // ─── Construction ───────────────────────────────────────────────────────────────────────────
 
 constexpr int kPageWidth = 700;   // logical px, two columns
@@ -3740,11 +3884,20 @@ void build_controls(HWND dlg, DialogState& st) {
         {L"OK", kIdOk, 0, BS_DEFPUSHBUTTON},
         {L"Cancel", kIdCancel, 1, BS_PUSHBUTTON},
         {L"Restore defaults", kIdDefaults, 2, BS_PUSHBUTTON},
+        {L"Save settings…", kIdSaveSnapshot, 3, BS_PUSHBUTTON},
+        {L"Restore settings…", kIdRestoreSnapshot, 4, BS_PUSHBUTTON},
     };
+    // OK and Cancel on the right; the three that load or keep a whole set of values on the left,
+    // in a row, because they are one family and "Restore defaults" is its first member.
+    const int left_w[] = {px(st, 140), px(st, 124), px(st, 136)};
     for (const ButtonDef& b : buttons) {
-        const int w = b.id == kIdDefaults ? px(st, 140) : button_w;
+        int w = button_w;
         int x = right - button_w * (b.slot + 1) - px(st, 8) * b.slot;
-        if (b.id == kIdDefaults) x = px(st, kMargin);
+        if (b.slot >= 2) {
+            x = px(st, kMargin);
+            for (int i = 2; i < b.slot; ++i) x += left_w[i - 2] + px(st, 8);
+            w = left_w[b.slot - 2];
+        }
         HWND h = CreateWindowExW(0, L"BUTTON", b.text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | b.style,
                                  x, button_y, w, button_h, dlg,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(b.id)), inst,
@@ -3964,6 +4117,12 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     load_controls(hwnd, *st);
                     return 0;
                 }
+                case kIdSaveSnapshot:
+                    save_snapshot(hwnd, *st);
+                    return 0;
+                case kIdRestoreSnapshot:
+                    restore_snapshot(hwnd, *st);
+                    return 0;
                 case kIdSessionNever:
                     EnableWindow(GetDlgItem(hwnd, kIdSessionMs),
                                  IsDlgButtonChecked(hwnd, kIdSessionNever) != BST_CHECKED);

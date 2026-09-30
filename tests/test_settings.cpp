@@ -662,6 +662,30 @@ KD_TEST(settings, an_api_key_that_could_end_a_header_line_is_refused) {
     KD_CHECK(kd::validate_api_key("").empty());
 }
 
+// ─── Save settings… (the file name it offers) ───────────────────────────────────────────────
+
+KD_TEST(settings, a_saved_copy_is_offered_a_name_that_says_which_setup_it_is) {
+    kd::Settings s;
+    KD_CHECK_EQ(kd::suggested_settings_file_name(s), std::string("settings"));
+
+    s.server.url = "http://strixhalo.lan:10301";
+    KD_CHECK_EQ(kd::suggested_settings_file_name(s), std::string("strixhalo.lan"));
+
+    // Two OpenRouter setups differ only in the model, so the model is in the name.
+    s.server.url = "https://openrouter.ai/api";
+    s.server.model = "qwen/qwen3-asr-1.7b";
+    KD_CHECK_EQ(kd::suggested_settings_file_name(s), std::string("openrouter.ai qwen3-asr-1.7b"));
+    s.server.model = "openai/whisper-large-v3";
+    KD_CHECK_EQ(kd::suggested_settings_file_name(s),
+                std::string("openrouter.ai whisper-large-v3"));
+
+    // Nothing Windows would refuse in a file name survives.
+    s.server.url = "ws://user@[::1]:10402/";
+    s.server.model = "a:b*c?";
+    const std::string name = kd::suggested_settings_file_name(s);
+    KD_CHECK(name.find_first_of("<>:\"/\\|?*") == std::string::npos);
+}
+
 KD_TEST(settings, reconnect_bounds_must_be_ordered) {
     kd::Settings s;
     s.server.reconnect_initial_ms = 30000;

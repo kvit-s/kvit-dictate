@@ -273,6 +273,8 @@ target_link_libraries(kd_core PUBLIC kd_common_flags kd_wire)
 #   crypt32   settings — CryptProtectData/CryptUnprotectData and the base64 codec, for the speech
 #             service's API key at rest (settings.h, ServerSettings::api_key). DPAPI rather than
 #             a key of our own, because a key this program kept would need somewhere safe to live.
+#   comdlg32  settings — the Save/Open file dialogs behind "Save settings…" and "Restore
+#             settings…".
 #   comctl32  main/settings — InitCommonControlsEx and the common controls used by the settings
 #             dialog; also required for the v6 visual styles the dialog assumes
 #
@@ -301,6 +303,7 @@ target_link_libraries(kd_core PUBLIC
     shcore
     shell32
     comctl32
+    comdlg32
     crypt32
     winhttp
 )

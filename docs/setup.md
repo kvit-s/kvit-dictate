@@ -82,6 +82,21 @@ What a hosted service costs you, compared with your own box:
 * **Clean-up has nowhere to go.** The text service defaults to the speech service's address, and
   OpenRouter has no `/v1/text/normalize`. Leave Clean-up off, or give it your own box's address.
 
+### Trying one service after another
+
+Two buttons at the bottom of Settings let you do this:
+
+* **Save settings…** writes everything the dialog is showing, including edits you haven't applied
+  yet, to a file you name. It starts in `%LOCALAPPDATA%\kvit-dictate\saved` and suggests a name
+  from the service and model, such as `strixhalo.lan.json` or
+  `openrouter.ai qwen3-asr-1.7b.json`.
+* **Restore settings…** loads such a file into the dialog. The title bar says which file it
+  came from. **OK** applies it; **Cancel** keeps what you had.
+
+So: save your working setup, experiment, and restore it when you're done. A saved file is an
+ordinary `settings.json`, and its API key is encrypted the same way. It restores the key for you
+on this machine. For anyone else, it restores everything except the key.
+
 ---
 
 ## 0.1 If you do not have a speech service

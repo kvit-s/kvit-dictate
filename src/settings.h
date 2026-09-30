@@ -487,6 +487,12 @@ Status save_settings(const Settings& s, const std::filesystem::path& file);
 Result<Settings> parse_settings(std::string_view json_text);
 std::string serialize_settings(const Settings& s);
 
+// The file name "Save settings…" offers, without the extension: the speech service's host and
+// the last part of the model, so several saved setups can be told apart in a folder listing —
+// `openrouter.ai qwen3-asr-1.7b`, `strixhalo.lan`. `settings` when there is no server. Characters
+// Windows refuses in a file name become `_`.
+std::string suggested_settings_file_name(const Settings& s);
+
 // ─── The settings dialog ────────────────────────────────────────────────────────────────────
 //
 // Plain Win32, built programmatically (no .rc, no dialog template — CMakeLists links no resource
