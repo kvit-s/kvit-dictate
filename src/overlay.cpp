@@ -54,7 +54,9 @@
 //
 //  6. **Fallback determinism.** Force a low-confidence anchor (dictate into a WSLg window, or
 //     set anchor.min_confidence to 1.0 in settings). The overlay must move to exactly one
-//     defined place — bottom-centre of the target's monitor — and stay there.
+//     defined place — beside the line being dictated into, on the side with more of the screen,
+//     or bottom-centre of the target's monitor if there was no anchor inside the target window
+//     when it appeared — and stay there however much text it collects.
 //     Failure looks like: flapping between the inline position and the pill on alternate
 //     commits. plan.md §1.5 calls that out specifically; the hysteresis that prevents it lives
 //     in anchor.cpp, but this is where it is visible.
@@ -757,6 +759,11 @@ struct OverlayCore {
     std::string pending;
     std::string unstable;
     std::optional<anchor::Anchor> anchor;
+    // The floating pill's position, fixed for as long as it is on screen: the anchor it latched
+    // and the foreground window that was the target when it did. Cleared by apply_visibility()
+    // on hide. See anchor_for_placement().
+    std::optional<anchor::Anchor> pill_anchor;
+    HWND pill_foreground = nullptr;
 
     bool violation = false;
     std::string violation_reason;
@@ -935,7 +942,11 @@ struct OverlayCore {
     // ── Geometry ────────────────────────────────────────────────────────────────────────────
 
     [[nodiscard]] OverlayMode effective_mode() const noexcept;
-    [[nodiscard]] anchor::Rect monitor_work_area_and_dpi(uint32_t& dpi_out) const;
+    // The anchor layout_overlay is given: the live one, except for the floating pill, which
+    // latches the first one inside the target window. Not const — it does the latching.
+    [[nodiscard]] std::optional<anchor::Anchor> anchor_for_placement(OverlayMode em);
+    [[nodiscard]] anchor::Rect monitor_work_area_and_dpi(const std::optional<anchor::Anchor>& at,
+                                                         uint32_t& dpi_out) const;
 
     // ── Painting ────────────────────────────────────────────────────────────────────────────
 
@@ -1095,10 +1106,40 @@ OverlayMode OverlayCore::effective_mode() const noexcept {
     return mode;
 }
 
-anchor::Rect OverlayCore::monitor_work_area_and_dpi(uint32_t& dpi_out) const {
+std::optional<anchor::Anchor> OverlayCore::anchor_for_placement(OverlayMode em) {
+    if (em != OverlayMode::FloatingPill) {
+        return anchor;  // Inline follows the estimate; StatusOnly ignores it
+    }
+
+    // The pill takes the anchor once, when it appears, and keeps it until it hides — see the
+    // FloatingPill branch of layout_overlay for why. A new foreground window is a new target, so
+    // it starts the choice over rather than leaving the pill next to the window the user left.
+    HWND fg = GetForegroundWindow();
+    if (fg != pill_foreground) {
+        pill_foreground = fg;
+        pill_anchor.reset();
+    }
+
+    // Only an anchor inside the target window is "near the target". latest_anchor_ in main.cpp is
+    // replaced, never cleared, so without this a click from a window the user has since
+    // Alt-Tabbed away from would pin the pill beside the wrong application. Physical pixels on
+    // both sides, the process being per-monitor DPI aware v2. Nothing latched is re-tried on the
+    // next paint: the first anchor to land in the target moves the pill there, once.
+    if (!pill_anchor.has_value() && anchor.has_value() && fg != nullptr) {
+        RECT wr{};
+        const POINT pt{anchor->insertion_point.x, anchor->insertion_point.y};
+        if (GetWindowRect(fg, &wr) && PtInRect(&wr, pt)) {
+            pill_anchor = anchor;
+        }
+    }
+    return pill_anchor;
+}
+
+anchor::Rect OverlayCore::monitor_work_area_and_dpi(const std::optional<anchor::Anchor>& at,
+                                                    uint32_t& dpi_out) const {
     HMONITOR mon = nullptr;
-    if (anchor.has_value()) {
-        POINT pt{anchor->insertion_point.x, anchor->insertion_point.y};
+    if (at.has_value()) {
+        POINT pt{at->insertion_point.x, at->insertion_point.y};
         mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     } else {
         // No anchor: the target's monitor is the next best thing, and the foreground window is
@@ -1170,12 +1211,13 @@ HRESULT OverlayCore::paint_once() {
         return hr;
     }
 
+    const OverlayMode em = effective_mode();
+    const std::optional<anchor::Anchor> placement_anchor = anchor_for_placement(em);
+
     uint32_t monitor_dpi = USER_DEFAULT_SCREEN_DPI;
-    const anchor::Rect work = monitor_work_area_and_dpi(monitor_dpi);
+    const anchor::Rect work = monitor_work_area_and_dpi(placement_anchor, monitor_dpi);
     dpi = monitor_dpi;
     const float scale = static_cast<float>(monitor_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
-
-    const OverlayMode em = effective_mode();
 
     // ── Build the strings ───────────────────────────────────────────────────────────────────
 
@@ -1504,7 +1546,7 @@ HRESULT OverlayCore::paint_once() {
 
     // ── Place ───────────────────────────────────────────────────────────────────────────────
 
-    const anchor::Anchor placement = anchor.value_or(anchor::Anchor{});
+    const anchor::Anchor placement = placement_anchor.value_or(anchor::Anchor{});
     const anchor::Rect rect = layout_overlay(placement, box_w_px, box_h_px, work, em);
     if (rect.empty()) {
         return S_OK;
@@ -1526,7 +1568,8 @@ HRESULT OverlayCore::paint_once() {
                     to_string(em), rect.left, rect.top, rect.width(), rect.height(), work.left,
                     work.top, work.width(), work.height(),
                     work.empty() ? " EMPTY WORK AREA - the final clamp was skipped" : "",
-                    anchor.has_value() ? anchor::to_string(anchor->source) : "none",
+                    placement_anchor.has_value() ? anchor::to_string(placement_anchor->source)
+                                                 : "none",
                     placement.insertion_point.x, placement.insertion_point.y, dpi);
     }
 
@@ -1863,6 +1906,9 @@ void OverlayCore::apply_visibility() {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     } else {
         ShowWindow(hwnd, SW_HIDE);
+        // The next time the pill appears it is for a new session, possibly in a new place.
+        pill_anchor.reset();
+        pill_foreground = nullptr;
     }
 }
 
@@ -2572,16 +2618,43 @@ anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int3
         }
 
         case OverlayMode::FloatingPill: {
-            // plan.md §1.5's deterministic degradation: position independent of the caret, so it
-            // cannot flap as the estimate changes. Bottom-centre of the target's monitor.
+            // plan.md §1.5's "floating pill near the target". This used to be bottom-centre of
+            // the target's monitor unconditionally, on the argument that any use of the anchor
+            // would make the pill follow the caret and flap. The first user to pick the pill
+            // reported it as "always in the centre down the screen": the click was at y=1677 of
+            // 2160 and the pill at 2020, a third of a screen from the field being dictated into.
             //
-            // "Near the target window" is implemented as "on the target's monitor": this
-            // function is given the monitor work area and no target rectangle, and inventing one
-            // from the anchor would reintroduce exactly the caret dependence the pill exists to
-            // remove.
+            // The flapping is prevented where it arises instead. OverlayCore hands this function
+            // the anchor *as it was when the pill appeared*, and holds it for as long as the pill
+            // stays up, so the position is chosen once and not re-derived from every estimate.
+            // `source == None` means it had no anchor inside the target window to give, and the
+            // pill falls back to the monitor edge below.
             if (work.empty()) {
                 left = a.insertion_point.x - text_width_px / 2;
                 top = a.insertion_point.y;
+            } else if (a.source != anchor::Source::None) {
+                // Centred on the anchor, because X is the unreliable half of a click anchor
+                // (anchor.h) and a pill hung off one end of it would exaggerate the error.
+                left = a.insertion_point.x - text_width_px / 2;
+
+                // The side is picked from where the line sits on the monitor, NOT from whether
+                // this particular pill fits below it. The pill grows and shrinks all session —
+                // a status dot, then eight lines of text, then just the buttons — and a
+                // fits-below test would flip it above the line and back as it did. Whichever half
+                // of the work area the line is not in always has room for any pill.
+                //
+                // The gap comes from the work area for the reason `edge_margin` does, and not
+                // from `text_height_px` the way the inline `gap` does: a gap that grew with the
+                // pill would walk its top edge down the screen as the text arrived. It clears
+                // half a line on each side, because a click anchor with no line height is the
+                // middle of the line and not its top.
+                const int32_t line_height = std::max<int32_t>(0, a.line_height);
+                const int32_t pill_gap = std::max<int32_t>(work.height() / 90, line_height / 2);
+                if (a.insertion_point.y < work.top + work.height() / 2) {
+                    top = a.insertion_point.y + line_height + pill_gap;
+                } else {
+                    top = a.insertion_point.y - pill_gap - text_height_px;
+                }
             } else {
                 left = work.left + (work.width() - text_width_px) / 2;
                 top = work.bottom - text_height_px - edge_margin;

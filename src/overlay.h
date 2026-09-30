@@ -73,9 +73,10 @@ enum class OverlayMode : uint8_t {
     Hidden,
     Inline,        // at the anchor, in the target's text flow. The baseline UX if Phase 0B's
                    // gate is met (plan.md §3 Phase 0B).
-    FloatingPill,  // near the target window, position independent of the caret. The
-                   // deterministic degradation when anchor confidence is low — a defined state,
-                   // not a bug (plan.md §1.5).
+    FloatingPill,  // near the target: placed beside the anchor when it appears and fixed there,
+                   // so it does not follow the caret while it is up. The deterministic
+                   // degradation when anchor confidence is low — a defined state, not a bug
+                   // (plan.md §1.5).
     StatusOnly,    // a small listening indicator, no text preview at all
 };
 
@@ -450,7 +451,9 @@ private:
 //
 // Given an anchor, a measured text size and the work area of the monitor the anchor is on,
 // compute the overlay's rectangle: flipped above the line when there is no room below, clamped
-// horizontally to the monitor, and never covering the anchor's own line. Pure, so the
+// horizontally to the monitor, and never covering the anchor's own line. For the floating pill,
+// `a` is the anchor the pill latched when it appeared; `source == None` means there was none in
+// the target window and places it on the monitor's bottom edge instead. Pure, so the
 // mixed-DPI and multi-monitor cases plan.md §7 gates on are unit-tested rather than eyeballed.
 anchor::Rect layout_overlay(const anchor::Anchor& a, int32_t text_width_px, int32_t text_height_px,
                             const anchor::Rect& monitor_work_area, OverlayMode mode);

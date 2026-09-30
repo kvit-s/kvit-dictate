@@ -177,6 +177,10 @@ kd::anchor::Anchor plain_anchor() {
     return a;
 }
 
+// The floating pill with no anchor in the target window — the case the edge margin is for. With
+// an anchor the pill goes beside it instead; see the "near the target" tests below.
+kd::anchor::Anchor no_anchor() { return Anchor{}; }
+
 // The reporter's monitor.
 constexpr kd::anchor::Rect k4k{0, 0, 3840, 2160};
 
@@ -185,7 +189,7 @@ constexpr kd::anchor::Rect k4k{0, 0, 3840, 2160};
 KD_TEST(overlay, a_tiny_pill_still_clears_the_screen_edge) {
     // The exact case that was reported: a 28x19 status dot on a 4K monitor.
     const kd::anchor::Rect r =
-        kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
+        kd::layout_overlay(no_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
     KD_REQUIRE(!r.empty());
 
     // Comfortably clear of the edge rather than technically inside it. The old behaviour put the
@@ -200,9 +204,9 @@ KD_TEST(overlay, the_edge_margin_does_not_shrink_with_the_overlay) {
     // The defect in one assertion: a shorter overlay must not sit closer to the edge. Deriving
     // the margin from text_height_px is what made it do so.
     const kd::anchor::Rect small =
-        kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
+        kd::layout_overlay(no_anchor(), 28, 19, k4k, OverlayMode::FloatingPill);
     const kd::anchor::Rect large =
-        kd::layout_overlay(plain_anchor(), 600, 120, k4k, OverlayMode::FloatingPill);
+        kd::layout_overlay(no_anchor(), 600, 120, k4k, OverlayMode::FloatingPill);
     KD_CHECK_EQ(k4k.bottom - small.bottom, k4k.bottom - large.bottom);
 }
 
@@ -212,10 +216,10 @@ KD_TEST(overlay, the_edge_margin_scales_with_the_monitor_not_the_dpi_argument) {
     // proportionally more of them.
     constexpr kd::anchor::Rect k1080{0, 0, 1920, 1080};
     const int32_t c4k =
-        k4k.bottom - kd::layout_overlay(plain_anchor(), 28, 19, k4k, OverlayMode::FloatingPill).bottom;
+        k4k.bottom - kd::layout_overlay(no_anchor(), 28, 19, k4k, OverlayMode::FloatingPill).bottom;
     const int32_t c1080 =
         k1080.bottom -
-        kd::layout_overlay(plain_anchor(), 28, 19, k1080, OverlayMode::FloatingPill).bottom;
+        kd::layout_overlay(no_anchor(), 28, 19, k1080, OverlayMode::FloatingPill).bottom;
     KD_CHECK(c4k > c1080);
     KD_CHECK(c1080 >= 20);  // still clear of the edge on a smaller screen
 }
@@ -236,6 +240,75 @@ KD_TEST(overlay, an_unknown_work_area_still_produces_a_rect) {
     const kd::anchor::Rect r =
         kd::layout_overlay(plain_anchor(), 28, 19, none, OverlayMode::FloatingPill);
     KD_CHECK(!r.empty());
+}
+
+// ═══ layout_overlay — the floating pill near the target ═════════════════════════════════════
+//
+// Reported as "I select the floating pill near the target, and it's always in the centre down
+// the screen". It was, by construction — the pill ignored the anchor — and the log showed how
+// far off that was:
+//
+//     overlay placed: mode=FloatingPill rect=[1560,2020 720x50] work=[0,0 3840x2160]
+//                     anchor=last_click(1615,1677) dpi=96
+
+namespace {
+
+Anchor click_at(int32_t x, int32_t y) {
+    Anchor a;
+    a.insertion_point = kd::anchor::Point{x, y};
+    a.line_height = 0;  // a click anchor with no line-height hint: y is the middle of the line
+    a.confidence = kd::anchor::kClickConfidence;
+    a.source = Source::LastClick;
+    return a;
+}
+
+}  // namespace
+
+KD_TEST(overlay, the_pill_sits_beside_the_reported_click_not_at_the_screen_edge) {
+    const Anchor a = click_at(1615, 1677);
+    const kd::anchor::Rect r = kd::layout_overlay(a, 720, 50, k4k, OverlayMode::FloatingPill);
+    // The line is in the lower half, so the pill goes above it, clear of it, and close to it.
+    KD_CHECK(r.bottom < a.insertion_point.y);
+    KD_CHECK(a.insertion_point.y - r.bottom <= 60);
+    // Centred on the click, not on the monitor.
+    KD_CHECK_EQ(r.left + r.width() / 2, a.insertion_point.x);
+}
+
+KD_TEST(overlay, the_pill_goes_below_a_line_in_the_upper_half) {
+    Anchor a = plain_anchor();  // (400, 400), line height 15
+    const kd::anchor::Rect r = kd::layout_overlay(a, 720, 50, k4k, OverlayMode::FloatingPill);
+    KD_CHECK(r.top > a.insertion_point.y + a.line_height);  // does not cover the line
+    KD_CHECK(r.top - (a.insertion_point.y + a.line_height) <= 60);
+    // Centred on x=400 would start at 40: still on the monitor, so not clamped.
+    KD_CHECK_EQ(r.left, 400 - 360);
+}
+
+KD_TEST(overlay, a_growing_pill_does_not_change_sides_or_move_its_near_edge) {
+    // The pill goes from a status dot to eight lines of text and back within one session. A
+    // fits-below rule would flip it over the line when it grew; the edge nearest the line must
+    // instead stay put, for a line in either half of the screen.
+    for (int32_t y : {400, 1677, 2000}) {
+        const Anchor a = click_at(1615, y);
+        const kd::anchor::Rect small = kd::layout_overlay(a, 720, 28, k4k, OverlayMode::FloatingPill);
+        const kd::anchor::Rect large =
+            kd::layout_overlay(a, 720, 300, k4k, OverlayMode::FloatingPill);
+        const bool below = small.top > y;
+        KD_CHECK_EQ(large.top > y, below);
+        if (below) {
+            KD_CHECK_EQ(small.top, large.top);
+        } else {
+            KD_CHECK_EQ(small.bottom, large.bottom);
+        }
+    }
+}
+
+KD_TEST(overlay, the_pill_near_a_screen_corner_stays_on_the_monitor) {
+    const Anchor a = click_at(3830, 2150);
+    const kd::anchor::Rect r = kd::layout_overlay(a, 720, 300, k4k, OverlayMode::FloatingPill);
+    KD_CHECK(r.right <= k4k.right);
+    KD_CHECK(r.left >= k4k.left);
+    KD_CHECK(r.bottom <= k4k.bottom);
+    KD_CHECK(r.bottom < a.insertion_point.y);  // above, as the bottom half demands
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
