@@ -49,10 +49,38 @@ The client launches it on a loopback port it chooses, supervises it, and kills i
 exits — including when the client crashes, because the child is in a job object. You never start
 it yourself unless you want to (§5).
 
-**What it does not do yet:** no API key. If your service wants an `Authorization: Bearer` header,
-this is not yet the way to reach it — that is a settings field and a header, and it is a separate
-argued change rather than a silent omission inside the HTTP client
-(`openai-translator.md` §1.4, §10 item 4).
+### A hosted service that wants an API key (OpenRouter)
+
+Settings → Server has an **API key** box. Leave it empty for a LAN box. Fill it in and the
+translator sends it as `Authorization: Bearer` on every request. For
+[OpenRouter's Qwen3-ASR](https://openrouter.ai/qwen/qwen3-asr-1.7b):
+
+| Field | Value |
+|---|---|
+| Speech service | `https://openrouter.ai/api` (the app adds `/v1/audio/transcriptions`) |
+| Model | `qwen/qwen3-asr-1.7b` |
+| API key | your OpenRouter key |
+
+Test checks the key as well as the address. With a key set, `kvit-asrd` POSTs a form with no
+audio in it before it reports ready: a wrong key gets 401 and Test says *refused the API key*,
+and a good one gets 400 for the missing file. No model runs and nothing is billed.
+
+Where the key lives: `settings.json` holds it encrypted with DPAPI under your Windows user
+(`server.api_key_dpapi`), so the file can be shared without sharing the key. A copy of the file on
+another machine or account loses the key and keeps everything else. The translator gets the key
+through a pipe on its stdin, never on its command line, which other processes can read.
+
+What a hosted service costs you, compared with your own box:
+
+* **Vocabulary hints do nothing.** OpenRouter accepts `prompt` and ignores it.
+* **No VAD gate.** There is no `/v1/audio/vad` there. The translator logs that once per connection
+  and transcribes without it, so a silent stretch can come back as a filler word.
+* **Your audio leaves your network**, to OpenRouter and whichever provider it routes to.
+* **Money, but not much.** $0.0000075 per second of audio in September 2026, about 3¢ per hour.
+  Live preview re-sends the whole utterance every second, so you pay for several times the audio
+  you speak.
+* **Clean-up has nowhere to go.** The text service defaults to the speech service's address, and
+  OpenRouter has no `/v1/text/normalize`. Leave Clean-up off, or give it your own box's address.
 
 ---
 
@@ -374,6 +402,7 @@ TLS on the listening side (§5 applies unchanged).
 | `--language LANG` | `en` | Passed through. Empty means the service's default. |
 | `--finalize-only on\|off` | `on` | Off is live preview. See below. |
 | `--vad-gate on\|off` | `on` | Ask the service's `/v1/audio/vad` route before transcribing. Fails open. |
+| `--api-key-stdin` | off | Read an API key from the first line of stdin and send it as a bearer token. Never an argument, because other processes can read a command line: `Get-Content key.txt \| kvit-asrd.exe --api-key-stdin ...` |
 | `--endpoint-silence-ms MS` | `1500` | How long a pause ends a phrase. |
 | `--log-level LEVEL` | `info` | Diagnostics go to stderr. |
 

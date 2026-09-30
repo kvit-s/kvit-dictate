@@ -125,6 +125,7 @@ OpenAiBackend::OpenAiBackend(OpenAiBackendConfig cfg)
     while (!cfg_.base_url.empty() && cfg_.base_url.back() == '/') cfg_.base_url.pop_back();
     parse_http_url(cfg_.base_url + kTranscriptionsPath, transcribe_url_);
     parse_http_url(cfg_.base_url + kVadPath, vad_url_);
+    http_.set_bearer_token(cfg_.api_key);
 }
 
 OpenAiBackend::~OpenAiBackend() { http_.cancel(); }
@@ -144,8 +145,29 @@ Status OpenAiBackend::load() {
                           "fallback.",
                       st.os_error()};
     }
-    KD_LOG_INFO("speech service reachable at %s (model %s, %s)", cfg_.base_url.c_str(),
-                cfg_.model.c_str(), cfg_.finalize_only ? "finalize-only" : "live preview");
+    if (!cfg_.api_key.empty()) {
+        // See the header: a form with no file, so the service can refuse the key without any
+        // model being asked anything.
+        std::string content_type;
+        const std::string body =
+            encode_multipart({{"model", cfg_.model}}, {}, {}, {}, {}, content_type);
+        const Result<HttpResponse> r = http_.post(transcribe_url_, content_type, body,
+                                                  std::min<uint32_t>(cfg_.timeout_ms, 10000));
+        if (!r) {
+            return Status{StatusCode::Unavailable,
+                          "cannot reach the transcription endpoint at " + cfg_.base_url + " (" +
+                              r.status().message() + ")",
+                          r.status().os_error()};
+        }
+        if (r->status == 401 || r->status == 403) {
+            return Status{StatusCode::Unavailable,
+                          "the speech service at " + cfg_.base_url + " refused the API key (HTTP " +
+                              std::to_string(r->status) + ": " + r->body.substr(0, 200) + ")"};
+        }
+    }
+    KD_LOG_INFO("speech service reachable at %s (model %s, %s, %s)", cfg_.base_url.c_str(),
+                cfg_.model.c_str(), cfg_.finalize_only ? "finalize-only" : "live preview",
+                cfg_.api_key.empty() ? "no API key" : "API key accepted");
     return Status::success();
 }
 
@@ -255,6 +277,17 @@ Status OpenAiBackend::transcribe_batch(const std::vector<int16_t>& pcm, std::str
     const Result<HttpResponse> r = http_.post(transcribe_url_, content_type, body,
                                               cfg_.timeout_ms);
     if (!r) return r.status();
+    if (r->status == 401 || r->status == 403) {
+        // Said in words, because "HTTP 401" is a support question and "the key" is a settings
+        // change. `load` checked the key once; this is the key being revoked, or running out of
+        // credit, since.
+        return Status{StatusCode::Unavailable,
+                      std::string(cfg_.api_key.empty()
+                                      ? "the speech service wants an API key and none is set"
+                                      : "the speech service refused the API key") +
+                          " (HTTP " + std::to_string(r->status) + ": " + r->body.substr(0, 400) +
+                          ")"};
+    }
     if (r->status != 200) {
         return Status{StatusCode::Unavailable,
                       "transcription endpoint returned HTTP " + std::to_string(r->status) + ": " +

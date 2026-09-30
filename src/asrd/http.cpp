@@ -111,6 +111,17 @@ std::string validate_service_url(const std::string& url) {
     return {};
 }
 
+std::string api_key_problem(std::string_view key) {
+    if (key.size() > 1024) return "the API key is longer than 1024 characters";
+    for (const char c : key) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u <= 0x20 || u >= 0x7F) {
+            return "the API key contains a space, a line break or a non-ASCII character";
+        }
+    }
+    return {};
+}
+
 // ─── multipart and WAV ──────────────────────────────────────────────────────────────────────
 
 std::string encode_multipart(const std::vector<std::pair<std::string, std::string>>& fields,
@@ -127,6 +138,13 @@ std::string encode_multipart(const std::vector<std::pair<std::string, std::strin
         out += "\"\r\n\r\n";
         out += value;
         out += "\r\n";
+    }
+    if (file_field.empty()) {
+        out += "--";
+        out += kBoundary;
+        out += "--\r\n";
+        content_type_out = std::string("multipart/form-data; boundary=") + kBoundary;
+        return out;
     }
     out += "--";
     out += kBoundary;
@@ -179,6 +197,7 @@ struct HttpClient::Impl {
     std::mutex mutex;
     HINTERNET in_flight = nullptr;  // the request handle, guarded by `mutex`
     bool cancelled = false;
+    std::string bearer;  // set before the first post(); never logged
 };
 
 HttpClient::HttpClient() : impl_(new Impl()) {}
@@ -204,6 +223,8 @@ void HttpClient::reset_cancel() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->cancelled = false;
 }
+
+void HttpClient::set_bearer_token(std::string token) { impl_->bearer = std::move(token); }
 
 bool HttpClient::cancelled() const noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -276,12 +297,19 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
         return Status{StatusCode::Unavailable, "cancelled before the request was sent"};
     }
 
+    std::string headers = std::string("Content-Type: ") + std::string(content_type) + "\r\n";
+    if (!impl_->bearer.empty()) {
+        if (!api_key_problem(impl_->bearer).empty()) {
+            return Status{StatusCode::InvalidArgument, "the API key cannot be sent as a header"};
+        }
+        headers += "Authorization: Bearer " + impl_->bearer + "\r\n";
+    }
+
     std::wstring whost;
     std::wstring wpath;
     std::wstring wheaders;
     if (!utf8::to_utf16(url.host, whost) || !utf8::to_utf16(url.path, wpath) ||
-        !utf8::to_utf16(std::string("Content-Type: ") + std::string(content_type) + "\r\n",
-                        wheaders)) {
+        !utf8::to_utf16(headers, wheaders)) {
         return Status{StatusCode::InvalidArgument, "URL is not representable as UTF-16"};
     }
 

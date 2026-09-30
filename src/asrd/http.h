@@ -61,6 +61,13 @@ bool parse_http_url(const std::string& url, HttpUrl& out);
 // the reason otherwise.
 std::string validate_service_url(const std::string& url);
 
+// Why `key` cannot be sent as a bearer token, or empty when it can. Printable ASCII with no
+// spaces, and not absurdly long: every provider's keys fit that, and anything else is either a
+// paste accident — a trailing newline, a smart quote — or a header injection. The client applies
+// the same rule to the settings field (`Settings::validate`), so a key it saved is a key this
+// accepts.
+std::string api_key_problem(std::string_view key);
+
 struct HttpResponse {
     uint32_t status = 0;
     std::string body;
@@ -87,6 +94,14 @@ public:
     Result<HttpResponse> post(const HttpUrl& url, std::string_view content_type,
                               std::string_view body, uint32_t timeout_ms);
 
+    // Sent as `Authorization: Bearer <token>` on every post() from now on; empty sends no
+    // `Authorization` header at all, which is what a LAN service that asks for none wants.
+    //
+    // Set once, before the first post(), by whoever owns the client. A token that could end a
+    // header line is refused here as well as at the command line — see `api_key_problem()` —
+    // because this is the call that would put it on the wire.
+    void set_bearer_token(std::string token);
+
     // Abort whatever is in flight, from any thread. Idempotent, and safe when nothing is in
     // flight. Latches: every subsequent post() fails immediately until reset_cancel().
     void cancel();
@@ -100,7 +115,9 @@ private:
 
 // ─── multipart/form-data ────────────────────────────────────────────────────────────────────
 
-// Encode text fields plus one file part, as `openai_http.py::_multipart` does.
+// Encode text fields plus one file part, as `openai_http.py::_multipart` does. An empty
+// `file_field` leaves the file part out, which is how the API-key check asks a question that no
+// model has to answer (backend_openai.h, `OpenAiBackend::load`).
 //
 // Hand-rolled on both sides. The boundary is a fixed string rather than a random one:
 // randomness would need a source and buys nothing here, because a WAV cannot contain the token

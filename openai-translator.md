@@ -21,6 +21,16 @@ What changed against the plan while building it, all of it small:
 * **A second fixture corpus**, `tests/fixtures/stability/`, generated from the Python tracker.
   §5 asks for property tests against it; the protocol corpus cannot express them.
 
+Added afterwards, 2026-09-30, and it closes §10 item 4:
+
+* **An API key, for OpenRouter.** It is the "settings field and a header" §10 predicted, done the
+  way §1.4 asked, with nothing left out in the HTTP client. The field is `server.api_key`,
+  stored DPAPI-encrypted as `server.api_key_dpapi`. It reaches the child as `--api-key-stdin`
+  and a pipe, not as an argument, since other processes can read a command line. It goes on
+  every request as `Authorization: Bearer`. With a key set, `load()` also POSTs a form with no
+  file in it, so a refused key fails `ready` (and Test) instead of the first word. What that
+  service does not do is in `docs/setup.md` under "A hosted service that wants an API key".
+
 This document restores a decision that was made, reversed, and then missed. It is effectively
 **revision 3 of `release-plan.md` §1**, and it exists because revision 2 produced a working
 release that is wrong for the person it was built for.

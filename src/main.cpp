@@ -1080,6 +1080,7 @@ kd::Result<std::wstring> App::resolve_server_url() {
     kd::TranslatorSpec spec;
     spec.service_url = settings_.server.url;
     spec.model = settings_.server.model;
+    spec.api_key = settings_.server.api_key;
     spec.live_preview = settings_.server.live_preview;
     spec.endpoint_silence_ms = settings_.session.endpoint_silence_ms;
     // Revision capture rides with the corpus: it is the same collection, and the same consent.
@@ -3963,6 +3964,7 @@ void App::apply_settings(kd::Settings next) {
     // launched with `--finalize-only on` and went on emitting no `partial` at all.
     const kd::ServerMode previous_mode = settings_.server.mode;
     const bool previous_live_preview = settings_.server.live_preview;
+    const std::string previous_api_key = settings_.server.api_key;
     const uint32_t previous_endpoint_silence_ms = settings_.session.endpoint_silence_ms;
     const bool diagnostics_file_changed =
         next.diagnostics_file_enabled != settings_.diagnostics_file_enabled;
@@ -4036,6 +4038,7 @@ void App::apply_settings(kd::Settings next) {
         settings_.server.mode != previous_mode ||
         settings_.server.model != previous_server_model ||
         settings_.server.live_preview != previous_live_preview ||
+        settings_.server.api_key != previous_api_key ||
         settings_.session.endpoint_silence_ms != previous_endpoint_silence_ms;
 
     if (settings_.server.url != previous_url || translator_spec_changed) {

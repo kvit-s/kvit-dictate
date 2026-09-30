@@ -206,6 +206,33 @@ KD_TEST(asrd_backend, a_file_only_multipart_has_no_stray_field_parts) {
     KD_CHECK_EQ(parts, size_t{2});  // the file part and the terminator
 }
 
+KD_TEST(asrd_backend, a_fields_only_multipart_has_no_file_part) {
+    // The API-key check at load: a form a service must authenticate before it can complain about
+    // the missing file, so a good key costs a 400 and no model is run.
+    std::string content_type;
+    const std::string body =
+        encode_multipart({{"model", "qwen/qwen3-asr-1.7b"}}, {}, {}, {}, {}, content_type);
+    const std::string boundary = content_type.substr(content_type.find('=') + 1);
+    KD_CHECK(body.find("name=\"model\"\r\n\r\nqwen/qwen3-asr-1.7b\r\n") != std::string::npos);
+    KD_CHECK(body.find("filename=") == std::string::npos);
+    const std::string tail = "\r\n--" + boundary + "--\r\n";
+    KD_CHECK_EQ(body.substr(body.size() - tail.size()), tail);
+}
+
+// ─── The API key ────────────────────────────────────────────────────────────────────────────
+
+KD_TEST(asrd_backend, an_api_key_that_could_end_a_header_line_is_refused) {
+    // It goes into `Authorization: Bearer <key>\r\n`. A CR or LF in it would end that line and
+    // start another header of the key's choosing.
+    KD_CHECK(api_key_problem("sk-or-v1-0123456789abcdef").empty());
+    KD_CHECK(api_key_problem("").empty());  // no key is not a bad key
+    KD_CHECK(!api_key_problem("sk-1\r\nX-Evil: 1").empty());
+    KD_CHECK(!api_key_problem("sk-1\n").empty());
+    KD_CHECK(!api_key_problem("sk 1").empty());
+    KD_CHECK(!api_key_problem("sk-\xE2\x80\x9C" "1").empty());  // a smart quote from a paste
+    KD_CHECK(!api_key_problem(std::string(1025, 'a')).empty());
+}
+
 // ─── The utterance buffer ──────────────────────────────────────────────────────────────
 
 KD_TEST(asrd_backend, a_hop_is_due_once_hop_ms_of_audio_has_arrived) {

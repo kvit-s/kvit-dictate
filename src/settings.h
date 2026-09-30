@@ -216,6 +216,17 @@ struct ServerSettings {
     // when it does, the Test button shows what came back.
     std::string model;
 
+    // Optional, Local mode only: sent as `Authorization: Bearer` to the speech service. A LAN box
+    // wants none; a hosted one such as OpenRouter does.
+    //
+    // Plain text here and **only here**. On disk it is `server.api_key_dpapi`, the key encrypted
+    // with CryptProtectData under this Windows user and base64'd, so settings.json can be backed
+    // up, diffed or pasted into a bug report without handing the key over. A file copied to
+    // another user or machine therefore loses its key rather than failing to load: the key is
+    // re-entered, and everything else survives. On the way to the translator it goes through a
+    // pipe, never a command line (translator.h).
+    std::string api_key;
+
     // Live preview in Local mode: `partial`s with a computed `stable_bytes` against a batch
     // model that structurally violates monotonicity. Meaningless in Protocol mode, where the
     // server decides for itself what it publishes.
@@ -255,6 +266,12 @@ struct ServerSettings {
 // ends up being upgraded. Returns an empty string when the URL is usable, and a sentence the
 // user can act on otherwise.
 std::string validate_speech_service_url(std::string_view url);
+
+// Validate an API key: printable ASCII, no spaces, at most 1024 characters. The same rule as
+// kvit-asrd's `api_key_problem()`, so a key this accepts is a key the translator accepts, and
+// none of them can end the header line it is sent on. Empty is valid and means "no key".
+// Returns an empty string when the key is usable, and a sentence the user can act on otherwise.
+std::string validate_api_key(std::string_view key);
 
 // Choose a `mode` for a settings file that has none (openai-translator.md §4.6):
 //

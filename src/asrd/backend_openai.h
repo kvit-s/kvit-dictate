@@ -150,6 +150,10 @@ struct OpenAiBackendConfig {
     uint32_t min_cut_head_ms = 4000;
     uint32_t min_cut_tail_ms = 1000;
     bool vad_gate = true;
+    // Sent as `Authorization: Bearer` on every request when non-empty — a hosted service such as
+    // OpenRouter wants one, a LAN box does not. Arrives on stdin, never on the command line
+    // (main.cpp, `--api-key-stdin`), and is never logged.
+    std::string api_key;
 };
 
 // The utterance buffer, with no network in it. Split out so the hop cadence can be tested
@@ -274,6 +278,13 @@ public:
     // with the user already talking. It is also what makes `ready` mean something: asrd does
     // not emit `ready` unless this succeeded, so a green Test button in the client's settings
     // means the translator *and* the speech host answered.
+    //
+    // With an API key there is one more thing to prove, because a reachable host that refuses
+    // the key would otherwise pass Test and fail on the first word. So `load` also POSTs the
+    // form with no file in it: a service that checks keys answers 401 or 403 before it looks
+    // at the body, and one that accepts the key answers 400 for the missing file. No model runs
+    // and nothing is billed. Only 401 and 403 fail the load; any other answer is the service's
+    // business and the first real request will say more.
     Status load();
 
     // Start a new utterance: clears the window, the frozen prefix and the audio clock.

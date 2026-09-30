@@ -213,6 +213,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     backend_cfg.language = cfg.language;
     backend_cfg.finalize_only = cfg.finalize_only;
     backend_cfg.vad_gate = cfg.vad_gate;
+    backend_cfg.api_key = cfg.api_key;
     OpenAiBackend backend(backend_cfg);
     // Only when there is somewhere to write it: the capture keeps a copy of every posted window,
     // which is the whole utterance on every hop, and nobody should pay that to produce nothing.

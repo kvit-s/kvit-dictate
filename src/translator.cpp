@@ -198,9 +198,12 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     append_quoted_arg(cmd, L"--parent-pid");
     append_quoted_arg(cmd, std::to_wstring(parent_pid));
 
-    // There is deliberately no --api-key, no --backend, no --silero-model and no environment
-    // block: openai-translator.md §1.4 and §4.6. Nothing the user types reaches this command
-    // line except `--service` and `--model`, both of them values rather than arguments.
+    // A switch, not a value: the key itself goes down the child's stdin (see `launch`).
+    if (!spec.api_key.empty()) append_quoted_arg(cmd, L"--api-key-stdin");
+
+    // There is deliberately no --backend, no --silero-model and no environment block:
+    // openai-translator.md §1.4 and §4.6. Nothing the user types reaches this command line except
+    // `--service` and `--model`, both of them values rather than arguments.
     return cmd;
 }
 
@@ -323,6 +326,11 @@ Result<std::string> Translator::start(const TranslatorSpec& spec) {
         return Status{StatusCode::InvalidArgument,
                       "no speech service is configured (docs/protocol.md §10.6)"};
     }
+    // The child reads one line of stdin, so a key with a line break in it would arrive cut short
+    // and fail as "refused" with nothing saying why.
+    if (const std::string why = validate_api_key(spec.api_key); !why.empty()) {
+        return Status{StatusCode::InvalidArgument, why};
+    }
 
     const Result<std::filesystem::path> image = image_path();
     if (!image) return image.status();
@@ -392,8 +400,26 @@ Status Translator::launch(const std::filesystem::path& image, const TranslatorSp
         // Our end must not be inheritable, or the child holds a copy and we never see EOF.
         SetHandleInformation(err_read.get(), HANDLE_FLAG_INHERIT, 0);
     }
-    Handle null_in(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit,
-                               OPEN_EXISTING, 0, nullptr));
+    // stdin is NUL, unless there is an API key to hand over — then it is a pipe that carries the
+    // key and nothing else. The key never touches the command line or an environment block,
+    // both of which other processes can read.
+    Handle child_in;
+    Handle key_write;
+    if (spec.api_key.empty()) {
+        child_in.reset(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &inherit, OPEN_EXISTING, 0, nullptr));
+    } else {
+        HANDLE r = nullptr;
+        HANDLE w = nullptr;
+        if (!CreatePipe(&r, &w, &inherit, 0)) {
+            const DWORD err = GetLastError();
+            im.job.close();
+            return os_failure("CreatePipe (child stdin)", err);
+        }
+        child_in.reset(r);
+        key_write.reset(w);
+        SetHandleInformation(key_write.get(), HANDLE_FLAG_INHERIT, 0);
+    }
 
     const std::wstring cmdline =
         build_translator_command_line(image, spec, port, GetCurrentProcessId());
@@ -401,7 +427,7 @@ Status Translator::launch(const std::filesystem::path& image, const TranslatorSp
     STARTUPINFOEXW si{};
     si.StartupInfo.cb = sizeof si;
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = null_in.get();
+    si.StartupInfo.hStdInput = child_in.get();
     si.StartupInfo.hStdOutput = err_write.get();
     si.StartupInfo.hStdError = err_write.get();
 
@@ -409,8 +435,8 @@ Status Translator::launch(const std::filesystem::path& image, const TranslatorSp
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
     std::vector<uint8_t> attr_buf(attr_size);
     si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
-    HANDLE inherited[2] = {err_write.get(), null_in.get()};
-    const DWORD inherited_count = null_in.valid() ? 2u : 1u;
+    HANDLE inherited[2] = {err_write.get(), child_in.get()};
+    const DWORD inherited_count = child_in.valid() ? 2u : 1u;
     if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size) ||
         !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                    inherited, inherited_count * sizeof(HANDLE), nullptr,
@@ -444,6 +470,23 @@ Status Translator::launch(const std::filesystem::path& image, const TranslatorSp
 
     Handle proc(pi.hProcess);
     Handle thread(pi.hThread);
+    if (key_write.valid()) {
+        // Written while the child is still suspended. A key is far smaller than a pipe's buffer,
+        // so this cannot block on a reader that has not started; closing the write end is what
+        // gives the child its end of input.
+        std::string line = spec.api_key + "\n";
+        DWORD written = 0;
+        const BOOL ok = WriteFile(key_write.get(), line.data(), static_cast<DWORD>(line.size()),
+                                  &written, nullptr);
+        const DWORD err = GetLastError();
+        SecureZeroMemory(line.data(), line.size());
+        key_write.close();
+        if (!ok || written != line.size()) {
+            TerminateProcess(proc.get(), 1);
+            im.job.close();
+            return os_failure("WriteFile (API key to the translator)", err);
+        }
+    }
     if (!AssignProcessToJobObject(im.job.get(), proc.get())) {
         const DWORD err = GetLastError();
         TerminateProcess(proc.get(), 1);
@@ -465,7 +508,7 @@ Status Translator::launch(const std::filesystem::path& image, const TranslatorSp
     im.running.store(true);
     // Drop our copy of the write end, or the log reader never sees end of stream.
     err_write.close();
-    null_in.close();
+    child_in.close();
 
     im.log_thread = std::thread([&im] { im.log_main(); });
 

@@ -54,6 +54,7 @@ struct Options {
     uint32_t parent_pid = 0;
     uint32_t max_connections = 1;
     kd::log::Level log_level = kd::log::Level::Info;
+    bool api_key_stdin = false;
     TranslatorConfig translator;
 };
 
@@ -74,6 +75,9 @@ void print_usage() {
         "  --max-connections N         default 1. 0 = unlimited. Extras get server_busy.\n"
         "  --finalize-only on|off      default on. Off is live preview, and is labelled.\n"
         "  --vad-gate on|off           default on. Fails open.\n"
+        "  --api-key-stdin             read an API key from the first line of stdin and send it\n"
+        "                              as Authorization: Bearer. The key is never an argument:\n"
+        "                              other processes can read a command line.\n"
         "  --endpoint-silence-ms MS    default 1500\n"
         "  --stability-n N             default 2\n"
         "  --stability-m M             default 3\n"
@@ -235,6 +239,10 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
             else opt.translator.stability.hold_ms_t = value;
             continue;
         }
+        if (a == "--api-key-stdin") {
+            opt.api_key_stdin = true;
+            continue;
+        }
         if (a == "--hostile-stability") {
             opt.translator.hostile_stability = true;
             continue;
@@ -255,14 +263,49 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
         return false;
     }
 
-    // There is deliberately no --api-key, no --silero-model and no --backend. Each is a separate,
-    // later, argued addition; openai-translator.md §1.4 records why a silent omission inside the
-    // HTTP client would be worse than an absent flag.
+    // There is deliberately no --api-key that takes a value: the key arrives on stdin under
+    // --api-key-stdin, because every process running as this user can read a command line. And
+    // still no --silero-model and no --backend; openai-translator.md §1.4 records why each is a
+    // separate, argued addition.
     const std::string why = validate_service_url(opt.translator.service);
     if (!why.empty()) {
         std::fprintf(stderr, "kvit-asrd: %s\n", why.c_str());
         print_usage();
         exit_code = 2;
+        return false;
+    }
+    return true;
+}
+
+// The first line of stdin, which is where the client puts the API key (translator.cpp writes it
+// into a pipe and closes it). A console works too, for somebody running this by hand — the key
+// echoes there, which is their terminal and their call.
+bool read_api_key(std::string& key, std::string& why) {
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+        why = "--api-key-stdin was given but this process has no stdin";
+        return false;
+    }
+    std::string buf;
+    for (;;) {
+        char chunk[256];
+        DWORD n = 0;
+        if (!ReadFile(in, chunk, sizeof chunk, &n, nullptr) || n == 0) break;
+        buf.append(chunk, n);
+        SecureZeroMemory(chunk, sizeof chunk);
+        if (buf.find('\n') != std::string::npos || buf.size() > 4096) break;
+    }
+    const size_t eol = buf.find_first_of("\r\n");
+    key.assign(buf, 0, eol == std::string::npos ? buf.size() : eol);
+    SecureZeroMemory(buf.data(), buf.size());
+    if (key.empty()) {
+        why = "--api-key-stdin was given but stdin held no key";
+        return false;
+    }
+    if (const std::string bad = api_key_problem(key); !bad.empty()) {
+        SecureZeroMemory(key.data(), key.size());
+        key.clear();
+        why = "--api-key-stdin: " + bad;
         return false;
     }
     return true;
@@ -306,6 +349,13 @@ int run(int argc, char** argv) {
     Options opt;
     int exit_code = 0;
     if (!parse_args(argc, argv, opt, exit_code)) return exit_code;
+    if (opt.api_key_stdin) {
+        std::string why;
+        if (!read_api_key(opt.translator.api_key, why)) {
+            std::fprintf(stderr, "kvit-asrd: %s\n", why.c_str());
+            return 2;
+        }
+    }
 
     kd::log::Config log_cfg;
     log_cfg.level = opt.log_level;
@@ -316,9 +366,11 @@ int run(int argc, char** argv) {
     log_cfg.to_debugger = false;
     kd::log::init(log_cfg);
 
-    KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s", opt.translator.service.c_str(),
-                opt.translator.model.c_str(), opt.translator.finalize_only ? "finalize-only" : "live-preview",
-                opt.translator.vad_gate ? "on" : "off");
+    KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s api_key=%s",
+                opt.translator.service.c_str(), opt.translator.model.c_str(),
+                opt.translator.finalize_only ? "finalize-only" : "live-preview",
+                opt.translator.vad_gate ? "on" : "off",
+                opt.translator.api_key.empty() ? "none" : "set");
     if (opt.translator.hostile_stability) {
         KD_LOG_ERROR(
             "--hostile-stability is on. This build deliberately emits non-conforming "

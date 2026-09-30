@@ -20,6 +20,9 @@
 
 #include "translator.h"
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+// Must follow winsock2.h.
 #include <windows.h>
 
 #include "ipc_client.h"
@@ -27,7 +30,10 @@
 #include "settings.h"
 #include "util/utf8.h"
 
+#include <atomic>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -44,6 +50,92 @@ std::wstring command_line_for(const std::string& service, const std::string& mod
 bool contains(const std::wstring& haystack, const wchar_t* needle) {
     return haystack.find(needle) != std::wstring::npos;
 }
+
+// Just enough of a speech service to see what a real, spawned kvit-asrd sends it: every request
+// is answered with one fixed status and body, and the head of each is kept. The full stub, with
+// routes and scripts, is test_asrd_session.cpp's and lives in-process; this one exists because
+// the only way to see the stdin handoff is from outside a child that was really launched.
+class RecordingService {
+public:
+    explicit RecordingService(int status, std::string body)
+        : status_(status), body_(std::move(body)) {
+        WSADATA d{};
+        WSAStartup(MAKEWORD(2, 2), &d);
+    }
+    ~RecordingService() {
+        if (listen_ != INVALID_SOCKET) ::closesocket(listen_);
+        if (thread_.joinable()) thread_.join();
+        WSACleanup();
+    }
+
+    bool start() {
+        listen_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listen_ == INVALID_SOCKET) return false;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(listen_, 8) != 0) return false;
+        int len = sizeof addr;
+        ::getsockname(listen_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] {
+            for (;;) {
+                const SOCKET fd = ::accept(listen_, nullptr, nullptr);
+                if (fd == INVALID_SOCKET) return;
+                serve(fd);
+                ::closesocket(fd);
+            }
+        });
+        return true;
+    }
+
+    [[nodiscard]] std::string url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    [[nodiscard]] std::string heads() const {
+        std::lock_guard<std::mutex> lock(m_);
+        return heads_;
+    }
+
+private:
+    void serve(SOCKET fd) {
+        // The head, then Content-Length more bytes: answering before WinHTTP has finished
+        // sending resets the connection on Windows.
+        std::string raw;
+        size_t head_end = std::string::npos;
+        size_t length = 0;
+        for (;;) {
+            if (head_end == std::string::npos && (head_end = raw.find("\r\n\r\n")) != std::string::npos) {
+                const size_t at = raw.find("Content-Length:");
+                if (at != std::string::npos && at < head_end) {
+                    length = std::strtoul(raw.c_str() + at + 15, nullptr, 10);
+                }
+            }
+            if (head_end != std::string::npos && raw.size() >= head_end + 4 + length) break;
+            char buf[8192];
+            const int n = ::recv(fd, buf, static_cast<int>(sizeof buf), 0);
+            if (n <= 0) return;  // the TCP probe at load connects and closes without a request
+            raw.append(buf, static_cast<size_t>(n));
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            heads_ += raw.substr(0, head_end + 4);
+        }
+        const std::string out = "HTTP/1.1 " + std::to_string(status_) +
+                                " X\r\nContent-Type: application/json\r\nContent-Length: " +
+                                std::to_string(body_.size()) + "\r\nConnection: close\r\n\r\n" +
+                                body_;
+        ::send(fd, out.data(), static_cast<int>(out.size()), 0);
+        ::shutdown(fd, SD_SEND);
+    }
+
+    int status_;
+    std::string body_;
+    SOCKET listen_ = INVALID_SOCKET;
+    uint16_t port_ = 0;
+    std::thread thread_;
+    mutable std::mutex m_;
+    std::string heads_;
+};
 
 }  // namespace
 
@@ -91,12 +183,95 @@ KD_TEST(translator, nothing_the_user_types_becomes_an_argument) {
     }
     // Deliberately absent: openai-translator.md §1.4 and §4.7. Each is a separate, later,
     // argued addition, and a silent omission inside the HTTP client would be worse than an
-    // absent flag.
+    // absent flag. (The API key is one that was added, and it is not an argument either: see
+    // the_api_key_never_reaches_the_command_line.)
     KD_CHECK(!contains(cmd, L"--api-key"));
     KD_CHECK(!contains(cmd, L"--backend"));
     KD_CHECK(!contains(cmd, L"--silero-model"));
     KD_CHECK(!contains(cmd, L"--hostile-stability"));
     // And no place for one: there is no environment-block mapping and no models.json.
+}
+
+KD_TEST(translator, the_api_key_never_reaches_the_command_line) {
+    // Any process running as this user can read another's command line — Task Manager shows it
+    // in a column. So the key adds a bare switch and nothing else; `launch` writes it into the
+    // child's stdin.
+    kd::TranslatorSpec spec;
+    spec.service_url = "https://openrouter.ai/api";
+    spec.api_key = "sk-or-v1-secret-0123456789";
+    const std::wstring cmd = kd::build_translator_command_line(
+        L"C:\\Program Files\\kvit-dictate\\kvit-asrd.exe", spec, 10500, 4242);
+    KD_CHECK(contains(cmd, L"--api-key-stdin"));
+    KD_CHECK(!contains(cmd, L"secret"));
+    KD_CHECK(!contains(cmd, L"sk-or-v1"));
+
+    // And no key, no switch: a child told to read stdin would read NUL and refuse to start.
+    KD_CHECK(!contains(command_line_for("http://h:1"), L"--api-key-stdin"));
+}
+
+KD_TEST(translator, a_key_that_would_be_cut_at_a_line_break_is_refused_before_launch) {
+    // The child reads one line, so a key with a newline in it would arrive truncated and fail as
+    // "refused" with nothing to say why. start() says why instead, before spawning anything.
+    kd::Translator translator;
+    kd::TranslatorSpec spec;
+    spec.service_url = "http://127.0.0.1:9";
+    spec.api_key = "sk-1\nsk-2";
+    const kd::Result<std::string> started = translator.start(spec);
+    KD_CHECK(!started);
+    KD_CHECK(!translator.running());
+}
+
+KD_TEST(translator, the_api_key_reaches_the_child_through_its_stdin) {
+    // The handoff itself, which no in-process test can see: a real kvit-asrd, launched the way
+    // the app launches it, must put the key it was piped on the wire as a bearer token. The
+    // check at load is the request this looks at; it happens before `ready`, so a probe that
+    // becomes ready means the service saw — and accepted — the key.
+    if (!kd::Translator::image_path()) {
+        KD_INFO("skipped: kvit-asrd.exe is not beside kd_tests.exe");
+        KD_CHECK(true);
+        return;
+    }
+    RecordingService service(400, R"({"error":"Missing required \"file\" field"})");
+    KD_REQUIRE(service.start());
+
+    {
+        kd::Translator translator;
+        kd::TranslatorSpec spec;
+        spec.service_url = service.url();
+        spec.api_key = "sk-or-v1-piped-0123456789";
+        const kd::Result<std::string> started = translator.start(spec);
+        KD_REQUIRE(started.is_ok());
+
+        kd::ServerEndpoint ep;
+        ep.url = kd::utf8::to_utf16_or_empty(*started);
+        const kd::Result<kd::ServerProbe> probe = kd::probe_server(ep, 15000);
+        if (!probe) KD_FAIL("the translator did not become ready: " + probe.status().message());
+    }
+    KD_CHECK(service.heads().find("\r\nAuthorization: Bearer sk-or-v1-piped-0123456789\r\n") !=
+             std::string::npos);
+}
+
+KD_TEST(translator, a_refused_key_is_what_the_test_button_reports) {
+    if (!kd::Translator::image_path()) {
+        KD_INFO("skipped: kvit-asrd.exe is not beside kd_tests.exe");
+        KD_CHECK(true);
+        return;
+    }
+    RecordingService service(401, R"({"error":{"message":"User not found.","code":401}})");
+    KD_REQUIRE(service.start());
+
+    kd::Translator translator;
+    kd::TranslatorSpec spec;
+    spec.service_url = service.url();
+    spec.api_key = "sk-or-v1-wrong";
+    const kd::Result<std::string> started = translator.start(spec);
+    KD_REQUIRE(started.is_ok());
+
+    kd::ServerEndpoint ep;
+    ep.url = kd::utf8::to_utf16_or_empty(*started);
+    const kd::Result<kd::ServerProbe> probe = kd::probe_server(ep, 15000);
+    KD_REQUIRE(!probe);
+    KD_CHECK(probe.status().message().find("refused the API key") != std::string::npos);
 }
 
 KD_TEST(translator, a_model_name_with_a_space_is_quoted_not_split) {
@@ -197,6 +372,13 @@ KD_TEST(translator, launches_and_supervises_a_real_child_when_a_service_is_named
         kd::Translator translator;
         kd::TranslatorSpec spec;
         spec.service_url = service;
+        // A hosted service wants both; see the same variables in test_asrd_session.cpp.
+        char model[256] = {};
+        DWORD got = GetEnvironmentVariableA("KD_ASRD_MODEL", model, sizeof model);
+        if (got != 0 && got < sizeof model) spec.model = model;
+        char key[1100] = {};
+        got = GetEnvironmentVariableA("KD_ASRD_API_KEY", key, sizeof key);
+        if (got != 0 && got < sizeof key) spec.api_key = key;
 
         const kd::Result<std::string> started = translator.start(spec);
         if (!started) {

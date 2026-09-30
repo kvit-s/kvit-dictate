@@ -67,6 +67,12 @@ struct TranslatorSpec {
     // being absent means on the wire.
     std::string model;
 
+    // Optional. Sent by the translator as `Authorization: Bearer`. **Never on the command line**:
+    // any process running as this user can read another's command line, so a non-empty key adds
+    // only the bare switch `--api-key-stdin`, and `launch` writes the key itself into the child's
+    // stdin pipe and closes it.
+    std::string api_key;
+
     // Live preview: `partial`s with a computed `stable_bytes`, against a model that
     // structurally violates monotonicity. On by default, and labelled in the dialog — see
     // `ServerSettings::live_preview` for why the §4.3 default was reversed. Always written onto

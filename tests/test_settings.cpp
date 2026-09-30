@@ -598,6 +598,70 @@ KD_TEST(settings, a_settings_file_carrying_a_bad_url_fails_to_load) {
     KD_CHECK(parsed.status().message().find("server.url") != std::string::npos);
 }
 
+// ─── server.api_key (settings.h, ServerSettings::api_key) ───────────────────────────────────
+
+KD_TEST(settings, the_api_key_round_trips_and_is_never_written_in_clear) {
+    kd::Settings s;
+    s.server.mode = kd::ServerMode::Local;
+    s.server.url = "https://openrouter.ai/api";
+    s.server.model = "qwen/qwen3-asr-1.7b";
+    s.server.api_key = "sk-or-v1-0123456789abcdef";
+    s.normalise();
+    KD_REQUIRE(s.validate().is_ok());
+
+    const std::string text = kd::serialize_settings(s);
+    // settings.json gets backed up, diffed and pasted into bug reports. None of those should
+    // hand over the key, in whole or in any recognisable part.
+    KD_CHECK(text.find("sk-or-v1") == std::string::npos);
+    KD_CHECK(text.find("0123456789abcdef") == std::string::npos);
+    KD_CHECK(text.find("\"api_key_dpapi\"") != std::string::npos);
+
+    kd::Result<kd::Settings> back = kd::parse_settings(text);
+    KD_REQUIRE(back.is_ok());
+    KD_CHECK_EQ(back->server.api_key, s.server.api_key);
+}
+
+KD_TEST(settings, a_file_without_a_key_has_no_key_field) {
+    // So every settings file written before the field existed, or by a user who has no key,
+    // serialises byte-for-byte as it did.
+    const std::string text = kd::serialize_settings(kd::Settings{});
+    KD_CHECK(text.find("api_key") == std::string::npos);
+}
+
+KD_TEST(settings, a_key_that_will_not_decrypt_costs_the_key_not_the_file) {
+    // A settings file copied from another Windows user or machine. DPAPI will not open the blob
+    // here, and refusing the whole file over that would lose everything else the user set.
+    kd::Result<kd::Settings> parsed = kd::parse_settings(R"({
+        "server": { "mode": "local", "url": "https://openrouter.ai/api",
+                    "model": "qwen/qwen3-asr-1.7b",
+                    "api_key_dpapi": "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAbm90IGEgcmVhbCBibG9i" }
+    })");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed->server.api_key.empty());
+    KD_CHECK_EQ(parsed->server.url, std::string("https://openrouter.ai/api"));
+    KD_CHECK_EQ(parsed->server.model, std::string("qwen/qwen3-asr-1.7b"));
+
+    // Nor is text that is not base64 at all a reason to lose the file.
+    parsed = kd::parse_settings(R"({ "server": { "api_key_dpapi": "not base64 !!" } })");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed->server.api_key.empty());
+}
+
+KD_TEST(settings, an_api_key_that_could_end_a_header_line_is_refused) {
+    // It becomes `Authorization: Bearer <key>` in kvit-asrd, and a line break would end that
+    // header and start another. The rule is the translator's own (api_key_problem), so a key the
+    // dialog saves is a key the translator will send.
+    kd::Settings s;
+    s.server.api_key = "sk-or-v1-abc\r\nX-Evil: 1";
+    KD_CHECK(!s.validate().is_ok());
+    KD_CHECK(s.validate().message().find("server.api_key") != std::string::npos);
+    s.server.api_key = "sk or v1";
+    KD_CHECK(!s.validate().is_ok());
+    s.server.api_key = "sk-or-v1-abc";
+    KD_CHECK(s.validate().is_ok());
+    KD_CHECK(kd::validate_api_key("").empty());
+}
+
 KD_TEST(settings, reconnect_bounds_must_be_ordered) {
     kd::Settings s;
     s.server.reconnect_initial_ms = 30000;

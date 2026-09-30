@@ -880,6 +880,12 @@ KD_TEST(asrd_session, against_a_real_speech_service_when_one_is_named) {
     //     set KD_ASRD_SERVICE=http://strixhalo.lan:10301
     //     kd_tests --suite asrd_session
     //
+    // or, for a hosted service, with its model and key as well:
+    //
+    //     set KD_ASRD_SERVICE=https://openrouter.ai/api
+    //     set KD_ASRD_MODEL=qwen/qwen3-asr-1.7b
+    //     set KD_ASRD_API_KEY=%OPENROUTER_API_KEY%
+    //
     // Skipped otherwise. A test that silently required somebody's LAN would fail on every other
     // machine and teach people to ignore a red suite.
     char service[512] = {};
@@ -892,6 +898,12 @@ KD_TEST(asrd_session, against_a_real_speech_service_when_one_is_named) {
 
     TranslatorConfig cfg;
     cfg.service = service;
+    char model[256] = {};
+    n = GetEnvironmentVariableA("KD_ASRD_MODEL", model, sizeof model);
+    if (n != 0 && n < sizeof model) cfg.model = model;
+    char key[1100] = {};
+    n = GetEnvironmentVariableA("KD_ASRD_API_KEY", key, sizeof key);
+    if (n != 0 && n < sizeof key) cfg.api_key = key;
     // The defaults a supervised translator would be launched with, except two:
     //
     //   * the endpoint silence is shortened, so the case is seconds rather than minutes;
@@ -1422,6 +1434,81 @@ KD_TEST(asrd_session, no_vocabulary_means_no_prompt_field_at_all) {
     const std::string req = stub.last_transcribe_request();
     KD_REQUIRE(!req.empty());
     KD_CHECK(req.find("name=\"prompt\"") == std::string::npos);
+}
+
+// ─── The API key (a hosted service such as OpenRouter) ──────────────────────────────────────
+
+KD_TEST(asrd_session, an_api_key_goes_on_the_wire_as_a_bearer_header) {
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"hello"})"});
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.api_key = "sk-or-v1-test-0123456789";
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance()));
+    KD_CHECK_EQ(seen.finals, size_t{1});
+
+    // The transcription itself carries it, not only the check at load.
+    const std::string req = stub.last_transcribe_request();
+    KD_REQUIRE(req.find("filename=") != std::string::npos);
+    KD_CHECK(req.find("\r\nAuthorization: Bearer sk-or-v1-test-0123456789\r\n") !=
+             std::string::npos);
+    // One more request than a keyless connection makes: the check at load.
+    KD_CHECK_EQ(stub.transcribe_requests(), 2);
+}
+
+KD_TEST(asrd_session, without_an_api_key_no_authorization_header_is_sent) {
+    // The LAN case, unchanged: no header, and no extra request at load.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"hello"})"});
+
+    TranslatorHarness harness(config_for(stub));
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance()));
+
+    const std::string req = stub.last_transcribe_request();
+    KD_REQUIRE(!req.empty());
+    KD_CHECK(req.find("Authorization:") == std::string::npos);
+    KD_CHECK_EQ(stub.transcribe_requests(), 1);
+}
+
+KD_TEST(asrd_session, a_refused_api_key_fails_before_ready) {
+    // Without the check at load, a reachable host that refuses the key passes Test and fails on
+    // the user's first word. With it, the refusal is what Test shows.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({401, R"({"error":{"message":"User not found.","code":401}})"});
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.api_key = "sk-or-v1-wrong";
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    kd::IpcClient client;
+    KD_REQUIRE(attach(client, seen, harness.url()));
+    KD_REQUIRE(seen.wait_for([&] { return seen.dead || seen.errors > 0; }));
+    const auto errors = seen.of<kd::proto::ErrorMsg>();
+    KD_REQUIRE_GT(errors.size(), size_t{0});
+    KD_CHECK(errors[0].code == kd::proto::ErrorCode::connect_refused);
+    KD_CHECK(errors[0].fatal);
+    KD_CHECK(errors[0].msg.find("refused the API key") != std::string::npos);
+    KD_CHECK(errors[0].msg.find("User not found.") != std::string::npos);
+    {
+        std::lock_guard<std::mutex> lock(seen.m);
+        KD_CHECK(!seen.ready);
+    }
+    // And the check asked no model anything: there was no audio in it.
+    KD_CHECK_EQ(stub.transcribe_requests(), 1);
+    KD_CHECK(stub.last_transcribe_request().find("filename=") == std::string::npos);
+    client.stop();
 }
 
 KD_TEST(asrd_session, the_translator_now_declares_context_supported) {

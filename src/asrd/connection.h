@@ -46,6 +46,11 @@ struct TranslatorConfig {
     bool hostile_stability = false;
     uint32_t http_timeout_ms = 30000;
 
+    // `OpenAiBackendConfig::api_key`. The one field here that does not come from a command-line
+    // argument: main.cpp reads it from stdin under `--api-key-stdin`, because a command line is
+    // readable by every other process running as the same user.
+    std::string api_key;
+
     // session_server.h `SessionServerConfig::revision_dir` — where to write the audio behind a
     // hypothesis that retracted words it had already shown the user. Empty disables it, and
     // empty is the default: the Client passes a path only when the user has enabled the corpus.

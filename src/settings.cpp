@@ -44,6 +44,9 @@
 #endif
 #include <windows.h>
 
+// CryptProtectData and the base64 codec for `server.api_key_dpapi`. WIN32_LEAN_AND_MEAN leaves
+// wincrypt.h out of windows.h, so it is named here.
+#include <wincrypt.h>
 #include <commctrl.h>
 #include <shlobj.h>
 #include <uxtheme.h>
@@ -501,6 +504,69 @@ Status parse_model_entry(const json::Value& v, size_t index, ModelEntry& out) {
 
     if (o.failed()) return Status{StatusCode::Malformed, o.error()};
     return Status::success();
+}
+
+// ─── The API key at rest (ServerSettings::api_key) ──────────────────────────────────────────
+//
+// DPAPI under the current user, then base64. Windows holds the master key and unlocks it with
+// the user's logon, so there is no second secret for this program to keep, and the same file
+// read by another user or on another machine simply fails to decrypt. The entropy string binds a
+// blob to this purpose: a DPAPI blob lifted from some other program's settings will not decrypt
+// here as a key.
+
+constexpr char kApiKeyEntropy[] = "kvit-dictate speech service API key";
+
+// Empty on failure; the caller says so.
+std::string protect_api_key(std::string_view key) {
+    DATA_BLOB in{static_cast<DWORD>(key.size()),
+                 reinterpret_cast<BYTE*>(const_cast<char*>(key.data()))};
+    DATA_BLOB entropy{static_cast<DWORD>(sizeof kApiKeyEntropy - 1),
+                      reinterpret_cast<BYTE*>(const_cast<char*>(kApiKeyEntropy))};
+    DATA_BLOB out{};
+    if (!CryptProtectData(&in, L"kvit-dictate", &entropy, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        return {};
+    }
+    constexpr DWORD kFlags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
+    std::string b64;
+    DWORD chars = 0;
+    if (CryptBinaryToStringA(out.pbData, out.cbData, kFlags, nullptr, &chars) && chars != 0) {
+        b64.resize(chars);
+        if (CryptBinaryToStringA(out.pbData, out.cbData, kFlags, b64.data(), &chars)) {
+            b64.resize(chars);  // the second call reports the length without the terminator
+        } else {
+            b64.clear();
+        }
+    }
+    LocalFree(out.pbData);
+    return b64;
+}
+
+bool unprotect_api_key(std::string_view b64, std::string& key) {
+    key.clear();
+    DWORD bytes = 0;
+    if (!CryptStringToBinaryA(b64.data(), static_cast<DWORD>(b64.size()), CRYPT_STRING_BASE64,
+                              nullptr, &bytes, nullptr, nullptr) ||
+        bytes == 0) {
+        return false;
+    }
+    std::vector<BYTE> blob(bytes);
+    if (!CryptStringToBinaryA(b64.data(), static_cast<DWORD>(b64.size()), CRYPT_STRING_BASE64,
+                              blob.data(), &bytes, nullptr, nullptr)) {
+        return false;
+    }
+    DATA_BLOB in{bytes, blob.data()};
+    DATA_BLOB entropy{static_cast<DWORD>(sizeof kApiKeyEntropy - 1),
+                      reinterpret_cast<BYTE*>(const_cast<char*>(kApiKeyEntropy))};
+    DATA_BLOB out{};
+    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
+                            &out)) {
+        return false;
+    }
+    key.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return true;
 }
 
 // ─── Atomic file write ──────────────────────────────────────────────────────────────────────
@@ -1006,6 +1072,17 @@ std::string validate_speech_service_url(std::string_view url) {
     return {};
 }
 
+std::string validate_api_key(std::string_view key) {
+    if (key.size() > 1024) return "the API key is longer than 1024 characters";
+    for (const char c : key) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u <= 0x20 || u >= 0x7F) {
+            return "the API key contains a space, a line break or a non-ASCII character";
+        }
+    }
+    return {};
+}
+
 ServerMode migrate_server_mode(std::string_view url) noexcept {
     std::string lower;
     lower.reserve(url.size());
@@ -1119,6 +1196,9 @@ Status Settings::validate() const {
             return Status{StatusCode::InvalidArgument, "server.url: " + u.status().message()};
         }
     }
+    if (const std::string why = validate_api_key(server.api_key); !why.empty()) {
+        return Status{StatusCode::InvalidArgument, "server.api_key: " + why};
+    }
     if (server.reconnect_max_ms < server.reconnect_initial_ms) {
         return Status{StatusCode::InvalidArgument,
                       "server.reconnect_max_ms must not be below reconnect_initial_ms"};
@@ -1225,6 +1305,19 @@ std::string serialize_settings(const Settings& s) {
         put_str(o, "mode", to_string(s.server.mode));
         put_str(o, "url", s.server.url);
         put_str(o, "model", s.server.model);
+        // Written only when there is a key, so a file without one is byte-for-byte what it was.
+        // Never the key itself: see ServerSettings::api_key. DPAPI salts every call, so this is
+        // the one field whose serialisation is not a fixed point — the *key* round-trips, the
+        // bytes do not.
+        if (!s.server.api_key.empty()) {
+            std::string blob = protect_api_key(s.server.api_key);
+            if (blob.empty()) {
+                KD_LOG_ERROR("the API key could not be encrypted (error %lu), so it was not saved",
+                             GetLastError());
+            } else {
+                put_str(o, "api_key_dpapi", std::move(blob));
+            }
+        }
         put_bool(o, "live_preview", s.server.live_preview);
         put_u64(o, "connect_timeout_ms", s.server.connect_timeout_ms);
         put_u64(o, "reconnect_initial_ms", s.server.reconnect_initial_ms);
@@ -1412,6 +1505,26 @@ Result<Settings> parse_settings(std::string_view json_text) {
         Obj o(*v, "settings.server");
         o.str_opt("url", s.server.url);
         o.str_opt("model", s.server.model);
+        // A blob that will not decrypt — the file came from another user or machine — costs the
+        // key, not the file: rule 2 is about the user's configuration being lost silently, and
+        // refusing to load everything else over one field Windows will not open for this user
+        // would be that, only louder. The warning is the "not silently".
+        std::string key_blob;
+        o.str_opt("api_key_dpapi", key_blob);
+        if (!key_blob.empty()) {
+            std::string key;
+            if (!unprotect_api_key(key_blob, key)) {
+                KD_LOG_WARN("settings.server.api_key_dpapi could not be decrypted by this Windows "
+                            "user (was the file copied from elsewhere?); the API key must be "
+                            "entered again");
+            } else if (!validate_api_key(key).empty()) {
+                SecureZeroMemory(key.data(), key.size());
+                KD_LOG_WARN("settings.server.api_key_dpapi decrypted to something that is not an "
+                            "API key; ignoring it");
+            } else {
+                s.server.api_key = std::move(key);
+            }
+        }
         // Absent `mode` means a settings file written before the translator existed. Infer it
         // from the URL rather than defaulting: defaulting to Local would hand a `ws://` address
         // to the speech-service validator, and defaulting to Protocol would hand an `http://`
@@ -1842,6 +1955,7 @@ enum : int {
     kIdServerModeLocal,
     kIdServerModeProtocol,
     kIdServerLivePreview,
+    kIdServerApiKey,
     // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
     // though it is an address the user types: it rewrites **the pill** and nothing else, and its
     // one hard precondition — the end-of-session cadence — is the same one that page already
@@ -2299,6 +2413,8 @@ void update_server_mode_ui(HWND dlg) {
     // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
     // the user cannot find again.
     EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
+    // Likewise the key: it is the translator that sends it, and a protocol server is not asked.
+    EnableWindow(GetDlgItem(dlg, kIdServerApiKey), local ? TRUE : FALSE);
 }
 
 std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
@@ -2320,6 +2436,17 @@ std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
 void update_server_warning(HWND dlg) {
     const std::wstring warning = server_warning_for(dlg, get_text(GetDlgItem(dlg, kIdServerUrl)));
     SetWindowTextW(GetDlgItem(dlg, kIdServerWarning), warning.c_str());
+}
+
+// The key box, with the whitespace a paste brings along removed from both ends. Inside the key
+// it is not trimmed but refused, by validate_api_key: a space in the middle is a wrong key, and
+// quietly sending half of it would fail as "refused" with nothing to say why.
+std::string trimmed_api_key(HWND dlg) {
+    std::wstring key = get_text(GetDlgItem(dlg, kIdServerApiKey));
+    const auto blank = [](wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; };
+    while (!key.empty() && blank(key.front())) key.erase(0, 1);
+    while (!key.empty() && blank(key.back())) key.pop_back();
+    return narrow(key);
 }
 
 // One line per fact, because this text is what a user will paste into a support conversation.
@@ -2356,6 +2483,7 @@ void start_server_test(HWND dlg, DialogState& st) {
     const ServerMode mode = mode_of(dlg);
     const std::wstring url = get_text(GetDlgItem(dlg, kIdServerUrl));
     const std::string model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+    const std::string api_key = trimmed_api_key(dlg);
     const bool live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
 
     if (url.empty()) {
@@ -2369,6 +2497,10 @@ void start_server_test(HWND dlg, DialogState& st) {
     if (mode == ServerMode::Local) {
         if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
             SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(why).c_str());
+            return;
+        }
+        if (const std::string why = validate_api_key(api_key); !why.empty()) {
+            SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide("API key: " + why).c_str());
             return;
         }
     } else if (const Result<ParsedServerUrl> u = parse_server_url(url); !u) {
@@ -2398,7 +2530,7 @@ void start_server_test(HWND dlg, DialogState& st) {
     // The worker owns everything it touches and hands back one heap-allocated string. It must
     // not read DialogState: by the time it finishes, the dialog may be gone. PostMessage to a
     // destroyed window fails harmlessly, and the string is freed by whoever wins.
-    std::thread([dlg, generation, mode, url, model, live_preview]() {
+    std::thread([dlg, generation, mode, url, model, api_key, live_preview]() {
         std::wstring text;
         // Declared here so the child outlives the probe and dies with this scope: its destructor
         // closes the job, which kills it. A Test that left a translator running would collide
@@ -2412,6 +2544,7 @@ void start_server_test(HWND dlg, DialogState& st) {
             TranslatorSpec spec;
             spec.service_url = narrow(url);
             spec.model = model;
+            spec.api_key = api_key;
             spec.live_preview = live_preview;
             if (const Result<std::string> started = probe_child.start(spec); started) {
                 ep.url = wide(*started);
@@ -3039,6 +3172,7 @@ void load_controls(HWND dlg, DialogState& st) {
     CheckDlgButton(dlg, kIdServerLivePreview, s.server.live_preview ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdServerUrl), wide(s.server.url).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
+    SetWindowTextW(GetDlgItem(dlg, kIdServerApiKey), wide(s.server.api_key).c_str());
     update_server_mode_ui(dlg);
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
                    s.server.configured()
@@ -3157,9 +3291,17 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
                 return false;
             }
         }
+        const std::string api_key = trimmed_api_key(dlg);
+        if (const std::string why = validate_api_key(api_key); !why.empty()) {
+            MessageBoxW(dlg, (L"API key: " + wide(why)).c_str(), L"kvit-dictate settings",
+                        MB_OK | MB_ICONWARNING);
+            SetFocus(GetDlgItem(dlg, kIdServerApiKey));
+            return false;
+        }
         s.server.mode = mode;
         s.server.url = narrow(url);
         s.server.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
+        s.server.api_key = api_key;
         s.server.live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
     }
 
@@ -3405,6 +3547,10 @@ void build_controls(HWND dlg, DialogState& st) {
 
         set_cue(c.label_edit(L"Model (optional)", kIdServerModel),
                 L"whatever the service offers");
+        // Masked, and stored encrypted (ServerSettings::api_key). Beside the model because the
+        // two are what a hosted service asks for and a LAN box does not.
+        set_cue(c.label_edit(L"API key (optional)", kIdServerApiKey, ES_PASSWORD),
+                L"only if the service asks for one");
         c.add(L"BUTTON", L"Test", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdServerTest);
         c.gap(6);
         // Seven lines, not nine. `describe_probe` writes six on a good answer and the box scrolls

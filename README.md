@@ -76,7 +76,9 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
 2. Type the address of your speech service — anything that serves
    `POST /v1/audio/transcriptions`, for example `http://strixhalo.lan:10301` — and press
    **Test**. It connects for real and tells you what answered: the model, the mode and the
-   round-trip time.
+   round-trip time. For a hosted service that wants a key, such as OpenRouter, put the key in
+   **API key** (it is stored encrypted). What that costs in privacy and features is in
+   [`docs/setup.md`](docs/setup.md).
 3. Press OK.
 
 That is the whole setup. **There is nothing else to start and no Python to install.**
