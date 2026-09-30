@@ -785,6 +785,76 @@ KD_TEST(asrd_session, a_timeout_is_decode_failed_and_bounded) {
     KD_INFO("session took " + std::to_string(elapsed) + " ms with a 2000 ms HTTP budget");
 }
 
+KD_TEST(asrd_session, a_slow_answer_inside_the_budget_is_not_thrown_away) {
+    // The regression: receive was armed with a quarter of the budget, like resolve, connect and
+    // send. A transcription is silence on the socket until the model finishes, so a service that
+    // took longer than a quarter of the budget to think had its answer discarded with most of
+    // the budget unspent. OpenRouter did that to the first dictation sent through it (a ~9 s
+    // answer against a 7.5 s quarter of 30 s; reproduced against httpbin.org/delay/9: dropped at
+    // 8.0 s with a 7.5 s receive, kept at 9.6 s with the remaining budget).
+    //
+    // Honestly: over loopback WinHTTP keeps a late answer whatever the receive timeout says —
+    // the discard only happens against a remote host — so what this pins is the other half: that
+    // an answer inside the budget is delivered, now that a watchdog enforces the budget.
+    // Here: 1.5 s against a 2 s budget, whose quarter is 0.5 s.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"worth the wait"})", "application/json",
+                         /*delay_ms=*/1500, false});
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.http_timeout_ms = 2000;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(), false, /*settle_ms=*/8000));
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+    const auto finals = seen.of<kd::proto::FinalMsg>();
+    KD_REQUIRE_EQ(finals.size(), size_t{1});
+    KD_CHECK_EQ(finals[0].text, std::string("worth the wait"));
+}
+
+KD_TEST(asrd_session, an_answer_later_than_the_budget_still_times_out_in_it) {
+    // The other half: the receive gets what is *left*, not a fresh budget, so the bound the test
+    // above relaxes is still a bound.
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"too late"})", "application/json",
+                         /*delay_ms=*/4000, false});
+
+    TranslatorConfig cfg = config_for(stub);
+    cfg.http_timeout_ms = 1000;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance(), false, /*settle_ms=*/8000));
+    const auto errors = seen.of<kd::proto::ErrorMsg>();
+    KD_REQUIRE_GT(errors.size(), size_t{0});
+    KD_CHECK(errors[0].code == kd::proto::ErrorCode::decode_failed);
+    // In words, not "WinHttpReceiveResponse failed", which is what the log said the first time.
+    KD_CHECK(errors[0].msg.find("did not answer within 1000 ms") != std::string::npos);
+
+    // And the bound itself, on one request rather than a whole session's wall clock — against a
+    // fresh stub, because this one serves one request at a time and is still asleep on the
+    // session's.
+    StubSpeechService slow;
+    KD_REQUIRE(slow.start());
+    slow.set_transcribe({200, R"({"text":"too late"})", "application/json",
+                         /*delay_ms=*/3000, false});
+    HttpClient http;
+    HttpUrl url;
+    KD_REQUIRE(parse_http_url(slow.base_url() + "/v1/audio/transcriptions", url));
+    const ULONGLONG t0 = GetTickCount64();
+    const kd::Result<HttpResponse> r = http.post(url, "text/plain", "x", 1000);
+    const ULONGLONG took = GetTickCount64() - t0;
+    KD_CHECK(!r);
+    KD_CHECK_LT(took, ULONGLONG{1600});
+    KD_INFO("a 3 s answer against a 1 s budget gave up after " + std::to_string(took) + " ms: " +
+            (r ? std::string("(succeeded)") : r.status().to_string()));
+}
+
 KD_TEST(asrd_session, the_vad_gate_fails_open) {
     // The rule with the strongest justification in the whole backend: losing something the user
     // actually said is worse than an occasional invented word, and a VAD outage must never be

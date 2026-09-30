@@ -16,8 +16,12 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 #include "util/log.h"
 #include "util/utf8.h"
@@ -313,12 +317,37 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
         return Status{StatusCode::InvalidArgument, "URL is not representable as UTF-16"};
     }
 
-    // Per-operation timeouts, so the request total is a quarter each, and the total is checked
-    // again between operations. Without both, a server that stalls at every step takes four
-    // times as long as configured.
+    // ─── Time ───────────────────────────────────────────────────────────────────────────────
+    //
+    // **WinHTTP's own timeouts do not bound a synchronous request, and this learned that late.**
+    // Measured 2026-09-30 against servers that take 3-4 s to answer, with every timeout at
+    // 1-1.5 s: WinHttpSendRequest itself blocks until the answer arrives. On loopback the request
+    // then simply succeeds; against httpbin.org, WinHttpReceiveResponse reports
+    // ERROR_WINHTTP_TIMEOUT only *after* the answer is already there. So the timeouts decide
+    // whether a slow answer is *kept*, and never when the caller gets control back.
+    //
+    // Two things follow, one for each half of that:
+    //
+    //   * **The receive timeout is whatever is left of the budget**, not a quarter of it like
+    //     resolve, connect and send. A transcription is silence on the socket until the model is
+    //     done, so the server's processing time is all receive. A quarter of 30 s never mattered
+    //     against a LAN box answering in half a second. OpenRouter took 9.8 s for ten seconds of
+    //     audio on 2026-09-30 (and 0.5 s a minute later), and the quarter-budget receive threw
+    //     that answer away with 22 s of the budget unspent — the first dictation sent through it.
+    //
+    //   * **The deadline is enforced by a watchdog**, which closes the request handle when it
+    //     passes — exactly what cancel() does, so the blocked call returns promptly and the
+    //     handle is still closed exactly once. Without it a provider that hangs holds the
+    //     session for as long as the provider likes.
     const auto share = static_cast<int>(timeout_ms / 4 + 1);
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
     const auto expired = [&]() { return GetTickCount64() >= deadline; };
+    const auto arm_receive = [&](HINTERNET h) {
+        const ULONGLONG now = GetTickCount64();
+        DWORD left = now >= deadline ? 1u : static_cast<DWORD>(deadline - now);
+        WinHttpSetOption(h, WINHTTP_OPTION_RECEIVE_TIMEOUT, &left, sizeof left);
+        WinHttpSetOption(h, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &left, sizeof left);
+    };
 
     HINTERNET session = WinHttpOpen(L"kvit-asrd/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -344,8 +373,8 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
         return Status{StatusCode::Unavailable, "WinHttpOpenRequest failed", e};
     }
 
-    // Publish the handle so cancel() can close it. Everything below must go through
-    // `take_request()` for the close, so the handle is closed exactly once.
+    // Publish the handle so cancel() — and the watchdog — can close it. Everything below must go
+    // through `take_request()` for the close, so the handle is closed exactly once.
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (impl_->cancelled) {
@@ -362,32 +391,68 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
         impl_->in_flight = nullptr;
         return h;
     };
+
+    // The watchdog. It owns nothing: it closes the handle only if it is still the one in flight,
+    // under the same lock cancel() and take_request() use, and says so in `timed_out` so the
+    // failure below is reported as the timeout it is rather than as whatever WinHTTP calls a
+    // handle closed under it.
+    std::atomic<bool> timed_out{false};
+    struct Watchdog {
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+        std::thread t;
+        ~Watchdog() {
+            {
+                std::lock_guard<std::mutex> lock(m);
+                done = true;
+            }
+            cv.notify_all();
+            if (t.joinable()) t.join();
+        }
+    } watchdog;
+    const ULONGLONG armed_at = GetTickCount64();
+    const auto left = std::chrono::milliseconds(deadline > armed_at ? deadline - armed_at : 0);
+    watchdog.t = std::thread([&, request, left] {
+        std::unique_lock<std::mutex> lock(watchdog.m);
+        if (watchdog.cv.wait_for(lock, left, [&] { return watchdog.done; })) {
+            return;
+        }
+        std::lock_guard<std::mutex> inner(impl_->mutex);
+        if (impl_->in_flight == request) {
+            timed_out.store(true);
+            WinHttpCloseHandle(request);
+            impl_->in_flight = nullptr;
+        }
+    });
+
     const auto finish = [&](Status st) -> Result<HttpResponse> {
         if (HINTERNET h = take_request(); h != nullptr) WinHttpCloseHandle(h);
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
         return st;
     };
+    const std::string too_slow =
+        "the speech service did not answer within " + std::to_string(timeout_ms) + " ms";
+    // Every WinHTTP failure goes through here, so the three reasons a call can fail under us —
+    // the deadline, a cancel, and WinHTTP's own timeout — are told apart the same way each time.
+    const auto failed = [&](const char* what, DWORD e) -> Result<HttpResponse> {
+        if (timed_out.load()) return finish(Status{StatusCode::Timeout, too_slow});
+        if (cancelled()) return finish(Status{StatusCode::Unavailable, "request cancelled"});
+        if (e == ERROR_WINHTTP_TIMEOUT) return finish(Status{StatusCode::Timeout, too_slow, e});
+        return finish(Status{StatusCode::Unavailable, std::string(what) + " failed", e});
+    };
 
+    arm_receive(request);
     if (!WinHttpSendRequest(request, wheaders.c_str(), static_cast<DWORD>(-1),
                             const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
                             static_cast<DWORD>(body.size()), 0)) {
-        const DWORD e = GetLastError();
-        if (cancelled()) {
-            return finish(Status{StatusCode::Unavailable, "request cancelled"});
-        }
-        return finish(Status{StatusCode::Unavailable, "WinHttpSendRequest failed", e});
+        return failed("WinHttpSendRequest", GetLastError());
     }
     if (!WinHttpReceiveResponse(request, nullptr)) {
-        const DWORD e = GetLastError();
-        if (cancelled()) {
-            return finish(Status{StatusCode::Unavailable, "request cancelled"});
-        }
-        return finish(Status{StatusCode::Unavailable, "WinHttpReceiveResponse failed", e});
+        return failed("WinHttpReceiveResponse", GetLastError());
     }
-    if (expired()) {
-        return finish(Status{StatusCode::Timeout, "timed out awaiting the response"});
-    }
+    if (expired()) return finish(Status{StatusCode::Timeout, too_slow});
 
     HttpResponse response;
     DWORD status_code = 0;
@@ -395,22 +460,16 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
     if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &len,
                              WINHTTP_NO_HEADER_INDEX)) {
-        return finish(Status{StatusCode::Unavailable, "WinHttpQueryHeaders failed",
-                             GetLastError()});
+        return failed("WinHttpQueryHeaders", GetLastError());
     }
     response.status = status_code;
 
     for (;;) {
-        if (expired()) {
-            return finish(Status{StatusCode::Timeout, "timed out reading the response"});
-        }
+        if (expired()) return finish(Status{StatusCode::Timeout, too_slow});
         DWORD avail = 0;
+        arm_receive(request);
         if (!WinHttpQueryDataAvailable(request, &avail)) {
-            const DWORD e = GetLastError();
-            if (cancelled()) {
-                return finish(Status{StatusCode::Unavailable, "request cancelled"});
-            }
-            return finish(Status{StatusCode::Unavailable, "WinHttpQueryDataAvailable failed", e});
+            return failed("WinHttpQueryDataAvailable", GetLastError());
         }
         // Zero available is the only reliable end-of-body signal; a short read is not one.
         if (avail == 0) break;
@@ -421,11 +480,7 @@ Result<HttpResponse> HttpClient::post(const HttpUrl& url, std::string_view conte
         response.body.resize(at + avail);
         DWORD read = 0;
         if (!WinHttpReadData(request, response.body.data() + at, avail, &read)) {
-            const DWORD e = GetLastError();
-            if (cancelled()) {
-                return finish(Status{StatusCode::Unavailable, "request cancelled"});
-            }
-            return finish(Status{StatusCode::Unavailable, "WinHttpReadData failed", e});
+            return failed("WinHttpReadData", GetLastError());
         }
         response.body.resize(at + read);
         if (read == 0) break;

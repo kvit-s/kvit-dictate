@@ -18,6 +18,11 @@
 //   * The timeouts WinHttpSetTimeouts sets are **per operation, not per request**. A request
 //     that stalls after each of four operations takes four times the configured value, so the
 //     total is bounded again by hand between operations.
+//   * **And none of them bounds a synchronous request anyway.** WinHttpSendRequest blocks until
+//     the server answers, whatever the timeouts say; they only decide whether a late answer is
+//     kept. So receive is armed with whatever is left of the budget (the server's processing
+//     time is all receive), and a watchdog closes the handle at the deadline. http.cpp has the
+//     measurements, and the 9.8 s OpenRouter answer a quarter-budget receive threw away.
 //   * WinHttpReceiveResponse must precede WinHttpQueryHeaders and WinHttpReadData, and
 //     WinHttpQueryDataAvailable returning 0 is the only reliable end-of-body signal. A reader
 //     that stops at a short read truncates any body arriving in more than one TCP segment.
