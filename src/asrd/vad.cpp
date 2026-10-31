@@ -34,6 +34,9 @@ double logistic(double x) {
 uint64_t VadConfig::min_speech_samples() const noexcept {
     return ms_to_samples(min_speech_ms, sample_rate);
 }
+uint64_t VadConfig::onset_gap_samples() const noexcept {
+    return ms_to_samples(onset_gap_ms, sample_rate);
+}
 uint64_t VadConfig::hangover_samples() const noexcept {
     return ms_to_samples(hangover_ms, sample_rate);
 }
@@ -61,6 +64,11 @@ std::string VadConfig::validate() const {
         return "min_speech_ms, hangover_ms and preroll_ms must be >= 0";
     }
     if (endpoint_silence_ms <= 0.0) return "endpoint_silence_ms must be > 0";
+    if (onset_gap_ms < 0.0) return "onset_gap_ms must be >= 0";
+    if (onset_gap_ms >= endpoint_silence_ms) {
+        // A dip the onset forgives would already have ended the utterance it is meant to open.
+        return "onset_gap_ms must be less than endpoint_silence_ms";
+    }
     if (hangover_ms > endpoint_silence_ms) {
         // A hangover longer than the endpoint would report the end of speech *after* the
         // utterance it belongs to had already been closed.
@@ -165,10 +173,17 @@ double EnergyZcrScorer::score(const int16_t* frame, size_t n) noexcept {
 // ─── Endpointer ─────────────────────────────────────────────────────────────────────────────
 
 VadEndpointer::VadEndpointer(const VadConfig& cfg) : cfg_(cfg), scorer_(cfg_) {
-    // Enough history for the largest pre-roll request: the pre-roll itself, plus the min-speech
-    // window that elapses before an onset can be confirmed, plus slack.
-    history_cap_ = static_cast<size_t>(cfg_.preroll_samples() + cfg_.min_speech_samples()) +
-                   2u * cfg_.frame_samples;
+    // Enough history for the largest pre-roll request: the pre-roll itself, plus the longest run
+    // that can elapse before an onset is confirmed, plus slack. The run is longer than
+    // `min_speech_ms` once dips are forgiven — every speaking frame but the last can be followed
+    // by a whole tolerated gap — and the onset is backdated to its start, so a cap sized for the
+    // minimum alone would replay the pre-roll from partway through the first syllable.
+    const uint64_t frame = cfg_.frame_samples;
+    const uint64_t speaking_frames = (cfg_.min_speech_samples() + frame - 1) / frame;
+    const uint64_t gap_frames = cfg_.onset_gap_samples() / frame;
+    const uint64_t longest_run =
+        (speaking_frames + (speaking_frames > 0 ? speaking_frames - 1 : 0) * gap_frames) * frame;
+    history_cap_ = static_cast<size_t>(cfg_.preroll_samples() + longest_run) + 2u * frame;
 }
 
 void VadEndpointer::emit(std::vector<VadItem>& out, VadItemKind kind, uint64_t sample,
@@ -194,6 +209,7 @@ void VadEndpointer::close_utterance(std::vector<VadItem>& out, const std::string
     last_boundary_ = pos_;
     have_pending_start_ = false;
     pending_samples_ = 0;
+    pending_gap_samples_ = 0;
 }
 
 void VadEndpointer::open_utterance(std::vector<VadItem>& out, uint64_t onset,
@@ -214,6 +230,7 @@ void VadEndpointer::reset_stream_state() {
     have_pending_start_ = false;
     pending_start_ = 0;
     pending_samples_ = 0;
+    pending_gap_samples_ = 0;
     silence_samples_ = 0;
     last_speech_end_ = pos_;
     last_boundary_ = pos_;
@@ -328,6 +345,7 @@ void VadEndpointer::on_frame(const int16_t* frame, size_t n, std::vector<VadItem
                 pending_samples_ = 0;
             }
             pending_samples_ += n;
+            pending_gap_samples_ = 0;
             if (pending_samples_ >= cfg.min_speech_samples()) {
                 // Backdate the onset to where the run began — that is where speech actually
                 // started; the detector is merely late. Clamp to the last utterance boundary so
@@ -337,13 +355,23 @@ void VadEndpointer::on_frame(const int16_t* frame, size_t n, std::vector<VadItem
                 last_speech_end_ = end;
                 have_pending_start_ = false;
                 pending_samples_ = 0;
+                pending_gap_samples_ = 0;
                 open_utterance(frame_items, onset, "");
                 onset_this_frame = true;
             }
         }
     } else {
-        have_pending_start_ = false;
-        pending_samples_ = 0;
+        // A dip inside a run on its way to an onset is forgiven up to `onset_gap_ms`, and does
+        // not count towards the minimum. vad.h has the session that needed this: a quiet voice
+        // that clears the absolute floor for a few frames at a time and never for seven in a row.
+        if (have_pending_start_) {
+            pending_gap_samples_ += n;
+            if (pending_gap_samples_ > cfg.onset_gap_samples()) {
+                have_pending_start_ = false;
+                pending_samples_ = 0;
+                pending_gap_samples_ = 0;
+            }
+        }
         silence_samples_ += n;
         if (speech_ && silence_samples_ >= cfg.hangover_samples()) {
             speech_ = false;

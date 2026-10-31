@@ -64,6 +64,25 @@ struct VadConfig {
     // A speech run shorter than this never produces an onset: it is a click, a lip smack, a
     // chair. Suppression is on the *onset*, not on the endpoint timer.
     double min_speech_ms = 200.0;
+    // How long a run on its way to `min_speech_ms` survives frames that do not score as speech.
+    // Only speaking frames count towards the minimum; a dip longer than this starts it over.
+    //
+    // Not in vad.py, and added because of what the run used to demand: `min_speech_ms` of
+    // *consecutive* speaking frames. A quiet voice does not provide that. Reported 2026-10-31
+    // as "the last phrase never shows, not even the uncommitted part": the operator said "so fix
+    // that" three times at the end of a session and none of it reached the model. Their speech
+    // had drifted to a median of -52 dBFS per frame (it was -43 in September, same BRIO), and the
+    // microphone chain writes digital zeros between words, which pulls the noise floor to -120
+    // and leaves `energy_abs_floor_dbfs` as the only gate. Each repeat cleared -55 for three to
+    // six frames at a time and dipped under it for one; seven in a row never happened, so no
+    // utterance opened, and the session ended with the tail unheard.
+    //
+    // Three frames, measured by replaying that session through this class at eight frame
+    // alignments: the three repeats opened in 21 of 24 cases, against 1 of 24 without it. Across
+    // 80 corpus sessions the utterances it adds are real speech except one "Uh." that the
+    // service's `vad_gate` turns away. A gap is still a reset at four frames, so isolated clicks
+    // a few frames apart do not add up to an onset.
+    double onset_gap_ms = 96.0;
     // How long speech must be absent before SPEECH_END. Below this a pause is invisible.
     double hangover_ms = 250.0;
     // Ends the UTTERANCE. Never the session.
@@ -122,6 +141,7 @@ struct VadConfig {
     double zcr_boost_db = 4.0;
 
     [[nodiscard]] uint64_t min_speech_samples() const noexcept;
+    [[nodiscard]] uint64_t onset_gap_samples() const noexcept;
     [[nodiscard]] uint64_t hangover_samples() const noexcept;
     [[nodiscard]] uint64_t endpoint_samples() const noexcept;
     [[nodiscard]] uint64_t preroll_samples() const noexcept;
@@ -185,7 +205,8 @@ struct VadItem {
 
 // Turns a stream of frame scores into utterance boundaries and a gated decoder feed.
 //
-//     SILENCE --(scores >= threshold for min_speech_ms)--> SPEECH   emits SpeechStart
+//     SILENCE --(scores >= threshold for min_speech_ms,--> SPEECH   emits SpeechStart
+//                no dip longer than onset_gap_ms)
 //     SPEECH  --(scores <  neg_threshold for hangover_ms)-> SILENCE emits SpeechEnd
 //     SILENCE --(endpoint_silence_ms since last speech)---> closed  emits UtteranceEnd
 //
@@ -250,7 +271,8 @@ private:
     uint64_t utterance_start_ = 0;
     bool have_pending_start_ = false;
     uint64_t pending_start_ = 0;
-    uint64_t pending_samples_ = 0;
+    uint64_t pending_samples_ = 0;      // speaking samples in the pending run, gaps excluded
+    uint64_t pending_gap_samples_ = 0;  // the dip the pending run is currently sitting in
     uint64_t silence_samples_ = 0;
     uint64_t last_speech_end_ = 0;
     uint64_t last_boundary_ = 0;

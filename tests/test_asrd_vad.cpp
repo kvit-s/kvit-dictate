@@ -121,6 +121,14 @@ KD_TEST(asrd_vad, rejects_an_inverted_hysteresis) {
     KD_CHECK(!cfg.validate().empty());
 }
 
+KD_TEST(asrd_vad, rejects_an_onset_gap_that_would_outlast_the_endpoint) {
+    VadConfig cfg;
+    cfg.onset_gap_ms = cfg.endpoint_silence_ms;
+    KD_CHECK(!cfg.validate().empty());
+    cfg.onset_gap_ms = -1.0;
+    KD_CHECK(!cfg.validate().empty());
+}
+
 // ─── The scorer ─────────────────────────────────────────────────────────────────────────────
 
 KD_TEST(asrd_vad, dbfs_and_zcr_are_measured_not_guessed) {
@@ -254,6 +262,127 @@ KD_TEST(asrd_vad, two_separated_utterances_are_two_utterances) {
     KD_CHECK_EQ(count_of(items, VadItemKind::UtteranceEnd), size_t{2});
     KD_CHECK_EQ(count_of(items, VadItemKind::SpeechStart), size_t{2});
     KD_CHECK_EQ(vad.utterance_index(), uint64_t{2});
+}
+
+// ─── A quiet voice, which clears the floor a few frames at a time ──────────────────────────
+//
+// vad.h `onset_gap_ms` has the session these come from. The shape is the one measured in it:
+// three frames over the absolute floor, one under it, again and again — never the seven in a row
+// `min_speech_ms` used to insist on. Frame-aligned (32 ms is exactly one 512-sample frame) so the
+// pattern is the one the detector actually sees rather than something smeared across frames.
+
+namespace {
+
+// ~-43 dBFS: a voice that clears `energy_abs_floor_dbfs` by twelve dB and no more.
+constexpr double kQuietVoice = 0.01;
+
+// `bursts` times: `on_ms` of quiet voice, then `off_ms` of digital silence.
+void append_choppy(std::vector<int16_t>& out, int bursts, uint32_t on_ms, uint32_t off_ms) {
+    for (int b = 0; b < bursts; ++b) {
+        append_tone(out, on_ms, kQuietVoice);
+        append_silence(out, off_ms);
+    }
+}
+
+}  // namespace
+
+KD_TEST(asrd_vad, a_quiet_voice_that_dips_between_syllables_still_opens_an_utterance) {
+    const VadConfig cfg = test_config();
+    std::vector<int16_t> audio;
+    append_silence(audio, 320);  // calibration: ten whole frames, so the bursts start on a frame
+    const uint64_t first_syllable = audio.size();
+    append_choppy(audio, 6, 96, 32);
+    append_silence(audio, 1000);
+
+    VadEndpointer vad(cfg);
+    std::vector<VadItem> items;
+    vad.process(audio.data(), audio.size(), items);
+    KD_INFO(trace(items));
+
+    KD_CHECK_EQ(count_of(items, VadItemKind::UtteranceEnd), size_t{1});
+    KD_CHECK_EQ(vad.utterance_index(), uint64_t{1});
+    // Backdated to the first syllable, not to the third burst where the count was reached: the
+    // dips are inside the word, and the word started where the run did.
+    for (const VadItem& i : items) {
+        if (i.kind == VadItemKind::SpeechStart) {
+            KD_CHECK_EQ(i.sample, first_syllable);
+            break;
+        }
+    }
+
+    // The same audio with dips not forgiven is the reported failure: nothing opens, so nothing
+    // reaches the model, and the pill has nothing to show — not even an uncommitted preview.
+    VadConfig strict = cfg;
+    strict.onset_gap_ms = 0.0;
+    VadEndpointer before(strict);
+    std::vector<VadItem> unheard;
+    before.process(audio.data(), audio.size(), unheard);
+    KD_CHECK_EQ(count_of(unheard, VadItemKind::SpeechStart), size_t{0});
+    KD_CHECK_EQ(gated_samples(unheard), size_t{0});
+
+    // The forgiven gap is state carried between frames, so it is exactly the kind of thing that
+    // goes wrong at one chunking and not another.
+    for (const size_t chunk : {size_t{1}, size_t{160}, size_t{513}}) {
+        VadEndpointer split(cfg);
+        std::vector<VadItem> got;
+        for (size_t at = 0; at < audio.size(); at += chunk) {
+            split.process(audio.data() + at, (std::min)(chunk, audio.size() - at), got);
+        }
+        if (trace(got) != trace(items)) {
+            KD_FAIL("chunk=" + std::to_string(chunk) + " produced a different item stream\n" +
+                    "  reference: " + trace(items) + "\n  got:       " + trace(got));
+        } else {
+            KD_CHECK(true);
+        }
+    }
+}
+
+KD_TEST(asrd_vad, a_dip_longer_than_the_onset_gap_starts_the_run_over) {
+    // The bound on the forgiveness. Two frames of sound every seven is a keyboard, a tapping
+    // pen, a clock — never two frames of speech in a row past the gap, so it must never add up
+    // to the minimum however long it goes on.
+    const VadConfig cfg = test_config();
+    std::vector<int16_t> audio;
+    append_silence(audio, 320);
+    append_choppy(audio, 12, 64, 160);
+    append_silence(audio, 1000);
+
+    VadEndpointer vad(cfg);
+    std::vector<VadItem> items;
+    vad.process(audio.data(), audio.size(), items);
+    KD_INFO(trace(items));
+    KD_CHECK_EQ(count_of(items, VadItemKind::SpeechStart), size_t{0});
+    KD_CHECK_EQ(gated_samples(items), size_t{0});
+    KD_CHECK_EQ(vad.utterance_index(), uint64_t{0});
+}
+
+KD_TEST(asrd_vad, the_longest_forgiven_run_still_gets_its_whole_preroll) {
+    // One speaking frame in every four is the sparsest run the default gap lets through, and it
+    // spans 25 frames before the seventh speaking frame confirms it — far more than
+    // `min_speech_ms`. The onset is backdated to the first of them, so the history has to reach
+    // back the whole run plus the pre-roll, or the first syllable is replayed from its middle.
+    VadConfig cfg = test_config();
+    cfg.preroll_ms = 300.0;
+    std::vector<int16_t> audio;
+    append_silence(audio, 320);
+    const uint64_t first_syllable = audio.size();
+    append_choppy(audio, 7, 32, 96);
+    append_silence(audio, 1000);
+
+    VadEndpointer vad(cfg);
+    std::vector<VadItem> items;
+    vad.process(audio.data(), audio.size(), items);
+    KD_INFO(trace(items));
+
+    uint64_t onset = UINT64_MAX;
+    uint64_t first_audio = UINT64_MAX;
+    for (const VadItem& i : items) {
+        if (i.kind == VadItemKind::SpeechStart && onset == UINT64_MAX) onset = i.sample;
+        if (i.kind == VadItemKind::Audio && first_audio == UINT64_MAX) first_audio = i.sample;
+    }
+    KD_REQUIRE(onset != UINT64_MAX);
+    KD_CHECK_EQ(onset, first_syllable);
+    KD_CHECK_EQ(first_audio, onset - cfg.preroll_samples());
 }
 
 KD_TEST(asrd_vad, the_same_audio_split_differently_produces_the_same_items) {
