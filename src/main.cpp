@@ -40,12 +40,14 @@
 #include <ctime>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "anchor.h"
 #include "audio_capture.h"
 #include "commit_engine.h"
 #include "corpus.h"
+#include "history.h"
 #include "hotkey.h"
 #include "normalizer.h"
 #include "injector.h"
@@ -216,6 +218,17 @@ constexpr UINT kMenuCorpusOpen = 105;
 // Hands back the text of the most recent delivered submission. The one control that answers
 // "it said it typed it and the document is empty" — see settings.h, keep_last_submission.
 constexpr UINT kMenuCopyLast = 106;
+
+// history.h: every submission, as a page in the browser. Built from the corpus, so it is
+// offered only where the corpus is being kept.
+constexpr UINT kMenuHistory = 107;
+
+// Where the corpus lives when the setting leaves it blank — the same default Corpus::open is
+// handed by settings.cpp, spelled once for the two menu items that open it.
+std::filesystem::path corpus_root(const kd::Settings& s) {
+    return s.corpus.dir.empty() ? kd::default_settings_path().parent_path() / "corpus"
+                                : s.corpus.dir;
+}
 
 const wchar_t kWindowClass[] = L"kvit-dictate-message-window";
 const wchar_t kSingleInstanceMutex[] = L"Local\\kvit-dictate-single-instance";
@@ -1509,14 +1522,32 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     return 0;
                 case kMenuCorpusOpen: {
-                    const std::filesystem::path dir =
-                        settings_.corpus.dir.empty()
-                            ? kd::default_settings_path().parent_path() / "corpus"
-                            : settings_.corpus.dir;
+                    const std::filesystem::path dir = corpus_root(settings_);
                     std::error_code ec;
                     std::filesystem::create_directories(dir, ec);
                     ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr,
                                   SW_SHOWNORMAL);
+                    return 0;
+                }
+                case kMenuHistory: {
+                    // Off this thread: a corpus of a thousand sessions on a spinning disk takes
+                    // a second or two to read, and this thread owns the keyboard hook, which
+                    // Windows silently removes if it stops answering for that long. The worker
+                    // touches nothing of App's — it has its own copy of the path — so it may
+                    // outlive the click and even the menu without a lifetime to manage.
+                    std::thread([root = corpus_root(settings_)] {
+                        const HRESULT hr =
+                            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+                        const auto page = kd::write_history_page(root);
+                        if (page.is_ok()) {
+                            ShellExecuteW(nullptr, L"open", page->wstring().c_str(), nullptr,
+                                          nullptr, SW_SHOWNORMAL);
+                        } else {
+                            KD_LOG_ERROR("could not build the dictation history: %s",
+                                         page.status().message().c_str());
+                        }
+                        if (SUCCEEDED(hr)) CoUninitialize();
+                    }).detach();
                     return 0;
                 }
                 case kMenuCopyLast: {
@@ -4186,6 +4217,7 @@ void App::show_tray_menu() {
         }
         AppendMenuW(menu, MF_STRING | (corpus_skip_ ? MF_CHECKED : MF_UNCHECKED), kMenuCorpusSkip,
                     L"Do not record this session");
+        AppendMenuW(menu, MF_STRING, kMenuHistory, L"Dictation history…");
         AppendMenuW(menu, MF_STRING, kMenuCorpusOpen, L"Open the corpus folder");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);

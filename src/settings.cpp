@@ -897,7 +897,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //                    "crash_recovery": true,
 //                    "keep_last_submission": true,
 //                    "corpus": { "enabled": false, "dir": "", "max_bytes": 8589934592,
-//                                "max_age_days": 60 },
+//                                "max_age_days": 0 },        // 0 = no bound
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,

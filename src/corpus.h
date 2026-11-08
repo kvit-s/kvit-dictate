@@ -72,10 +72,17 @@ struct CorpusConfig {
     // room, which is why this is configurable at all.
     std::filesystem::path dir;
 
-    // Oldest-first pruning bounds. Audio is 32 KB per second of open microphone, so a bound in
-    // bytes is the one that actually binds — 8 GiB is about 70 hours.
+    // Oldest-first pruning bounds; 0 turns that bound off. Audio is 32 KB per second of open
+    // microphone, so a bound in bytes is the one that keeps a disk from filling — 8 GiB is about
+    // 70 hours.
+    //
+    // There is no age bound by default. This used to be 60 days, chosen when the corpus was
+    // written and never asked about, and it quietly deleted the first 461 sessions of the
+    // collection on the day they turned 61 days old. The corpus is also the dictation history
+    // (history.h), and "what did I say in August" is a question the age bound answered with
+    // nothing. Old sessions go when the disk bound needs the room, not because of a date.
     uint64_t max_bytes = 8ull * 1024 * 1024 * 1024;
-    uint32_t max_age_days = 60;
+    uint32_t max_age_days = 0;
 };
 
 // One session's recording. Not thread-safe: `append_audio` is called from the capture thread and

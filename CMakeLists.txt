@@ -177,6 +177,7 @@ set(KD_CORE_SOURCES
     src/commit_engine.cpp
     src/settings.cpp
     src/corpus.cpp
+    src/history.cpp
     src/edit_buffer.cpp
 
     # Windows-facing, but with no UI: launching and supervising kvit-asrd.exe.
@@ -209,6 +210,7 @@ set(KD_CORE_HEADERS
     src/theme.h
     src/tray_icon.h
     src/corpus.h
+    src/history.h
     src/edit_buffer.h
     src/translator.h
 )
