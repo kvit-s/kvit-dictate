@@ -905,7 +905,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "affix":     { "prefix": "[dictated: ", "suffix": "]" },  // put around the text, empty by
 //                                                              // default; applied at injection
 //     "normalizer":{ "enabled": false,                     // normalizer.h; off by default
-//                    "url": "http://strixhalo.lan:10301/v1/text/normalize",
+//                    "url": "http://your-gpu-box.lan:10301/v1/text/normalize",
 //                    "timeout_ms": 3000, "max_bytes": 4000,
 //                    "styling": "semi-formal", "structure": "prose",
 //                    "context": "general" }
@@ -2290,7 +2290,7 @@ struct Cursor {
 };
 
 // The grey example text an empty EDIT shows. This is where "for example
-// http://strixhalo.lan:10301" belongs: in the box it is an example *of*, shown exactly while the
+// http://your-gpu-box.lan:10301" belongs: in the box it is an example *of*, shown exactly while the
 // box is empty and gone the moment it is not — rather than as a paragraph underneath that is
 // still there, still being read, long after the user has filled the box in.
 //
@@ -2452,7 +2452,7 @@ ServerMode mode_of(HWND dlg) {
 }
 
 // The label and the example change with the mode, because "Server address" over a box that
-// wants `http://strixhalo.lan:10301` is how the two get confused in the first place.
+// wants `http://your-gpu-box.lan:10301` is how the two get confused in the first place.
 void update_server_mode_ui(HWND dlg) {
     const ServerMode mode = mode_of(dlg);
     const bool local = mode == ServerMode::Local;

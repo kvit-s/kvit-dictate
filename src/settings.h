@@ -181,7 +181,7 @@ inline constexpr int kSettingsSchema = 1;
 // This exists because the two things a user might type into one box are indistinguishable by
 // inspection and catastrophically different in effect. `parse_server_url` treats `http://` and
 // `https://` as **WebSocket synonyms** (docs §2.6.1, because people type them), so storing
-// `http://strixhalo.lan:10301` in a Local-mode field and connecting to it as a protocol server
+// `http://your-gpu-box.lan:10301` in a Local-mode field and connecting to it as a protocol server
 // would make the client attempt a WinHTTP upgrade against an OpenAI HTTP API — which is
 // precisely the failure openai-translator.md exists to end.
 enum class ServerMode : uint8_t {
@@ -495,8 +495,8 @@ std::string serialize_settings(const Settings& s);
 
 // The file name "Save settings…" offers, without the extension: the speech service's host and
 // the last part of the model, so several saved setups can be told apart in a folder listing —
-// `openrouter.ai qwen3-asr-1.7b`, `strixhalo.lan`. `settings` when there is no server. Characters
-// Windows refuses in a file name become `_`.
+// `openrouter.ai qwen3-asr-1.7b`, `your-gpu-box.lan`. `settings` when there is no server.
+// Characters Windows refuses in a file name become `_`.
 std::string suggested_settings_file_name(const Settings& s);
 
 // ─── The settings dialog ────────────────────────────────────────────────────────────────────

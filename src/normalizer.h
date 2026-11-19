@@ -165,7 +165,7 @@ struct NormalizerConfig {
     // this sends every dictated word to another machine. Nothing turns it on but the user.
     bool enabled = false;
 
-    // Full URL of the normalize route, e.g. "http://strixhalo.lan:10301/v1/text/normalize".
+    // Full URL of the normalize route, e.g. "http://your-gpu-box.lan:10301/v1/text/normalize".
     std::string url;
 
     // The whole request, including connect and read. The model's own numbers are ~0.2 s for a

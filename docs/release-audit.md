@@ -96,7 +96,7 @@ Published 2026-11-19 as `kvit-s/kvit-dictate` (see `docs/publish-github.md`).
 | What | Where | Weight |
 |---|---|---|
 | A former work address as author | 92 commits' author line (87 more use `info@kvit.app`) | done: history rewritten before publishing, every commit now `Kvit <info@kvit.app>` or `Kvit Agent` |
-| Home network names: `strixhalo.lan`, `192.168.138.186` | 119 mentions in history; the Settings URL example (`src/settings.cpp:2445`, `:2527`); default in `server/kvit_asr/backends/openai_http.py:98`; `models.json` | the Settings example is shown to every user and should be generic |
+| Home network names: `strixhalo.lan`, `192.168.138.186` | 119 mentions in history; the Settings URL example (`src/settings.cpp:2445`, `:2527`); default in `server/kvit_asr/backends/openai_http.py:98`; `models.json` | done for what users see: Settings already showed `your-gpu-box.lan`, and `docs/setup.md` and the code comments now do too. Left on purpose: the Python server's default address and the two `models.json` entries that rely on it (the developer setup uses them), plus tests, bench records and design notes |
 | Local paths: `C:\Users\sk`, `D:\projects\wan-dancer`, `H:\kvit-corpus` | code comments, `server/kvit_asr/backends/*.py`, bench aggregates | low |
 | Working notes about your own setup | `progress.md`, `plan.md`, `openai-translator.md`, `prd.md` | a choice: keep as design history or move out |
 | `.claude/` and `.kvit/` not listed in `.gitignore` | ignored here only by their own rules | done: both are in the root `.gitignore` |

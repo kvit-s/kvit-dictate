@@ -1020,7 +1020,7 @@ bool host_is_private(std::wstring_view host) {
     if (iequals_suffix(host, L".internal")) return true;
     if (iequals_suffix(host, L".home.arpa")) return true;
 
-    // An unqualified single label — `strixhalo`, `nas` — is a machine on the local network in
+    // An unqualified single label — `gpu-box`, `nas` — is a machine on the local network in
     // every deployment this tool has. A dotted name is not.
     return host.find(L'.') == std::wstring_view::npos;
 }

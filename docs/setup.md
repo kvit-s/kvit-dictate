@@ -22,7 +22,7 @@ If something on your network already serves `/v1/audio/transcriptions` — a lla
 server, a Qwen3-ASR box, a vLLM deployment, anything OpenAI-compatible — then:
 
 1. Open **Settings → Server**.
-2. Type its address into **Speech service**: for example `http://strixhalo.lan:10301`.
+2. Type its address into **Speech service**: for example `http://your-gpu-box.lan:10301`.
 3. Press **Test**.
 
 Test does not merely ping that address. It starts `kvit-asrd.exe` — the translator that ships
@@ -88,7 +88,7 @@ Two buttons at the bottom of Settings let you do this:
 
 * **Save settings…** writes everything the dialog is showing, including edits you haven't applied
   yet, to a file you name. It starts in `%LOCALAPPDATA%\kvit-dictate\saved` and suggests a name
-  from the service and model, such as `strixhalo.lan.json` or
+  from the service and model, such as `your-gpu-box.lan.json` or
   `openrouter.ai qwen3-asr-1.7b.json`.
 * **Restore settings…** loads such a file into the dialog. The title bar says which file it
   came from. **OK** applies it; **Cancel** keeps what you had.
@@ -215,7 +215,7 @@ Once an environment exists, the shape is the same:
 | Field | What to put in it |
 |---|---|
 | Which radio | **"…OpenAI-compatible speech service"** for §0's case, **"I run my own kvit-dictate server"** for everything else on this page. It is a stored setting, not a guess from the scheme: `http://` is a legal WebSocket synonym (`docs/protocol.md` §2.6.1), so there is no way to tell the two apart by looking at the address. |
-| Speech service (first radio) | `http://strixhalo.lan:10301` — an OpenAI-compatible service. `http://` or `https://` only. |
+| Speech service (first radio) | `http://your-gpu-box.lan:10301` — an OpenAI-compatible service. `http://` or `https://` only. |
 | Server address (second radio) | `ws://127.0.0.1:10402/` for this machine, `ws://box.lan:10402/` for another. `wss://` and `https://` work too. |
 | Model | Leave empty unless your server hosts several. If you name one it does not have, it says so — it never quietly substitutes another. |
 
@@ -401,7 +401,7 @@ this machine.
 You never have to, but it is the same program and it takes a command line:
 
 ```
-kvit-asrd.exe --listen 127.0.0.1:10402 --service http://strixhalo.lan:10301
+kvit-asrd.exe --listen 127.0.0.1:10402 --service http://your-gpu-box.lan:10301
 ```
 
 That is also how you run it on **another machine** — put it next to your speech service and point
