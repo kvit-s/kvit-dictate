@@ -86,3 +86,9 @@ desktop.ini
 tools/kvit-speech/bin/
 tools/kvit-speech/obj/
 tools/kvit-speech/dist/
+
+# ── Local agent state ───────────────────────────────────────────────────────────────────────
+# Per-machine tool state, including .claude/settings.local.json. Each directory ignores itself
+# here, but a fresh clone would not have those inner rules, so the root says it too.
+.claude/
+.kvit/
