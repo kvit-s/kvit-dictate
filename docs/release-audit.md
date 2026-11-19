@@ -91,12 +91,12 @@ gitleaks.
 
 ## 3. Not secret, but personal, and public once pushed
 
-No remote is configured, so history can still be changed before the first push.
+Published 2026-11-19 as `kvit-s/kvit-dictate` (see `docs/publish-github.md`).
 
 | What | Where | Weight |
 |---|---|---|
-| Author address a former address | 92 commits' author line (87 more use `info@kvit.app`) | only removable by rewriting history before publishing |
+| A former work address as author | 92 commits' author line (87 more use `info@kvit.app`) | done: history rewritten before publishing, every commit now `Kvit <info@kvit.app>` or `Kvit Agent` |
 | Home network names: `strixhalo.lan`, `192.168.138.186` | 119 mentions in history; the Settings URL example (`src/settings.cpp:2445`, `:2527`); default in `server/kvit_asr/backends/openai_http.py:98`; `models.json` | the Settings example is shown to every user and should be generic |
 | Local paths: `C:\Users\sk`, `D:\projects\wan-dancer`, `H:\kvit-corpus` | code comments, `server/kvit_asr/backends/*.py`, bench aggregates | low |
 | Working notes about your own setup | `progress.md`, `plan.md`, `openai-translator.md`, `prd.md` | a choice: keep as design history or move out |
-| `.claude/` and `.kvit/` not listed in `.gitignore` | ignored here only by their own rules | add them, so `.claude/settings.local.json` cannot be committed from another clone |
+| `.claude/` and `.kvit/` not listed in `.gitignore` | ignored here only by their own rules | done: both are in the root `.gitignore` |
