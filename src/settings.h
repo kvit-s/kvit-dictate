@@ -191,6 +191,11 @@ enum class ServerMode : uint8_t {
     // `url` is a docs/protocol.md server the user runs themselves. Unchanged behaviour: the
     // client speaks the protocol to it directly and spawns nothing.
     Protocol,
+    // **No server at all.** The client launches `kvit-asrd.exe --backend windows-speech`, which
+    // runs Microsoft's on-device speech model through `kvit-speech\kvit-speech.exe`
+    // (src/asrd/backend_windows.h). Nothing crosses the network. `url`, `model` and `api_key`
+    // are kept and unused, so switching back to a service restores what was typed there.
+    ThisPc,
 };
 
 const char* to_string(ServerMode m) noexcept;
@@ -254,7 +259,8 @@ struct ServerSettings {
     uint32_t reconnect_initial_ms = 1000;
     uint32_t reconnect_max_ms = 30000;
 
-    [[nodiscard]] bool configured() const { return !url.empty(); }
+    // This PC needs no address: the model is on the machine, so choosing it *is* configuring it.
+    [[nodiscard]] bool configured() const { return mode == ServerMode::ThisPc || !url.empty(); }
 };
 
 // Validate `url` as a **speech-service** address: `http://` or `https://` only, well formed, and

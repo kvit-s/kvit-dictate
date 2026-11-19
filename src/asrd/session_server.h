@@ -61,7 +61,7 @@
 #include <thread>
 #include <vector>
 
-#include "asrd/backend_openai.h"
+#include "asrd/backend.h"
 #include "asrd/stability.h"
 #include "asrd/vad.h"
 #include "protocol.h"
@@ -145,7 +145,7 @@ struct SessionServerConfig {
 // not a multiplexer.
 class SessionServer {
 public:
-    SessionServer(OpenAiBackend& backend, SessionServerConfig cfg, MessageSink& sink);
+    SessionServer(Backend& backend, SessionServerConfig cfg, MessageSink& sink);
     ~SessionServer();
     SessionServer(const SessionServer&) = delete;
     SessionServer& operator=(const SessionServer&) = delete;
@@ -205,7 +205,7 @@ private:
     void fail_fatal(proto::ErrorCode code, const std::string& msg);
     [[nodiscard]] uint64_t audio_pos_ms_locked() const noexcept;
 
-    OpenAiBackend& backend_;
+    Backend& backend_;
     SessionServerConfig cfg_;
     MessageSink& sink_;
 

@@ -431,3 +431,33 @@ KD_TEST(translator, launches_and_supervises_a_real_child_when_a_service_is_named
         KD_CHECK(true);
     }
 }
+
+// ─── This PC (ServerMode::ThisPc) ───────────────────────────────────────────────────────────
+
+KD_TEST(translator, on_this_pc_the_command_line_names_the_backend_and_nothing_typed) {
+    // Whatever the other modes left in the spec, none of it may reach the child: no address, no
+    // model, no key, and no live preview the model cannot keep up with.
+    kd::TranslatorSpec spec;
+    spec.on_device = true;
+    spec.service_url = "http://stale.lan:10301";
+    spec.model = "Qwen/Qwen3-ASR-1.7B";
+    spec.api_key = "sk-or-v1-0123456789abcdef";
+    spec.live_preview = true;
+    const std::wstring cmd = kd::build_translator_command_line(
+        L"C:\\Program Files\\kvit-dictate\\kvit-asrd.exe", spec, 10500, 4242);
+    KD_CHECK(contains(cmd, L"--backend windows-speech"));
+    KD_CHECK(contains(cmd, L"--finalize-only on"));
+    KD_CHECK(contains(cmd, L"--listen 127.0.0.1:10500"));
+    KD_CHECK(contains(cmd, L"--parent-pid 4242"));
+    KD_CHECK(!contains(cmd, L"--service"));
+    KD_CHECK(!contains(cmd, L"--model"));
+    KD_CHECK(!contains(cmd, L"--api-key"));
+    KD_CHECK(!contains(cmd, L"stale.lan"));
+    // The helper's path is the translator's fixed default; the client never names it.
+    KD_CHECK(!contains(cmd, L"--speech-helper"));
+    // A dictation never downloads the model; only Test asks for that.
+    KD_CHECK(!contains(cmd, L"--speech-install-model"));
+    spec.install_speech_model = true;
+    KD_CHECK(contains(kd::build_translator_command_line(L"C:\\k\\kvit-asrd.exe", spec, 1, 2),
+                      L"--speech-install-model"));
+}

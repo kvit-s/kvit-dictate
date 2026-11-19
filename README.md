@@ -4,12 +4,18 @@ Press **Win+Y**, talk, and text appears in whatever field has focus. A replaceme
 `Win+H` that types the words you actually use — `llama.cpp`, `Qwen3.6`, `sm_120`, file paths, CLI
 flags — and lets you decide how long a pause ends a sentence.
 
-Windows 10 (1809+) and 11, x64.
+Windows 10 (1809+) and 11, x64. Dictating with no server needs Windows 11 24H2 or later.
 
-> **You need an ASR server.** kvit-dictate does not recognise speech itself; it sends your audio
-> to a server you run. There is no bundled recogniser and no cloud service. If that sentence is a
-> dealbreaker, stop here — it is the honest cost of the design and
-> [`docs/setup.md`](docs/setup.md) is where it gets paid.
+> **Two ways to turn speech into text, and you pick one in Settings → Server:**
+>
+> * **This PC** — Microsoft's own on-device speech model (Whisper Small, an optional Windows
+>   component). Nothing leaves the computer and there is no server to run. Windows 11 24H2 or
+>   later; the model downloads once, through Windows Update, when you press **Test**. It is
+>   slower than a GPU box — about 3 s for a 5 s sentence on a fast desktop CPU — and the Windows
+>   API it uses is still marked *experimental* by Microsoft.
+> * **A speech service** you run or rent — anything that serves `/v1/audio/transcriptions`.
+>   Faster and better on technical vocabulary, and your audio crosses the network to it.
+>   [`docs/setup.md`](docs/setup.md) is how to get one.
 
 ---
 
@@ -25,8 +31,9 @@ it from the program before you hear it from Defender.
 * **It types into other applications.** That is the entire product: it synthesises keystrokes into
   the window that has focus. It refuses to do so into password fields, into windows running with
   higher privileges than it has, and into applications you tell it to leave alone.
-* **It opens your microphone while you hold the hotkey**, and sends that audio to the server you
-  configured. Nothing is sent before you press the hotkey, and nothing is sent anywhere else.
+* **It opens your microphone while you hold the hotkey**, and sends that audio to the speech
+  model you chose — on this PC, or the server you configured. Nothing is recorded before you
+  press the hotkey, and nothing is sent anywhere else.
 
 The source is public and this build is not code-signed. Decide accordingly.
 
@@ -36,14 +43,14 @@ No cloud service. No telemetry. No account. No automatic updates and nothing dow
 time. Recognised text is never written to a log unless you switch that on, and that switch is
 compiled out of release builds entirely.
 
-**Your audio does cross the network**, to the server you named and nowhere else — unencrypted,
-and to a server that does not ask who you are. Run it on a network you control.
-[`docs/protocol.md`](docs/protocol.md) §2.8 is the long version, and `wss://` works if you put a
-proxy with a certificate in front of your server.
+**With This PC, your audio never leaves the computer.** The recogniser runs in a helper process
+on this machine (`kvit-speech\kvit-speech.exe`), and the only network use is the one-time model
+download Windows does when you press Test.
 
-*(An earlier version of this file promised "no network access during dictation". That was true
-when the recogniser was a child process on this machine. It is false now, by design, and saying
-so plainly is worth more than a claim that used to be true.)*
+**With a speech service, your audio does cross the network**, to the server you named and
+nowhere else — unencrypted, and to a server that does not ask who you are. Run it on a network
+you control. [`docs/protocol.md`](docs/protocol.md) §2.8 is the long version, and `wss://` works
+if you put a proxy with a certificate in front of your server.
 
 ---
 
@@ -71,20 +78,22 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
 
 ## First run
 
-1. It starts in the tray and opens **Settings → Server**, because it cannot do anything without
-   an address.
-2. Type the address of your speech service — anything that serves
-   `POST /v1/audio/transcriptions`, for example `http://strixhalo.lan:10301` — and press
+1. It starts in the tray and opens **Settings → Server**, because it cannot do anything until
+   you say what turns speech into text.
+2. **No server?** Choose **This PC: Windows speech, no server** and press **Test**. If Windows
+   has not installed its speech model yet, Test asks Windows for it (a few hundred MB, once) and
+   waits; then it reports what answered. Press OK and you are done.
+3. **Have a speech service?** Type its address — anything that serves
+   `POST /v1/audio/transcriptions`, for example `http://your-gpu-box.lan:10301` — and press
    **Test**. It connects for real and tells you what answered: the model, the mode and the
    round-trip time. For a hosted service that wants a key, such as OpenRouter, put the key in
    **API key** (it is stored encrypted). What that costs in privacy and features is in
-   [`docs/setup.md`](docs/setup.md).
-3. Press OK.
+   [`docs/setup.md`](docs/setup.md). Press OK.
 
 That is the whole setup. **There is nothing else to start and no Python to install.**
 kvit-dictate ships with `kvit-asrd.exe`, a translator that speaks its own protocol on one side
-and `/v1/audio/transcriptions` on the other; the app launches it, supervises it, and stops it
-when you quit. Test starts a private copy and completes the real handshake with it, so a green
+and, on the other, `/v1/audio/transcriptions` or the Windows speech model; the app launches it,
+supervises it, and stops it when you quit. Test starts a private copy and completes the real handshake with it, so a green
 Test means the whole path answered — the app, the translator and your service.
 
 Already run a **kvit-dictate protocol server**? Pick "I run my own kvit-dictate server" and give
@@ -93,7 +102,7 @@ it the `ws://` address. Nothing is launched for you in that mode.
 Do not have either? [`docs/setup.md`](docs/setup.md) §1 gets you a working endpoint in five
 minutes that proves the plumbing without needing a model, and §2 gets you a real one.
 
-Until a server is configured **the hotkey does not open your microphone**, the pill does not
+Until you have chosen This PC or a server, **the hotkey does not open your microphone**, the pill does not
 appear, and the tray says why. A dictation tool that silently recorded into nothing would be
 worse than one that refuses.
 
@@ -235,7 +244,7 @@ src/
 docs/examples/        a complete conforming server, in the standard library
 packaging/windows/    icon generator, manifest, .rc, Inno Setup script, release build
 tools/probe/          Phase 0B measurement harness; also `--server <url>`, the Test button's twin
-tools/kvit-speech/    C# helper for the on-device Windows AI speech model (WinRT)
+tools/kvit-speech/    C# helper for the on-device Windows AI speech model (WinRT); shipped as kvit-speech\
 tools/testtarget/     controlled target: edit, richedit, multiline, password, RTL
 tests/                kd_test harness + suites + shared protocol fixtures
 server/kvit_asr/      the reference server: ws, session, stability, vad, backends/
@@ -313,6 +322,7 @@ Honest, and specific about what has and has not been run.
 | **Signing** | ❌ **Not done, and the largest risk in the release.** No certificate exists. An unsigned binary that hooks the keyboard earns a SmartScreen warning at best. |
 | **Clean-VM test** | ❌ Not done. The gate is a browser download with Mark-of-the-Web intact, Defender and SmartScreen at defaults. |
 | **Phase 0B measurements** | ⚠️ 11 of 162 cells, all against `tools/testtarget`. Until an operator runs the rest, `docs/supported-targets.md` is a template rather than evidence. |
+| **No-server dictation** | ✅ **This PC** ships in the installer: `kvit-asrd --backend windows-speech` drives `kvit-speech.exe`, published self-contained (.NET and Windows App SDK runtimes inside, ≈ 230 MB installed, 62 MB installer). Verified 2026-11-19 on Windows 11 build 26300, CPU only: real speech through the real client, translator and model, transcribed word for word. The Settings page itself has not been looked at on screen, and no clean machine has run it. |
 | **Real-model dictation** | ⚠️ Runs against `openai-http` and `windows-speech`. The four backends that need a model on disk and an environment that does not exist yet still have not. |
 | **Text normalizer** | ⚠️ Implemented, off by default, never used in real dictation. The first measurement caught the model rewriting `llama.cpp` as `LLMCpp`; the guard rejects it. |
 

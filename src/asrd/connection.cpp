@@ -9,6 +9,7 @@
 
 #include <windows.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -160,8 +161,9 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
         info.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
         // The endpoint takes vocabulary hints as `prompt`; `session_server` joins `start.context`
         // and sends them. Measured 2026-09-20: on the same audio, "Qt UI" becomes "kvit-ui" and
-        // "Piper D" becomes "Piperd" once the terms are on the wire.
-        info.context_supported = true;
+        // "Piper D" becomes "Piperd" once the terms are on the wire. The Windows speech model
+        // takes no prompt, and saying so lets the client grey out a box that would do nothing.
+        info.context_supported = cfg.backend == BackendKind::OpenAiHttp;
         ack.models.push_back(std::move(info));
         if (!sink.send(proto::Message::of(std::move(ack)))) return kExitTransport;
         KD_LOG_INFO("handshake_ok client=%s model=%s",
@@ -206,22 +208,38 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
         return kExitInternal;
     }
 
-    OpenAiBackendConfig backend_cfg;
-    backend_cfg.base_url = cfg.service;
-    backend_cfg.model = cfg.model;
-    backend_cfg.timeout_ms = cfg.http_timeout_ms;
-    backend_cfg.language = cfg.language;
-    backend_cfg.finalize_only = cfg.finalize_only;
-    backend_cfg.vad_gate = cfg.vad_gate;
-    backend_cfg.api_key = cfg.api_key;
-    OpenAiBackend backend(backend_cfg);
+    // Both backends are batch models behind the same driver, so everything after this block is
+    // the same code for either — which is the point of `Backend` (backend.h).
+    std::unique_ptr<Backend> backend;
+    proto::ErrorCode load_error = proto::ErrorCode::connect_refused;
+    if (cfg.backend == BackendKind::WindowsSpeech) {
+        WindowsSpeechConfig speech_cfg = cfg.speech;
+        speech_cfg.finalize_only = cfg.finalize_only;
+        // The helper belongs to the process, not to this connection: a reconnect must not pay
+        // the model's three-second load again (backend_windows.h).
+        backend = std::make_unique<WindowsSpeechBackend>(
+            speech_cfg, shared_speech_helper(WindowsSpeechBackend::helper_spec(speech_cfg)));
+        // Not `connect_refused`: there is no host to refuse anything. The model, or the helper
+        // that carries it, is what failed, and the message says which.
+        load_error = proto::ErrorCode::model_load_failed;
+    } else {
+        OpenAiBackendConfig backend_cfg;
+        backend_cfg.base_url = cfg.service;
+        backend_cfg.model = cfg.model;
+        backend_cfg.timeout_ms = cfg.http_timeout_ms;
+        backend_cfg.language = cfg.language;
+        backend_cfg.finalize_only = cfg.finalize_only;
+        backend_cfg.vad_gate = cfg.vad_gate;
+        backend_cfg.api_key = cfg.api_key;
+        backend = std::make_unique<OpenAiBackend>(backend_cfg);
+    }
     // Only when there is somewhere to write it: the capture keeps a copy of every posted window,
     // which is the whole utterance on every hop, and nobody should pay that to produce nothing.
-    backend.set_capture_window(!cfg.revision_dir.empty());
+    backend->set_capture_window(!cfg.revision_dir.empty());
 
     const ULONGLONG load_started = GetTickCount64();
-    if (const Status st = backend.load(); !st.ok()) {
-        send_error(proto::ErrorCode::connect_refused, true, st.message(), nullptr);
+    if (const Status st = backend->load(); !st.ok()) {
+        send_error(load_error, true, st.message(), nullptr);
         KD_LOG_ERROR("load failed: %s", st.to_string().c_str());
         return kExitProtocolError;
     }
@@ -234,7 +252,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     // latency numbers in the same column as the native-streaming rows.
     ready.mode = proto::StreamingMode::PseudoStreaming;
     ready.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
-    ready.context_supported = true;  // see the `hello_ack` above
+    ready.context_supported = cfg.backend == BackendKind::OpenAiHttp;  // see the `hello_ack`
     if (!sink.send(proto::Message::of(std::move(ready)))) return kExitTransport;
 
     // ── §6 the conversation ─────────────────────────────────────────────────────────────────
@@ -261,7 +279,7 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     session_cfg.revision_dir = cfg.revision_dir;
     session_cfg.hostile_stability = cfg.hostile_stability;
 
-    SessionServer session(backend, session_cfg, sink);
+    SessionServer session(*backend, session_cfg, sink);
     std::vector<int16_t> pcm;
     int exit_code = kExitOk;
 

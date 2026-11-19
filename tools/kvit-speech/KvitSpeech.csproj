@@ -19,8 +19,9 @@
     <!-- Self-contained *Windows App SDK*, not self-contained .NET. The Speech API ships only in
          the WinAppSDK experimental channel, whose framework package is NOT installed on a normal
          machine; carrying it in this folder means using this backend never requires installing a
-         preview runtime system-wide. The .NET runtime is still a machine dependency, declared in
-         the models.json entry's "requires". -->
+         preview runtime system-wide. The .NET runtime is a machine dependency for a developer
+         build; the release script publishes with -p:SelfContained=true, so an installed copy
+         needs no .NET either. -->
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>false</SelfContained>
   </PropertyGroup>

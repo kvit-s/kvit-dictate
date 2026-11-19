@@ -1020,6 +1020,7 @@ const char* to_string(ServerMode m) noexcept {
     switch (m) {
         case ServerMode::Local:    return "local";
         case ServerMode::Protocol: return "protocol";
+        case ServerMode::ThisPc:   return "this-pc";
     }
     return "local";
 }
@@ -1031,6 +1032,10 @@ bool server_mode_from_string(std::string_view s, ServerMode& out) noexcept {
     }
     if (s == "protocol") {
         out = ServerMode::Protocol;
+        return true;
+    }
+    if (s == "this-pc") {
+        out = ServerMode::ThisPc;
         return true;
     }
     return false;
@@ -1056,7 +1061,7 @@ std::string validate_speech_service_url(std::string_view url) {
     }
     if (lower.rfind("http://", 0) != 0 && lower.rfind("https://", 0) != 0) {
         return "a speech service address starts with http:// or https:// "
-               "(for example http://strixhalo.lan:10301)";
+               "(for example http://your-gpu-box.lan:10301)";
     }
 
     // The characters that would have to be quoted onto `kvit-asrd --service`. Rejected here, in
@@ -1188,7 +1193,10 @@ Status Settings::validate() const {
     // Which parser applies depends on `mode`, and that is the whole point of the field: in Local
     // mode the URL is a speech service and `parse_server_url` would happily accept it as a
     // WebSocket synonym, which is the mistake openai-translator.md exists to end.
-    if (!server.url.empty()) {
+    //
+    // In This PC mode the URL is not used — it is what the user typed before switching, kept so
+    // switching back restores it — so it is not judged by either parser.
+    if (!server.url.empty() && server.mode != ServerMode::ThisPc) {
         if (server.mode == ServerMode::Local) {
             if (const std::string why = validate_speech_service_url(server.url); !why.empty()) {
                 return Status{StatusCode::InvalidArgument, "server.url: " + why};
@@ -1564,7 +1572,8 @@ Result<Settings> parse_settings(std::string_view json_text) {
         if (!mode_text.empty()) {
             if (!server_mode_from_string(mode_text, s.server.mode)) {
                 return Status{StatusCode::Malformed,
-                              "settings.server.mode: expected \"local\" or \"protocol\", got \"" +
+                              "settings.server.mode: expected \"local\", \"protocol\" or "
+                              "\"this-pc\", got \"" +
                                   mode_text + "\""};
             }
         } else {
@@ -1984,6 +1993,10 @@ enum : int {
     // by looking at the URL — which is the whole reason `ServerMode` exists.
     kIdServerModeLocal,
     kIdServerModeProtocol,
+    // The model on this machine (ServerMode::ThisPc). A third radio rather than a separate page:
+    // it is the same question — "what turns my speech into text?" — with an answer that needs
+    // no address.
+    kIdServerModeThisPc,
     kIdServerLivePreview,
     kIdServerApiKey,
     // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
@@ -2433,6 +2446,7 @@ std::vector<std::string> terms_from_text(const std::wstring& text) {
 // Which of the two things the URL box currently means. Read from the controls rather than from
 // the working copy, because the user may have just clicked the other radio.
 ServerMode mode_of(HWND dlg) {
+    if (IsDlgButtonChecked(dlg, kIdServerModeThisPc) == BST_CHECKED) return ServerMode::ThisPc;
     return IsDlgButtonChecked(dlg, kIdServerModeProtocol) == BST_CHECKED ? ServerMode::Protocol
                                                                         : ServerMode::Local;
 }
@@ -2440,18 +2454,28 @@ ServerMode mode_of(HWND dlg) {
 // The label and the example change with the mode, because "Server address" over a box that
 // wants `http://strixhalo.lan:10301` is how the two get confused in the first place.
 void update_server_mode_ui(HWND dlg) {
-    const bool local = mode_of(dlg) == ServerMode::Local;
+    const ServerMode mode = mode_of(dlg);
+    const bool local = mode == ServerMode::Local;
+    const bool this_pc = mode == ServerMode::ThisPc;
     set_cue(GetDlgItem(dlg, kIdServerUrl),
-            local ? L"http://strixhalo.lan:10301" : L"ws://127.0.0.1:10402/");
+            this_pc ? L"not needed: the model runs on this PC"
+                    : (local ? L"http://your-gpu-box.lan:10301" : L"ws://127.0.0.1:10402/"));
+    // On this PC there is no address, no model to name and no key to send. Disabled rather than
+    // cleared, so switching back finds what was typed.
+    EnableWindow(GetDlgItem(dlg, kIdServerUrl), this_pc ? FALSE : TRUE);
+    EnableWindow(GetDlgItem(dlg, kIdServerModel), this_pc ? FALSE : TRUE);
     // Live preview is a translator setting, so it means nothing when the translator is not the
     // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
-    // the user cannot find again.
+    // the user cannot find again. On this PC it is off by measurement, not by policy: a decode
+    // costs ~1.4 s plus a third of the audio, so a preview every second would fall further
+    // behind with each word (src/asrd/backend_windows.h).
     EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
     // Likewise the key: it is the translator that sends it, and a protocol server is not asked.
     EnableWindow(GetDlgItem(dlg, kIdServerApiKey), local ? TRUE : FALSE);
 }
 
 std::wstring server_warning_for(HWND dlg, const std::wstring& url) {
+    if (mode_of(dlg) == ServerMode::ThisPc) return {};  // nothing crosses the network
     if (url.empty()) return {};
     if (mode_of(dlg) == ServerMode::Local) {
         if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
@@ -2520,15 +2544,17 @@ void start_server_test(HWND dlg, DialogState& st) {
     const std::string api_key = trimmed_api_key(dlg);
     const bool live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
 
-    if (url.empty()) {
+    if (url.empty() && mode != ServerMode::ThisPc) {
         SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
                        mode == ServerMode::Local
                            ? L"Type your speech service's address first, for example "
-                             L"http://strixhalo.lan:10301"
+                             L"http://your-gpu-box.lan:10301"
                            : L"Type a server address first, for example ws://127.0.0.1:10402/");
         return;
     }
-    if (mode == ServerMode::Local) {
+    if (mode == ServerMode::ThisPc) {
+        // Nothing to validate: no address, no key.
+    } else if (mode == ServerMode::Local) {
         if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
             SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(why).c_str());
             return;
@@ -2545,8 +2571,11 @@ void start_server_test(HWND dlg, DialogState& st) {
     st.probe_running = true;
     const uint32_t generation = ++st.probe_generation;
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
-                   L"Connecting… (a service loading a model for the first time can take a "
-                   L"while; this waits up to a minute)");
+                   mode == ServerMode::ThisPc
+                       ? L"Loading the Windows speech model… If it is not installed yet, Windows "
+                         L"downloads it now — a few hundred MB, once — and this waits for it."
+                       : L"Connecting… (a service loading a model for the first time can take a "
+                         L"while; this waits up to a minute)");
     EnableWindow(GetDlgItem(dlg, kIdServerTest), FALSE);
 
     // ── What Test actually does, which is the point of it ───────────────────────────────────
@@ -2572,9 +2601,24 @@ void start_server_test(HWND dlg, DialogState& st) {
         Translator probe_child;
 
         ServerEndpoint ep;
-        ep.model = model;
+        ep.model = mode == ServerMode::ThisPc ? std::string() : model;
         bool launched = true;
-        if (mode == ServerMode::Local) {
+        // The one place the model may be downloaded: the user chose This PC and pressed Test,
+        // which is asking for it (plan.md §1.9). A dictation never does; it reports instead.
+        uint32_t probe_ms = 60000;
+        if (mode == ServerMode::ThisPc) {
+            TranslatorSpec spec;
+            spec.on_device = true;
+            spec.install_speech_model = true;
+            probe_ms = 15u * 60u * 1000u;
+            if (const Result<std::string> started = probe_child.start(spec); started) {
+                ep.url = wide(*started);
+                text = L"Started the translator on " + ep.url + L"\r\n";
+            } else {
+                launched = false;
+                text = L"Could not start the translator.\r\n" + wide(started.status().message());
+            }
+        } else if (mode == ServerMode::Local) {
             TranslatorSpec spec;
             spec.service_url = narrow(url);
             spec.model = model;
@@ -2592,16 +2636,22 @@ void start_server_test(HWND dlg, DialogState& st) {
         }
 
         if (launched) {
-            if (const Result<ServerProbe> r = probe_server(ep, 60000); r) {
+            if (const Result<ServerProbe> r = probe_server(ep, probe_ms); r) {
                 text += describe_probe(*r);
-                if (mode == ServerMode::Local) {
+                if (mode == ServerMode::ThisPc) {
+                    text += L"\r\nThe speech model on this PC answered. Nothing you say leaves "
+                            L"this computer.";
+                } else if (mode == ServerMode::Local) {
                     text += L"\r\nThe translator and your speech service both answered. "
                             L"kvit-dictate starts this for you when you dictate; there is "
                             L"nothing else to run.";
                 }
             } else {
                 text += L"Could not use this endpoint.\r\n" + wide(r.status().message());
-                if (mode == ServerMode::Local) {
+                if (mode == ServerMode::ThisPc) {
+                    text += L"\r\nThe Windows speech model needs Windows 11 24H2 or later. Its "
+                            L"diagnostics are in this app's log, prefixed \"asrd:\".";
+                } else if (mode == ServerMode::Local) {
                     text += L"\r\nThe translator started but did not become ready, which "
                             L"usually means it could not reach the speech service at that "
                             L"address. Its own diagnostics are in this app's log, prefixed "
@@ -3204,13 +3254,17 @@ void load_controls(HWND dlg, DialogState& st) {
                    s.server.mode == ServerMode::Local ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, kIdServerModeProtocol,
                    s.server.mode == ServerMode::Protocol ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdServerModeThisPc,
+                   s.server.mode == ServerMode::ThisPc ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, kIdServerLivePreview, s.server.live_preview ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdServerUrl), wide(s.server.url).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerApiKey), wide(s.server.api_key).c_str());
     update_server_mode_ui(dlg);
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
-                   s.server.configured()
+                   s.server.mode == ServerMode::ThisPc
+                       ? L"Press Test to load the Windows speech model on this PC."
+                   : s.server.configured()
                        ? L"Press Test to check that this address answers."
                        : L"No server is configured yet, so dictation is switched off. Type an "
                          L"address above and press Test.");
@@ -3306,7 +3360,7 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         while (!url.empty() && (url.front() == L' ' || url.front() == L'	')) url.erase(0, 1);
         while (!url.empty() && (url.back() == L' ' || url.back() == L'	')) url.pop_back();
         const ServerMode mode = mode_of(dlg);
-        if (!url.empty()) {
+        if (!url.empty() && mode != ServerMode::ThisPc) {
             // Which parser applies is the mode's whole job. In Local mode `parse_server_url`
             // would accept `http://` as a WebSocket synonym and the dialog would cheerfully
             // save an address the client then tries to upgrade.
@@ -3687,6 +3741,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
         c.radio(L"OpenAI-compatible speech service", kIdServerModeLocal, true);
         c.radio(L"kvit-dictate service", kIdServerModeProtocol, false);
+        c.radio(L"This PC: Windows speech, no server", kIdServerModeThisPc, false);
         c.gap(6);
 
         set_cue(c.label_edit(L"Model (optional)", kIdServerModel),
@@ -4178,6 +4233,7 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case kIdServerModeLocal:
                 case kIdServerModeProtocol:
+                case kIdServerModeThisPc:
                     // The label, the example and the warning all change meaning with the mode,
                     // and the warning in particular is about a *different* validation — so it is
                     // recomputed here rather than only on the next keystroke.

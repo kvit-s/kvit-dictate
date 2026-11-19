@@ -110,6 +110,7 @@
 #include <string>
 #include <vector>
 
+#include "asrd/backend.h"
 #include "asrd/http.h"
 #include "util/result.h"
 
@@ -237,22 +238,8 @@ struct Segment {
 [[nodiscard]] std::string join_context_prompt(const std::vector<std::string>& terms,
                                               size_t max_bytes, size_t* dropped = nullptr);
 
-// A cut the model proposed for itself. `committed_text` is the transcript of exactly the first
-// `cut_samples` samples — not an estimate of it, not a prefix matched against it — so a caller
-// may emit that text as final and keep the rest of the audio with no overlap between the two.
-struct ProposedCut {
-    size_t cut_samples = 0;
-    std::string committed_text;
-};
-
-struct Transcription {
-    // The cumulative hypothesis for everything currently buffered.
-    std::string text;
-    bool have_text = false;
-    // Set only when the response's own segment table supports it, and never on a finalize.
-    bool have_cut = false;
-    ProposedCut cut;
-};
+// `ProposedCut` and `Transcription` live in backend.h, with the interface they belong to. Here a
+// cut is set only when the response's own segment table supports it.
 
 // Decide whether a response's segment table supports committing a prefix of the recording.
 //
@@ -265,10 +252,10 @@ bool propose_segment_cut(const OpenAiBackendConfig& cfg, size_t buffered_samples
                          ProposedCut& out);
 
 // The backend itself. One per connection; its HTTP client is what `cancel()` reaches.
-class OpenAiBackend {
+class OpenAiBackend final : public Backend {
 public:
     explicit OpenAiBackend(OpenAiBackendConfig cfg);
-    ~OpenAiBackend();
+    ~OpenAiBackend() override;
     OpenAiBackend(const OpenAiBackend&) = delete;
     OpenAiBackend& operator=(const OpenAiBackend&) = delete;
 
@@ -285,21 +272,21 @@ public:
     // at the body, and one that accepts the key answers 400 for the missing file. No model runs
     // and nothing is billed. Only 401 and 403 fail the load; any other answer is the service's
     // business and the first real request will say more.
-    Status load();
+    Status load() override;
 
     // Start a new utterance: clears the window, the frozen prefix and the audio clock.
-    void reset();
+    void reset() override;
 
     // The session's vocabulary hints (docs/protocol.md §6.1), sent as `prompt` on every
     // transcription. Set once at `session_start`; empty restores the unbiased default.
     //
     // Session-scoped rather than config-scoped because that is what the protocol makes it: the
     // terms arrive with `start`, and a connection may serve sessions with different ones.
-    void set_context(const std::vector<std::string>& terms);
-    [[nodiscard]] const std::string& context_prompt() const noexcept { return prompt_; }
+    void set_context(const std::vector<std::string>& terms) override;
+    [[nodiscard]] const std::string& context_prompt() const noexcept override { return prompt_; }
 
     // Append gated PCM to the window. Cheap; no network. Returns true when a hop is due.
-    bool feed(const int16_t* samples, size_t count);
+    bool feed(const int16_t* samples, size_t count) override;
 
     // Transcribe the current buffer. `force` finalises.
     //
@@ -307,11 +294,11 @@ public:
     // measured endpoint is 237–541 ms (plus 50–176 ms for the optional VAD gate), and doing
     // that on the connection thread would stall audio intake for half a second at a time and
     // overflow the AUDIO_QUEUE_MAX_MS budget docs/protocol.md §9 makes fatal.
-    Status transcribe(bool force, Transcription& out);
+    Status transcribe(bool force, Transcription& out) override;
 
     // Abort whatever is in flight, from any thread.
-    void cancel();
-    void reset_cancel();
+    void cancel() override;
+    void reset_cancel() override;
 
     [[nodiscard]] const std::string& model() const noexcept { return cfg_.model; }
     [[nodiscard]] uint64_t audio_ms() const;
@@ -322,16 +309,18 @@ public:
     //
     // Opt-in because it is a copy of the whole utterance on every hop, and because only one
     // caller wants it: the revision capture in session_server.cpp. Off, this costs nothing.
-    void set_capture_window(bool on) { capture_window_ = on; }
+    void set_capture_window(bool on) override { capture_window_ = on; }
     // Valid until the next `transcribe`. Empty when capture is off or nothing has been posted.
-    [[nodiscard]] const std::vector<int16_t>& last_window() const noexcept { return last_window_; }
+    [[nodiscard]] const std::vector<int16_t>& last_window() const noexcept override {
+        return last_window_;
+    }
     [[nodiscard]] bool finalize_only() const noexcept { return cfg_.finalize_only; }
     [[nodiscard]] uint64_t requests() const noexcept { return requests_; }
     [[nodiscard]] uint64_t vad_skipped() const noexcept { return vad_skipped_; }
     [[nodiscard]] uint64_t segment_cuts_taken() const noexcept { return segment_cuts_; }
 
     // Drop the committed head and keep the tail, after a `ProposedCut` has been acted on.
-    void retain_tail(size_t cut_samples);
+    void retain_tail(size_t cut_samples) override;
 
 private:
     // The server's Silero route. Returns true — "go ahead" — on every failure. See the header.

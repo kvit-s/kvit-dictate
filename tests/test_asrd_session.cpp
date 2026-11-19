@@ -37,6 +37,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1598,4 +1602,158 @@ KD_TEST(asrd_session, the_translator_now_declares_context_supported) {
     const auto readys = seen.of<kd::proto::ReadyMsg>();
     KD_REQUIRE_EQ(readys.size(), size_t{1});
     KD_CHECK(readys[0].context_supported);
+}
+
+// ─── --backend windows-speech, through the real client ─────────────────────────────────────
+//
+// The same session machine and the same client as every case above, with the model on this
+// machine instead of behind an address. `tests/fake_speech` stands in for `kvit-speech.exe`;
+// test_asrd_windows.cpp covers the helper link on its own.
+
+namespace {
+
+TranslatorConfig windows_speech_config() {
+    TranslatorConfig cfg;
+    cfg.backend = BackendKind::WindowsSpeech;
+    cfg.model = kWindowsSpeechModel;
+    cfg.finalize_only = true;
+    cfg.endpoint_silence_ms = 400;
+    cfg.stability.hold_ms_t = 0;
+    cfg.speech.helper = std::filesystem::path(KD_FAKE_SPEECH_EXE);
+    return cfg;
+}
+
+}  // namespace
+
+KD_TEST(asrd_windows, a_whole_dictation_on_this_machine_through_the_real_client) {
+    release_speech_helpers();
+    TranslatorHarness harness(windows_speech_config());
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    KD_REQUIRE(run_session(harness, seen, one_utterance()));
+
+    const auto readys = seen.of<kd::proto::ReadyMsg>();
+    KD_REQUIRE_EQ(readys.size(), size_t{1});
+    KD_CHECK_EQ(readys[0].model, std::string("windows-speech"));
+    // No prompt field on this API, so the client must not offer a vocabulary box that does
+    // nothing.
+    KD_CHECK(!readys[0].context_supported);
+    KD_CHECK_EQ(readys[0].chunk_ms, 0);
+
+    const auto finals = seen.of<kd::proto::FinalMsg>();
+    KD_REQUIRE_EQ(finals.size(), size_t{1});
+    // The fake answers " heard <ms> ms " — padded, so this also proves the trim — for exactly
+    // the audio the endpointer gated, which is the speech and a little of its edges.
+    KD_CHECK(finals[0].text.rfind("heard ", 0) == 0);
+    KD_CHECK(finals[0].text.size() > 9 && finals[0].text.substr(finals[0].text.size() - 3) == " ms");
+    KD_CHECK_EQ(seen.of<kd::proto::ErrorMsg>().size(), size_t{0});
+    harness.stop();
+    release_speech_helpers();
+}
+
+KD_TEST(asrd_windows, a_second_connection_reuses_the_loaded_model) {
+    // The model takes three or four seconds to load. A reconnect that paid that again would put
+    // the user's first word of every session into a pending pill.
+    release_speech_helpers();
+    TranslatorHarness harness(windows_speech_config());
+    KD_REQUIRE(harness.start());
+    for (int i = 0; i < 2; ++i) {
+        Observed seen;
+        KD_REQUIRE(run_session(harness, seen, one_utterance()));
+        KD_CHECK_EQ(seen.of<kd::proto::FinalMsg>().size(), size_t{1});
+    }
+    KD_CHECK_EQ(harness.served(), 2);
+    const auto helper =
+        shared_speech_helper(WindowsSpeechBackend::helper_spec(windows_speech_config().speech));
+    KD_CHECK_EQ(helper->launches(), uint64_t{1});
+    harness.stop();
+    release_speech_helpers();
+}
+
+KD_TEST(asrd_windows, a_missing_helper_is_a_fatal_error_instead_of_ready) {
+    release_speech_helpers();
+    TranslatorConfig cfg = windows_speech_config();
+    cfg.speech.helper = std::filesystem::path(KD_FAKE_SPEECH_EXE).parent_path() / L"absent.exe";
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    kd::IpcClient client;
+    KD_REQUIRE(attach(client, seen, harness.url()));
+    KD_REQUIRE(seen.wait_for([&] { return seen.errors > 0 || seen.ready; }));
+    const auto errors = seen.of<kd::proto::ErrorMsg>();
+    KD_REQUIRE_EQ(errors.size(), size_t{1});
+    KD_CHECK(errors[0].fatal);
+    KD_CHECK(errors[0].code == kd::proto::ErrorCode::model_load_failed);
+    KD_CHECK(errors[0].msg.find("absent.exe") != std::string::npos);
+    KD_CHECK(!seen.ready);
+    client.stop();
+    harness.stop();
+    release_speech_helpers();
+}
+
+KD_TEST(asrd_windows, against_the_real_windows_speech_model_when_one_is_named) {
+    // The half of a human dictation test a machine can do: real speech, through the real client,
+    // the real translator and the real `kvit-speech.exe`, on the model Windows installed.
+    //
+    // Opt-in, because it needs the optional Windows AI component and a built helper:
+    //
+    //     set KD_SPEECH_HELPER=D:\projects\kvit-dictate\tools\kvit-speech\bin\Release\
+    //                          net9.0-windows10.0.26100.0\win-x64\kvit-speech.exe
+    //     set KD_SPEECH_WAV=C:\path\to\speech-16k-mono.wav
+    //     kd_tests --suite asrd_windows
+    //
+    // Any 16 kHz mono 16-bit WAV of speech will do; Windows' own text-to-speech makes one
+    // (System.Speech's SpeechAudioFormatInfo(16000, Sixteen, Mono)). The transcript is printed,
+    // not asserted: what a model hears is the model's business, and the test is the round trip.
+    char helper[1024] = {};
+    char wav[1024] = {};
+    const DWORD nh = GetEnvironmentVariableA("KD_SPEECH_HELPER", helper, sizeof helper);
+    const DWORD nw = GetEnvironmentVariableA("KD_SPEECH_WAV", wav, sizeof wav);
+    if (nh == 0 || nh >= sizeof helper || nw == 0 || nw >= sizeof wav) {
+        KD_INFO("skipped: set KD_SPEECH_HELPER and KD_SPEECH_WAV to run this");
+        KD_CHECK(true);
+        return;
+    }
+
+    std::ifstream in(wav, std::ios::binary);
+    KD_REQUIRE(static_cast<bool>(in));
+    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // The data chunk, wherever the writer put it.
+    const size_t data = bytes.find("data");
+    KD_REQUIRE(data != std::string::npos && data + 8 <= bytes.size());
+    std::vector<int16_t> pcm((bytes.size() - data - 8) / 2);
+    std::memcpy(pcm.data(), bytes.data() + data + 8, pcm.size() * 2);
+    // Silence after the speech, so the endpointer closes the utterance by itself.
+    pcm.insert(pcm.begin(), 16000 / 2, int16_t{0});
+    pcm.insert(pcm.end(), 16000 * 2, int16_t{0});
+
+    release_speech_helpers();
+    TranslatorConfig cfg = windows_speech_config();
+    cfg.speech.helper = std::filesystem::path(kd::utf8::to_utf16_or_empty(helper));
+    cfg.endpoint_silence_ms = 700;
+    TranslatorHarness harness(cfg);
+    KD_REQUIRE(harness.start());
+
+    Observed seen;
+    const auto t0 = std::chrono::steady_clock::now();
+    KD_REQUIRE(run_session(harness, seen, pcm, false, /*settle_ms=*/60000));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    for (const kd::proto::ErrorMsg& e : seen.of<kd::proto::ErrorMsg>()) {
+        KD_FAIL(std::string("the Windows speech path produced an error: ") + e.code_raw + " - " +
+                e.msg);
+    }
+    const auto finals = seen.of<kd::proto::FinalMsg>();
+    KD_CHECK_GT(finals.size(), size_t{0});
+    for (const kd::proto::FinalMsg& f : finals) {
+        KD_INFO("final " + std::to_string(f.utterance_id) + ": " + f.text);
+        if (f.stable_bytes.has_value()) KD_CHECK_EQ(*f.stable_bytes, f.text.size());
+    }
+    KD_INFO("session took " + std::to_string(ms) + " ms for " +
+            std::to_string(pcm.size() / 16) + " ms of audio, model load included");
+    harness.stop();
+    release_speech_helpers();
 }

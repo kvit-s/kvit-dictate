@@ -172,18 +172,26 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     append_quoted_arg(cmd, L"--listen");
     append_quoted_arg(cmd, L"127.0.0.1:" + std::to_wstring(port));
 
-    append_quoted_arg(cmd, L"--service");
-    append_quoted_arg(cmd, utf8::to_utf16_or_empty(spec.service_url));
+    if (spec.on_device) {
+        // No service, no model name, no key: the model is on this machine. The helper's path is
+        // the translator's own fixed default (backend_windows.h), so nothing here names it.
+        append_quoted_arg(cmd, L"--backend");
+        append_quoted_arg(cmd, L"windows-speech");
+        if (spec.install_speech_model) append_quoted_arg(cmd, L"--speech-install-model");
+    } else {
+        append_quoted_arg(cmd, L"--service");
+        append_quoted_arg(cmd, utf8::to_utf16_or_empty(spec.service_url));
 
-    if (!spec.model.empty()) {
-        append_quoted_arg(cmd, L"--model");
-        append_quoted_arg(cmd, utf8::to_utf16_or_empty(spec.model));
+        if (!spec.model.empty()) {
+            append_quoted_arg(cmd, L"--model");
+            append_quoted_arg(cmd, utf8::to_utf16_or_empty(spec.model));
+        }
     }
 
     // Explicit on/off rather than a bare switch, because the translator's default is ON and a
     // bare `--finalize-only` would read as if it changed something.
     append_quoted_arg(cmd, L"--finalize-only");
-    append_quoted_arg(cmd, spec.live_preview ? L"off" : L"on");
+    append_quoted_arg(cmd, spec.live_preview && !spec.on_device ? L"off" : L"on");
 
     append_quoted_arg(cmd, L"--endpoint-silence-ms");
     append_quoted_arg(cmd, std::to_wstring(spec.endpoint_silence_ms));
@@ -199,11 +207,12 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     append_quoted_arg(cmd, std::to_wstring(parent_pid));
 
     // A switch, not a value: the key itself goes down the child's stdin (see `launch`).
-    if (!spec.api_key.empty()) append_quoted_arg(cmd, L"--api-key-stdin");
+    if (!spec.api_key.empty() && !spec.on_device) append_quoted_arg(cmd, L"--api-key-stdin");
 
-    // There is deliberately no --backend, no --silero-model and no environment block:
-    // openai-translator.md §1.4 and §4.6. Nothing the user types reaches this command line except
-    // `--service` and `--model`, both of them values rather than arguments.
+    // There is deliberately no --silero-model and no environment block: openai-translator.md
+    // §1.4 and §4.6. `--backend` is a constant this program chooses, never text the user typed.
+    // Nothing the user types reaches this command line except `--service` and `--model`, both of
+    // them values rather than arguments.
     return cmd;
 }
 
@@ -314,15 +323,27 @@ std::string Translator::url() const {
     return impl_->url;
 }
 
-Result<std::string> Translator::start(const TranslatorSpec& spec) {
+Result<std::string> Translator::start(const TranslatorSpec& spec_in) {
     if (impl_->running.load()) stop();
+
+    // On this PC there is no address, no model and no key, and none may reach the command line
+    // by accident: `build_translator_command_line` leaves them off, and so does this copy.
+    TranslatorSpec on_device_spec;
+    if (spec_in.on_device) {
+        on_device_spec.on_device = true;
+        on_device_spec.install_speech_model = spec_in.install_speech_model;
+        on_device_spec.live_preview = false;
+        on_device_spec.endpoint_silence_ms = spec_in.endpoint_silence_ms;
+        on_device_spec.revision_dir = spec_in.revision_dir;
+    }
+    const TranslatorSpec& spec = spec_in.on_device ? on_device_spec : spec_in;
 
     // The URL is validated before it can reach a command line. This is the check that makes
     // "user-supplied content" different from "a user-supplied argv" — see translator.h.
     if (const std::string why = validate_speech_service_url(spec.service_url); !why.empty()) {
         return Status{StatusCode::InvalidArgument, "speech service address: " + why};
     }
-    if (spec.service_url.empty()) {
+    if (spec.service_url.empty() && !spec.on_device) {
         return Status{StatusCode::InvalidArgument,
                       "no speech service is configured (docs/protocol.md §10.6)"};
     }
@@ -348,7 +369,8 @@ Result<std::string> Translator::start(const TranslatorSpec& spec) {
             // support question is answered from, and the Settings page shows it too.
             KD_LOG_INFO("kvit-asrd pid %lu listening on %s for %s",
                         static_cast<unsigned long>(impl_->pid.load()), impl_->url.c_str(),
-                        spec.service_url.c_str());
+                        spec.on_device ? "the Windows speech model on this PC"
+                                       : spec.service_url.c_str());
             return impl_->url;
         }
         last = st;

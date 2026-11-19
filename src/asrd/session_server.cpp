@@ -67,7 +67,7 @@ proto::Message error_message(proto::ErrorCode code, bool fatal, const std::strin
 
 }  // namespace
 
-SessionServer::SessionServer(OpenAiBackend& backend, SessionServerConfig cfg, MessageSink& sink)
+SessionServer::SessionServer(Backend& backend, SessionServerConfig cfg, MessageSink& sink)
     : backend_(backend),
       cfg_(std::move(cfg)),
       sink_(sink),

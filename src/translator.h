@@ -59,6 +59,15 @@ namespace kd {
 // owns the published mark and a second place to set those numbers is one too many
 // (openai-translator.md §4.3).
 struct TranslatorSpec {
+    // `--backend windows-speech`: the model on this machine, no service (ServerMode::ThisPc).
+    // `service_url`, `model`, `api_key` and `live_preview` are then not used, and the command
+    // line says `--finalize-only on` whatever `live_preview` holds — see
+    // `update_server_mode_ui` for the measurement that decides it.
+    bool on_device = false;
+    // With `on_device`: let the helper download the model if Windows has not installed it.
+    // Only the Settings page's Test button sets this; a dictation never downloads anything.
+    bool install_speech_model = false;
+
     // The user's speech service. Validated with `validate_speech_service_url()` before it gets
     // anywhere near a command line.
     std::string service_url;

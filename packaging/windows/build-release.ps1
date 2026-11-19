@@ -18,14 +18,17 @@
     release and no certificate exists yet; a script that quietly produced unsigned output while
     looking like it signed would be worse than one that says so. It says so, at the end.
 
-    The staged payload is **two** executables plus documents. No models.json, no Python, no CRT
-    redistributable — the build is /MT (CMakeLists.txt), so there is nothing to redistribute.
-    models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and shipping it would
-    put a "mock" model in front of a new user, which types invented sentences.
+    The staged payload is **two** executables, one helper folder and documents. No models.json,
+    no Python, no CRT redistributable — the build is /MT (CMakeLists.txt), so there is nothing
+    to redistribute. models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and
+    shipping it would put a "mock" model in front of a new user, which types invented sentences.
 
         kvit-dictate.exe   the client: hotkey, capture, session, injection, overlay
-        kvit-asrd.exe      the translator: docs/protocol.md on one side, an OpenAI-compatible
-                           /v1/audio/transcriptions service on the other
+        kvit-asrd.exe      the translator: docs/protocol.md on one side, and on the other an
+                           OpenAI-compatible /v1/audio/transcriptions service, or the model on
+                           this PC through the helper below
+        kvit-speech\       the on-device Windows AI speech helper (tools/kvit-speech), published
+                           self-contained with its .NET and Windows App SDK runtimes
 
     ── The spawn check changed, and it is worth reading before "fixing" it ────────────────────
 
@@ -129,6 +132,39 @@ if (-not (Test-Path $asrd)) {
 }
 Copy-Item $asrd $stageDir
 
+# ─── The on-device speech helper (src/asrd/backend_windows.h) ───────────────────────────────
+#
+# What lets "This PC" in Settings > Server dictate with no server at all: kvit-asrd launches
+# kvit-speech\kvit-speech.exe, which reaches the Windows AI speech model through the Windows App
+# SDK. It is C#, so it is built here with the .NET SDK rather than by CMake.
+#
+# **Published self-contained, .NET runtime included.** The csproj leaves the .NET runtime to the
+# machine, which is right for a developer and wrong for an installer: a clean Windows has no .NET
+# 9, and a helper that fails to start on one is exactly the failure a clean-VM test exists to
+# find. The Windows App SDK runtime is carried beside it either way (WindowsAppSDKSelfContained,
+# because the API is only in the experimental channel; tools/kvit-speech/README.md). That makes
+# this folder most of the installer's size, and it is the price of needing no server.
+$dotnet = Find-Tool 'dotnet.exe' @((Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'))
+if (-not $dotnet) {
+    throw 'dotnet.exe (the .NET 9 SDK) not found; it builds tools\kvit-speech, without which "This PC" in Settings cannot dictate'
+}
+$speechOut = Join-Path $buildDir 'kvit-speech'
+if (Test-Path $speechOut) { Remove-Item -Recurse -Force $speechOut }
+Write-Host "`n[release] === kvit-speech (dotnet publish, self-contained) ==="
+& $dotnet publish (Join-Path $repo 'tools\kvit-speech\KvitSpeech.csproj') -c Release -r win-x64 `
+    --self-contained true -p:SelfContained=true -o $speechOut --nologo
+if ($LASTEXITCODE -ne 0) { throw 'dotnet publish of tools\kvit-speech failed' }
+if (-not (Test-Path (Join-Path $speechOut 'kvit-speech.exe'))) {
+    throw "kvit-speech.exe not found in $speechOut after publish"
+}
+# The .NET runtime really is inside: without it the helper would ask the machine for one.
+if (-not (Test-Path (Join-Path $speechOut 'coreclr.dll'))) {
+    throw 'the published kvit-speech has no coreclr.dll, so it is not self-contained and would need .NET 9 installed'
+}
+# Debug symbols are not shipped; they are a third of the folder and help nobody who installs it.
+Copy-Item -Recurse $speechOut (Join-Path $stageDir 'kvit-speech')
+Get-ChildItem -Recurse -File -Filter '*.pdb' (Join-Path $stageDir 'kvit-speech') | Remove-Item -Force
+
 # The whole payload, and the list is short on purpose (release-plan.md §3.2).
 foreach ($f in @('LICENSE', 'LICENSE-APACHE', 'README.md')) {
     Copy-Item (Join-Path $repo $f) $stageDir
@@ -175,7 +211,11 @@ Write-Host "[release] the models.json interpreter spawn is compiled out (no 'spa
 if (-not (Test-Path (Join-Path $stageDir 'kvit-asrd.exe'))) {
     throw 'kvit-asrd.exe is missing from the stage directory'
 }
-Write-Host "[release] both halves staged (kvit-dictate.exe + kvit-asrd.exe)"
+# Where the translator looks for it, and nowhere else (default_speech_helper_path).
+if (-not (Test-Path (Join-Path $stageDir 'kvit-speech\kvit-speech.exe'))) {
+    throw 'kvit-speech\kvit-speech.exe is missing from the stage directory; "This PC" could not dictate'
+}
+Write-Host "[release] both halves staged (kvit-dictate.exe + kvit-asrd.exe), and the on-device helper (kvit-speech\)"
 
 $staged = Get-ChildItem -Recurse -File $stageDir
 Write-Host "[release] staged $($staged.Count) files, $([math]::Round(($staged | Measure-Object Length -Sum).Sum / 1MB, 2)) MB"

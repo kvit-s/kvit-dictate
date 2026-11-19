@@ -486,6 +486,12 @@ private:
 #endif
     }
     kd::Result<std::wstring> resolve_server_url();
+    // What is being talked to, for a log line or a corpus record: the address, or — on this PC,
+    // where `server.url` is a leftover from another mode — the name of the backend.
+    [[nodiscard]] std::string server_label() const {
+        return settings_.server.mode == kd::ServerMode::ThisPc ? std::string("this-pc:windows-speech")
+                                                               : settings_.server.url;
+    }
     void schedule_reconnect();
     void on_conn_state(kd::proto::ConnState s);
     void on_sidecar_lost();
@@ -1036,8 +1042,8 @@ bool App::startup() {
     }
 
     // A broken installation, reported once and early rather than at the first hotkey press.
-    // In Local mode the translator is not optional: it is half the application.
-    if (settings_.server.mode == kd::ServerMode::Local &&
+    // In Local and This PC modes the translator is not optional: it is half the application.
+    if (settings_.server.mode != kd::ServerMode::Protocol &&
         settings_.server.configured()) {
         if (const kd::Result<std::filesystem::path> image = kd::Translator::image_path(); !image) {
             KD_LOG_ERROR("%s", image.status().message().c_str());
@@ -1091,10 +1097,15 @@ kd::Result<std::wstring> App::resolve_server_url() {
     }
 
     kd::TranslatorSpec spec;
-    spec.service_url = settings_.server.url;
-    spec.model = settings_.server.model;
-    spec.api_key = settings_.server.api_key;
-    spec.live_preview = settings_.server.live_preview;
+    if (settings_.server.mode == kd::ServerMode::ThisPc) {
+        // The model on this machine. No address, no model name, no key (translator.h).
+        spec.on_device = true;
+    } else {
+        spec.service_url = settings_.server.url;
+        spec.model = settings_.server.model;
+        spec.api_key = settings_.server.api_key;
+        spec.live_preview = settings_.server.live_preview;
+    }
     spec.endpoint_silence_ms = settings_.session.endpoint_silence_ms;
     // Revision capture rides with the corpus: it is the same collection, and the same consent.
     // Its own subdirectory, so a `revisions/` full of one-utterance clips never gets mistaken
@@ -1131,7 +1142,10 @@ bool App::connect_server() {
 
     kd::ServerEndpoint ep;
     ep.url = *url;
-    ep.model = settings_.server.model;
+    // On this PC the translator serves exactly one model, and a stale name from Local mode in
+    // `hello.model` would be refused as `model_unavailable`.
+    ep.model = settings_.server.mode == kd::ServerMode::ThisPc ? std::string()
+                                                               : settings_.server.model;
     ep.connect_timeout_ms = settings_.server.connect_timeout_ms;
 
     kd::IpcClient::Callbacks cb;
@@ -1158,13 +1172,15 @@ bool App::connect_server() {
     };
 
     set_tray_state(kd::OverlayState::ModelLoading);
-    tray_reason_ = L"kvit-dictate — connecting to " + widen(settings_.server.url);
+    tray_reason_ = settings_.server.mode == kd::ServerMode::ThisPc
+                       ? std::wstring(L"kvit-dictate — loading the speech model on this PC")
+                       : L"kvit-dictate — connecting to " + widen(settings_.server.url);
     // Deliberately the *user's* address rather than `ep.url`: in Local mode `ep.url` is a
     // loopback port this program chose a second ago, which tells the user nothing.
     update_tray();
 
     if (const kd::Status st = ipc_->connect(ep, cb); !st.ok()) {
-        KD_LOG_ERROR("could not connect to %s: %s", settings_.server.url.c_str(),
+        KD_LOG_ERROR("could not connect to %s: %s", server_label().c_str(),
                      st.message().c_str());
         no_server_ = st.code() == kd::StatusCode::InvalidArgument;
         tray_reason_ = L"kvit-dictate — " + widen(st.message());
@@ -1191,7 +1207,7 @@ void App::schedule_reconnect() {
                    std::to_wstring(reconnect_delay_ms_ / 1000) + L" s";
     set_tray_state(kd::OverlayState::Error);
     update_tray();
-    KD_LOG_INFO("reconnecting to %s in %u ms", settings_.server.url.c_str(),
+    KD_LOG_INFO("reconnecting to %s in %u ms", server_label().c_str(),
                 reconnect_delay_ms_);
 }
 
@@ -1404,7 +1420,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 // already exists rather than on a timer of its own.
                 if (reconnect_at_ms_ != 0 && clock_.now_ms() >= reconnect_at_ms_) {
                     reconnect_at_ms_ = 0;
-                    KD_LOG_INFO("reconnecting to %s", settings_.server.url.c_str());
+                    KD_LOG_INFO("reconnecting to %s", server_label().c_str());
                     connect_server();
                 }
                 // The review pill goes away when focus leaves the window its text went into.
@@ -3224,7 +3240,7 @@ void App::corpus_open() {
     kd::json::Value h = kd::json::Value::object();
     h.set("model", kd::json::Value::string(loaded_model_.empty() ? settings_.server.model
                                                                  : loaded_model_));
-    h.set("service", kd::json::Value::string(settings_.server.url));
+    h.set("service", kd::json::Value::string(server_label()));
     h.set("language", kd::json::Value::string(std::string("en")));
     h.set("target", kd::json::Value::string(target_.has_value() ? target_->process_name
                                                                 : std::string()));

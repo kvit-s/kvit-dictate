@@ -17,7 +17,8 @@
 //   session_server.cpp   L3: start/stop/cancel, utterances, emission.          PORTED
 //   vad.cpp              endpointing.                                          PORTED
 //   stability.cpp        hypotheses -> stable_bytes.                           PORTED
-//   backend_openai.cpp   PCM -> text.                                          PORTED
+//   backend_openai.cpp   PCM -> text, over HTTP.                               PORTED
+//   backend_windows.cpp  PCM -> text on this machine, through kvit-speech.exe. NEW
 //
 // This file is the run loop and the handshake, and nothing else.
 
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "asrd/backend_openai.h"
+#include "asrd/backend_windows.h"
 #include "asrd/connection.h"
 #include "asrd/http.h"
 #include "asrd/ws_server.h"
@@ -62,13 +64,20 @@ void print_usage() {
     std::fputs(
         "kvit-asrd - the kvit-dictate translator.\n"
         "\n"
-        "Speaks docs/protocol.md on a loopback WebSocket and an OpenAI-compatible\n"
-        "/v1/audio/transcriptions service over HTTP.\n"
+        "Speaks docs/protocol.md on a loopback WebSocket, and turns audio into text with an\n"
+        "OpenAI-compatible /v1/audio/transcriptions service over HTTP, or with the on-device\n"
+        "Windows AI speech model.\n"
         "\n"
         "  kvit-asrd --service http://host:port [--listen 127.0.0.1:10402] [options]\n"
+        "  kvit-asrd --backend windows-speech [--listen 127.0.0.1:10402] [options]\n"
         "\n"
         "  --listen [host:]port        default 127.0.0.1:10402. Loopback unless a host is given.\n"
-        "  --service URL               REQUIRED. http:// or https:// only.\n"
+        "  --backend NAME              openai-http (default) or windows-speech.\n"
+        "  --service URL               REQUIRED for openai-http. http:// or https:// only.\n"
+        "  --speech-helper PATH        windows-speech: the helper executable. Default\n"
+        "                              kvit-speech\\kvit-speech.exe beside this program.\n"
+        "  --speech-install-model      windows-speech: let the helper download the model\n"
+        "                              through Windows Update if it is not installed.\n"
         "  --model NAME                default Qwen/Qwen3-ASR-1.7B\n"
         "  --language LANG             default en. Empty means the server's default.\n"
         "  --parent-pid PID            exit when that process does.\n"
@@ -86,6 +95,26 @@ void print_usage() {
         "  --log-level LEVEL           trace|debug|info|warn|error. Default info.\n"
         "  --version, --help\n",
         stderr);
+}
+
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+std::string narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr,
+                                      0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n > 0 ? n : 0), '\0');
+    if (n > 0) {
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n,
+                            nullptr, nullptr);
+    }
+    return s;
 }
 
 bool parse_bool(const std::string& v, bool& out) {
@@ -161,6 +190,32 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
                 exit_code = 2;
                 return false;
             }
+            continue;
+        }
+        if (a == "--backend") {
+            const std::string v = next("--backend");
+            if (exit_code != 0) return false;
+            if (v == "openai-http") {
+                opt.translator.backend = BackendKind::OpenAiHttp;
+            } else if (v == "windows-speech") {
+                opt.translator.backend = BackendKind::WindowsSpeech;
+            } else {
+                std::fprintf(stderr,
+                             "kvit-asrd: --backend wants openai-http or windows-speech, got %s\n",
+                             v.c_str());
+                exit_code = 2;
+                return false;
+            }
+            continue;
+        }
+        if (a == "--speech-helper") {
+            const std::string v = next("--speech-helper");
+            if (exit_code != 0) return false;
+            opt.translator.speech.helper = std::filesystem::path(widen(v));
+            continue;
+        }
+        if (a == "--speech-install-model") {
+            opt.translator.speech.install_model = true;
             continue;
         }
         if (a == "--service") {
@@ -265,8 +320,21 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
 
     // There is deliberately no --api-key that takes a value: the key arrives on stdin under
     // --api-key-stdin, because every process running as this user can read a command line. And
-    // still no --silero-model and no --backend; openai-translator.md §1.4 records why each is a
-    // separate, argued addition.
+    // still no --silero-model; openai-translator.md §1.4 records why it is a separate, argued
+    // addition. `--backend` was one too, and backend_windows.h is the argument.
+    if (opt.translator.backend == BackendKind::WindowsSpeech) {
+        if (!opt.translator.service.empty()) {
+            std::fprintf(stderr,
+                         "kvit-asrd: --service has no meaning with --backend windows-speech; the "
+                         "model runs on this machine\n");
+            exit_code = 2;
+            return false;
+        }
+        // One model, and its name is what `hello.model` must match. A `--model` that said
+        // anything else would be a promise this backend cannot keep.
+        opt.translator.model = kWindowsSpeechModel;
+        return true;
+    }
     const std::string why = validate_service_url(opt.translator.service);
     if (!why.empty()) {
         std::fprintf(stderr, "kvit-asrd: %s\n", why.c_str());
@@ -366,11 +434,21 @@ int run(int argc, char** argv) {
     log_cfg.to_debugger = false;
     kd::log::init(log_cfg);
 
-    KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s api_key=%s",
-                opt.translator.service.c_str(), opt.translator.model.c_str(),
-                opt.translator.finalize_only ? "finalize-only" : "live-preview",
-                opt.translator.vad_gate ? "on" : "off",
-                opt.translator.api_key.empty() ? "none" : "set");
+    if (opt.translator.backend == BackendKind::WindowsSpeech) {
+        const std::filesystem::path helper = opt.translator.speech.helper.empty()
+                                                 ? default_speech_helper_path()
+                                                 : opt.translator.speech.helper;
+        KD_LOG_INFO("kvit-asrd starting: backend=windows-speech helper=%s %s install_model=%s",
+                    narrow(helper.wstring()).c_str(),
+                    opt.translator.finalize_only ? "finalize-only" : "live-preview",
+                    opt.translator.speech.install_model ? "yes" : "no");
+    } else {
+        KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s api_key=%s",
+                    opt.translator.service.c_str(), opt.translator.model.c_str(),
+                    opt.translator.finalize_only ? "finalize-only" : "live-preview",
+                    opt.translator.vad_gate ? "on" : "off",
+                    opt.translator.api_key.empty() ? "none" : "set");
+    }
     if (opt.translator.hostile_stability) {
         KD_LOG_ERROR(
             "--hostile-stability is on. This build deliberately emits non-conforming "
@@ -456,6 +534,8 @@ int run(int argc, char** argv) {
     for (std::thread& t : connections) {
         if (t.joinable()) t.join();
     }
+    // Asked to quit rather than left to the job object, so its last log lines arrive.
+    release_speech_helpers();
     KD_LOG_INFO("kvit-asrd exiting (%d)", last);
     kd::log::shutdown();
     return last;

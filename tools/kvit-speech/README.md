@@ -8,8 +8,12 @@ sidecar is stdlib-only CPython. Reaching WinRT from that interpreter would mean 
 Windows App SDK bootstrapper inside it, ending the stdlib-only rule for *every* backend. So the
 WinRT lives here, in its own process, and the sidecar talks to it over a small framed protocol.
 
-Nothing else in kvit-dictate depends on this directory. If the Speech API is ever withdrawn, or
-graduates and changes shape, this is the only thing that has to change.
+Two things use it: the Python reference server's `windows-speech` backend, and — since
+2026-11-19 — the shipped translator, `kvit-asrd --backend windows-speech`
+(`src/asrd/backend_windows.h`), which is what **This PC** in Settings → Server runs. The
+installer carries it as `kvit-speech\` beside `kvit-asrd.exe`, published self-contained by
+`packaging/windows/build-release.ps1`. If the Speech API is ever withdrawn, or graduates and
+changes shape, this directory is still the only thing that has to change.
 
 ---
 

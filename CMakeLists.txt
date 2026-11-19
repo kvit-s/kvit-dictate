@@ -380,6 +380,7 @@ set(KD_ASRD_SOURCES
     src/asrd/stability.cpp
     src/asrd/vad.cpp
     src/asrd/backend_openai.cpp
+    src/asrd/backend_windows.cpp
     src/asrd/http.cpp
 )
 
@@ -389,7 +390,9 @@ set(KD_ASRD_HEADERS
     src/asrd/session_server.h
     src/asrd/stability.h
     src/asrd/vad.h
+    src/asrd/backend.h
     src/asrd/backend_openai.h
+    src/asrd/backend_windows.h
     src/asrd/http.h
 )
 
@@ -476,6 +479,7 @@ if(KD_BUILD_TESTS)
         tests/test_asrd_vad.cpp
         tests/test_asrd_backend.cpp
         tests/test_asrd_session.cpp
+        tests/test_asrd_windows.cpp
     )
 
     # Everything under src/asrd/ except main.cpp, which owns the process and its own int main().
@@ -491,6 +495,13 @@ if(KD_BUILD_TESTS)
     # keep a private copy (docs/protocol.md §12).
     target_compile_definitions(kd_tests PRIVATE
         KD_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+
+    # A stand-in for tools/kvit-speech: its framed protocol with no model behind it, and a flag
+    # for each way the real helper can fail. See tests/fake_speech/main.cpp.
+    add_executable(kd_fake_speech tests/fake_speech/main.cpp)
+    add_dependencies(kd_tests kd_fake_speech)
+    target_compile_definitions(kd_tests PRIVATE
+        KD_FAKE_SPEECH_EXE=L"$<TARGET_FILE:kd_fake_speech>")
 endif()
 
 # ─── ctest registration ──────────────────────────────────────────────────────────────────────
@@ -539,6 +550,7 @@ if(KD_BUILD_TESTS)
         asrd_vad        # src/asrd/vad.cpp — the energy endpointer and its chunking invariance
         asrd_backend    # src/asrd/backend_openai.cpp — the window driver, WAV, multipart
         asrd_session    # src/asrd/session_server.cpp — in-process loopback and a stub service
+        asrd_windows    # src/asrd/backend_windows.cpp — the helper link, against tests/fake_speech
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module
     # starts here, disabled and visible, instead of being silently uncovered.

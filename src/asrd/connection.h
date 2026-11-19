@@ -21,6 +21,7 @@
 #include <string>
 
 #include "asrd/backend_openai.h"
+#include "asrd/backend_windows.h"
 #include "asrd/stability.h"
 #include "asrd/ws_server.h"
 
@@ -35,8 +36,18 @@ inline constexpr int kExitInternal = 5;
 // Everything a connection needs to know. Filled from the command line in `main.cpp`; there is
 // no settings file and no environment on this side (openai-translator.md §4.6: configuration
 // arrives on the command line from the client that launched it).
+// Which side of the translator turns audio into text. `--backend` on the command line.
+enum class BackendKind : uint8_t {
+    // `--service`, an OpenAI-compatible `/v1/audio/transcriptions` endpoint. The default.
+    OpenAiHttp,
+    // The on-device Windows AI speech model, through `kvit-speech.exe`. No `--service`, no
+    // network: backend_windows.h.
+    WindowsSpeech,
+};
+
 struct TranslatorConfig {
-    std::string service;                      // validated by validate_service_url()
+    BackendKind backend = BackendKind::OpenAiHttp;
+    std::string service;                      // validated by validate_service_url(); OpenAiHttp only
     std::string model = kDefaultModel;
     std::string language = kDefaultLanguage;  // empty means "omit the field, server default"
     bool finalize_only = true;
@@ -50,6 +61,9 @@ struct TranslatorConfig {
     // argument: main.cpp reads it from stdin under `--api-key-stdin`, because a command line is
     // readable by every other process running as the same user.
     std::string api_key;
+
+    // `--backend windows-speech` only. `finalize_only` above wins over the copy in here.
+    WindowsSpeechConfig speech;
 
     // session_server.h `SessionServerConfig::revision_dir` — where to write the audio behind a
     // hypothesis that retracted words it had already shown the user. Empty disables it, and

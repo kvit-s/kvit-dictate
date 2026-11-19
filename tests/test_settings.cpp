@@ -888,3 +888,37 @@ KD_TEST(settings, keeping_the_last_dictation_defaults_on_and_survives_an_older_f
     // exactly the mistake a shared "privacy is off" flag would make.
     KD_CHECK(!loaded->crash_recovery);
 }
+
+// ─── server.mode = this-pc ──────────────────────────────────────────────────────────────────
+
+KD_TEST(settings, this_pc_is_configured_without_an_address) {
+    kd::Settings s;
+    s.server.mode = kd::ServerMode::ThisPc;
+    KD_CHECK(s.server.configured());
+    KD_CHECK(s.validate().ok());
+}
+
+KD_TEST(settings, this_pc_keeps_the_address_it_does_not_use) {
+    // Switching to This PC and back must find what was typed. The stale address is not judged by
+    // either parser while it is unused — a ws:// one left from Protocol mode would fail the
+    // speech-service check, and refusing to save for a field the user cannot even edit would be
+    // a dialog that cannot be closed.
+    kd::Settings in;
+    in.server.mode = kd::ServerMode::ThisPc;
+    in.server.url = "ws://mybox.lan:10402/";
+    in.server.model = "some-model";
+    KD_CHECK(in.validate().ok());
+
+    kd::Result<kd::Settings> back = kd::parse_settings(kd::serialize_settings(in));
+    KD_REQUIRE(back.is_ok());
+    KD_CHECK(back->server.mode == kd::ServerMode::ThisPc);
+    KD_CHECK_EQ(back->server.url, in.server.url);
+    KD_CHECK_EQ(back->server.model, in.server.model);
+    KD_CHECK(back->validate().ok());
+
+    kd::Result<kd::Settings> parsed =
+        kd::parse_settings(R"({"schema":1,"server":{"mode":"this-pc"}})");
+    KD_REQUIRE(parsed.is_ok());
+    KD_CHECK(parsed->server.mode == kd::ServerMode::ThisPc);
+    KD_CHECK(parsed->server.configured());
+}
