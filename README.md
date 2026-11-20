@@ -56,7 +56,7 @@ if you put a proxy with a certificate in front of your server.
 
 ## Install
 
-Download the installer or the portable ZIP from the releases page.
+Download the installer or the portable ZIP from the [releases page](https://github.com/kvit-s/kvit-dictate/releases).
 
 * **Installer** — per-user, into `%LOCALAPPDATA%\Programs\kvit-dictate`, no administrator prompt.
   That is deliberate: the first thing this program does is register a global keyboard hook, and
@@ -297,6 +297,12 @@ packaging\windows\build-release.ps1
 It refuses to package a red build, and it checks the executable for dynamic-CRT imports —
 because a silent revert from `/MT` produces an installer that works on the build machine and
 fails on a clean one.
+
+A published release runs the same script on a GitHub Windows machine. Pushing a tag `v<version>`
+that matches `CMakeLists.txt` (`v1.1.0`, or `v1.1.0-rc1` for a pre-release) makes
+`.github/workflows/release.yml` build, test and attach the installer, the ZIP and
+`SHA256SUMS.txt` to a new release. Run that workflow by hand from the Actions tab to build without
+publishing anything.
 
 ### Cross-language conformance fixtures
 

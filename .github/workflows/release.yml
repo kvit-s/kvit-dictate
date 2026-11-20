@@ -1,0 +1,116 @@
+# Builds the installer and the portable ZIP on a clean GitHub Windows machine, with the same
+# script a developer runs (packaging/windows/build-release.ps1), and publishes them as a GitHub
+# release when a version tag is pushed.
+#
+#   git tag v1.0.0 && git push origin v1.0.0     build, test, and publish release v1.0.0
+#   git tag v1.1.0-rc1 && git push origin ...     the same, marked as a pre-release
+#   Actions → Release → Run workflow             build and test only; the files are kept as the
+#                                                run's artifact, and nothing is published
+#
+# The tag must match the version in CMakeLists.txt's project() line (a suffix after `-` is
+# allowed), because that version is what the installer and both binaries are stamped with.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # windows-2022 because build-release.ps1 asks for the "Visual Studio 17 2022" generator. The
+    # image also carries CMake, the .NET 9 SDK, Inno Setup 6 and PowerShell 7, which is the whole
+    # tool list; this project has no third-party dependencies to fetch.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the version, and check the tag against it
+        id: version
+        shell: pwsh
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch 'project\(kvit-dictate\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw 'could not read the version from CMakeLists.txt project()'
+          }
+          $version = $Matches[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            $base = ($tag -replace '^v', '') -replace '-.*$', ''
+            if ($base -ne $version) {
+              throw "tag $tag does not match CMakeLists.txt version $version; the installer would be named and stamped $version"
+            }
+            "tag=$tag" >> $env:GITHUB_OUTPUT
+            "prerelease=$($tag.Contains('-'))" >> $env:GITHUB_OUTPUT
+          }
+          Write-Host "version $version, ref $env:GITHUB_REF_NAME"
+
+      - name: Tool versions
+        shell: pwsh
+        run: |
+          (cmake --version)[0]
+          dotnet --version
+          $PSVersionTable.PSVersion.ToString()
+
+      # Configure, build, test (a red build is never packaged), stage, check the static CRT and
+      # the compiled-out spawn path, publish the on-device speech helper, then ZIP and installer.
+      - name: Build, test and package
+        shell: pwsh
+        run: ./packaging/windows/build-release.ps1
+
+      # The script only warns when Inno Setup is missing, which is right on a developer machine
+      # and wrong here: a release without its installer is not the release.
+      - name: Check both files, and write checksums
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $files = @("dist/kvit-dictate-$v-setup.exe", "dist/kvit-dictate-$v-win-x64.zip")
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "$f was not produced" }
+          }
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLowerInvariant()
+            "$h  $(Split-Path $f -Leaf)"
+          }
+          # LF endings, so `sha256sum -c` reads it as well as PowerShell does.
+          [System.IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", (($lines -join "`n") + "`n"))
+          Get-Content dist/SHA256SUMS.txt
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kvit-dictate-${{ steps.version.outputs.version }}
+          path: |
+            dist/kvit-dictate-*-setup.exe
+            dist/kvit-dictate-*-win-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $tag = '${{ steps.version.outputs.tag }}'
+          $files = @("dist/kvit-dictate-$v-setup.exe", "dist/kvit-dictate-$v-win-x64.zip", 'dist/SHA256SUMS.txt')
+          # A re-run of the same tag replaces the files instead of failing on an existing release.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber
+          } else {
+            $flags = @('--title', "kvit-dictate $v", '--notes-file', 'packaging/windows/release-notes.md', '--verify-tag')
+            if ('${{ steps.version.outputs.prerelease }}' -eq 'True') { $flags += '--prerelease' }
+            gh release create $tag @files @flags
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'publishing the release failed' }
