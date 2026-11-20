@@ -1998,6 +1998,9 @@ enum : int {
     // no address.
     kIdServerModeThisPc,
     kIdServerLivePreview,
+    // One line under the box, empty except where the box is greyed for a reason the box itself
+    // cannot show: on this PC it is not a preference that was turned off, it is not on offer.
+    kIdServerLivePreviewNote,
     kIdServerApiKey,
     // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
     // though it is an address the user types: it rewrites **the pill** and nothing else, and its
@@ -2065,6 +2068,12 @@ struct DialogState {
     bool probe_running = false;
     uint32_t normalize_test_generation = 0;
     bool normalize_test_running = false;
+
+    // What the user wants from "Show words as they are recognised" when an HTTP speech service
+    // is in use. Kept apart from the box because the box shows what *will happen*, and on this
+    // PC that is no preview whatever this says (update_server_mode_ui) — a greyed tick there
+    // read as "on", and the first person to pick Windows speech took it at its word.
+    bool live_preview_choice = true;
 
     //: One line of `font`, in *logical* px, measured rather than assumed.
     //:
@@ -2469,7 +2478,21 @@ void update_server_mode_ui(HWND dlg) {
     // the user cannot find again. On this PC it is off by measurement, not by policy: a decode
     // costs ~1.4 s plus a third of the audio, so a preview every second would fall further
     // behind with each word (src/asrd/backend_windows.h).
+    //
+    // So on this PC the box is shown *unticked*, with the reason under it. It used to keep the
+    // user's tick and only grey it, and a greyed tick reads as "on, and locked on": the pill
+    // then stayed empty until each sentence was finished and nothing on screen said why. The
+    // choice itself is kept in DialogState and comes back with an HTTP service.
     EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
+    if (const auto* st = reinterpret_cast<const DialogState*>(GetWindowLongPtrW(dlg, GWLP_USERDATA));
+        st != nullptr) {
+        CheckDlgButton(dlg, kIdServerLivePreview,
+                       !this_pc && st->live_preview_choice ? BST_CHECKED : BST_UNCHECKED);
+    }
+    SetWindowTextW(GetDlgItem(dlg, kIdServerLivePreviewNote),
+                   this_pc ? L"Not with Windows speech: it reads each sentence once you pause, "
+                             L"about 1.5 s later."
+                           : L"");
     // Likewise the key: it is the translator that sends it, and a protocol server is not asked.
     EnableWindow(GetDlgItem(dlg, kIdServerApiKey), local ? TRUE : FALSE);
 }
@@ -2678,10 +2701,17 @@ void start_server_test(HWND dlg, DialogState& st) {
 // answer Settings::normalise() computes cannot come apart. A dialog that let the user tick a box
 // which the loader then quietly untick is worse than a disabled box: the user believes they
 // configured something.
+//
+// The box itself is never disabled, though. It used to be, under any other cadence, and with
+// `immediate` the default that meant a fresh install opened this page with every control on it
+// greyed and the way out on another tab — reported as "everything is disabled". Ticking it now
+// *is* the way out: it sets the cadence (select_end_of_session), and choosing another cadence
+// unticks it. So the box is never ticked while the cadence forbids it, which is the invariant
+// the old greying protected.
 void refresh_editing_page(HWND dlg) {
     const bool eos = SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) ==
                      cadence_index(Cadence::EndOfSession);
-    EnableWindow(GetDlgItem(dlg, kIdEditingEnabled), eos ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(dlg, kIdEditingEnabled), TRUE);
 
     const bool on = eos && IsDlgButtonChecked(dlg, kIdEditingEnabled) == BST_CHECKED;
     EnableWindow(GetDlgItem(dlg, kIdEditingMouse), on ? TRUE : FALSE);
@@ -2689,9 +2719,29 @@ void refresh_editing_page(HWND dlg) {
 
     SetWindowTextW(GetDlgItem(dlg, kIdEditingStatus),
                    eos ? L""
-                       : L"Needs the \"end-of-session\" cadence, on the Dictation tab: with any "
-                         L"other one the text is already in your document as you speak.");
+                       : L"Ticking this also sets the cadence, on the Dictation tab, to "
+                         L"\"end-of-session\": what you say then waits in the pill until you "
+                         L"finish, instead of going into your document as you speak.");
 }
+
+// The cadence the two features above and below need, chosen on the user's behalf because they
+// just asked for one of those features. True when it was not already selected, so the caller
+// can say that it moved: a setting on another tab that changes without a word is the kind of
+// thing a user finds out about a week later.
+bool select_end_of_session(HWND dlg) {
+    HWND cad = GetDlgItem(dlg, kIdCadence);
+    const LRESULT want = cadence_index(Cadence::EndOfSession);
+    if (SendMessageW(cad, CB_GETCURSEL, 0, 0) == want) return false;
+    SendMessageW(cad, CB_SETCURSEL, static_cast<WPARAM>(want), 0);
+    // CB_SETCURSEL sends no CBN_SELCHANGE, so the one control that follows the combo directly
+    // is moved here, as the combo's own handler would.
+    EnableWindow(GetDlgItem(dlg, kIdCadenceMs), FALSE);
+    return true;
+}
+
+constexpr wchar_t kCadenceMovedNote[] =
+    L"The cadence, on the Dictation tab, is now \"end-of-session\": what you say waits in the "
+    L"pill until you finish.";
 
 // ─── The rewriter (normalizer.h), in two controls ───────────────────────────────────────────
 
@@ -2734,9 +2784,14 @@ bool stored_normalizer_url_is_custom(const DialogState& st) {
 //
 // `normalizer.enabled` has one hard precondition — Cadence::EndOfSession — enforced in three
 // places that must agree: NormalizerConfig::validate() refuses the file, Settings::normalise()
-// forces the flag off, and App::pump_normalize() refuses to send. It has one soft one: there
-// has to be an address, which here means an HTTP speech service to derive one from, or a
-// `normalizer.url` already in the file.
+// forces the flag off, and App::pump_normalize() refuses to send. Here, as on the compose-buffer
+// page, ticking the box selects that cadence rather than the cadence greying the box.
+//
+// It has one soft one: there has to be an address, which means an HTTP speech service to derive
+// one from, or one typed into the box. That box used to be enabled only while the feature was
+// on, and the feature only while there was an address — so with no HTTP speech service (this
+// PC's Windows speech, a protocol server) neither could ever be enabled. The box is now open
+// whenever it is the only place an address can come from.
 void refresh_normalizer_controls(HWND dlg) {
     const bool eos = SendMessageW(GetDlgItem(dlg, kIdCadence), CB_GETCURSEL, 0, 0) ==
                      cadence_index(Cadence::EndOfSession);
@@ -2746,26 +2801,31 @@ void refresh_normalizer_controls(HWND dlg) {
     // read_controls, so the line the user reads and the value that gets written agree.
     const bool have_url =
         !derived.empty() || !get_text(GetDlgItem(dlg, kIdNormalizerUrl)).empty();
-    const bool available = eos && have_url;
-    EnableWindow(GetDlgItem(dlg, kIdNormalizerEnabled), available ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(dlg, kIdNormalizerEnabled), have_url ? TRUE : FALSE);
 
-    const bool on = available && IsDlgButtonChecked(dlg, kIdNormalizerEnabled) == BST_CHECKED;
+    const bool on =
+        have_url && eos && IsDlgButtonChecked(dlg, kIdNormalizerEnabled) == BST_CHECKED;
     HWND url_box = GetDlgItem(dlg, kIdNormalizerUrl);
-    EnableWindow(url_box, on ? TRUE : FALSE);
+    EnableWindow(url_box, (on || derived.empty()) ? TRUE : FALSE);
     EnableWindow(GetDlgItem(dlg, kIdNormalizerTest), on ? TRUE : FALSE);
     // An empty box means "the speech service above", and the cue banner is what says so — it
     // shows the address that resolves to, and follows that address as it is edited. No flag to
     // keep, nothing written into the box behind the user, and clearing the box is how you go
-    // back to following.
-    set_cue(url_box, derived.c_str());
+    // back to following. With nothing to follow, the cue is an example instead.
+    set_cue(url_box, derived.empty() ? L"http://your-text-service:10301/v1/text/normalize"
+                                     : derived.c_str());
 
-    // Only ever the reason it is greyed. When it is available there is nothing to say that the
-    // box and the address above it do not already say.
+    // Only ever the reason it is greyed, or what ticking it will also do. When it is available
+    // and on there is nothing to say that the box and the address above it do not already say.
     std::wstring status;
-    if (!eos) {
-        status = L"Needs the \"end-of-session\" cadence, on the Dictation tab.";
-    } else if (!have_url) {
-        status = L"Needs a speech service above.";
+    if (!have_url) {
+        status = mode_of(dlg) == ServerMode::ThisPc
+                     ? L"Windows speech has no text service. To use one, type its address above."
+                     : L"Needs a text service: an http:// speech service above, or an address "
+                       L"in the box.";
+    } else if (!eos) {
+        status = L"Ticking this also sets the cadence, on the Dictation tab, to "
+                 L"\"end-of-session\".";
     }
     SetWindowTextW(GetDlgItem(dlg, kIdNormalizerStatus), status.c_str());
 }
@@ -3256,6 +3316,7 @@ void load_controls(HWND dlg, DialogState& st) {
                    s.server.mode == ServerMode::Protocol ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, kIdServerModeThisPc,
                    s.server.mode == ServerMode::ThisPc ? BST_CHECKED : BST_UNCHECKED);
+    st.live_preview_choice = s.server.live_preview;
     CheckDlgButton(dlg, kIdServerLivePreview, s.server.live_preview ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(dlg, kIdServerUrl), wide(s.server.url).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
@@ -3391,7 +3452,9 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         s.server.url = narrow(url);
         s.server.model = narrow(get_text(GetDlgItem(dlg, kIdServerModel)));
         s.server.api_key = api_key;
-        s.server.live_preview = IsDlgButtonChecked(dlg, kIdServerLivePreview) == BST_CHECKED;
+        // The choice, not the box: on this PC the box shows "off" whatever the user wants from
+        // an HTTP service, and saving that would quietly lose their preview the day they go back.
+        s.server.live_preview = st.live_preview_choice;
     }
 
     const int hk_sel = static_cast<int>(SendMessageW(GetDlgItem(dlg, kIdHotkey), CB_GETCURSEL, 0, 0));
@@ -3761,7 +3824,7 @@ void build_controls(HWND dlg, DialogState& st) {
         Cursor c{dlg, inst, &st, 0, col2_x, top, top, col_w};
         c.section(L"Live preview");
         c.check(L"Show words as they are recognised", kIdServerLivePreview);
-        c.gap(6);
+        c.add(L"STATIC", L"", 0, st.line_h * 2, kIdServerLivePreviewNote);
 
         // ── The rewriter (docs/normalizer.md) ───────────────────────────────────────────────
         //
@@ -4193,22 +4256,49 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         EnableWindow(GetDlgItem(hwnd, kIdCadenceMs),
                                      SendMessageW(GetDlgItem(hwnd, kIdCadence), CB_GETCURSEL, 0,
                                                   0) == 1);
-                        // The compose buffer's availability follows the cadence, and it is on a
-                        // different page — so the user changes the cadence here and finds the
-                        // other page already telling them what it now permits, rather than
-                        // discovering it on the next launch (docs/editing.md §12).
+                        // The compose buffer and the rewriter both need end-of-session, and
+                        // ticking either selects it. Choosing another cadence here is the
+                        // converse, so it unticks them: neither box may say "on" under a
+                        // cadence that normalise() will turn it off for (docs/editing.md §12).
+                        if (SendMessageW(GetDlgItem(hwnd, kIdCadence), CB_GETCURSEL, 0, 0) !=
+                            cadence_index(Cadence::EndOfSession)) {
+                            CheckDlgButton(hwnd, kIdEditingEnabled, BST_UNCHECKED);
+                            CheckDlgButton(hwnd, kIdNormalizerEnabled, BST_UNCHECKED);
+                        }
+                        // Both pages are told at once rather than each finding out when it is
+                        // next shown.
                         refresh_editing_page(hwnd);
-                        // The rewriter's precondition is the same one, so it follows the same
-                        // combo. Both pages are told at once rather than each finding out when
-                        // it is next shown.
                         refresh_normalizer_controls(hwnd);
                     }
                     return 0;
-                case kIdEditingEnabled:
+                case kIdEditingEnabled: {
+                    const bool moved =
+                        IsDlgButtonChecked(hwnd, kIdEditingEnabled) == BST_CHECKED &&
+                        select_end_of_session(hwnd);
                     refresh_editing_page(hwnd);
-                    return 0;
-                case kIdNormalizerEnabled:
                     refresh_normalizer_controls(hwnd);
+                    if (moved) {
+                        SetWindowTextW(GetDlgItem(hwnd, kIdEditingStatus), kCadenceMovedNote);
+                    }
+                    return 0;
+                }
+                case kIdNormalizerEnabled: {
+                    const bool moved =
+                        IsDlgButtonChecked(hwnd, kIdNormalizerEnabled) == BST_CHECKED &&
+                        select_end_of_session(hwnd);
+                    refresh_editing_page(hwnd);
+                    refresh_normalizer_controls(hwnd);
+                    if (moved) {
+                        SetWindowTextW(GetDlgItem(hwnd, kIdNormalizerStatus), kCadenceMovedNote);
+                    }
+                    return 0;
+                }
+                case kIdServerLivePreview:
+                    // Only reachable while the box is enabled, which is only with an HTTP
+                    // service — so this is always the user's own choice, never the "off" shown
+                    // on this PC.
+                    st->live_preview_choice =
+                        IsDlgButtonChecked(hwnd, kIdServerLivePreview) == BST_CHECKED;
                     return 0;
                 case kIdNormalizerUrl:
                     // Whether there is an address at all is what decides if the check box above

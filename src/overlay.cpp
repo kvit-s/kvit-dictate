@@ -632,6 +632,22 @@ std::string key_legend(OverlayState state, bool composing, std::string_view hotk
     return out;
 }
 
+std::string state_note(OverlayMode mode, OverlayState state, bool has_text) {
+    // StatusOnly's body *is* the state label; a note repeating it would say everything twice.
+    if (mode == OverlayMode::StatusOnly || mode == OverlayMode::Hidden) return {};
+    if (state == OverlayState::Idle) return {};
+    if (state == OverlayState::Listening || state == OverlayState::Speaking) {
+        // Once there are words the words are the evidence, and a label beside them is noise.
+        // Before there are any, the label is the only thing in the pill: without it an open
+        // microphone was a dot one character wide — beside the caret in Inline mode, where
+        // there is no key legend either — and with a recogniser that shows no words until a
+        // sentence ends (Windows speech, or any service with live preview off) that dot was
+        // the whole pill for seconds at a time. Reported as "the pill never shows".
+        return has_text ? std::string{} : std::string{state_label(state)};
+    }
+    return state_label(state);
+}
+
 const char* to_string(OverlayState s) noexcept {
     switch (s) {
         case OverlayState::Idle: return "Idle";
@@ -1255,9 +1271,8 @@ HRESULT OverlayCore::paint_once() {
         line += std::to_string(transcriber_lag_ms / 1000);
         line += "s behind";
         note = utf8::to_utf16_or_empty(line);
-    } else if (em != OverlayMode::StatusOnly && state != OverlayState::Idle &&
-               state != OverlayState::Listening && state != OverlayState::Speaking) {
-        note = utf8::to_utf16_or_empty(state_label(state));
+    } else {
+        note = utf8::to_utf16_or_empty(state_note(em, state, !body.empty()));
     }
 
     // ── Measure ─────────────────────────────────────────────────────────────────────────────

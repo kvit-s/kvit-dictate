@@ -447,6 +447,16 @@ private:
 [[nodiscard]] std::string key_legend(OverlayState state, bool composing, std::string_view hotkey,
                                     bool push_to_talk = false);
 
+// ─── The state line, pure ───────────────────────────────────────────────────────────────────
+//
+// What the note line under the text says when nothing more pressing (a hint, a violation, the
+// transcriber's lag) has it: the state in words, as UTF-8, or empty. `mode` is the mode being
+// painted, after any degradation; `has_text` is whether the pill has dictated text in it.
+//
+// The rule it exists to keep: **an open microphone is never shown as a bare dot.** Listening
+// and Speaking are named until the first words arrive and then give way to them.
+[[nodiscard]] std::string state_note(OverlayMode mode, OverlayState state, bool has_text);
+
 // ─── Pure layout helper ─────────────────────────────────────────────────────────────────────
 //
 // Given an anchor, a measured text size and the work area of the monitor the anchor is on,

@@ -74,6 +74,9 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         bool ensureModel = args.Contains("--ensure-model");
+        // A test switch: take the model's non-VNNI routine even on a processor that does not
+        // need it, to show that routine transcribes. See VnniWorkaround.cs.
+        bool vnniOff = args.Contains("--vnni-off");
 
         // Must happen before the first speech DLL is loaded. See the header.
         Stream protocolOut = StdIo.CaptureStdoutAndSilenceIt();
@@ -96,9 +99,15 @@ internal static class Program
             return 1;
         }
 
+        // After the model exists and before the first decode, which is where the fault was.
+        // In the ready answer as well as on stderr, because the ready answer is what the sidecar
+        // always logs.
+        string vnni = VnniWorkaround.Apply(nativeFolder, vnniOff);
+        Log("vnni: " + vnni);
+
         using (model)
         {
-            WriteFrame(protocolOut, (byte)'R', Encoding.UTF8.GetBytes(ReadyJson(nativeFolder)));
+            WriteFrame(protocolOut, (byte)'R', Encoding.UTF8.GetBytes(ReadyJson(nativeFolder, vnni)));
             return await ServeAsync(protocolIn, protocolOut, model);
         }
     }
@@ -158,12 +167,12 @@ internal static class Program
         return created.SpeechModel;
     }
 
-    private static string ReadyJson(string? nativeFolder)
+    private static string ReadyJson(string? nativeFolder, string vnni)
     {
-        // Hand-built rather than serialized: three fields, and a JSON dependency for three fields
-        // is not worth the reference. Only native_folder can contain anything needing escaping.
+        // Hand-built rather than serialized: four fields, and a JSON dependency for four fields
+        // is not worth the reference. Both strings go through JsonString.
         return "{\"model\":\"windows-ai-speech\",\"proto\":1,\"native_folder\":" +
-               JsonString(nativeFolder ?? "") + "}";
+               JsonString(nativeFolder ?? "") + ",\"vnni\":" + JsonString(vnni) + "}";
     }
 
     private static string JsonString(string s)

@@ -596,3 +596,41 @@ KD_TEST(overlay, the_dark_pill_is_still_translucent_and_still_two_inks) {
     KD_CHECK(((dark.pending >> 8) & 0xFFu) > ((dark.background >> 8) & 0xFFu));
     KD_CHECK(((light.pending >> 8) & 0xFFu) < ((light.background >> 8) & 0xFFu));
 }
+
+// ─── The state line ────────────────────────────────────────────────────────────────────────
+//
+// "The pill never shows", from a fresh install on Windows speech: Inline mode, no key legend,
+// and a recogniser that shows no words until a sentence ends left an open microphone drawn as a
+// dot one character wide. These pin the rule that fixed it — an open microphone is named until
+// there are words to show instead.
+
+KD_TEST(overlay, an_empty_pill_names_the_open_microphone_in_both_text_modes) {
+    using kd::OverlayMode;
+    using kd::state_note;
+    for (OverlayMode m : {OverlayMode::Inline, OverlayMode::FloatingPill}) {
+        KD_CHECK(mentions(state_note(m, OverlayState::Listening, false), "Listening"));
+        KD_CHECK(mentions(state_note(m, OverlayState::Speaking, false), "Listening"));
+    }
+}
+
+KD_TEST(overlay, the_label_gives_way_to_the_words_once_there_are_some) {
+    using kd::OverlayMode;
+    using kd::state_note;
+    for (OverlayMode m : {OverlayMode::Inline, OverlayMode::FloatingPill}) {
+        KD_CHECK(state_note(m, OverlayState::Listening, true).empty());
+        KD_CHECK(state_note(m, OverlayState::Speaking, true).empty());
+        // Every other state is still named beside the text, as it always was.
+        KD_CHECK(mentions(state_note(m, OverlayState::Finalizing, true), "Finishing"));
+        KD_CHECK(mentions(state_note(m, OverlayState::Editing, true), "Editing"));
+    }
+}
+
+KD_TEST(overlay, status_only_and_idle_never_get_a_second_label) {
+    using kd::OverlayMode;
+    using kd::state_note;
+    // StatusOnly draws the label as its body; a note would repeat it.
+    KD_CHECK(state_note(OverlayMode::StatusOnly, OverlayState::Listening, false).empty());
+    KD_CHECK(state_note(OverlayMode::StatusOnly, OverlayState::Finalizing, false).empty());
+    KD_CHECK(state_note(OverlayMode::Inline, OverlayState::Idle, false).empty());
+    KD_CHECK(state_note(OverlayMode::FloatingPill, OverlayState::Idle, false).empty());
+}

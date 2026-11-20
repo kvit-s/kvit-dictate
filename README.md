@@ -82,7 +82,9 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
    you say what turns speech into text.
 2. **No server?** Choose **This PC: Windows speech, no server** and press **Test**. If Windows
    has not installed its speech model yet, Test asks Windows for it (a few hundred MB, once) and
-   waits; then it reports what answered. Press OK and you are done.
+   waits; then it reports what answered. Press OK and you are done. Windows speech has no live
+   preview: the pill says *Listening* while you talk, and each sentence appears about a second
+   and a half after you pause.
 3. **Have a speech service?** Type its address — anything that serves
    `POST /v1/audio/transcriptions`, for example `http://your-gpu-box.lan:10301` — and press
    **Test**. It connects for real and tells you what answered: the model, the mode and the

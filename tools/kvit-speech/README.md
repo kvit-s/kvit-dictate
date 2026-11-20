@@ -225,6 +225,25 @@ hypothetical: it happens on every startup. `Program.cs` captures the real stdout
 `STD_OUTPUT_HANDLE` at `NUL` before any speech DLL is loaded. Diagnostics go to stderr, which the
 sidecar captures and includes in its error messages.
 
+### It crashes on processors with AVX-512 VNNI but not AVX-VNNI
+
+Found 2026-11-20 on an AMD Ryzen Threadripper PRO 7945WX (Zen 4): every decode killed the helper
+with `0xC000001D`, illegal instruction, in `asrmodelapi.dll` 5.2.1.261053 (model package
+1.2607.112.0). The instruction is `vpdpbusd` in its VEX (AVX-VNNI) form, the only VNNI
+instruction in the DLL. The DLL enables it when the processor has AVX-VNNI **or** AVX512-VNNI,
+so a processor with only the AVX-512 form faults: Zen 4, and Intel's Ice Lake, Tiger Lake,
+Rocket Lake and Cascade Lake.
+
+`VnniWorkaround.cs` clears that flag in this process on such a processor, so the model uses its
+non-VNNI routine. It finds the flag by matching the DLL's own processor check and writes nothing
+if the check is not there exactly once. The helper logs what it did, and puts the same line in
+its ready answer as `vnni`.
+
+Checked on the i7-14700K, which has AVX-VNNI, by overwriting that one instruction with `ud2`:
+the helper then crashed with `0xC000001D` on its first decode, as on the Zen 4 machine; with
+`--vnni-off`, which applies the workaround on any processor, it transcribed a 6.5 s sentence
+correctly, about 5% slower than the VNNI routine. Not yet run on an affected processor.
+
 ---
 
 ## The protocol
