@@ -47,5 +47,5 @@ and is still private. A fresh `kvit-s/kvit-dictate` got the rewritten `main`, be
 force-push leaves the replaced commits reachable by ID. Delete `kvit-dictate-old` in the browser
 (Settings → Delete repository): the current GitHub login lacks the `delete_repo` permission.
 
-No remote is stored in the local git settings. Pushes go to
-`git@github.com:kvit-s/kvit-dictate.git` by address.
+The local repository has `origin` set to `git@github.com:kvit-s/kvit-dictate.git` (added
+2026-11-20), and `main` tracks `origin/main`, so a plain `git push` from `main` publishes.
