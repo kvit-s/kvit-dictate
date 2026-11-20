@@ -71,6 +71,7 @@ kd::Settings unusual() {
     s.crash_recovery = false;
     s.keep_last_submission = false;
     s.start_with_windows = true;
+    s.check_for_updates = false;
     s.context_terms = {"llama.cpp", "Qwen3", "WASAPI"};
     s.send_context = true;
 
@@ -157,6 +158,7 @@ KD_TEST(settings, serialize_then_parse_preserves_every_field) {
     KD_CHECK_EQ(out.crash_recovery, in.crash_recovery);
     KD_CHECK_EQ(out.keep_last_submission, in.keep_last_submission);
     KD_CHECK_EQ(out.start_with_windows, in.start_with_windows);
+    KD_CHECK_EQ(out.check_for_updates, in.check_for_updates);
     KD_CHECK_EQ(out.context_terms.size(), in.context_terms.size());
     KD_CHECK_EQ(out.send_context, in.send_context);
     KD_CHECK_EQ(out.affix.prefix, in.affix.prefix);

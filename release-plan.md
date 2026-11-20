@@ -57,7 +57,10 @@ specification, and a README that teaches a stranger to use the thing.
   §1 makes it easier: after this release the protocol is a documented network API rather than a
   private pipe to a child process.
 * **Auto-update.** A version check that points at a download page, nothing more. A silent updater
-  is a second signed-binary supply chain and it can wait.
+  is a second signed-binary supply chain and it can wait. *Since 1.0.0-rc2 (src/updater.h): the
+  check runs daily and, when the user presses Install, downloads the release's own installer,
+  checks it against the release's SHA256SUMS.txt and runs it. Still never silent, still unsigned,
+  and the portable ZIP only gets the download page.*
 * **Remote / internet servers.** LAN and loopback only (§2.4).
 
 ---

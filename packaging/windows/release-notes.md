@@ -7,6 +7,11 @@ Press **Win+Y**, talk, and the text appears in whichever window has focus. Windo
 | `kvit-dictate-…-win-x64.zip` | Portable copy. Unpack anywhere and run `kvit-dictate.exe`. |
 | `SHA256SUMS.txt` | Checksums of both. |
 
+**Updating.** Run the new installer over the old one; it closes the running copy itself. From
+1.0.0-rc2 on, the app also finds new versions by itself: the tray's **Check for updates…** (or the
+notification it shows) downloads the installer, checks its checksum, and installs it when you
+press **Install now**. The portable ZIP is not updated in place; it offers the download page.
+
 After installing, open **Settings → Server** and choose where the speech is recognised:
 
 * **This PC**: Microsoft's on-device speech model, so nothing leaves the computer. Needs Windows 11

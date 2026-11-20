@@ -442,6 +442,12 @@ struct Settings {
 
     bool start_with_windows = false;
 
+    // updater.h: ask GitHub once a day whether a newer release exists, and say so in a tray
+    // notification. Only *asks*: nothing is downloaded or installed until the user presses
+    // Install. On by default, because a user who never hears about a fix keeps the bug; the one
+    // request it makes goes to api.github.com and carries nothing but the version.
+    bool check_for_updates = true;
+
     // Put around the dictated text on its way into the document. Empty by default: the marker
     // is useful to a reader that knows what to do with it and is noise to every other one, so
     // it is opt-in rather than a default anybody has to notice and turn off.
@@ -530,5 +536,10 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
 //
 // Valid only on the thread that opened the dialog, which is the only thread that may touch it.
 uintptr_t open_settings_dialog_window() noexcept;
+
+// The WM_COMMAND id the dialog's "Check for updates now" button posts to its owner, which is
+// main.cpp's window and also the id of its tray-menu item. The dialog stays open; the update
+// flow (updater.h) runs on its own thread with its own dialogs.
+inline constexpr unsigned kCommandCheckForUpdates = 108;
 
 }  // namespace kd

@@ -57,10 +57,17 @@
 .PARAMETER SkipTests
     Package without running ctest. For iterating on the packaging itself only; the release build
     is never made this way.
+
+.PARAMETER VersionPre
+    The pre-release part of the version, without the dash: `rc2` for tag v1.0.0-rc2. Stamped
+    into the client (KD_VERSION_PRE, src/updater.h) so a release candidate knows it is one and
+    is offered the release that follows it. The release workflow passes it from the tag; leave
+    it empty for a release. The file names stay MAJOR.MINOR.PATCH either way.
 #>
 [CmdletBinding()]
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$VersionPre = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,14 +100,19 @@ if ($cmakeLists -notmatch 'project\(kvit-dictate\s+VERSION\s+([0-9]+\.[0-9]+\.[0
     throw 'could not read the version from CMakeLists.txt project()'
 }
 $version = $Matches[1]
-Write-Host "[release] version   : $version"
+if ($VersionPre -notmatch '^[0-9A-Za-z.-]*$') {
+    throw "-VersionPre '$VersionPre' may hold only letters, digits, '.' and '-'"
+}
+$fullVersion = if ($VersionPre) { "$version-$VersionPre" } else { $version }
+Write-Host "[release] version   : $fullVersion"
 Write-Host "[release] repo      : $repo"
 
 # ─── Build ───────────────────────────────────────────────────────────────────────────────────
 
 Write-Host "`n[release] === configure ==="
 & $cmake -S $repo -B $buildDir -G 'Visual Studio 17 2022' -A x64 `
-    -DKD_ENABLE_SIDECAR_SPAWN=OFF -DKD_BUILD_TOOLS=OFF -DKD_BUILD_TESTS=ON
+    -DKD_ENABLE_SIDECAR_SPAWN=OFF -DKD_BUILD_TOOLS=OFF -DKD_BUILD_TESTS=ON `
+    "-DKD_VERSION_PRE=$VersionPre"
 if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
 
 Write-Host "`n[release] === build ==="

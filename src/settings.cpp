@@ -77,6 +77,7 @@
 #include "audio_capture.h"
 #include "ipc_client.h"
 #include "translator.h"
+#include "updater.h"
 #include "theme.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -901,6 +902,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //                    "transcript": { "enabled": false, "file": "", "max_bytes": 1048576,
 //                                    "max_age_days": 7 } },
 //     "start_with_windows": false,
+//     "check_for_updates": true,                           // updater.h; asks, never installs
 //     "context":   { "send": true, "terms": [ "llama.cpp", "Qwen3" ] },
 //     "affix":     { "prefix": "[dictated: ", "suffix": "]" },  // put around the text, empty by
 //                                                              // default; applied at injection
@@ -1475,6 +1477,7 @@ std::string serialize_settings(const Settings& s) {
     }
 
     put_bool(root, "start_with_windows", s.start_with_windows);
+    put_bool(root, "check_for_updates", s.check_for_updates);
 
     {
         json::Value o = json::Value::object();
@@ -1586,6 +1589,7 @@ Result<Settings> parse_settings(std::string_view json_text) {
         if (o.failed()) return Status{StatusCode::Malformed, o.error()};
     }
     top.bool_opt("start_with_windows", s.start_with_windows);
+    top.bool_opt("check_for_updates", s.check_for_updates);
     if (top.failed()) return Status{StatusCode::Malformed, top.error()};
 
     {
@@ -1973,6 +1977,8 @@ enum : int {
     kIdTranscriptDays,
     kIdStartup,
     kIdKeepLast,
+    kIdUpdateCheck,
+    kIdUpdateNow,
     kIdSendContext,
     kIdContextTerms,
     // The dictation marker (settings.h, TextAffix). Two boxes rather than one, because the
@@ -2058,6 +2064,9 @@ struct DialogState {
     std::vector<HWND> page_controls[kPageCount];
     HFONT font = nullptr;
     int dpi = 96;
+    // main.cpp's window, which runs the update flow. Kept here rather than asked of Windows:
+    // it is a message-only window, and GW_OWNER is not something to rely on for one.
+    HWND owner = nullptr;
 
     // ── The Test button (release-plan.md §2.2) ──────────────────────────────────────────────
     //
@@ -3395,6 +3404,7 @@ void load_controls(HWND dlg, DialogState& st) {
     EnableWindow(GetDlgItem(dlg, kIdTranscriptKb), s.transcript.enabled);
     EnableWindow(GetDlgItem(dlg, kIdTranscriptDays), s.transcript.enabled);
     CheckDlgButton(dlg, kIdStartup, s.start_with_windows ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, kIdUpdateCheck, s.check_for_updates ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(dlg, kIdKeepLast,
                    s.keep_last_submission ? BST_CHECKED : BST_UNCHECKED);
 
@@ -3618,6 +3628,7 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
         s.transcript.max_age_days = static_cast<uint32_t>(n);
     }
     s.start_with_windows = IsDlgButtonChecked(dlg, kIdStartup) == BST_CHECKED;
+    s.check_for_updates = IsDlgButtonChecked(dlg, kIdUpdateCheck) == BST_CHECKED;
     s.keep_last_submission = IsDlgButtonChecked(dlg, kIdKeepLast) == BST_CHECKED;
 
     s.send_context = IsDlgButtonChecked(dlg, kIdSendContext) == BST_CHECKED;
@@ -3945,6 +3956,16 @@ void build_controls(HWND dlg, DialogState& st) {
         c.label_edit(L"Pending text, custom scheme only (#AARRGGBB)", kIdColorPending);
         c.label_edit(L"Unstable text, custom scheme only (#AARRGGBB)", kIdColorUnstable);
         c.label_edit(L"Background, custom scheme only (#AARRGGBB)", kIdColorBackground);
+
+        // Here because this column had the room, and because the version is the one fact about
+        // this program the other pages never state.
+        c.section(L"Updates");
+        const std::wstring version =
+            L"This is kvit-dictate " + wide(update::running_version()) + L".";
+        c.note(version.c_str(), 1);
+        c.check(L"Check GitHub for a new version once a day", kIdUpdateCheck);
+        c.gap(2);
+        c.add(L"BUTTON", L"Check for updates now", WS_TABSTOP | BS_PUSHBUTTON, 26, kIdUpdateNow);
     }
     {
         Cursor c{dlg, inst, &st, 4, col2_x, top, top, col_w};
@@ -4308,6 +4329,13 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kIdServerTest:
                     start_server_test(hwnd, *st);
                     return 0;
+                case kIdUpdateNow:
+                    // To the owner, which owns the update flow (main.cpp). Posted: the flow
+                    // starts a thread and returns, and this dialog stays as it is.
+                    if (st->owner != nullptr) {
+                        PostMessageW(st->owner, WM_COMMAND, kCommandCheckForUpdates, 0);
+                    }
+                    return 0;
                 case kIdNormalizerTest:
                     start_normalize_test(hwnd, *st);
                     return 0;
@@ -4470,6 +4498,7 @@ bool show_settings_dialog(uintptr_t instance, uintptr_t owner, Settings& s,
 
     DialogState st;
     st.settings = s;
+    st.owner = owner_hwnd;
     st.manifest = &manifest;
 
     // The device list is a snapshot taken when the dialog opens. It does not follow a device

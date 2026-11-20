@@ -51,6 +51,10 @@ jobs:
             }
             "tag=$tag" >> $env:GITHUB_OUTPUT
             "prerelease=$($tag.Contains('-'))" >> $env:GITHUB_OUTPUT
+            # v1.0.0-rc2 -> rc2: stamped into the client so its updater knows it is a
+            # pre-release (src/updater.h). Empty for a release.
+            $pre = if ($tag -match '^v?[0-9]+\.[0-9]+\.[0-9]+-(.+)$') { $Matches[1] } else { '' }
+            "pre=$pre" >> $env:GITHUB_OUTPUT
           }
           Write-Host "version $version, ref $env:GITHUB_REF_NAME"
 
@@ -65,7 +69,10 @@ jobs:
       # the compiled-out spawn path, publish the on-device speech helper, then ZIP and installer.
       - name: Build, test and package
         shell: pwsh
-        run: ./packaging/windows/build-release.ps1
+        # Through the environment rather than spliced into the command, so a tag name is data.
+        env:
+          KD_VERSION_PRE: ${{ steps.version.outputs.pre }}
+        run: ./packaging/windows/build-release.ps1 -VersionPre "$env:KD_VERSION_PRE"
 
       # The script only warns when Inno Setup is missing, which is right on a developer machine
       # and wrong here: a release without its installer is not the release.

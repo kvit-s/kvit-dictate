@@ -68,7 +68,13 @@ LicenseFile={#StageDir}\LICENSE
 ; the user's antivirus says something less accurate.
 InfoBeforeFile=disclosure.txt
 ChangesEnvironment=no
-CloseApplications=yes
+; force, not yes. The Restart Manager cannot ask kvit-dictate to close: its only window is a
+; message-only one, which receives no WM_QUERYENDSESSION, so with `yes` an upgrade over a running
+; copy waited 30 s, failed with "some applications could not be shut down" and rolled back. With
+; `force` it ends the process after that wait instead (its child processes go with it — they are
+; in a kill-on-close job). The in-app updater never gets that far: it quits first, and
+; InitializeSetup below waits for it (/WAITPID).
+CloseApplications=force
 RestartApplications=no
 
 [Languages]
@@ -103,6 +109,10 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\kvit-dictate.exe"; Description: "{cm:LaunchProgram,kvit-dictate}"; \
     Flags: nowait postinstall skipifsilent
+; The in-app updater (src/updater.h) runs this silently with /RELAUNCH=1, and the app it closed
+; comes back when the install is done. As the original user, because an all-users install runs
+; elevated and the app must not: plan.md §1.7 treats an elevated kvit-dictate as unsupported.
+Filename: "{app}\kvit-dictate.exe"; Flags: nowait runasoriginaluser; Check: RelaunchAfterInstall
 
 [UninstallDelete]
 ; Nothing here by default. Settings and logs live in %LOCALAPPDATA%\kvit-dictate and are removed
@@ -111,12 +121,84 @@ Filename: "{app}\kvit-dictate.exe"; Description: "{cm:LaunchProgram,kvit-dictate
 Type: filesandordirs; Name: "{localappdata}\kvit-dictate"; Check: RemoveSettingsRequested
 
 [Code]
+const
+  SYNCHRONIZE = $00100000;
+
 var
   RemoveSettings: Boolean;
+  Relaunched: Boolean;
+
+function OpenProcess(dwDesiredAccess: Cardinal; bInheritHandle: Boolean;
+  dwProcessId: Cardinal): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(hHandle: THandle; dwMilliseconds: Cardinal): Cardinal;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(hObject: THandle): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 function RemoveSettingsRequested(): Boolean;
 begin
   Result := RemoveSettings;
+end;
+
+// ─── The in-app updater's two parameters (src/updater.h) ────────────────────────────────────
+//
+//   /WAITPID=<pid>   the kvit-dictate that started this installer and is now quitting. Waited
+//                    for before anything else happens, so no file is replaced while it runs.
+//   /RELAUNCH=1      start kvit-dictate again afterwards — the new version when the install
+//                    worked, the old one when it was cancelled or failed and rolled back.
+
+function RelaunchRequested(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+function RelaunchAfterInstall(): Boolean;
+begin
+  Result := RelaunchRequested();
+  if Result then Relaunched := True;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  Pid: Integer;
+  Process: THandle;
+begin
+  Result := True;
+  Relaunched := False;
+  Pid := StrToIntDef(ExpandConstant('{param:WAITPID|0}'), 0);
+  if Pid > 0 then
+  begin
+    Process := OpenProcess(SYNCHRONIZE, False, Pid);
+    if Process <> 0 then
+    begin
+      Log(Format('Waiting up to 30 s for kvit-dictate (pid %d) to exit', [Pid]));
+      // Bounded: if it is somehow still there, CloseApplications=force deals with it.
+      if WaitForSingleObject(Process, 30000) <> 0 then
+        Log('It had not exited; leaving it to the Restart Manager');
+      CloseHandle(Process);
+    end;
+  end;
+end;
+
+procedure DeinitializeSetup();
+var
+  Exe: String;
+  ResultCode: Integer;
+begin
+  // Cancelled, or failed and rolled back: the updater already quit, so put the old version back
+  // on the tray rather than leave the user with no dictation and no explanation.
+  if RelaunchRequested() and not Relaunched then
+  begin
+    Exe := '';
+    try
+      Exe := ExpandConstant('{app}\kvit-dictate.exe');
+    except
+      Exe := '';
+    end;
+    if (Exe <> '') and FileExists(Exe) then
+      ExecAsOriginalUser(Exe, '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+  end;
 end;
 
 function InitializeUninstall(): Boolean;

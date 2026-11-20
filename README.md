@@ -39,9 +39,15 @@ The source is public and this build is not code-signed. Decide accordingly.
 
 ## Privacy, exactly
 
-No cloud service. No telemetry. No account. No automatic updates and nothing downloaded at run
-time. Recognised text is never written to a log unless you switch that on, and that switch is
-compiled out of release builds entirely.
+No cloud service. No telemetry. No account. Recognised text is never written to a log unless you
+switch that on, and that switch is compiled out of release builds entirely.
+
+**Updates are asked about, never installed behind your back.** Once a day the app asks GitHub's
+release list whether a newer version exists; the request carries nothing but the version number.
+If there is one, a notification says so, and it is downloaded, checked against the release's
+`SHA256SUMS.txt` and installed only when you press **Install now**. The tray's **Check for
+updates…** does the same on demand. Turn the daily check off under Settings → Overlay & privacy →
+Updates.
 
 **With This PC, your audio never leaves the computer.** The recogniser runs in a helper process
 on this machine (`kvit-speech\kvit-speech.exe`), and the only network use is the one-time model

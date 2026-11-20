@@ -59,6 +59,7 @@
 #include "settings.h"
 #include "theme.h"
 #include "tray_icon.h"
+#include "updater.h"
 #include "util/clock.h"
 #include "util/json.h"
 #include "util/log.h"
@@ -81,6 +82,14 @@ constexpr UINT kMsgShowSettings = WM_APP + 6;
 constexpr UINT kMsgNormalized  = WM_APP + 7;
 // The pill's post-submission buttons, posted from overlay_wndproc with the index in wParam.
 constexpr UINT kMsgPillAction  = WM_APP + 8;
+// The update threads (updater.h): something is in the UpdateMailbox.
+constexpr UINT kMsgUpdate      = WM_APP + 9;
+
+// The daily update check: the first one a couple of minutes after start, so it never competes
+// with the model loading or with the first dictation, then once a day for as long as it runs.
+constexpr UINT_PTR kUpdateTimer = 3;
+constexpr UINT kUpdateFirstCheckMs = 2 * 60 * 1000;
+constexpr UINT kUpdateIntervalMs = 24 * 60 * 60 * 1000;
 
 constexpr UINT_PTR kTickTimer = 1;
 constexpr UINT kTickIntervalMs = 50;  // drives the two silence timers and the commit cadence
@@ -222,6 +231,9 @@ constexpr UINT kMenuCopyLast = 106;
 // history.h: every submission, as a page in the browser. Built from the corpus, so it is
 // offered only where the corpus is being kept.
 constexpr UINT kMenuHistory = 107;
+// "Check for updates…", or "Install kvit-dictate X…" once a check found X. The settings dialog's
+// button posts the same id, which is why it lives in settings.h.
+constexpr UINT kMenuCheckUpdates = kd::kCommandCheckForUpdates;
 
 // Where the corpus lives when the setting leaves it blank — the same default Corpus::open is
 // handed by settings.cpp, spelled once for the two menu items that open it.
@@ -502,6 +514,32 @@ private:
     // kind of broken.
     void show_no_server_notice();
     bool no_server_notice_shown_ = false;
+
+    // ─── Updates (updater.h) ────────────────────────────────────────────────────────────────
+    //
+    // The checks and the dialogs run on threads of their own, because this thread owns the
+    // keyboard hook. They report through the mailbox and a kMsgUpdate wake-up, and the mailbox
+    // is shared rather than a member so a thread that outlives this object writes to memory that
+    // still exists.
+    struct UpdateMailbox {
+        std::mutex mu;
+        std::optional<kd::update::Release> found;  // a background check found this
+        std::optional<std::pair<std::filesystem::path, kd::update::InstallKind>> ready;
+        std::atomic<bool> checking{false};     // a background check is in flight
+        std::atomic<bool> interactive{false};  // the update dialogs are up
+    };
+    std::shared_ptr<UpdateMailbox> update_box_ = std::make_shared<UpdateMailbox>();
+    std::optional<kd::update::Release> available_update_;
+    std::string announced_update_;  // the tag the tray notification was shown for, once per run
+    bool update_balloon_ = false;   // the balloon on screen is the update one, not another
+    // Downloaded, verified, agreed to — and held while a dictation is in progress, because
+    // quitting in the middle of one would lose its uncommitted text.
+    std::optional<std::pair<std::filesystem::path, kd::update::InstallKind>> pending_install_;
+    void schedule_update_check(UINT delay_ms);
+    void start_background_update_check();
+    void start_update_flow();
+    void drain_update_mailbox();
+    void try_install_pending();
     void apply_settings(kd::Settings next);
 
     void set_tray_state(kd::OverlayState s);
@@ -1029,6 +1067,7 @@ bool App::startup() {
 
     SetTimer(hwnd_, kTickTimer, kTickIntervalMs, nullptr);
     SetTimer(hwnd_, kHeartbeatTimer, kHeartbeatIntervalMs, heartbeat_timer_proc);
+    if (settings_.check_for_updates) schedule_update_check(kUpdateFirstCheckMs);
 
     // release-plan.md §2.2, first run. With no settings file the old default came from
     // `models.json`'s `default_model`, which is `"mock"` — a scripted fixture that types
@@ -1351,6 +1390,10 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             drain_normalize_queue();
             return 0;
 
+        case kMsgUpdate:
+            drain_update_mailbox();
+            return 0;
+
         case kMsgPillAction:
             // Posted by overlay_wndproc so the work lands here, on the message loop, rather than
             // inside the overlay's own WM_LBUTTONDOWN. It injects text and writes settings.
@@ -1374,7 +1417,22 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_TIMER:
+            if (wp == kUpdateTimer) {
+                if (settings_.check_for_updates) {
+                    start_background_update_check();
+                    schedule_update_check(kUpdateIntervalMs);
+                } else {
+                    KillTimer(hwnd_, kUpdateTimer);
+                }
+                return 0;
+            }
             if (wp == kTickTimer) {
+                // An update the user agreed to while dictating, now that the dictation is over.
+                // First, and returning if it ran: it destroys this window.
+                if (pending_install_.has_value() && !target_.has_value()) {
+                    try_install_pending();
+                    if (quitting_) return 0;
+                }
                 if (finalizing_ && clock_.now_ms() >= finalize_deadline_ms_) {
                     // Covers both waits: for `stopped`, and for a rewrite that `stopped` is
                     // being held on. A normalizer that has stopped answering must never be the
@@ -1508,6 +1566,9 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 show_tray_menu();
             } else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
                 PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
+            } else if (LOWORD(lp) == NIN_BALLOONUSERCLICK && update_balloon_) {
+                update_balloon_ = false;
+                start_update_flow();
             }
             return 0;
 
@@ -1588,6 +1649,9 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case kMenuSettings:
                     PostMessageW(hwnd_, kMsgShowSettings, 0, 0);
+                    return 0;
+                case kMenuCheckUpdates:
+                    start_update_flow();
                     return 0;
                 case kMenuOpenLogs:
                     ShellExecuteW(nullptr, L"open",
@@ -3940,6 +4004,7 @@ void App::on_sidecar_lost() {
 void App::show_no_server_notice() {
     if (no_server_notice_shown_ || quitting_) return;
     no_server_notice_shown_ = true;
+    update_balloon_ = false;  // this balloon replaces any update one; a click on it is not "install"
 
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -4013,6 +4078,7 @@ void App::apply_settings(kd::Settings next) {
     const bool previous_live_preview = settings_.server.live_preview;
     const std::string previous_api_key = settings_.server.api_key;
     const uint32_t previous_endpoint_silence_ms = settings_.session.endpoint_silence_ms;
+    const bool previous_update_check = settings_.check_for_updates;
     const bool diagnostics_file_changed =
         next.diagnostics_file_enabled != settings_.diagnostics_file_enabled;
     settings_ = std::move(next);
@@ -4029,6 +4095,15 @@ void App::apply_settings(kd::Settings next) {
 
     kd::log::set_level(settings_.log_level);
     kd::log::set_transcript_policy(settings_.transcript);
+    // Only when it changed: re-arming on every OK would turn the daily check into one per visit
+    // to the dialog.
+    if (settings_.check_for_updates != previous_update_check) {
+        if (settings_.check_for_updates) {
+            schedule_update_check(kUpdateFirstCheckMs);
+        } else {
+            KillTimer(hwnd_, kUpdateTimer);
+        }
+    }
     if (diagnostics_file_changed) {
         // log::init is documented as "once, early". The level and the transcript policy are
         // runtime switches; opening or closing the diagnostics file is not, and pretending it took
@@ -4247,6 +4322,14 @@ void App::show_tray_menu() {
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
     }
+    if (available_update_.has_value()) {
+        AppendMenuW(menu, MF_STRING, kMenuCheckUpdates,
+                    (L"Install kvit-dictate " +
+                     widen(kd::update::to_string(available_update_->version)) + L"…")
+                        .c_str());
+    } else {
+        AppendMenuW(menu, MF_STRING, kMenuCheckUpdates, L"Check for updates…");
+    }
     AppendMenuW(menu, MF_STRING, kMenuSettings, L"Settings…");
     AppendMenuW(menu, MF_STRING, kMenuOpenLogs, L"Open settings folder");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -4260,6 +4343,119 @@ void App::show_tray_menu() {
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
     PostMessageW(hwnd_, WM_NULL, 0, 0);
     DestroyMenu(menu);
+}
+
+// ─── Updates ────────────────────────────────────────────────────────────────────────────────
+
+void App::schedule_update_check(UINT delay_ms) { SetTimer(hwnd_, kUpdateTimer, delay_ms, nullptr); }
+
+// The daily one: quiet unless it finds something. A failure is a log line and nothing else — a
+// PC with no internet for a day is not something to interrupt anyone about.
+void App::start_background_update_check() {
+    std::shared_ptr<UpdateMailbox> box = update_box_;
+    if (box->checking.exchange(true)) return;
+    kd::update::Version current;
+    if (!kd::update::parse_version(kd::update::running_version(), current)) {
+        box->checking.store(false);
+        return;
+    }
+    HWND hwnd = hwnd_;
+    std::thread([box, hwnd, current] {
+        // Here, two minutes after start, rather than at start: the installer that put this
+        // version here is still running when it starts this copy, and its file is locked.
+        kd::update::remove_stale_downloads(current);
+        auto r = kd::update::check_github(current);
+        if (!r.is_ok()) {
+            KD_LOG_WARN("the daily update check failed: %s", r.status().message().c_str());
+        } else if (r->has_value()) {
+            {
+                std::lock_guard<std::mutex> lock(box->mu);
+                box->found = **r;
+            }
+            PostMessageW(hwnd, kMsgUpdate, 0, 0);
+        }
+        box->checking.store(false);
+    }).detach();
+}
+
+// The tray item, the settings button, and a click on the notification all come here.
+void App::start_update_flow() {
+    std::shared_ptr<UpdateMailbox> box = update_box_;
+    if (box->interactive.exchange(true)) return;  // its dialog is already up
+    kd::update::UiContext ctx;
+    ctx.exe_dir = kd::executable_directory();
+    HWND hwnd = hwnd_;
+    ctx.on_ready = [box, hwnd](const std::filesystem::path& setup, kd::update::InstallKind kind) {
+        {
+            std::lock_guard<std::mutex> lock(box->mu);
+            box->ready = std::make_pair(setup, kind);
+        }
+        PostMessageW(hwnd, kMsgUpdate, 0, 0);
+    };
+    std::thread([box, ctx = std::move(ctx), known = available_update_]() mutable {
+        // ShellExecuteW, for the "what's new" link, wants COM on its thread.
+        const HRESULT hr =
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        kd::update::run_interactive(ctx, std::move(known));
+        if (SUCCEEDED(hr)) CoUninitialize();
+        box->interactive.store(false);
+    }).detach();
+}
+
+void App::drain_update_mailbox() {
+    std::optional<kd::update::Release> found;
+    std::optional<std::pair<std::filesystem::path, kd::update::InstallKind>> ready;
+    {
+        std::lock_guard<std::mutex> lock(update_box_->mu);
+        found.swap(update_box_->found);
+        ready.swap(update_box_->ready);
+    }
+    if (found.has_value() && !quitting_) {
+        available_update_ = found;
+        // Once per version per run of the app. The tray menu keeps saying so after that.
+        if (announced_update_ != found->tag) {
+            announced_update_ = found->tag;
+            const std::wstring v = widen(kd::update::to_string(found->version));
+            NOTIFYICONDATAW nid{};
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = hwnd_;
+            nid.uID = kTrayId;
+            nid.uFlags = NIF_INFO;
+            nid.dwInfoFlags = NIIF_INFO;
+            lstrcpynW(nid.szInfoTitle, (L"kvit-dictate " + v + L" is available").c_str(),
+                      ARRAYSIZE(nid.szInfoTitle));
+            lstrcpynW(nid.szInfo, L"Click here to install it, or later from the tray menu.",
+                      ARRAYSIZE(nid.szInfo));
+            update_balloon_ = Shell_NotifyIconW(NIM_MODIFY, &nid) != FALSE;
+        }
+    }
+    if (ready.has_value()) {
+        pending_install_ = std::move(ready);
+        if (target_.has_value()) {
+            KD_LOG_INFO("update: downloaded; it installs when this dictation ends");
+        }
+        try_install_pending();
+    }
+}
+
+void App::try_install_pending() {
+    if (!pending_install_.has_value() || quitting_) return;
+    if (target_.has_value()) return;  // the tick tries again once the dictation is over
+    const auto [setup, kind] = *pending_install_;
+    pending_install_.reset();
+    if (const kd::Status st = kd::update::launch_installer(
+            setup, kind, static_cast<uint32_t>(GetCurrentProcessId()));
+        !st.ok()) {
+        std::thread([why = st.to_string()] {
+            kd::update::show_error("The installer could not be started.", why);
+        }).detach();
+        return;
+    }
+    // The installer waits for this process to exit before it replaces anything
+    // (kvit-dictate.iss, /WAITPID), so the ordinary orderly exit is the whole hand-over.
+    KD_LOG_INFO("exiting: installing an update (%s)", setup.filename().string().c_str());
+    quitting_ = true;
+    DestroyWindow(hwnd_);
 }
 
 // ─── Shutdown ───────────────────────────────────────────────────────────────────────────────
@@ -4280,6 +4476,7 @@ void App::shutdown() {
 
     KillTimer(hwnd_, kTickTimer);
     KillTimer(hwnd_, kHeartbeatTimer);
+    KillTimer(hwnd_, kUpdateTimer);
     if (hotkey_ != nullptr) hotkey_->stop();
     if (audio_running_ && capture_ != nullptr) capture_->stop();
     if (anchor_ != nullptr) anchor_->stop();

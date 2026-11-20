@@ -194,6 +194,7 @@ set(KD_CORE_SOURCES
     src/overlay.cpp
     src/theme.cpp
     src/tray_icon.cpp
+    src/updater.cpp
 )
 
 set(KD_CORE_HEADERS
@@ -213,9 +214,25 @@ set(KD_CORE_HEADERS
     src/history.h
     src/edit_buffer.h
     src/translator.h
+    src/updater.h
 )
 
 add_library(kd_core STATIC ${KD_CORE_SOURCES} ${KD_CORE_HEADERS})
+
+# The version the updater compares against GitHub's releases (src/updater.h). project() carries
+# only MAJOR.MINOR.PATCH, so a release candidate's tag suffix arrives separately:
+# packaging/windows/build-release.ps1 passes it from the tag (v1.0.0-rc2 -> rc2), and every other
+# build leaves it empty. Without it an rc build would call itself 1.0.0 and never be offered the
+# 1.0.0 release. On this one file only, so changing it recompiles one file.
+set(KD_VERSION_PRE "" CACHE STRING "Pre-release part of the version, e.g. rc2; empty for a release")
+if(NOT KD_VERSION_PRE MATCHES "^[0-9A-Za-z.-]*$")
+    message(FATAL_ERROR "KD_VERSION_PRE='${KD_VERSION_PRE}' may hold only letters, digits, '.' and '-'")
+endif()
+set(KD_UPDATER_DEFINES KVIT_VERSION_RAW=${PROJECT_VERSION})
+if(NOT KD_VERSION_PRE STREQUAL "")
+    list(APPEND KD_UPDATER_DEFINES KVIT_VERSION_PRE=${KD_VERSION_PRE})
+endif()
+set_source_files_properties(src/updater.cpp PROPERTIES COMPILE_DEFINITIONS "${KD_UPDATER_DEFINES}")
 
 target_include_directories(kd_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(kd_core PUBLIC kd_common_flags kd_wire)
@@ -466,6 +483,7 @@ if(KD_BUILD_TESTS)
         tests/test_normalizer.cpp
         tests/test_injector.cpp
         tests/test_translator.cpp
+        tests/test_updater.cpp
         tests/test_fixtures.cpp
 
         # kvit-asrd. openai-translator.md §4.8 and §5: the translator's code is compiled INTO
@@ -544,6 +562,7 @@ if(KD_BUILD_TESTS)
         settings        # src/settings.cpp — the round trip, and docs/editing.md §12's block
         normalizer      # src/normalizer.cpp — the term guard and the request/response codecs
         translator      # src/translator.cpp — the client's half of the spawn contract
+        updater         # src/updater.cpp — version order, the release pick, the checksum line
         asrd_ws         # src/asrd/ws_server.cpp — the handshake and RFC 6455 framing
         asrd_fixtures   # tests/fixtures/protocol/ — the same corpus, from the server's role
         asrd_stability  # src/asrd/stability.cpp — the producer of stable_bytes
