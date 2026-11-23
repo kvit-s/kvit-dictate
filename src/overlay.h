@@ -249,6 +249,13 @@ public:
     // having no source C at all, so the degradation is exposed here rather than only logged.
     [[nodiscard]] bool capture_excluded() const noexcept;
 
+    // Hide the window from capture, or stop hiding it (Settings::overlay_hide_from_capture).
+    // create() hides it; this is how a user who sees the screen *through* a capture — Citrix, a
+    // remote-viewing app, a DisplayLink dock — gets the pill back. Takes effect at once, shown or
+    // not. Returns what capture_excluded() says afterwards, which is the previous state when
+    // Windows refuses the change.
+    bool set_capture_excluded(bool exclude);
+
     // ── Content ─────────────────────────────────────────────────────────────────────────────
 
     // `pending` is text the commit engine has accepted but not yet injected; `unstable` is the

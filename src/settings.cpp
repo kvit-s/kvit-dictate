@@ -891,6 +891,7 @@ Status check_model_launchable(const ModelManifest& m, std::string_view model_id)
 //     "editing":   { "enabled": true, "mouse": true,      // docs/editing.md §12
 //                    "on_foreign_key": "ignore", "commit_key": "enter" },
 //     "overlay":   { "mode": "inline", "theme": "system",   // system | light | dark | custom
+//                    "hide_from_capture": true,
 //                    "font_family": "Segoe UI", "font_size_dip": 14.0,
 //                    "color_pending": "#FF3C3C3C", ... },   // read only under theme "custom"
 //     "audio_device_id": "",
@@ -1438,6 +1439,7 @@ std::string serialize_settings(const Settings& s) {
     {
         json::Value o = json::Value::object();
         put_str(o, "mode", enum_to_text(kOverlayModes, static_cast<int>(s.overlay_mode), "inline"));
+        put_bool(o, "hide_from_capture", s.overlay_hide_from_capture);
         put_str(o, "theme",
                 enum_to_text(kThemeModes, static_cast<int>(s.overlay_style.theme), "system"));
         put_str(o, "font_family", s.overlay_style.font_family);
@@ -1756,6 +1758,7 @@ Result<Settings> parse_settings(std::string_view json_text) {
         Obj o(*v, "settings.overlay");
         std::string mode = enum_to_text(kOverlayModes, static_cast<int>(s.overlay_mode), "inline");
         o.str_opt("mode", mode);
+        o.bool_opt("hide_from_capture", s.overlay_hide_from_capture);
         std::string theme =
             enum_to_text(kThemeModes, static_cast<int>(s.overlay_style.theme), "system");
         // Noted before the colours are read, because the migration below turns on exactly this:
@@ -1963,6 +1966,9 @@ enum : int {
     kIdAudioDevice,
     kIdOverlayMode,
     kIdFallback,
+    // Settings::overlay_hide_from_capture. On the privacy column, because what it trades is who
+    // else can see the pill: off is for the person who sees their own screen through Citrix.
+    kIdHideFromCapture,
     kIdMinConfidence,
     kIdTheme,
     kIdFontFamily,
@@ -3374,6 +3380,8 @@ void load_controls(HWND dlg, DialogState& st) {
     combo_add(fb, L"no preview at all");
     SendMessageW(fb, CB_SETCURSEL,
                  s.anchor.below_threshold == anchor::Fallback::NoPreview ? 1u : 0u, 0);
+    CheckDlgButton(dlg, kIdHideFromCapture,
+                   s.overlay_hide_from_capture ? BST_CHECKED : BST_UNCHECKED);
     set_float(GetDlgItem(dlg, kIdMinConfidence), s.anchor.min_confidence);
     HWND th = GetDlgItem(dlg, kIdTheme);
     SendMessageW(th, CB_RESETCONTENT, 0, 0);
@@ -3589,6 +3597,7 @@ bool read_controls(HWND dlg, DialogState& st, Settings& out) {
             s.overlay_mode = static_cast<OverlayMode>(kOverlayModes[sel].value);
         }
     }
+    s.overlay_hide_from_capture = IsDlgButtonChecked(dlg, kIdHideFromCapture) == BST_CHECKED;
     s.anchor.below_threshold =
         SendMessageW(GetDlgItem(dlg, kIdFallback), CB_GETCURSEL, 0, 0) == 1
             ? anchor::Fallback::NoPreview
@@ -3984,6 +3993,9 @@ void build_controls(HWND dlg, DialogState& st) {
         c.check(L"Keep the last dictation so it can be recovered (tray → Copy the last dictation)",
                 kIdKeepLast);
         c.check(L"Start kvit-dictate with Windows", kIdStartup);
+        c.check(L"Hide the pill from screenshots and screen sharing", kIdHideFromCapture);
+        c.note(L"Turn this off if you see this PC through Citrix, a remote-desktop app or a "
+               L"USB display dock: they copy the screen, so a hidden pill never reaches you.", 3);
 
         c.section(L"Vocabulary context");
         c.check(L"Send vocabulary context to the model", kIdSendContext);

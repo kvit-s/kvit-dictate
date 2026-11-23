@@ -2205,6 +2205,20 @@ uintptr_t Overlay::hwnd() const noexcept { return reinterpret_cast<uintptr_t>(im
 
 bool Overlay::capture_excluded() const noexcept { return impl_->capture_excluded; }
 
+bool Overlay::set_capture_excluded(bool exclude) {
+    if (!impl_->hwnd) return false;
+    if (exclude == impl_->capture_excluded) return exclude;
+    if (SetWindowDisplayAffinity(impl_->hwnd, exclude ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE)) {
+        impl_->capture_excluded = exclude;
+        KD_LOG_INFO("overlay %s screen capture", exclude ? "hidden from" : "visible to");
+    } else {
+        KD_LOG_WARN("SetWindowDisplayAffinity(%s) failed (%lu); the overlay stays %s capture",
+                    exclude ? "WDA_EXCLUDEFROMCAPTURE" : "WDA_NONE", GetLastError(),
+                    impl_->capture_excluded ? "hidden from" : "visible to");
+    }
+    return impl_->capture_excluded;
+}
+
 void Overlay::set_text(std::string_view pending, std::string_view unstable) {
     if (impl_->pending == pending && impl_->unstable == unstable) {
         return;  // render() is cheap when nothing changed; not marking dirty is cheaper

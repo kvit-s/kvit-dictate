@@ -40,6 +40,8 @@
 
 #include "kd_test.h"
 
+#include <windows.h>
+
 #include "anchor.h"
 #include "overlay.h"
 #include "util/utf8.h"
@@ -633,4 +635,37 @@ KD_TEST(overlay, status_only_and_idle_never_get_a_second_label) {
     KD_CHECK(state_note(OverlayMode::StatusOnly, OverlayState::Finalizing, false).empty());
     KD_CHECK(state_note(OverlayMode::Inline, OverlayState::Idle, false).empty());
     KD_CHECK(state_note(OverlayMode::FloatingPill, OverlayState::Idle, false).empty());
+}
+
+// ─── Capture exclusion, switchable ─────────────────────────────────────────────────────────
+//
+// Settings::overlay_hide_from_capture. A real overlay window, created and never shown, and the
+// answer read back from Windows rather than from the overlay's own flag: the flag agreeing with
+// itself proves nothing about what Citrix will be able to see.
+
+namespace {
+
+DWORD affinity_of(const kd::Overlay& o) {
+    DWORD a = 0xFFFFFFFFu;
+    GetWindowDisplayAffinity(reinterpret_cast<HWND>(o.hwnd()), &a);
+    return a;
+}
+
+}  // namespace
+
+KD_TEST(overlay, the_pill_can_be_shown_to_capture_and_hidden_again) {
+    kd::Overlay o;
+    KD_REQUIRE(o.create(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), kd::OverlayStyle{})
+                   .ok());
+    // Hidden by default, which is what the anchor estimator's source C relies on.
+    KD_CHECK(o.capture_excluded());
+    KD_CHECK_EQ(affinity_of(o), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+
+    KD_CHECK(!o.set_capture_excluded(false));
+    KD_CHECK(!o.capture_excluded());
+    KD_CHECK_EQ(affinity_of(o), static_cast<DWORD>(WDA_NONE));
+
+    KD_CHECK(o.set_capture_excluded(true));
+    KD_CHECK_EQ(affinity_of(o), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+    o.destroy();
 }

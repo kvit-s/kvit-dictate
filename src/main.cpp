@@ -974,6 +974,7 @@ bool App::startup() {
         // No anchor yet, so this resolves to the configured fallback rather than Inline. That is
         // the contract in anchor.h: current_fallback() is consulted when current() is absent.
         apply_overlay_mode();
+        overlay_->set_capture_excluded(settings_.overlay_hide_from_capture);
         // Where the pill posts a click on a post-submission button. Set once, here, so the
         // overlay never has to know what an App is.
         overlay_->set_action_target(reinterpret_cast<uintptr_t>(hwnd_), kMsgPillAction);
@@ -2252,7 +2253,12 @@ void App::perform_commit(const kd::CommitEngine::Result& r) {
         affix_open_ = true;
     }
 
-    const bool framed = anchor_ != nullptr && submit_before_frame();
+    // Source C only while the pill is out of its captures (overlay.h, capture_excluded). With
+    // the pill visible to capture — Settings::overlay_hide_from_capture off, for Citrix — the
+    // after-frame would hold the pill's own glyphs, and the anchor would chase the pill.
+    const bool framed = anchor_ != nullptr &&
+                        (overlay_ == nullptr || overlay_->capture_excluded()) &&
+                        submit_before_frame();
     const kd::InjectResult res = injector_->inject(*target_, text);
     if (framed) anchor_->submit_after_frame(text);
 
@@ -4127,6 +4133,7 @@ void App::apply_settings(kd::Settings next) {
     if (session_ != nullptr) session_->set_config(settings_.session);
     if (overlay_ != nullptr) {
         overlay_->set_style(settings_.overlay_style);
+        overlay_->set_capture_excluded(settings_.overlay_hide_from_capture);
         // Re-derived, not copied: the user may have changed overlay_mode, min_confidence or
         // below_threshold in the dialog that just closed, and all three feed this.
         apply_overlay_mode();

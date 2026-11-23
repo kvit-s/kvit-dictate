@@ -924,3 +924,24 @@ KD_TEST(settings, this_pc_keeps_the_address_it_does_not_use) {
     KD_CHECK(parsed->server.mode == kd::ServerMode::ThisPc);
     KD_CHECK(parsed->server.configured());
 }
+
+// Settings::overlay_hide_from_capture. Found on a work PC used through Citrix: the pill was
+// hidden from screen capture, Citrix shows the desktop by capturing it, so the pill never reached
+// the person dictating. The default stays "hidden", and an upgrade must not change it; "off" has
+// to survive the file, or the fix lasts until the next restart.
+KD_TEST(settings, hiding_the_pill_from_capture_defaults_on_and_off_survives_the_file) {
+    const kd::Settings fresh;
+    KD_CHECK(fresh.overlay_hide_from_capture);
+
+    const char* older = R"({"schema":1,"overlay":{"mode":"floating-pill"}})";
+    const kd::Result<kd::Settings> loaded = kd::parse_settings(older);
+    KD_REQUIRE(static_cast<bool>(loaded));
+    KD_CHECK(loaded->overlay_hide_from_capture);
+
+    kd::Settings s;
+    s.overlay_hide_from_capture = false;
+    bool ok = false;
+    const kd::Settings out = round_trip(s, ok);
+    KD_REQUIRE(ok);
+    KD_CHECK(!out.overlay_hide_from_capture);
+}

@@ -388,6 +388,19 @@ struct Settings {
     OverlayStyle overlay_style;
     OverlayMode overlay_mode = OverlayMode::Inline;
 
+    // Keep the pill out of screen capture (overlay.h, `set_capture_excluded`). On by default,
+    // because the anchor estimator's commit differencing (source C) captures the screen around
+    // the caret and must not find the pill's own glyphs there, and because it keeps dictated
+    // text out of screenshots and screen sharing.
+    //
+    // **Off is for a screen the user sees *through* a capture**: Citrix, a remote-viewing app,
+    // a DisplayLink dock. Those copy the desktop the way a screenshot does, so a hidden pill
+    // never reaches the person dictating — reported 2026-11-23 from a work PC used through
+    // Citrix, where the log placed the pill beside the caret on every dictation and nobody
+    // could see it. With this off, App skips source C, since the pill would be in its captures;
+    // the caret and the last click still place the pill.
+    bool overlay_hide_from_capture = true;
+
     // Audio device. Empty means "follow the default capture device".
     std::string audio_device_id;
 
@@ -412,9 +425,9 @@ struct Settings {
     // the process was killed mid-session. `Cadence::EndOfSession` exists to encourage exactly
     // that kind of long dictation, and until this the buffer lived only in `EditBuffer` with the
     // clipboard fallback sitting on the graceful path, so a crash, Task Manager or a power cut
-    // lost all of it. Worse, the overlay carries `WDA_EXCLUDEFROMCAPTURE` (overlay.h) — which is
-    // load-bearing for the anchor estimator and is not negotiable — so the pending text is
-    // invisible to screen recorders too. Nothing outside the process can see it. That is what
+    // lost all of it. Worse, the overlay carries `WDA_EXCLUDEFROMCAPTURE` (overlay.h) unless
+    // `overlay_hide_from_capture` is off — so the pending text is invisible to screen recorders
+    // too. Nothing outside the process can see it. That is what
     // makes an on-disk copy the only recovery there can be, and why this defaults to on.
     bool crash_recovery = true;
 
