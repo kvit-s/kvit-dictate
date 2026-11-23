@@ -2634,6 +2634,9 @@ void start_server_test(HWND dlg, DialogState& st) {
 
         ServerEndpoint ep;
         ep.model = mode == ServerMode::ThisPc ? std::string() : model;
+        // The translator launched below may take seconds to start listening on a machine whose
+        // security software inspects it first; Test waits for it as dictation does.
+        ep.refused_retry_ms = mode == ServerMode::Protocol ? 0 : kTranslatorListenWaitMs;
         bool launched = true;
         // The one place the model may be downloaded: the user chose This PC and pressed Test,
         // which is asking for it (plan.md §1.9). A dictation never does; it reports instead.
@@ -2681,8 +2684,11 @@ void start_server_test(HWND dlg, DialogState& st) {
             } else {
                 text += L"Could not use this endpoint.\r\n" + wide(r.status().message());
                 if (mode == ServerMode::ThisPc) {
-                    text += L"\r\nThe Windows speech model needs Windows 11 24H2 or later. Its "
-                            L"diagnostics are in this app's log, prefixed \"asrd:\".";
+                    // Not "needs Windows 11 24H2": that was printed under every failure, on a
+                    // 24H2 machine whose only problem was a slow start. When the model really is
+                    // unsupported, the helper says so in the message above.
+                    text += L"\r\nThe Windows speech model did not answer. Its diagnostics are "
+                            L"in this app's log, prefixed \"asrd:\".";
                 } else if (mode == ServerMode::Local) {
                     text += L"\r\nThe translator started but did not become ready, which "
                             L"usually means it could not reach the speech service at that "

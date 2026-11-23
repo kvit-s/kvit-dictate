@@ -1186,6 +1186,10 @@ bool App::connect_server() {
     ep.model = settings_.server.mode == kd::ServerMode::ThisPc ? std::string()
                                                                : settings_.server.model;
     ep.connect_timeout_ms = settings_.server.connect_timeout_ms;
+    // Our own translator may still be starting; a server the user runs is either listening or
+    // not, and they should hear which at once.
+    ep.refused_retry_ms =
+        settings_.server.mode == kd::ServerMode::Protocol ? 0 : kd::kTranslatorListenWaitMs;
 
     kd::IpcClient::Callbacks cb;
     // Every one of these runs on the I/O thread. They enqueue and wake; they never decide.

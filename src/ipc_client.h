@@ -219,6 +219,15 @@ struct ServerEndpoint {
     std::string model;
 
     uint32_t connect_timeout_ms = proto::kConnectTimeoutMs;
+
+    // How long a *refused* connection is tried again before it counts. Zero, the default, for an
+    // address the user named: refused means nothing is listening there, and saying so at once is
+    // the useful answer. Set for a translator this program has just launched (translator.h,
+    // kTranslatorListenWaitMs), which refuses until it has bound its port — and on a machine whose
+    // security software inspects a newly installed program before letting it run, that took nine
+    // seconds, while the connect came 250 ms after the launch. A refusal past this budget is
+    // reported exactly as before.
+    uint32_t refused_retry_ms = 0;
 };
 
 // The pieces of a URL the transport needs. Split out as a pure function because URL parsing is

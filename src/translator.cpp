@@ -367,7 +367,10 @@ Result<std::string> Translator::start(const TranslatorSpec& spec_in) {
             impl_->url = "ws://127.0.0.1:" + std::to_string(*port) + "/";
             // Logged rather than merely known: openai-translator.md §4.6 makes this the line a
             // support question is answered from, and the Settings page shows it too.
-            KD_LOG_INFO("kvit-asrd pid %lu listening on %s for %s",
+            // "Will listen", not "listening": the process is up, but on a slow start it binds
+            // its port seconds later (kTranslatorListenWaitMs), and a log that claimed otherwise
+            // made a refused connect look like a translator that had refused it on purpose.
+            KD_LOG_INFO("kvit-asrd pid %lu started; it will listen on %s for %s",
                         static_cast<unsigned long>(impl_->pid.load()), impl_->url.c_str(),
                         spec.on_device ? "the Windows speech model on this PC"
                                        : spec.service_url.c_str());

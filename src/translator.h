@@ -100,6 +100,18 @@ struct TranslatorSpec {
     std::filesystem::path revision_dir;
 };
 
+// How long the client keeps trying a translator it has just launched while the translator still
+// refuses connections (ServerEndpoint::refused_retry_ms).
+//
+// `start()` returns once the process has survived its first 250 ms, which proves it did not lose
+// the race for its port — not that it is listening. On the machine where this was found, a work
+// PC with Windows 11 Enterprise, kvit-asrd wrote its first log line nine seconds after it was
+// launched, and every connect before then was refused and counted as fatal: the Test button said
+// `connect_refused`, and dictation backed off and retried for twenty seconds. Thirty seconds
+// covers that three times over; a translator still not listening after it is broken, and is
+// reported as before.
+inline constexpr uint32_t kTranslatorListenWaitMs = 30000;
+
 // One supervised `kvit-asrd.exe`. Not copyable; owns a job object, a process and two threads.
 class Translator {
 public:

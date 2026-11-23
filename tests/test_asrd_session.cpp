@@ -262,11 +262,12 @@ public:
 
     ~TranslatorHarness() { stop(); }
 
-    bool start() {
-        // Port 0: two tests must be able to run back to back without TIME_WAIT deciding
-        // otherwise, which is also why the shipped client picks the port rather than using a
-        // fixed one (openai-translator.md §4.6).
-        if (!listener_.listen("127.0.0.1", 0).ok()) return false;
+    // `port` 0 by default: two tests must be able to run back to back without TIME_WAIT deciding
+    // otherwise, which is also why the shipped client picks the port rather than using a fixed
+    // one (openai-translator.md §4.6). A port is given only to stand in for a translator the
+    // client already knows the address of and that has not started listening yet.
+    bool start(uint16_t port = 0) {
+        if (!listener_.listen("127.0.0.1", port).ok()) return false;
         thread_ = std::thread([this] {
             for (;;) {
                 bool retry = false;
@@ -697,6 +698,123 @@ KD_TEST(asrd_session, a_down_speech_host_fails_before_ready) {
         KD_CHECK(!seen.ready);  // `ready` is earned, and it was not earned
     }
     client.stop();
+}
+
+// ─── A translator that is slow to start listening ──────────────────────────────────────────
+//
+// Found on a work PC running Windows 11 Enterprise: kvit-asrd wrote its first log line nine
+// seconds after it was launched, the client connected after 250 ms, and `connect_refused` was
+// fatal — the Test button failed and dictation spent twenty seconds in reconnect backoff.
+// ServerEndpoint::refused_retry_ms is what bridges that, and only for our own translator.
+
+namespace {
+
+// A loopback port with nothing on it, chosen the way the shipped client chooses one.
+uint16_t free_loopback_port() {
+    WsListener probe;
+    if (!probe.listen("127.0.0.1", 0).ok()) return 0;
+    const uint16_t port = probe.port();
+    probe.stop();
+    return port;
+}
+
+std::wstring loopback_url(uint16_t port) {
+    return L"ws://127.0.0.1:" + std::to_wstring(port) + L"/";
+}
+
+}  // namespace
+
+KD_TEST(asrd_session, the_test_button_waits_for_a_translator_that_listens_late) {
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    TranslatorHarness harness(config_for(stub));
+    const uint16_t port = free_loopback_port();
+    KD_REQUIRE_GT(port, uint16_t{0});
+
+    std::atomic<bool> listening{false};
+    std::thread late([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        listening = harness.start(port);
+    });
+
+    kd::ServerEndpoint ep;
+    ep.url = loopback_url(port);
+    ep.refused_retry_ms = 10000;
+    const kd::Result<kd::ServerProbe> r = kd::probe_server(ep, 20000);
+    late.join();
+    KD_REQUIRE(listening.load());
+    KD_REQUIRE(r.is_ok());
+    KD_CHECK_EQ(r->model, std::string("stub-model"));
+}
+
+KD_TEST(asrd_session, dictation_waits_for_a_translator_that_listens_late) {
+    StubSpeechService stub;
+    KD_REQUIRE(stub.start());
+    stub.set_transcribe({200, R"({"text":"late but here"})"});
+    TranslatorHarness harness(config_for(stub));
+    const uint16_t port = free_loopback_port();
+    KD_REQUIRE_GT(port, uint16_t{0});
+
+    std::thread late([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        harness.start(port);
+    });
+
+    // IpcClient's own path, the one dictation takes, rather than probe_server's.
+    Observed seen;
+    kd::IpcClient client;
+    kd::IpcClient::Callbacks cb;
+    cb.on_message = [&seen](const kd::proto::Message& m) { seen.note(m); };
+    cb.on_error = [&seen](const kd::proto::ProtocolError& e) {
+        std::lock_guard<std::mutex> lock(seen.m);
+        seen.dead = true;
+        seen.dead_reason = e.msg;
+        seen.cv.notify_all();
+    };
+    cb.on_disconnected = [&seen]() {
+        std::lock_guard<std::mutex> lock(seen.m);
+        seen.disconnected = true;
+        seen.cv.notify_all();
+    };
+    kd::ServerEndpoint ep;
+    ep.url = loopback_url(port);
+    ep.refused_retry_ms = 10000;
+    KD_REQUIRE(client.connect(ep, cb).ok());
+    // `hello` goes out once the connection reaches HANDSHAKE, as in attach(); send_control
+    // queues it until then.
+    kd::proto::HelloMsg hello;
+    hello.proto = kd::proto::kProtoVersion;
+    hello.client = "kd_tests";
+    KD_REQUIRE(client.send_control(kd::proto::Message::of(hello)).ok());
+
+    KD_REQUIRE(seen.wait_for([&] { return seen.ready || seen.dead || seen.disconnected; }));
+    late.join();
+    {
+        std::lock_guard<std::mutex> lock(seen.m);
+        KD_CHECK(seen.ready);
+        KD_CHECK(!seen.dead);
+        KD_CHECK_EQ(seen.dead_reason, std::string());
+    }
+    client.stop();
+}
+
+KD_TEST(asrd_session, a_server_the_user_named_is_still_refused_at_once) {
+    // The wait is for our own translator only. An address the user typed is either listening or
+    // not, and they should hear which immediately rather than after thirty seconds.
+    const uint16_t port = free_loopback_port();
+    KD_REQUIRE_GT(port, uint16_t{0});
+    kd::ServerEndpoint ep;
+    ep.url = loopback_url(port);  // refused_retry_ms left at its default, 0
+    const auto t0 = std::chrono::steady_clock::now();
+    const kd::Result<kd::ServerProbe> r = kd::probe_server(ep, 20000);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    KD_REQUIRE(!r.is_ok());
+    KD_CHECK(r.status().message().rfind("connect_refused", 0) == 0);
+    // One refusal, which Windows takes about two seconds to deliver even on loopback — not the
+    // thirty a translator is given.
+    KD_CHECK_LT(ms, 6000);
 }
 
 KD_TEST(asrd_session, a_500_on_transcription_is_decode_failed_and_keeps_the_connection) {

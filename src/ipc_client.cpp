@@ -798,6 +798,41 @@ bool message_length_agrees(const std::vector<uint8_t>& msg, std::string& why) {
     return true;
 }
 
+// ─── A refused connect, tried again while the endpoint allows it ─────────────────────────────
+
+// WsConn::open, repeated while the answer is `connect_refused` and the endpoint's
+// `refused_retry_ms` has not run out. Any other failure — a timeout, a TLS failure, an HTTP
+// answer instead of an upgrade — is returned at once: those are not a program that has not
+// started listening yet. `closing` is checked between attempts, so stop() is not held up by a
+// wait it has made pointless.
+Status open_waiting_for_listener(WsConn& conn, const ParsedServerUrl& u,
+                                 const ServerEndpoint& endpoint, uint32_t connect_timeout_ms,
+                                 uint32_t* upgrade_ms) {
+    // A refused connect is not instant on Windows, even on loopback: the stack retries the SYN
+    // before it believes the reset, and one refusal measured 2052 ms. A listener that appears
+    // during those retries is simply connected to. So the pause between attempts is short, and
+    // the budget is the thing that bounds the wait.
+    constexpr uint32_t kStepMs = 200;
+    const Millis started = now_ms();
+    const Millis give_up = started + endpoint.refused_retry_ms;
+    uint32_t refusals = 0;
+    for (;;) {
+        Status st = conn.open(u, connect_timeout_ms, proto::kWriteDeadlineMs, upgrade_ms);
+        const bool refused = !st.ok() && st.message().rfind("connect_refused", 0) == 0;
+        if (!refused || now_ms() >= give_up || conn.closing.load()) {
+            if (refusals > 0) {
+                KD_LOG_INFO("%s after %u refusal(s) over %llu ms (the listener was still "
+                            "starting)",
+                            st.ok() ? "connected" : "gave up", refusals,
+                            static_cast<unsigned long long>(now_ms() - started));
+            }
+            return st;
+        }
+        ++refusals;
+        Sleep(kStepMs);
+    }
+}
+
 }  // namespace
 
 // ─── URL parsing ─────────────────────────────────────────────────────────────────────────────
@@ -1867,8 +1902,8 @@ void IpcClient::Impl::ws_main() {
     }
 
     uint32_t upgrade_ms = 0;
-    const Status opened = ws->open(*parsed, endpoint.connect_timeout_ms, proto::kWriteDeadlineMs,
-                                   &upgrade_ms);
+    const Status opened =
+        open_waiting_for_listener(*ws, *parsed, endpoint, endpoint.connect_timeout_ms, &upgrade_ms);
     if (!opened.ok()) {
         proto::ProtocolError e;
         e.fatal = true;
@@ -1952,9 +1987,9 @@ Result<ServerProbe> probe_server(const ServerEndpoint& endpoint, uint32_t timeou
     WsConn conn;
     ServerProbe probe;
 
-    const Status opened =
-        conn.open(*parsed, std::min<uint32_t>(timeout_ms, endpoint.connect_timeout_ms),
-                  proto::kWriteDeadlineMs, &probe.connect_ms);
+    const Status opened = open_waiting_for_listener(
+        conn, *parsed, endpoint, std::min<uint32_t>(timeout_ms, endpoint.connect_timeout_ms),
+        &probe.connect_ms);
     if (!opened.ok()) return opened;
 
     proto::HelloMsg hello;
