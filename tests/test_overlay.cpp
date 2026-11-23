@@ -657,6 +657,18 @@ KD_TEST(overlay, the_pill_can_be_shown_to_capture_and_hidden_again) {
     kd::Overlay o;
     KD_REQUIRE(o.create(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), kd::OverlayStyle{})
                    .ok());
+    // A desktop that cannot exclude a window from capture at all — the GitHub Actions runner,
+    // whose session has no interactive desktop, refuses WDA_EXCLUDEFROMCAPTURE outright — has
+    // nothing to switch. What can still be checked there is that the refusal is reported: the
+    // overlay says it is visible to capture, and asking again does not claim otherwise.
+    if (!o.capture_excluded() && affinity_of(o) == static_cast<DWORD>(WDA_NONE)) {
+        KD_INFO("skipped: this desktop refuses WDA_EXCLUDEFROMCAPTURE, so there is no switch");
+        KD_CHECK(!o.set_capture_excluded(true));
+        KD_CHECK(!o.capture_excluded());
+        KD_CHECK_EQ(affinity_of(o), static_cast<DWORD>(WDA_NONE));
+        o.destroy();
+        return;
+    }
     // Hidden by default, which is what the anchor estimator's source C relies on.
     KD_CHECK(o.capture_excluded());
     KD_CHECK_EQ(affinity_of(o), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
