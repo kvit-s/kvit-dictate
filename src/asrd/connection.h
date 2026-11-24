@@ -20,8 +20,8 @@
 #include <cstdint>
 #include <string>
 
+#include "asrd/backend_nemotron.h"
 #include "asrd/backend_openai.h"
-#include "asrd/backend_windows.h"
 #include "asrd/stability.h"
 #include "asrd/ws_server.h"
 
@@ -40,9 +40,10 @@ inline constexpr int kExitInternal = 5;
 enum class BackendKind : uint8_t {
     // `--service`, an OpenAI-compatible `/v1/audio/transcriptions` endpoint. The default.
     OpenAiHttp,
-    // The on-device Windows AI speech model, through `kvit-speech.exe`. No `--service`, no
-    // network: backend_windows.h.
-    WindowsSpeech,
+    // NVIDIA Nemotron Speech Streaming on this machine's CPU, through onnxruntime-genai. No
+    // `--service`; the network is used once, for the model download Test asks for:
+    // backend_nemotron.h.
+    Nemotron,
 };
 
 struct TranslatorConfig {
@@ -62,8 +63,8 @@ struct TranslatorConfig {
     // readable by every other process running as the same user.
     std::string api_key;
 
-    // `--backend windows-speech` only. `finalize_only` above wins over the copy in here.
-    WindowsSpeechConfig speech;
+    // `--backend nemotron` only. `finalize_only` above wins over the copy in here.
+    NemotronConfig nemotron;
 
     // session_server.h `SessionServerConfig::revision_dir` — where to write the audio behind a
     // hypothesis that retracted words it had already shown the user. Empty disables it, and

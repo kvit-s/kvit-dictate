@@ -191,10 +191,12 @@ enum class ServerMode : uint8_t {
     // `url` is a docs/protocol.md server the user runs themselves. Unchanged behaviour: the
     // client speaks the protocol to it directly and spawns nothing.
     Protocol,
-    // **No server at all.** The client launches `kvit-asrd.exe --backend windows-speech`, which
-    // runs Microsoft's on-device speech model through `kvit-speech\kvit-speech.exe`
-    // (src/asrd/backend_windows.h). Nothing crosses the network. `url`, `model` and `api_key`
-    // are kept and unused, so switching back to a service restores what was typed there.
+    // **No server at all.** The client launches `kvit-asrd.exe --backend nemotron`, which runs
+    // NVIDIA's Nemotron speech model on this machine's CPU (src/asrd/backend_nemotron.h). The
+    // model is downloaded once, from the Settings page; after that nothing crosses the network.
+    // `url`, `model` and `api_key` are kept and unused, so switching back to a service restores
+    // what was typed there. Until 2026-11-23 this meant Microsoft's Windows speech model; the
+    // stored value `this-pc` is unchanged, so a settings file from then simply moves to Nemotron.
     ThisPc,
 };
 

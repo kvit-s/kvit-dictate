@@ -173,11 +173,12 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     append_quoted_arg(cmd, L"127.0.0.1:" + std::to_wstring(port));
 
     if (spec.on_device) {
-        // No service, no model name, no key: the model is on this machine. The helper's path is
-        // the translator's own fixed default (backend_windows.h), so nothing here names it.
+        // No service, no model name, no key: the model is on this machine. Its runtime and model
+        // folders are the translator's own fixed defaults (backend_nemotron.h), so nothing here
+        // names them. No `--nemotron-install-model` either: the Settings page downloads the
+        // model itself, when the user presses its button, and a dictation never does.
         append_quoted_arg(cmd, L"--backend");
-        append_quoted_arg(cmd, L"windows-speech");
-        if (spec.install_speech_model) append_quoted_arg(cmd, L"--speech-install-model");
+        append_quoted_arg(cmd, L"nemotron");
     } else {
         append_quoted_arg(cmd, L"--service");
         append_quoted_arg(cmd, utf8::to_utf16_or_empty(spec.service_url));
@@ -191,7 +192,7 @@ std::wstring build_translator_command_line(const std::filesystem::path& image,
     // Explicit on/off rather than a bare switch, because the translator's default is ON and a
     // bare `--finalize-only` would read as if it changed something.
     append_quoted_arg(cmd, L"--finalize-only");
-    append_quoted_arg(cmd, spec.live_preview && !spec.on_device ? L"off" : L"on");
+    append_quoted_arg(cmd, spec.live_preview ? L"off" : L"on");
 
     append_quoted_arg(cmd, L"--endpoint-silence-ms");
     append_quoted_arg(cmd, std::to_wstring(spec.endpoint_silence_ms));
@@ -331,8 +332,8 @@ Result<std::string> Translator::start(const TranslatorSpec& spec_in) {
     TranslatorSpec on_device_spec;
     if (spec_in.on_device) {
         on_device_spec.on_device = true;
-        on_device_spec.install_speech_model = spec_in.install_speech_model;
-        on_device_spec.live_preview = false;
+        // Nemotron streams, so the preview is the user's choice here as it is with a service.
+        on_device_spec.live_preview = spec_in.live_preview;
         on_device_spec.endpoint_silence_ms = spec_in.endpoint_silence_ms;
         on_device_spec.revision_dir = spec_in.revision_dir;
     }
@@ -372,7 +373,7 @@ Result<std::string> Translator::start(const TranslatorSpec& spec_in) {
             // made a refused connect look like a translator that had refused it on purpose.
             KD_LOG_INFO("kvit-asrd pid %lu started; it will listen on %s for %s",
                         static_cast<unsigned long>(impl_->pid.load()), impl_->url.c_str(),
-                        spec.on_device ? "the Windows speech model on this PC"
+                        spec.on_device ? "the Nemotron model on this PC"
                                        : spec.service_url.c_str());
             return impl_->url;
         }

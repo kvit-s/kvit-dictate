@@ -6,8 +6,13 @@ entry in §3e with it. Commit `41ef07e` on `main`. §4c added 2026-09-21.
 Read with `plan.md` (the specification), `bench/CANDIDATES.md` (model picks),
 `bench/results/ab/README.md` (the service A/B runs and what was decided from them),
 `docs/supported-targets.md` (measurements + open questions §9) and
-`tools/kvit-speech/README.md` (the local model's measurement record). This file is only: what
+`docs/copilot-speech-model.md` (the local model's measurement record). This file is only: what
 works, what does not, and what to do next.
+
+**2026-11-23: "This PC" is NVIDIA Nemotron, and Windows speech is removed.** Everything below
+that describes `windows-speech`, `kvit-speech` or Whisper Small on this PC is history: that
+backend, its helper and its tests are gone. `docs/copilot-speech-model.md` §6 and §9 say what
+replaced it and how it was checked.
 
 ---
 

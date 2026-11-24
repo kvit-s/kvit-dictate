@@ -181,7 +181,7 @@ std::string url_authority(std::string_view url) {
 // protocol allows the sidecar 180 s to reach ready (docs/protocol.md §1.1 READY_TIMEOUT_MS), which
 // is far too long to hold a microphone-shaped promise on screen; a model that has not loaded in
 // this long is a problem to report, not to wait out. The slowest real load measured is 4155 ms
-// (windows-speech, cold).
+// (Windows speech, cold, before it was removed); Nemotron loads in about 0.7 s.
 constexpr uint64_t kActivationWaitMs = 30000;
 
 // How long docs/editing.md §4.4's one-line hint stays in the pill. "A couple of seconds", says
@@ -501,7 +501,7 @@ private:
     // What is being talked to, for a log line or a corpus record: the address, or — on this PC,
     // where `server.url` is a leftover from another mode — the name of the backend.
     [[nodiscard]] std::string server_label() const {
-        return settings_.server.mode == kd::ServerMode::ThisPc ? std::string("this-pc:windows-speech")
+        return settings_.server.mode == kd::ServerMode::ThisPc ? std::string("this-pc:nemotron")
                                                                : settings_.server.url;
     }
     void schedule_reconnect();
@@ -678,10 +678,9 @@ private:
     uint64_t finalize_deadline_ms_ = 0;
 
     // A hotkey press that arrived before the model was ready, held until it is (§10.2 allows
-    // `start` only from IDLE). Nothing before `windows-speech` made this reachable: every other
-    // backend reports ready in 0–77 ms, so the window did not exist in practice. That model takes
-    // ~4.2 s, which is long enough that pressing the hotkey inside it is the normal case rather
-    // than a race.
+    // `start` only from IDLE). Windows speech, now removed, made this reachable: it took ~4.2 s
+    // to load, long enough that pressing the hotkey inside it was the normal case. Nemotron's
+    // first load is ~0.7 s, so it is a race now, and still handled.
     bool activation_pending_ = false;
     uint64_t activation_deadline_ms_ = 0;
 
@@ -1140,6 +1139,7 @@ kd::Result<std::wstring> App::resolve_server_url() {
     if (settings_.server.mode == kd::ServerMode::ThisPc) {
         // The model on this machine. No address, no model name, no key (translator.h).
         spec.on_device = true;
+        spec.live_preview = settings_.server.live_preview;
     } else {
         spec.service_url = settings_.server.url;
         spec.model = settings_.server.model;

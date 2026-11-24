@@ -14,8 +14,9 @@ press **Install now**. The portable ZIP is not updated in place; it offers the d
 
 After installing, open **Settings → Server** and choose where the speech is recognised:
 
-* **This PC**: Microsoft's on-device speech model, so nothing leaves the computer. Needs Windows 11
-  24H2 or later. The model downloads once, through Windows Update, when you press **Test**.
+* **This PC**: NVIDIA's Nemotron speech model on your CPU, so nothing you say leaves the computer.
+  Press **Download Nemotron model** once (728 MB, from Microsoft's model catalog), then **Test**.
+  It replaces Microsoft's Windows speech model, which earlier releases used and which is gone.
 * **A speech service** you run or rent: anything that serves `/v1/audio/transcriptions`. See
   [`docs/setup.md`](https://github.com/kvit-s/kvit-dictate/blob/main/docs/setup.md).
 

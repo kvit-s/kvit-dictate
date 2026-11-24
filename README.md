@@ -4,15 +4,15 @@ Press **Win+Y**, talk, and text appears in whatever field has focus. A replaceme
 `Win+H` that types the words you actually use — `llama.cpp`, `Qwen3.6`, `sm_120`, file paths, CLI
 flags — and lets you decide how long a pause ends a sentence.
 
-Windows 10 (1809+) and 11, x64. Dictating with no server needs Windows 11 24H2 or later.
+Windows 10 (1809+) and 11, x64.
 
 > **Two ways to turn speech into text, and you pick one in Settings → Server:**
 >
-> * **This PC** — Microsoft's own on-device speech model (Whisper Small, an optional Windows
->   component). Nothing leaves the computer and there is no server to run. Windows 11 24H2 or
->   later; the model downloads once, through Windows Update, when you press **Test**. It is
->   slower than a GPU box — about 3 s for a 5 s sentence on a fast desktop CPU — and the Windows
->   API it uses is still marked *experimental* by Microsoft.
+> * **This PC** — NVIDIA's Nemotron speech model, the one VS Code and Copilot CLI use for voice,
+>   running on your CPU. Nothing you say leaves the computer and there is no server to run.
+>   Press **Download Nemotron model** once (728 MB, from Microsoft's model catalog). Words appear
+>   while you speak, and each sentence is final about a third of a second after you stop, on a
+>   fast desktop CPU. English only, and it writes "uh" and "um" when you say them.
 > * **A speech service** you run or rent — anything that serves `/v1/audio/transcriptions`.
 >   Faster and better on technical vocabulary, and your audio crosses the network to it.
 >   [`docs/setup.md`](docs/setup.md) is how to get one.
@@ -49,9 +49,13 @@ If there is one, a notification says so, and it is downloaded, checked against t
 updates…** does the same on demand. Turn the daily check off under Settings → Overlay & privacy →
 Updates.
 
-**With This PC, your audio never leaves the computer.** The recogniser runs in a helper process
-on this machine (`kvit-speech\kvit-speech.exe`), and the only network use is the one-time model
-download Windows does when you press Test.
+**With This PC, your audio never leaves the computer.** The recogniser runs inside `kvit-asrd.exe`
+on this machine, and the only network use is the one-time model download when you press
+**Download Nemotron model**: two HTTPS requests to Microsoft's model catalog, and every file is
+checked against a SHA-256 built into the program. The engine it runs on, Microsoft's
+onnxruntime-genai, contains a usage reporter; kvit-dictate switches it off before the engine is
+loaded, and a watch on the process's connections saw none
+([`docs/copilot-speech-model.md`](docs/copilot-speech-model.md) §5).
 
 **With a speech service, your audio does cross the network**, to the server you named and
 nowhere else — unencrypted, and to a server that does not ask who you are. Run it on a network
@@ -86,11 +90,9 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
 
 1. It starts in the tray and opens **Settings → Server**, because it cannot do anything until
    you say what turns speech into text.
-2. **No server?** Choose **This PC: Windows speech, no server** and press **Test**. If Windows
-   has not installed its speech model yet, Test asks Windows for it (a few hundred MB, once) and
-   waits; then it reports what answered. Press OK and you are done. Windows speech has no live
-   preview: the pill says *Listening* while you talk, and each sentence appears about a second
-   and a half after you pause.
+2. **No server?** Press **Download Nemotron model** (728 MB, once; the line under it counts the
+   megabytes), choose **This PC: Nemotron, no server**, and press **Test**. Press OK and you are
+   done.
 3. **Have a speech service?** Type its address — anything that serves
    `POST /v1/audio/transcriptions`, for example `http://your-gpu-box.lan:10301` — and press
    **Test**. It connects for real and tells you what answered: the model, the mode and the
@@ -100,7 +102,7 @@ logs          %LOCALAPPDATA%\kvit-dictate\logs
 
 That is the whole setup. **There is nothing else to start and no Python to install.**
 kvit-dictate ships with `kvit-asrd.exe`, a translator that speaks its own protocol on one side
-and, on the other, `/v1/audio/transcriptions` or the Windows speech model; the app launches it,
+and, on the other, `/v1/audio/transcriptions` or the Nemotron model; the app launches it,
 supervises it, and stops it when you quit. Test starts a private copy and completes the real handshake with it, so a green
 Test means the whole path answered — the app, the translator and your service.
 
@@ -252,7 +254,7 @@ src/
 docs/examples/        a complete conforming server, in the standard library
 packaging/windows/    icon generator, manifest, .rc, Inno Setup script, release build
 tools/probe/          Phase 0B measurement harness; also `--server <url>`, the Test button's twin
-tools/kvit-speech/    C# helper for the on-device Windows AI speech model (WinRT); shipped as kvit-speech\
+tools/nemotron-probe/ timing the Nemotron model on recorded sessions, in Python
 tools/testtarget/     controlled target: edit, richedit, multiline, password, RTL
 tests/                kd_test harness + suites + shared protocol fixtures
 server/kvit_asr/      the reference server: ws, session, stability, vad, backends/
@@ -330,14 +332,14 @@ Honest, and specific about what has and has not been run.
 | **Protocol** | Published, Apache-2.0, two transport bindings over one framing layer. Concurrency and model discovery answered (§2.7, §5.1). 20 shared fixtures run by both endpoints, plus a worked example server that the suite executes. |
 | **Client** | Every module under `src/` implemented and wired together. 494 tests. The whole path — hotkey, microphone, session, commit, injection, finalisation — has been executed against a real target. |
 | **Transport** | WebSocket, through WinHTTP, verified end to end against a server written only from the specification. The named-pipe binding survives for the bench. |
-| **Reference server** | Implemented: `ws`, session, stability, VAD, and backends for mock, sherpa-onnx, zipformer, whisper, faster-whisper, openai-http and windows-speech. 475 tests. Two have run against real audio. |
+| **Reference server** | Implemented: `ws`, session, stability, VAD, and backends for mock, sherpa-onnx, zipformer, whisper, faster-whisper and openai-http. 449 tests. Two have run against real audio. |
 | **Configuration** | Server address, optional model, a Test button that opens a real connection, and a no-server state with words in it. |
 | **Packaging** | One 1.16 MB executable, static CRT, icon, version block, application manifest. Both artefacts build: the portable ZIP and the per-user installer. Neither has been *installed* anywhere yet. |
 | **Signing** | ❌ **Not done, and the largest risk in the release.** No certificate exists. An unsigned binary that hooks the keyboard earns a SmartScreen warning at best. |
 | **Clean-VM test** | ❌ Not done. The gate is a browser download with Mark-of-the-Web intact, Defender and SmartScreen at defaults. |
 | **Phase 0B measurements** | ⚠️ 11 of 162 cells, all against `tools/testtarget`. Until an operator runs the rest, `docs/supported-targets.md` is a template rather than evidence. |
-| **No-server dictation** | ✅ **This PC** ships in the installer: `kvit-asrd --backend windows-speech` drives `kvit-speech.exe`, published self-contained (.NET and Windows App SDK runtimes inside, ≈ 230 MB installed, 62 MB installer). Verified 2026-11-19 on Windows 11 build 26300, CPU only: real speech through the real client, translator and model, transcribed word for word. The Settings page itself has not been looked at on screen, and no clean machine has run it. |
-| **Real-model dictation** | ⚠️ Runs against `openai-http` and `windows-speech`. The four backends that need a model on disk and an environment that does not exist yet still have not. |
+| **No-server dictation** | ⚠️ **This PC** is Nemotron since 2026-11-23: `kvit-asrd --backend nemotron`, with onnxruntime-genai in `nemotron\` (≈ 33 MB) and the 728 MB model downloaded from Settings. Verified on an i7-14700K, CPU only, on recorded sessions through the real translator and client code (`tests/test_asrd_nemotron.cpp`). Not yet dictated with live through the app, and not yet run on any other machine. Windows speech, which this replaced, is removed. |
+| **Real-model dictation** | ⚠️ Runs against `openai-http` and `nemotron`. The four backends that need a model on disk and an environment that does not exist yet still have not. |
 | **Text normalizer** | ⚠️ Implemented, off by default, never used in real dictation. The first measurement caught the model rewriting `llama.cpp` as `LLMCpp`; the guard rejects it. |
 
 ---

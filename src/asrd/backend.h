@@ -6,19 +6,20 @@
 // The seam between the session machine and whatever turns PCM into text.
 //
 // `SessionServer` used to hold an `OpenAiBackend&`, because there was exactly one backend and it
-// was compiled in. There are two now:
+// was compiled in. There are two:
 //
 //   backend_openai.cpp    an OpenAI-compatible `/v1/audio/transcriptions` service, over HTTP
-//   backend_windows.cpp   the on-device Windows AI speech model, through `kvit-speech.exe`
+//   backend_nemotron.cpp  NVIDIA Nemotron on this machine's CPU, streaming
 //
-// Both are batch models behind a streaming interface, driven by the same `PseudoStreamingDriver`
-// (backend_openai.h), so the contract below is the one `OpenAiBackend` already had, named. It is
-// deliberately not wider: the session machine must not learn which backend it is talking to,
-// because a branch on that inside `session_server.cpp` is a branch whose other arm is tested by
-// nobody.
+// The HTTP one is a batch model behind a streaming interface, driven by `PseudoStreamingDriver`
+// (backend_openai.h), and the contract below is the one `OpenAiBackend` already had, named.
+// Nemotron streams for real and keeps the same contract: it decodes on its own thread as audio
+// is fed, and `transcribe` reads what it has. The contract is deliberately not wider: the session
+// machine must not learn which backend it is talking to, because a branch on that inside
+// `session_server.cpp` is a branch whose other arm is tested by nobody.
 //
-// Threading is the driver's: `feed` runs on the connection thread, `transcribe` on the decode
-// thread, `cancel` from either. Each implementation owes that.
+// Threading: `feed` runs on the connection thread, `transcribe` on the decode thread, `cancel`
+// from either. Each implementation owes that.
 
 #include <cstddef>
 #include <cstdint>

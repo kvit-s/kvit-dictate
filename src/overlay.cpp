@@ -641,7 +641,7 @@ std::string state_note(OverlayMode mode, OverlayState state, bool has_text) {
         // Before there are any, the label is the only thing in the pill: without it an open
         // microphone was a dot one character wide — beside the caret in Inline mode, where
         // there is no key legend either — and with a recogniser that shows no words until a
-        // sentence ends (Windows speech, or any service with live preview off) that dot was
+        // sentence ends (any service with live preview off) that dot was
         // the whole pill for seconds at a time. Reported as "the pill never shows".
         return has_text ? std::string{} : std::string{state_label(state)};
     }

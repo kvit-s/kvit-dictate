@@ -436,7 +436,7 @@ KD_TEST(translator, launches_and_supervises_a_real_child_when_a_service_is_named
 
 KD_TEST(translator, on_this_pc_the_command_line_names_the_backend_and_nothing_typed) {
     // Whatever the other modes left in the spec, none of it may reach the child: no address, no
-    // model, no key, and no live preview the model cannot keep up with.
+    // model and no key.
     kd::TranslatorSpec spec;
     spec.on_device = true;
     spec.service_url = "http://stale.lan:10301";
@@ -445,19 +445,27 @@ KD_TEST(translator, on_this_pc_the_command_line_names_the_backend_and_nothing_ty
     spec.live_preview = true;
     const std::wstring cmd = kd::build_translator_command_line(
         L"C:\\Program Files\\kvit-dictate\\kvit-asrd.exe", spec, 10500, 4242);
-    KD_CHECK(contains(cmd, L"--backend windows-speech"));
-    KD_CHECK(contains(cmd, L"--finalize-only on"));
+    KD_CHECK(contains(cmd, L"--backend nemotron"));
     KD_CHECK(contains(cmd, L"--listen 127.0.0.1:10500"));
     KD_CHECK(contains(cmd, L"--parent-pid 4242"));
     KD_CHECK(!contains(cmd, L"--service"));
     KD_CHECK(!contains(cmd, L"--model"));
     KD_CHECK(!contains(cmd, L"--api-key"));
     KD_CHECK(!contains(cmd, L"stale.lan"));
-    // The helper's path is the translator's fixed default; the client never names it.
-    KD_CHECK(!contains(cmd, L"--speech-helper"));
-    // A dictation never downloads the model; only Test asks for that.
-    KD_CHECK(!contains(cmd, L"--speech-install-model"));
-    spec.install_speech_model = true;
+    // The runtime and model folders are the translator's fixed defaults; the client never names
+    // them, and a dictation never downloads anything: only the Settings button does.
+    KD_CHECK(!contains(cmd, L"--nemotron-"));
+    KD_CHECK(!contains(cmd, L"windows-speech"));
+}
+
+KD_TEST(translator, on_this_pc_live_preview_is_the_users_choice) {
+    // Nemotron streams, so unlike Windows speech before it the preview follows the setting.
+    kd::TranslatorSpec spec;
+    spec.on_device = true;
+    spec.live_preview = true;
     KD_CHECK(contains(kd::build_translator_command_line(L"C:\\k\\kvit-asrd.exe", spec, 1, 2),
-                      L"--speech-install-model"));
+                      L"--finalize-only off"));
+    spec.live_preview = false;
+    KD_CHECK(contains(kd::build_translator_command_line(L"C:\\k\\kvit-asrd.exe", spec, 1, 2),
+                      L"--finalize-only on"));
 }

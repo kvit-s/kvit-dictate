@@ -18,17 +18,19 @@
     release and no certificate exists yet; a script that quietly produced unsigned output while
     looking like it signed would be worse than one that says so. It says so, at the end.
 
-    The staged payload is **two** executables, one helper folder and documents. No models.json,
-    no Python, no CRT redistributable — the build is /MT (CMakeLists.txt), so there is nothing
-    to redistribute. models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and
-    shipping it would put a "mock" model in front of a new user, which types invented sentences.
+    The staged payload is **two** executables, one engine folder and documents. No models.json,
+    no Python, no CRT redistributable installer — both executables are /MT (CMakeLists.txt), and
+    the engine folder carries the few Visual C++ runtime DLLs its third-party DLLs import.
+    models.json is NOT staged: release-plan.md §2.2 makes it a bench file, and shipping it would
+    put a "mock" model in front of a new user, which types invented sentences.
 
         kvit-dictate.exe   the client: hotkey, capture, session, injection, overlay
         kvit-asrd.exe      the translator: docs/protocol.md on one side, and on the other an
-                           OpenAI-compatible /v1/audio/transcriptions service, or the model on
-                           this PC through the helper below
-        kvit-speech\       the on-device Windows AI speech helper (tools/kvit-speech), published
-                           self-contained with its .NET and Windows App SDK runtimes
+                           OpenAI-compatible /v1/audio/transcriptions service, or the Nemotron
+                           model on this PC through the engine below
+        nemotron\          onnxruntime-genai and onnxruntime from Microsoft's NuGet packages,
+                           pinned, with their licences and the Visual C++ runtime DLLs. About
+                           33 MB. The 728 MB model is downloaded by Settings, not shipped.
 
     ── The spawn check changed, and it is worth reading before "fixing" it ────────────────────
 
@@ -144,38 +146,98 @@ if (-not (Test-Path $asrd)) {
 }
 Copy-Item $asrd $stageDir
 
-# ─── The on-device speech helper (src/asrd/backend_windows.h) ───────────────────────────────
+# ─── The on-device speech engine (src/asrd/backend_nemotron.h) ──────────────────────────────
 #
-# What lets "This PC" in Settings > Server dictate with no server at all: kvit-asrd launches
-# kvit-speech\kvit-speech.exe, which reaches the Windows AI speech model through the Windows App
-# SDK. It is C#, so it is built here with the .NET SDK rather than by CMake.
+# What lets "This PC" in Settings > Server dictate with no server at all: kvit-asrd loads
+# nemotron\onnxruntime-genai.dll at run time and runs NVIDIA's Nemotron model on the CPU. The
+# model itself (728 MB) is not shipped; the Settings page downloads it when the user asks.
 #
-# **Published self-contained, .NET runtime included.** The csproj leaves the .NET runtime to the
-# machine, which is right for a developer and wrong for an installer: a clean Windows has no .NET
-# 9, and a helper that fails to start on one is exactly the failure a clean-VM test exists to
-# find. The Windows App SDK runtime is carried beside it either way (WindowsAppSDKSelfContained,
-# because the API is only in the experimental channel; tools/kvit-speech/README.md). That makes
-# this folder most of the installer's size, and it is the price of needing no server.
-$dotnet = Find-Tool 'dotnet.exe' @((Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'))
-if (-not $dotnet) {
-    throw 'dotnet.exe (the .NET 9 SDK) not found; it builds tools\kvit-speech, without which "This PC" in Settings cannot dictate'
+# The two engine DLLs come from Microsoft's NuGet packages, **pinned by version and by the
+# SHA-256 of the whole package**, so a package re-published under the same version cannot change
+# what ships. Both are MIT; their LICENSE and ThirdPartyNotices go into the folder beside them.
+#
+# They are built against the dynamic Visual C++ runtime, unlike this project's own two
+# executables (/MT, checked below), so the runtime DLLs they import are copied app-locally from
+# this machine's Visual Studio redistributable folder. backend_nemotron.cpp loads the engine with
+# its own folder searched first, so these are the ones it gets, on a machine with no
+# redistributable installed.
+$nemotronDir = Join-Path $stageDir 'nemotron'
+New-Item -ItemType Directory -Force -Path $nemotronDir | Out-Null
+$nugetCache = Join-Path $buildDir 'nuget'
+New-Item -ItemType Directory -Force -Path $nugetCache | Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$enginePackages = @(
+    @{ Id = 'microsoft.ml.onnxruntimegenai'; Version = '0.20.0'; Short = 'onnxruntime-genai'
+       Sha256 = '4f6bec1befdbe93c177b6c10592c0d5c531657addb4854f28ba14cf0057d38c8'
+       Dlls = @('onnxruntime-genai.dll') },
+    @{ Id = 'microsoft.ml.onnxruntime'; Version = '1.32.0'; Short = 'onnxruntime'
+       Sha256 = 'a9150bc2992cbbb6722070da9910e1ffa989a8bfc67bdd5bb8e745ca755641db'
+       Dlls = @('onnxruntime.dll', 'onnxruntime_providers_shared.dll') }
+)
+Write-Host "`n[release] === Nemotron engine (NuGet, pinned) ==="
+foreach ($p in $enginePackages) {
+    $name = "$($p.Id).$($p.Version).nupkg"
+    $nupkg = Join-Path $nugetCache $name
+    if (-not (Test-Path $nupkg)) {
+        $url = "https://api.nuget.org/v3-flatcontainer/$($p.Id)/$($p.Version)/$name"
+        Write-Host "[release] downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile $nupkg -UseBasicParsing
+    }
+    $hash = (Get-FileHash -Algorithm SHA256 $nupkg).Hash.ToLowerInvariant()
+    if ($hash -ne $p.Sha256) {
+        Remove-Item -Force $nupkg
+        throw "$name has SHA-256 $hash, not the pinned $($p.Sha256); it was deleted. A new engine version is a deliberate change to this list."
+    }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+    try {
+        $wanted = @{}
+        foreach ($d in $p.Dlls) { $wanted["runtimes/win-x64/native/$d"] = $d }
+        $wanted['LICENSE'] = "$($p.Short)-LICENSE.txt"
+        $wanted['ThirdPartyNotices.txt'] = "$($p.Short)-ThirdPartyNotices.txt"
+        foreach ($entry in $zip.Entries) {
+            if ($wanted.ContainsKey($entry.FullName)) {
+                $dest = Join-Path $nemotronDir $wanted[$entry.FullName]
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+                $wanted.Remove($entry.FullName)
+            }
+        }
+        if ($wanted.Count -gt 0) {
+            throw "$name lacks $($wanted.Keys -join ', ')"
+        }
+    } finally {
+        $zip.Dispose()
+    }
 }
-$speechOut = Join-Path $buildDir 'kvit-speech'
-if (Test-Path $speechOut) { Remove-Item -Recurse -Force $speechOut }
-Write-Host "`n[release] === kvit-speech (dotnet publish, self-contained) ==="
-& $dotnet publish (Join-Path $repo 'tools\kvit-speech\KvitSpeech.csproj') -c Release -r win-x64 `
-    --self-contained true -p:SelfContained=true -o $speechOut --nologo
-if ($LASTEXITCODE -ne 0) { throw 'dotnet publish of tools\kvit-speech failed' }
-if (-not (Test-Path (Join-Path $speechOut 'kvit-speech.exe'))) {
-    throw "kvit-speech.exe not found in $speechOut after publish"
+
+# The Visual Studio that built this, first: CMake records it as CMAKE_GENERATOR_INSTANCE, and its
+# runtime is the one the build was linked against. vswhere is only the fallback. On the machine
+# this was written on it did not list that install at all, and `-latest` named a VS 2019 Build
+# Tools with no VC143 runtime folder.
+$vsRoots = @()
+$cache = Join-Path $buildDir 'CMakeCache.txt'
+if ((Test-Path $cache) -and ((Get-Content $cache -Raw) -match 'CMAKE_GENERATOR_INSTANCE:INTERNAL=([^\r\n]+)')) {
+    $vsRoots += $Matches[1].Trim()
 }
-# The .NET runtime really is inside: without it the helper would ask the machine for one.
-if (-not (Test-Path (Join-Path $speechOut 'coreclr.dll'))) {
-    throw 'the published kvit-speech has no coreclr.dll, so it is not self-contained and would need .NET 9 installed'
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (Test-Path $vswhere) {
+    $vsRoots += @(& $vswhere -all -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
 }
-# Debug symbols are not shipped; they are a third of the folder and help nobody who installs it.
-Copy-Item -Recurse $speechOut (Join-Path $stageDir 'kvit-speech')
-Get-ChildItem -Recurse -File -Filter '*.pdb' (Join-Path $stageDir 'kvit-speech') | Remove-Item -Force
+$crt = $vsRoots |
+    ForEach-Object { Join-Path $_ 'VC\Redist\MSVC' } |
+    Where-Object { Test-Path $_ } |
+    ForEach-Object { Get-ChildItem -Directory $_ } |
+    Where-Object { $_.Name -match '^[0-9]+\.[0-9]+\.[0-9]+$' } |
+    Sort-Object { [version]$_.Name } -Descending |
+    ForEach-Object { Join-Path $_.FullName 'x64\Microsoft.VC143.CRT' } |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $crt) { throw "no x64 Microsoft.VC143.CRT folder in any Visual Studio 2022 install ($($vsRoots -join ', '))" }
+foreach ($dll in @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+    $src = Join-Path $crt $dll
+    if (-not (Test-Path $src)) { throw "$dll is missing from $crt" }
+    Copy-Item $src $nemotronDir
+}
+Write-Host "[release] engine staged in nemotron\ with the Visual C++ runtime from $crt"
 
 # The whole payload, and the list is short on purpose (release-plan.md §3.2).
 foreach ($f in @('LICENSE', 'LICENSE-APACHE', 'README.md')) {
@@ -223,11 +285,13 @@ Write-Host "[release] the models.json interpreter spawn is compiled out (no 'spa
 if (-not (Test-Path (Join-Path $stageDir 'kvit-asrd.exe'))) {
     throw 'kvit-asrd.exe is missing from the stage directory'
 }
-# Where the translator looks for it, and nowhere else (default_speech_helper_path).
-if (-not (Test-Path (Join-Path $stageDir 'kvit-speech\kvit-speech.exe'))) {
-    throw 'kvit-speech\kvit-speech.exe is missing from the stage directory; "This PC" could not dictate'
+# Where the translator looks for the engine, and nowhere else (default_nemotron_runtime_dir).
+foreach ($dll in @('onnxruntime-genai.dll', 'onnxruntime.dll')) {
+    if (-not (Test-Path (Join-Path $stageDir "nemotron\$dll"))) {
+        throw "nemotron\$dll is missing from the stage directory; `"This PC`" could not dictate"
+    }
 }
-Write-Host "[release] both halves staged (kvit-dictate.exe + kvit-asrd.exe), and the on-device helper (kvit-speech\)"
+Write-Host "[release] both halves staged (kvit-dictate.exe + kvit-asrd.exe), and the on-device engine (nemotron\)"
 
 $staged = Get-ChildItem -Recurse -File $stageDir
 Write-Host "[release] staged $($staged.Count) files, $([math]::Round(($staged | Measure-Object Length -Sum).Sum / 1MB, 2)) MB"

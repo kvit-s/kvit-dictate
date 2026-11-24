@@ -18,7 +18,7 @@
 //   vad.cpp              endpointing.                                          PORTED
 //   stability.cpp        hypotheses -> stable_bytes.                           PORTED
 //   backend_openai.cpp   PCM -> text, over HTTP.                               PORTED
-//   backend_windows.cpp  PCM -> text on this machine, through kvit-speech.exe. NEW
+//   backend_nemotron.cpp PCM -> text on this machine's CPU, streaming.         NEW
 //
 // This file is the run loop and the handshake, and nothing else.
 
@@ -35,10 +35,12 @@
 #include <thread>
 #include <vector>
 
+#include "asrd/backend_nemotron.h"
 #include "asrd/backend_openai.h"
-#include "asrd/backend_windows.h"
 #include "asrd/connection.h"
 #include "asrd/http.h"
+#include "model_download.h"
+#include "asrd/power.h"
 #include "asrd/ws_server.h"
 #include "protocol.h"
 #include "util/log.h"
@@ -57,6 +59,8 @@ struct Options {
     uint32_t max_connections = 1;
     kd::log::Level log_level = kd::log::Level::Info;
     bool api_key_stdin = false;
+    // `--nemotron-download`: fetch and check the model, then exit. No listener.
+    bool download_only = false;
     TranslatorConfig translator;
 };
 
@@ -65,19 +69,23 @@ void print_usage() {
         "kvit-asrd - the kvit-dictate translator.\n"
         "\n"
         "Speaks docs/protocol.md on a loopback WebSocket, and turns audio into text with an\n"
-        "OpenAI-compatible /v1/audio/transcriptions service over HTTP, or with the on-device\n"
-        "Windows AI speech model.\n"
+        "OpenAI-compatible /v1/audio/transcriptions service over HTTP, or with NVIDIA Nemotron\n"
+        "on this machine's CPU.\n"
         "\n"
         "  kvit-asrd --service http://host:port [--listen 127.0.0.1:10402] [options]\n"
-        "  kvit-asrd --backend windows-speech [--listen 127.0.0.1:10402] [options]\n"
+        "  kvit-asrd --backend nemotron [--listen 127.0.0.1:10402] [options]\n"
+        "  kvit-asrd --nemotron-download [--nemotron-model DIR]\n"
         "\n"
         "  --listen [host:]port        default 127.0.0.1:10402. Loopback unless a host is given.\n"
-        "  --backend NAME              openai-http (default) or windows-speech.\n"
+        "  --backend NAME              openai-http (default) or nemotron.\n"
         "  --service URL               REQUIRED for openai-http. http:// or https:// only.\n"
-        "  --speech-helper PATH        windows-speech: the helper executable. Default\n"
-        "                              kvit-speech\\kvit-speech.exe beside this program.\n"
-        "  --speech-install-model      windows-speech: let the helper download the model\n"
-        "                              through Windows Update if it is not installed.\n"
+        "  --nemotron-runtime DIR     nemotron: the folder holding onnxruntime-genai.dll.\n"
+        "                              Default nemotron\\ beside this program.\n"
+        "  --nemotron-model DIR        nemotron: the model folder. Default\n"
+        "                              %LOCALAPPDATA%\\kvit-dictate\\models\\nemotron-...-v3.\n"
+        "  --nemotron-install-model    nemotron: download the model (728 MB, from Microsoft's\n"
+        "                              model catalog) if it is not there.\n"
+        "  --nemotron-download         download and check the model, then exit.\n"
         "  --model NAME                default Qwen/Qwen3-ASR-1.7B\n"
         "  --language LANG             default en. Empty means the server's default.\n"
         "  --parent-pid PID            exit when that process does.\n"
@@ -197,25 +205,31 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
             if (exit_code != 0) return false;
             if (v == "openai-http") {
                 opt.translator.backend = BackendKind::OpenAiHttp;
-            } else if (v == "windows-speech") {
-                opt.translator.backend = BackendKind::WindowsSpeech;
+            } else if (v == "nemotron") {
+                opt.translator.backend = BackendKind::Nemotron;
             } else {
-                std::fprintf(stderr,
-                             "kvit-asrd: --backend wants openai-http or windows-speech, got %s\n",
+                // `windows-speech` was removed on 2026-11-23, with the helper it drove.
+                std::fprintf(stderr, "kvit-asrd: --backend wants openai-http or nemotron, got %s\n",
                              v.c_str());
                 exit_code = 2;
                 return false;
             }
             continue;
         }
-        if (a == "--speech-helper") {
-            const std::string v = next("--speech-helper");
+        if (a == "--nemotron-runtime" || a == "--nemotron-model") {
+            const std::string v = next(a.c_str());
             if (exit_code != 0) return false;
-            opt.translator.speech.helper = std::filesystem::path(widen(v));
+            (a == "--nemotron-runtime" ? opt.translator.nemotron.runtime_dir
+                                       : opt.translator.nemotron.model_dir) =
+                std::filesystem::path(widen(v));
             continue;
         }
-        if (a == "--speech-install-model") {
-            opt.translator.speech.install_model = true;
+        if (a == "--nemotron-install-model") {
+            opt.translator.nemotron.install_model = true;
+            continue;
+        }
+        if (a == "--nemotron-download") {
+            opt.download_only = true;
             continue;
         }
         if (a == "--service") {
@@ -321,18 +335,19 @@ bool parse_args(int argc, char** argv, Options& opt, int& exit_code) {
     // There is deliberately no --api-key that takes a value: the key arrives on stdin under
     // --api-key-stdin, because every process running as this user can read a command line. And
     // still no --silero-model; openai-translator.md §1.4 records why it is a separate, argued
-    // addition. `--backend` was one too, and backend_windows.h is the argument.
-    if (opt.translator.backend == BackendKind::WindowsSpeech) {
+    // addition. `--backend` was one too, and backend_nemotron.h is the argument.
+    if (opt.download_only) return true;
+    if (opt.translator.backend == BackendKind::Nemotron) {
         if (!opt.translator.service.empty()) {
             std::fprintf(stderr,
-                         "kvit-asrd: --service has no meaning with --backend windows-speech; the "
-                         "model runs on this machine\n");
+                         "kvit-asrd: --service has no meaning with --backend nemotron; the model "
+                         "runs on this machine\n");
             exit_code = 2;
             return false;
         }
         // One model, and its name is what `hello.model` must match. A `--model` that said
         // anything else would be a promise this backend cannot keep.
-        opt.translator.model = kWindowsSpeechModel;
+        opt.translator.model = kNemotronModel;
         return true;
     }
     const std::string why = validate_service_url(opt.translator.service);
@@ -434,14 +449,56 @@ int run(int argc, char** argv) {
     log_cfg.to_debugger = false;
     kd::log::init(log_cfg);
 
-    if (opt.translator.backend == BackendKind::WindowsSpeech) {
-        const std::filesystem::path helper = opt.translator.speech.helper.empty()
-                                                 ? default_speech_helper_path()
-                                                 : opt.translator.speech.helper;
-        KD_LOG_INFO("kvit-asrd starting: backend=windows-speech helper=%s %s install_model=%s",
-                    narrow(helper.wstring()).c_str(),
+    // power.h: a window-less decoder is exactly what Windows throttles, and the user is waiting.
+    if (!opt_out_of_power_throttling()) {
+        KD_LOG_WARN("Windows refused to exempt this process from power throttling (error %lu); "
+                    "on-device decoding may run on efficiency cores",
+                    GetLastError());
+    }
+
+    if (opt.download_only) {
+        const std::filesystem::path dir = opt.translator.nemotron.model_dir.empty()
+                                              ? default_nemotron_model_dir()
+                                              : opt.translator.nemotron.model_dir;
+        const CatalogModel& model = nemotron_en_catalog_model();
+        std::atomic<bool> never{false};
+        int last_percent = -1;
+        Status st = download_catalog_model(
+            model, dir,
+            [&last_percent](uint64_t done, uint64_t total) {
+                const int percent = total == 0 ? 100 : static_cast<int>(done * 100 / total);
+                if (percent / 5 != last_percent / 5) {
+                    last_percent = percent;
+                    KD_LOG_INFO("downloaded %llu of %llu MB (%d%%)",
+                                static_cast<unsigned long long>(done / 1000000),
+                                static_cast<unsigned long long>(total / 1000000), percent);
+                }
+            },
+            never);
+        // A folder that was already there was only checked by size; this is the full check.
+        if (st.ok()) st = verify_model_dir(model, dir, true);
+        if (!st.ok()) {
+            KD_LOG_ERROR("%s", st.to_string().c_str());
+            kd::log::shutdown();
+            return kExitInternal;
+        }
+        KD_LOG_INFO("the Nemotron model is in %s and every file matches its SHA-256",
+                    narrow(dir.wstring()).c_str());
+        kd::log::shutdown();
+        return kExitOk;
+    }
+
+    if (opt.translator.backend == BackendKind::Nemotron) {
+        const NemotronConfig& n = opt.translator.nemotron;
+        KD_LOG_INFO("kvit-asrd starting: backend=nemotron runtime=%s model=%s %s install_model=%s",
+                    narrow((n.runtime_dir.empty() ? default_nemotron_runtime_dir() : n.runtime_dir)
+                               .wstring())
+                        .c_str(),
+                    narrow((n.model_dir.empty() ? default_nemotron_model_dir() : n.model_dir)
+                               .wstring())
+                        .c_str(),
                     opt.translator.finalize_only ? "finalize-only" : "live-preview",
-                    opt.translator.speech.install_model ? "yes" : "no");
+                    n.install_model ? "yes" : "no");
     } else {
         KD_LOG_INFO("kvit-asrd starting: service=%s model=%s %s vad_gate=%s api_key=%s",
                     opt.translator.service.c_str(), opt.translator.model.c_str(),
@@ -534,8 +591,8 @@ int run(int argc, char** argv) {
     for (std::thread& t : connections) {
         if (t.joinable()) t.join();
     }
-    // Asked to quit rather than left to the job object, so its last log lines arrive.
-    release_speech_helpers();
+    // After the last connection: the runtime's globals must not be left to static destruction.
+    release_nemotron_engines();
     KD_LOG_INFO("kvit-asrd exiting (%d)", last);
     kd::log::shutdown();
     return last;

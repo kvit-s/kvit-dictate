@@ -39,6 +39,22 @@ private:
     WsConnection& conn_;
 };
 
+// What `hello_ack` and `ready` say about the backend. The protocol's taxonomy has no other value
+// for a batch model behind a window, and base.py's rule applies here too: a wrapper that
+// relabelled itself would put uncomparable latency numbers in the same column as the
+// native-streaming rows. Nemotron is one of those rows: it decodes 560 ms chunks as they arrive.
+proto::StreamingMode streaming_mode_of(const TranslatorConfig& cfg) {
+    return cfg.backend == BackendKind::Nemotron ? proto::StreamingMode::NativeStreaming
+                                                : proto::StreamingMode::PseudoStreaming;
+}
+
+int32_t chunk_ms_of(const TranslatorConfig& cfg) {
+    if (cfg.finalize_only) return 0;
+    return cfg.backend == BackendKind::Nemotron
+               ? static_cast<int32_t>(kNemotronChunkSamples * 1000 / 16000)
+               : 1000;
+}
+
 }  // namespace
 
 bool length_agrees(const std::string& message) {
@@ -157,12 +173,12 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
         // `mode` is stated here as well as in `ready`: unlike the Python server, this process
         // knows its backend before it loads anything, because there is exactly one and it is
         // compiled in.
-        info.mode = proto::StreamingMode::PseudoStreaming;
-        info.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
+        info.mode = streaming_mode_of(cfg);
+        info.chunk_ms = chunk_ms_of(cfg);
         // The endpoint takes vocabulary hints as `prompt`; `session_server` joins `start.context`
         // and sends them. Measured 2026-09-20: on the same audio, "Qt UI" becomes "kvit-ui" and
-        // "Piper D" becomes "Piperd" once the terms are on the wire. The Windows speech model
-        // takes no prompt, and saying so lets the client grey out a box that would do nothing.
+        // "Piper D" becomes "Piperd" once the terms are on the wire. The Nemotron model takes no
+        // prompt, and saying so lets the client grey out a box that would do nothing.
         info.context_supported = cfg.backend == BackendKind::OpenAiHttp;
         ack.models.push_back(std::move(info));
         if (!sink.send(proto::Message::of(std::move(ack)))) return kExitTransport;
@@ -208,19 +224,15 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
         return kExitInternal;
     }
 
-    // Both backends are batch models behind the same driver, so everything after this block is
-    // the same code for either — which is the point of `Backend` (backend.h).
+    // Everything after this block is the same code for every backend — which is the point of
+    // `Backend` (backend.h). The HTTP service is a batch model behind a driver; Nemotron streams.
     std::unique_ptr<Backend> backend;
     proto::ErrorCode load_error = proto::ErrorCode::connect_refused;
-    if (cfg.backend == BackendKind::WindowsSpeech) {
-        WindowsSpeechConfig speech_cfg = cfg.speech;
-        speech_cfg.finalize_only = cfg.finalize_only;
-        // The helper belongs to the process, not to this connection: a reconnect must not pay
-        // the model's three-second load again (backend_windows.h).
-        backend = std::make_unique<WindowsSpeechBackend>(
-            speech_cfg, shared_speech_helper(WindowsSpeechBackend::helper_spec(speech_cfg)));
-        // Not `connect_refused`: there is no host to refuse anything. The model, or the helper
-        // that carries it, is what failed, and the message says which.
+    if (cfg.backend == BackendKind::Nemotron) {
+        NemotronConfig nemotron_cfg = cfg.nemotron;
+        nemotron_cfg.finalize_only = cfg.finalize_only;
+        // The model belongs to the process, not to this connection: backend_nemotron.h.
+        backend = std::make_unique<NemotronBackend>(nemotron_cfg);
         load_error = proto::ErrorCode::model_load_failed;
     } else {
         OpenAiBackendConfig backend_cfg;
@@ -247,11 +259,8 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     proto::ReadyMsg ready;
     ready.model = cfg.model;
     ready.warm_ms = static_cast<int64_t>(GetTickCount64() - load_started);
-    // The protocol's taxonomy has no other value for a batch model behind a window, and
-    // base.py's rule applies here too: a wrapper that relabelled itself would put uncomparable
-    // latency numbers in the same column as the native-streaming rows.
-    ready.mode = proto::StreamingMode::PseudoStreaming;
-    ready.chunk_ms = static_cast<int32_t>(cfg.finalize_only ? 0 : 1000);
+    ready.mode = streaming_mode_of(cfg);  // see the function for why the label matters
+    ready.chunk_ms = chunk_ms_of(cfg);
     ready.context_supported = cfg.backend == BackendKind::OpenAiHttp;  // see the `hello_ack`
     if (!sink.send(proto::Message::of(std::move(ready)))) return kExitTransport;
 
@@ -274,6 +283,10 @@ int serve_connection(WsConnection& conn, const TranslatorConfig& cfg) {
     // word at byte 421; §8.3 obliges the sender to refuse, so the session was failed and the
     // utterance in flight was lost. Preview now publishes `stable_bytes = 0` and promises
     // nothing, so there is no mark to contradict and everything still commits at the `final`.
+    //
+    // Nemotron's text only grows (backend_nemotron.h), so a mark there would be keepable. It is
+    // still off: a partial can end in half a word, and marking it is its own change, with its
+    // own measurement, after the backend has been dictated with.
     session_cfg.emit_partials = !cfg.finalize_only;
     session_cfg.publish_stable_partials = false;
     session_cfg.revision_dir = cfg.revision_dir;

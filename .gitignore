@@ -81,12 +81,6 @@ desktop.ini
 .DS_Store
 *.swp
 
-# tools/kvit-speech build output. The helper is built on demand with `dotnet build`; its output
-# tree is ~200 MB because WindowsAppSDKSelfContained carries the runtime next to the exe.
-tools/kvit-speech/bin/
-tools/kvit-speech/obj/
-tools/kvit-speech/dist/
-
 # ── Local agent state ───────────────────────────────────────────────────────────────────────
 # Per-machine tool state, including .claude/settings.local.json. Each directory ignores itself
 # here, but a fresh clone would not have those inner rules, so the root says it too.

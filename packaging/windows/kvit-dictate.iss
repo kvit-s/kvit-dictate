@@ -89,6 +89,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; having agreed to it.
 Name: "startup"; Description: "Start kvit-dictate when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
 
+[InstallDelete]
+; The Windows speech helper of releases up to 2026-11: removed, with the Windows speech model it
+; drove, when "This PC" moved to Nemotron. An upgrade would otherwise leave ~200 MB of it behind.
+Type: filesandordirs; Name: "{app}\kvit-speech"
+
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 

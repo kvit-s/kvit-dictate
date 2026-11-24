@@ -153,10 +153,14 @@ set(KD_WIRE_SOURCES
     src/util/utf8.cpp
     src/util/json.cpp
     src/util/log.cpp
+    # The Nemotron model's download: the Settings page runs it, and `kvit-asrd --nemotron-download`
+    # runs the same code, so it lives where both executables can reach it.
+    src/model_download.cpp
 )
 
 set(KD_WIRE_HEADERS
     src/protocol.h
+    src/model_download.h
     src/util/clock.h
     src/util/json.h
     src/util/wav.h
@@ -167,7 +171,9 @@ set(KD_WIRE_HEADERS
 
 add_library(kd_wire STATIC ${KD_WIRE_SOURCES} ${KD_WIRE_HEADERS})
 target_include_directories(kd_wire PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(kd_wire PUBLIC kd_common_flags)
+# model_download.cpp: WinHTTP for the two HTTPS requests, BCrypt for SHA-256, shell32 and ole32
+# for SHGetKnownFolderPath(%LOCALAPPDATA%) and the CoTaskMemFree it requires.
+target_link_libraries(kd_wire PUBLIC kd_common_flags winhttp bcrypt shell32 ole32)
 
 # ─── kd_core: every module except main.cpp ───────────────────────────────────────────────────
 
@@ -397,7 +403,8 @@ set(KD_ASRD_SOURCES
     src/asrd/stability.cpp
     src/asrd/vad.cpp
     src/asrd/backend_openai.cpp
-    src/asrd/backend_windows.cpp
+    src/asrd/backend_nemotron.cpp
+    src/asrd/power.cpp
     src/asrd/http.cpp
 )
 
@@ -409,7 +416,8 @@ set(KD_ASRD_HEADERS
     src/asrd/vad.h
     src/asrd/backend.h
     src/asrd/backend_openai.h
-    src/asrd/backend_windows.h
+    src/asrd/backend_nemotron.h
+    src/asrd/power.h
     src/asrd/http.h
 )
 
@@ -434,6 +442,9 @@ target_include_directories(kvit-asrd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/packag
 #   winhttp  backend_openai/http — the POST to /v1/audio/transcriptions and /v1/audio/vad.
 #   ws2_32   ws_server — the listening socket. WinHTTP is a client API and has no server-side
 #            counterpart short of http.sys, which wants a namespace reservation and elevation.
+# **onnxruntime-genai is not linked.** backend_nemotron.cpp opens it with LoadLibraryExW from
+# `nemotron\` beside the executable, so a translator without that folder starts, serves every
+# other backend, and says in words what is missing when Nemotron is asked for.
 target_link_libraries(kvit-asrd PRIVATE kd_wire bcrypt winhttp ws2_32)
 
 # Same version numbers as the client, from project(), so the two binaries in one installer can
@@ -497,7 +508,7 @@ if(KD_BUILD_TESTS)
         tests/test_asrd_vad.cpp
         tests/test_asrd_backend.cpp
         tests/test_asrd_session.cpp
-        tests/test_asrd_windows.cpp
+        tests/test_asrd_nemotron.cpp
     )
 
     # Everything under src/asrd/ except main.cpp, which owns the process and its own int main().
@@ -514,12 +525,6 @@ if(KD_BUILD_TESTS)
     target_compile_definitions(kd_tests PRIVATE
         KD_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
-    # A stand-in for tools/kvit-speech: its framed protocol with no model behind it, and a flag
-    # for each way the real helper can fail. See tests/fake_speech/main.cpp.
-    add_executable(kd_fake_speech tests/fake_speech/main.cpp)
-    add_dependencies(kd_tests kd_fake_speech)
-    target_compile_definitions(kd_tests PRIVATE
-        KD_FAKE_SPEECH_EXE=L"$<TARGET_FILE:kd_fake_speech>")
 endif()
 
 # ─── ctest registration ──────────────────────────────────────────────────────────────────────
@@ -569,7 +574,7 @@ if(KD_BUILD_TESTS)
         asrd_vad        # src/asrd/vad.cpp — the energy endpointer and its chunking invariance
         asrd_backend    # src/asrd/backend_openai.cpp — the window driver, WAV, multipart
         asrd_session    # src/asrd/session_server.cpp — in-process loopback and a stub service
-        asrd_windows    # src/asrd/backend_windows.cpp — the helper link, against tests/fake_speech
+        asrd_nemotron   # src/asrd/backend_nemotron.cpp, src/model_download.cpp — the model, when given
     )
     # Empty: every suite now has tests. Keep the list rather than deleting it — a new module
     # starts here, disabled and visible, instead of being silently uncovered.

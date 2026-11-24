@@ -59,6 +59,7 @@
 #include <vssym32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +68,7 @@
 #include <cwctype>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -76,6 +78,7 @@
 
 #include "audio_capture.h"
 #include "ipc_client.h"
+#include "model_download.h"
 #include "translator.h"
 #include "updater.h"
 #include "theme.h"
@@ -2013,6 +2016,10 @@ enum : int {
     // One line under the box, empty except where the box is greyed for a reason the box itself
     // cannot show: on this PC it is not a preference that was turned off, it is not on offer.
     kIdServerLivePreviewNote,
+    // The Nemotron model's download (model_download.h), for "This PC". A button and a status
+    // line: the model is 728 MB and fetched only when the user presses this (plan.md §1.9).
+    kIdModelDownload,
+    kIdModelStatus,
     kIdServerApiKey,
     // The rewriter (normalizer.h). On the compose-buffer page rather than the server one, even
     // though it is an address the user types: it rewrites **the pill** and nothing else, and its
@@ -2063,6 +2070,11 @@ constexpr UINT kMsgProbeDone = WM_APP + 41;
 // cannot answer into each other's status line.
 constexpr UINT kMsgNormalizeTestDone = WM_APP + 42;
 
+// The model download: progress (wParam MB done, lParam MB in all), and the end (wParam 1 when the
+// model is there and checked, lParam a heap std::wstring for the status line).
+constexpr UINT kMsgModelProgress = WM_APP + 43;
+constexpr UINT kMsgModelDone = WM_APP + 44;
+
 struct DialogState {
     Settings settings;                       // the working copy; only copied out on OK
     const ModelManifest* manifest = nullptr;
@@ -2084,9 +2096,15 @@ struct DialogState {
     uint32_t normalize_test_generation = 0;
     bool normalize_test_running = false;
 
-    // What the user wants from "Show words as they are recognised" when an HTTP speech service
-    // is in use. Kept apart from the box because the box shows what *will happen*, and on this
-    // PC that is no preview whatever this says (update_server_mode_ui) — a greyed tick there
+    // The model download. Shared with its worker, which outlives nothing it does not own: closing
+    // the dialog sets this, and the worker stops after the read it is in.
+    bool model_download_running = false;
+    std::shared_ptr<std::atomic<bool>> model_download_cancel;
+
+    // What the user wants from "Show words as they are recognised". Kept apart from the box
+    // because the box shows what *will happen*, and against a protocol server that is whatever
+    // the server does, whatever this says (update_server_mode_ui). Under Windows speech, now
+    // removed, this PC was the same case — a greyed tick there
     // read as "on", and the first person to pick Windows speech took it at its word.
     bool live_preview_choice = true;
 
@@ -2490,24 +2508,20 @@ void update_server_mode_ui(HWND dlg) {
     EnableWindow(GetDlgItem(dlg, kIdServerModel), this_pc ? FALSE : TRUE);
     // Live preview is a translator setting, so it means nothing when the translator is not the
     // thing being talked to. Disabled rather than hidden: a control that vanishes is a control
-    // the user cannot find again. On this PC it is off by measurement, not by policy: a decode
-    // costs ~1.4 s plus a third of the audio, so a preview every second would fall further
-    // behind with each word (src/asrd/backend_windows.h).
+    // the user cannot find again.
     //
-    // So on this PC the box is shown *unticked*, with the reason under it. It used to keep the
-    // user's tick and only grey it, and a greyed tick reads as "on, and locked on": the pill
-    // then stayed empty until each sentence was finished and nothing on screen said why. The
-    // choice itself is kept in DialogState and comes back with an HTTP service.
-    EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), local ? TRUE : FALSE);
+    // On this PC it is the user's choice, as with a service. It was not with Windows speech,
+    // which needed ~1.4 s a decode and could not keep up; Nemotron streams 560 ms chunks in
+    // ~75 ms each (src/asrd/backend_nemotron.h). When the box is greyed it shows *unticked*: a
+    // greyed tick reads as "on, and locked on". The choice itself is kept in DialogState.
+    const bool preview_offered = local || this_pc;
+    EnableWindow(GetDlgItem(dlg, kIdServerLivePreview), preview_offered ? TRUE : FALSE);
     if (const auto* st = reinterpret_cast<const DialogState*>(GetWindowLongPtrW(dlg, GWLP_USERDATA));
         st != nullptr) {
         CheckDlgButton(dlg, kIdServerLivePreview,
-                       !this_pc && st->live_preview_choice ? BST_CHECKED : BST_UNCHECKED);
+                       preview_offered && st->live_preview_choice ? BST_CHECKED : BST_UNCHECKED);
     }
-    SetWindowTextW(GetDlgItem(dlg, kIdServerLivePreviewNote),
-                   this_pc ? L"Not with Windows speech: it reads each sentence once you pause, "
-                             L"about 1.5 s later."
-                           : L"");
+    SetWindowTextW(GetDlgItem(dlg, kIdServerLivePreviewNote), L"");
     // Likewise the key: it is the translator that sends it, and a protocol server is not asked.
     EnableWindow(GetDlgItem(dlg, kIdServerApiKey), local ? TRUE : FALSE);
 }
@@ -2573,6 +2587,81 @@ std::wstring describe_probe(const ServerProbe& p) {
     return out;
 }
 
+// ─── The Nemotron model, for "This PC" ──────────────────────────────────────────────────────
+
+// Whether the model is in its folder. By size only, which is a directory listing; the hashes
+// were checked when it was downloaded.
+bool nemotron_model_present() {
+    return verify_model_dir(nemotron_en_catalog_model(), default_nemotron_model_dir(), false).ok();
+}
+
+std::wstring megabytes(uint64_t bytes) { return std::to_wstring(bytes / 1000000) + L" MB"; }
+
+// The button and the line under it, from what is on disk. Not while a download runs: the worker's
+// progress owns both until it is done.
+void refresh_model_ui(HWND dlg, const DialogState& st) {
+    if (st.model_download_running) return;
+    const bool have = nemotron_model_present();
+    const std::wstring size = megabytes(nemotron_en_catalog_model().total_bytes());
+    HWND button = GetDlgItem(dlg, kIdModelDownload);
+    SetWindowTextW(button, have ? L"Nemotron model downloaded"
+                                : (L"Download Nemotron model (" + size + L")").c_str());
+    EnableWindow(button, have ? FALSE : TRUE);
+    SetWindowTextW(GetDlgItem(dlg, kIdModelStatus),
+                   have ? L"Ready for \"This PC\". Nothing you say leaves this computer."
+                        : (L"\"This PC\" needs it: " + size +
+                           L", once, from Microsoft's model catalog. Nothing you say leaves "
+                           L"this computer.")
+                              .c_str());
+}
+
+// The download, on a worker, with progress in the status line.
+//
+// Same shape as start_server_test: the worker copies what it needs, reads no DialogState, and
+// posts its answer. What it shares is one flag, so that closing the dialog stops a 728 MB
+// download instead of leaving it running behind a window that is gone. What it had fetched
+// stays in `<dir>.partial` and the next press carries on from the first file not yet complete.
+void start_model_download(HWND dlg, DialogState& st) {
+    if (st.model_download_running) return;
+    st.model_download_running = true;
+    st.model_download_cancel = std::make_shared<std::atomic<bool>>(false);
+    EnableWindow(GetDlgItem(dlg, kIdModelDownload), FALSE);
+    SetWindowTextW(GetDlgItem(dlg, kIdModelDownload), L"Downloading…");
+    SetWindowTextW(GetDlgItem(dlg, kIdModelStatus),
+                   L"Asking Microsoft's model catalog where the files are…");
+
+    std::thread([dlg, cancel = st.model_download_cancel]() {
+        const CatalogModel& model = nemotron_en_catalog_model();
+        const std::filesystem::path dir = default_nemotron_model_dir();
+        uint64_t last_percent = 101;
+        Status result = download_catalog_model(
+            model, dir,
+            [&](uint64_t done, uint64_t total) {
+                const uint64_t percent = total == 0 ? 100 : done * 100 / total;
+                if (percent == last_percent) return;
+                last_percent = percent;
+                PostMessageW(dlg, kMsgModelProgress, static_cast<WPARAM>(done / 1000000),
+                             static_cast<LPARAM>(total / 1000000));
+            },
+            *cancel);
+        // A folder that was already there was only checked by size; this is the full check.
+        if (result.ok()) result = verify_model_dir(model, dir, true);
+        auto* text = new std::wstring(
+            result.ok() ? L"Downloaded and checked. Choose \"This PC\" and press Test."
+                        : L"The download did not finish: " + wide(result.message()) +
+                              L" Press the button again to carry on.");
+        if (result.ok()) {
+            KD_LOG_INFO("the Nemotron model is downloaded and checked");
+        } else {
+            KD_LOG_WARN("the Nemotron model download failed: %s", result.to_string().c_str());
+        }
+        if (!PostMessageW(dlg, kMsgModelDone, result.ok() ? 1 : 0,
+                          reinterpret_cast<LPARAM>(text))) {
+            delete text;
+        }
+    }).detach();
+}
+
 void start_server_test(HWND dlg, DialogState& st) {
     if (st.probe_running) return;
 
@@ -2591,7 +2680,14 @@ void start_server_test(HWND dlg, DialogState& st) {
         return;
     }
     if (mode == ServerMode::ThisPc) {
-        // Nothing to validate: no address, no key.
+        // No address and no key to validate, but there has to be a model. Said here rather than
+        // left to the translator, whose refusal would arrive after a launch and a handshake.
+        if (!nemotron_model_present()) {
+            SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
+                           L"The Nemotron model is not downloaded yet. Press \"Download "
+                           L"Nemotron model\" first.");
+            return;
+        }
     } else if (mode == ServerMode::Local) {
         if (const std::string why = validate_speech_service_url(narrow(url)); !why.empty()) {
             SetWindowTextW(GetDlgItem(dlg, kIdServerStatus), wide(why).c_str());
@@ -2610,8 +2706,7 @@ void start_server_test(HWND dlg, DialogState& st) {
     const uint32_t generation = ++st.probe_generation;
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
                    mode == ServerMode::ThisPc
-                       ? L"Loading the Windows speech model… If it is not installed yet, Windows "
-                         L"downloads it now — a few hundred MB, once — and this waits for it."
+                       ? L"Loading the Nemotron model on this PC…"
                        : L"Connecting… (a service loading a model for the first time can take a "
                          L"while; this waits up to a minute)");
     EnableWindow(GetDlgItem(dlg, kIdServerTest), FALSE);
@@ -2644,14 +2739,13 @@ void start_server_test(HWND dlg, DialogState& st) {
         // security software inspects it first; Test waits for it as dictation does.
         ep.refused_retry_ms = mode == ServerMode::Protocol ? 0 : kTranslatorListenWaitMs;
         bool launched = true;
-        // The one place the model may be downloaded: the user chose This PC and pressed Test,
-        // which is asking for it (plan.md §1.9). A dictation never does; it reports instead.
+        // The model is already downloaded (checked above, and downloaded only by its own
+        // button). Loading it takes under a second warm; a cold disk reading 700 MB is slower.
         uint32_t probe_ms = 60000;
         if (mode == ServerMode::ThisPc) {
             TranslatorSpec spec;
             spec.on_device = true;
-            spec.install_speech_model = true;
-            probe_ms = 15u * 60u * 1000u;
+            spec.live_preview = live_preview;
             if (const Result<std::string> started = probe_child.start(spec); started) {
                 ep.url = wide(*started);
                 text = L"Started the translator on " + ep.url + L"\r\n";
@@ -2680,8 +2774,8 @@ void start_server_test(HWND dlg, DialogState& st) {
             if (const Result<ServerProbe> r = probe_server(ep, probe_ms); r) {
                 text += describe_probe(*r);
                 if (mode == ServerMode::ThisPc) {
-                    text += L"\r\nThe speech model on this PC answered. Nothing you say leaves "
-                            L"this computer.";
+                    text += L"\r\nThe Nemotron model on this PC answered. Nothing you say "
+                            L"leaves this computer.";
                 } else if (mode == ServerMode::Local) {
                     text += L"\r\nThe translator and your speech service both answered. "
                             L"kvit-dictate starts this for you when you dictate; there is "
@@ -2690,11 +2784,10 @@ void start_server_test(HWND dlg, DialogState& st) {
             } else {
                 text += L"Could not use this endpoint.\r\n" + wide(r.status().message());
                 if (mode == ServerMode::ThisPc) {
-                    // Not "needs Windows 11 24H2": that was printed under every failure, on a
-                    // 24H2 machine whose only problem was a slow start. When the model really is
-                    // unsupported, the helper says so in the message above.
-                    text += L"\r\nThe Windows speech model did not answer. Its diagnostics are "
-                            L"in this app's log, prefixed \"asrd:\".";
+                    // The translator's own refusal, above, names what is wrong: a missing DLL,
+                    // a model that does not load. This only says where to look for more.
+                    text += L"\r\nThe Nemotron model did not answer. Its diagnostics are in "
+                            L"this app's log, prefixed \"asrd:\".";
                 } else if (mode == ServerMode::Local) {
                     text += L"\r\nThe translator started but did not become ready, which "
                             L"usually means it could not reach the speech service at that "
@@ -2841,7 +2934,7 @@ void refresh_normalizer_controls(HWND dlg) {
     std::wstring status;
     if (!have_url) {
         status = mode_of(dlg) == ServerMode::ThisPc
-                     ? L"Windows speech has no text service. To use one, type its address above."
+                     ? L"This PC has no text service. To use one, type its address in the box."
                      : L"Needs a text service: an http:// speech service above, or an address "
                        L"in the box.";
     } else if (!eos) {
@@ -3343,9 +3436,12 @@ void load_controls(HWND dlg, DialogState& st) {
     SetWindowTextW(GetDlgItem(dlg, kIdServerModel), wide(s.server.model).c_str());
     SetWindowTextW(GetDlgItem(dlg, kIdServerApiKey), wide(s.server.api_key).c_str());
     update_server_mode_ui(dlg);
+    refresh_model_ui(dlg, st);
     SetWindowTextW(GetDlgItem(dlg, kIdServerStatus),
                    s.server.mode == ServerMode::ThisPc
-                       ? L"Press Test to load the Windows speech model on this PC."
+                       ? (nemotron_model_present()
+                              ? L"Press Test to load the Nemotron model on this PC."
+                              : L"Press \"Download Nemotron model\" first, then Test.")
                    : s.server.configured()
                        ? L"Press Test to check that this address answers."
                        : L"No server is configured yet, so dictation is switched off. Type an "
@@ -3830,7 +3926,7 @@ void build_controls(HWND dlg, DialogState& st) {
 
         c.radio(L"OpenAI-compatible speech service", kIdServerModeLocal, true);
         c.radio(L"kvit-dictate service", kIdServerModeProtocol, false);
-        c.radio(L"This PC: Windows speech, no server", kIdServerModeThisPc, false);
+        c.radio(L"This PC: Nemotron, no server", kIdServerModeThisPc, false);
         c.gap(6);
 
         set_cue(c.label_edit(L"Model (optional)", kIdServerModel),
@@ -3848,6 +3944,15 @@ void build_controls(HWND dlg, DialogState& st) {
     }
     {
         Cursor c{dlg, inst, &st, 0, col2_x, top, top, col_w};
+        // At the top of this column, level with the radios it serves, rather than under them:
+        // the left column already carries the address, the model, the key and Test's seven
+        // lines, and the tallest column on any page sets the dialog's height for all five.
+        c.section(L"Speech model on this PC");
+        c.add(L"BUTTON", L"Download Nemotron model", WS_TABSTOP | BS_PUSHBUTTON, 26,
+              kIdModelDownload);
+        c.gap(4);
+        c.add(L"STATIC", L"", 0, st.line_h * 2, kIdModelStatus);
+
         c.section(L"Live preview");
         c.check(L"Show words as they are recognised", kIdServerLivePreview);
         c.add(L"STATIC", L"", 0, st.line_h * 2, kIdServerLivePreviewNote);
@@ -4215,6 +4320,47 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case kMsgModelProgress:
+            if (st && st->model_download_running) {
+                const std::wstring line = L"Downloading the Nemotron model: " +
+                                          std::to_wstring(static_cast<uint64_t>(wp)) + L" of " +
+                                          std::to_wstring(static_cast<uint64_t>(lp)) +
+                                          L" MB. You can keep using this dialog.";
+                SetWindowTextW(GetDlgItem(hwnd, kIdModelStatus), line.c_str());
+            }
+            return 0;
+
+        case kMsgModelDone: {
+            auto* text = reinterpret_cast<std::wstring*>(lp);
+            if (st) {
+                st->model_download_running = false;
+                st->model_download_cancel.reset();
+                refresh_model_ui(hwnd, *st);
+                // After the refresh, which wrote the at-rest line: this one says what just
+                // happened, and on failure what to do about it.
+                if (text != nullptr) SetWindowTextW(GetDlgItem(hwnd, kIdModelStatus), text->c_str());
+                // Someone who downloaded the model and has typed no address wants This PC; making
+                // them find the radio as well would be one more step for nothing. An address in
+                // the box is a choice already made, and is left alone.
+                if (wp == 1 && mode_of(hwnd) != ServerMode::ThisPc &&
+                    get_text(GetDlgItem(hwnd, kIdServerUrl)).empty()) {
+                    CheckDlgButton(hwnd, kIdServerModeLocal, BST_UNCHECKED);
+                    CheckDlgButton(hwnd, kIdServerModeProtocol, BST_UNCHECKED);
+                    CheckDlgButton(hwnd, kIdServerModeThisPc, BST_CHECKED);
+                    update_server_mode_ui(hwnd);
+                    update_server_warning(hwnd);
+                    refresh_normalizer_controls(hwnd);
+                }
+                // The Test hint under the radios was written before there was a model.
+                if (wp == 1 && mode_of(hwnd) == ServerMode::ThisPc && !st->probe_running) {
+                    SetWindowTextW(GetDlgItem(hwnd, kIdServerStatus),
+                                   L"Press Test to load the Nemotron model on this PC.");
+                }
+            }
+            delete text;
+            return 0;
+        }
+
         case kMsgNormalizeTestDone: {
             auto* text = reinterpret_cast<std::wstring*>(lp);
             if (st) {
@@ -4347,6 +4493,9 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kIdServerTest:
                     start_server_test(hwnd, *st);
                     return 0;
+                case kIdModelDownload:
+                    start_model_download(hwnd, *st);
+                    return 0;
                 case kIdUpdateNow:
                     // To the owner, which owns the update flow (main.cpp). Posted: the flow
                     // starts a thread and returns, and this dialog stays as it is.
@@ -4462,7 +4611,12 @@ LRESULT CALLBACK dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_DESTROY:
-            if (st) st->running = false;
+            if (st) {
+                st->running = false;
+                // A download nobody can see any more stops after the read it is in; what it
+                // fetched is kept, and the next press carries on from there.
+                if (st->model_download_cancel) st->model_download_cancel->store(true);
+            }
             return 0;
 
         default:

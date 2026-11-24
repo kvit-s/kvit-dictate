@@ -195,7 +195,7 @@ Three of those flags are not decoration:
 ### 2.3 A model on this machine
 
 The other backends — `sherpa-onnx`, `zipformer-hotwords`, `whisper-transformers`,
-`faster-whisper`, `windows-speech` — each need their own environment and, in most cases, model
+`faster-whisper` — each need their own environment and, in most cases, model
 files on disk. **Nothing is ever downloaded automatically** (`plan.md` §1.9). `server/README.md`
 §6 lists the requirement file for each, and `bench/CANDIDATES.md` says which models are real,
 what they need, and which four are worth trying first.
